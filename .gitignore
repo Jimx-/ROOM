@@ -1,0 +1,7 @@
+__pycache__
+
+rtl/wrapper.v
+
+results.xml
+sim_build
+*.vcd
