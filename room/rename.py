@@ -3,6 +3,8 @@ from amaranth.lib.coding import PriorityEncoder, Decoder
 
 from room.consts import *
 from room.types import MicroOp
+from room.rob import CommitReq
+from room.issue import IssueQueueWakeup
 
 
 class MapReq(Record):
@@ -101,14 +103,17 @@ class Freelist(Elaboratable):
         self.core_width = core_width
         self.num_pregs = num_pregs
 
-        self.reqs = [Signal(name=f'req{i}') for i in range(core_width)]
+        self.reqs = Signal(core_width)
         self.alloc_pregs = [
-            Signal(range(num_pregs), name=f'alloc_pregs{i}')
+            Signal(range(num_pregs), name=f'alloc_preg{i}')
             for i in range(core_width)
         ]
         self.alloc_valids = [Signal() for _ in range(core_width)]
 
-        self.dealloc_pregs = [Signal() for _ in range(core_width)]
+        self.dealloc_pregs = [
+            Signal(range(num_pregs), name=f'dealloc_preg{i}')
+            for i in range(core_width)
+        ]
         self.dealloc_valids = [Signal() for _ in range(core_width)]
 
     def elaborate(self, platform):
@@ -152,7 +157,19 @@ class Freelist(Elaboratable):
                 self.alloc_valids[i].eq(valid),
             ]
 
-        m.d.sync += [free_list.eq(free_list & ~sel_mask)]
+        dealloc_mask = 0
+        for preg, v in zip(self.dealloc_pregs, self.dealloc_valids):
+            dec = Decoder(self.num_pregs)
+            m.submodules += dec
+
+            m.d.comb += dec.i.eq(preg)
+
+            dealloc_mask |= Mux(v, dec.o, 0)
+
+        m.d.sync += [
+            free_list.eq((free_list & ~sel_mask | dealloc_mask)
+                         & ~Const(1, self.num_pregs)),
+        ]
 
         return m
 
@@ -170,7 +187,7 @@ class BusyResp(Record):
 
 class BusyTable(Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, num_wakeup_ports, params):
         self.core_width = params['core_width']
         self.num_pregs = params['num_pregs']
 
@@ -185,11 +202,26 @@ class BusyTable(Elaboratable):
 
         self.busy_reqs = Signal(self.core_width)
 
+        self.wb_valids = Signal(num_wakeup_ports)
+        self.wb_pdst = [
+            Signal(range(self.num_pregs), name=f'wb_pdst{i}')
+            for i in range(num_wakeup_ports)
+        ]
+
     def elaborate(self, platform):
         m = Module()
 
         busy_table = Array(
             Signal(name=f'busy_table{i}') for i in range(self.num_pregs))
+
+        wb_mask = 0
+        for preg, v in zip(self.wb_pdst, self.wb_valids):
+            dec = Decoder(self.num_pregs)
+            m.submodules += dec
+
+            m.d.comb += dec.i.eq(preg)
+
+            wb_mask |= Mux(v, dec.o, 0)
 
         busy_table_next = 0
         for uop, req in zip(self.ren_uops, self.busy_reqs):
@@ -201,13 +233,14 @@ class BusyTable(Elaboratable):
             busy_table_next = busy_table_next | Mux(req, dec.o, 0)
 
         for i in range(self.num_pregs):
-            m.d.sync += busy_table[i].eq(busy_table_next[i])
+            m.d.sync += busy_table[i].eq(busy_table[i] & ~wb_mask[i]
+                                         | busy_table_next[i])
 
         for resp, uop in zip(self.busy_resps, self.ren_uops):
             m.d.comb += [
-                resp.prs1_busy.eq(uop.prs1),
-                resp.prs2_busy.eq(uop.prs2),
-                resp.prs3_busy.eq(uop.prs3),
+                resp.prs1_busy.eq(busy_table[uop.prs1]),
+                resp.prs2_busy.eq(busy_table[uop.prs2]),
+                resp.prs3_busy.eq(busy_table[uop.prs3]),
             ]
 
         return m
@@ -215,10 +248,11 @@ class BusyTable(Elaboratable):
 
 class RenameStage(Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, num_wakeup_ports, params):
         self.params = params
         self.core_width = params['core_width']
         self.num_pregs = params['num_pregs']
+        self.num_wakeup_ports = num_wakeup_ports
 
         self.kill = Signal()
 
@@ -236,11 +270,19 @@ class RenameStage(Elaboratable):
         ]
         self.ren2_mask = Signal(self.core_width)
 
+        self.wakeup_ports = [
+            IssueQueueWakeup(self.num_pregs, name=f'wakeup_port{i}')
+            for i in range(self.num_wakeup_ports)
+        ]
+
+        self.commit = CommitReq(self.params)
+
         self.stalls = Signal(self.core_width)
 
-    def bypass_preg_alloc(self, m, w, uop, older_uops, alloc_reqs):
-        bypass_uop = MicroOp(self.params, name=f'bypass_uop{w}')
+    def bypass_preg_alloc(self, m, i, uop, older_uops, alloc_reqs):
+        bypass_uop = MicroOp(self.params, name=f'bypass_uop{i}')
         m.d.comb += bypass_uop.eq(uop)
+        w = len(older_uops)
 
         bypass_rs1 = [Signal(range(self.num_pregs)) for _ in range(w + 1)]
         bypass_rs2 = [Signal(range(self.num_pregs)) for _ in range(w + 1)]
@@ -292,6 +334,7 @@ class RenameStage(Elaboratable):
             for i in range(self.core_width)
         ]
         ren2_valids = Signal(self.core_width)
+        ren2_alloc_reqs = Signal(self.core_width)
         m.d.comb += [
             ren2_fire.eq(self.dis_fire),
             ren2_ready.eq(self.dis_ready)
@@ -318,7 +361,11 @@ class RenameStage(Elaboratable):
                 m.d.sync += ren2_valid.eq(ren2_valid & ~r2_fire)
                 m.d.comb += uop_next.eq(uop)
 
-            m.d.sync += uop.eq(uop_next)
+            # If REN1 and REN2 fire at the same cycle, REN1 will read stale mapping
+            # invalidated by REN2.
+            m.d.sync += uop.eq(
+                self.bypass_preg_alloc(m, i, uop_next, ren2_uops,
+                                       ren2_alloc_reqs))
 
             m.d.comb += ren2_uop.eq(uop)
 
@@ -328,7 +375,15 @@ class RenameStage(Elaboratable):
                                                       self.num_pregs)
         freelist = m.submodules.freelist = Freelist(self.core_width,
                                                     self.num_pregs)
-        busy_table = m.submodules.busy_table = BusyTable(self.params)
+        busy_table = m.submodules.busy_table = BusyTable(
+            self.num_wakeup_ports, self.params)
+
+        commit_valids = Signal(self.core_width)
+
+        for v, cuop, cv in zip(commit_valids, self.commit.uops,
+                               self.commit.valids):
+            m.d.comb += v.eq(cuop.ldst_valid
+                             & (cuop.dst_rtype == RegisterType.FIX) & cv)
 
         #
         # Map table
@@ -349,7 +404,7 @@ class RenameStage(Elaboratable):
             ]
 
         for rem_req, ren2_uop, alloc_req in zip(map_table.remap_reqs,
-                                                ren2_uops, freelist.reqs):
+                                                ren2_uops, ren2_alloc_reqs):
             m.d.comb += [
                 rem_req.ldst.eq(ren2_uop.ldst),
                 rem_req.pdst.eq(ren2_uop.pdst),
@@ -360,12 +415,21 @@ class RenameStage(Elaboratable):
         # Free list
         #
 
-        for uop, fire, req in zip(ren2_uops, ren2_fire, freelist.reqs):
+        for uop, fire, req in zip(ren2_uops, ren2_fire, ren2_alloc_reqs):
             m.d.comb += req.eq(uop.ldst_valid
                                & (uop.dst_rtype == RegisterType.FIX) & fire)
 
         for uop, preg in zip(ren2_uops, freelist.alloc_pregs):
             m.d.comb += uop.pdst.eq(Mux(uop.ldst != 0, preg, 0))
+
+        for preg, uop, v, cv in zip(freelist.dealloc_pregs, self.commit.uops,
+                                    freelist.dealloc_valids, commit_valids):
+            m.d.comb += [
+                preg.eq(uop.stale_pdst),
+                v.eq(cv),
+            ]
+
+        m.d.comb += freelist.reqs.eq(ren2_alloc_reqs)
 
         #
         # Busy table
@@ -380,8 +444,12 @@ class RenameStage(Elaboratable):
                 ren_uop.prs2_busy.eq((ren_uop.lrs2_rtype == RegisterType.FIX)
                                      & busy_resp.prs2_busy),
             ]
-        for busy_req, fl_req in zip(busy_table.busy_reqs, freelist.reqs):
+        for busy_req, fl_req in zip(busy_table.busy_reqs, ren2_alloc_reqs):
             m.d.comb += busy_req.eq(fl_req)
+
+        for wb_v, wb_pdst, wu in zip(busy_table.wb_valids, busy_table.wb_pdst,
+                                     self.wakeup_ports):
+            m.d.comb += [wb_v.eq(wu.valid), wb_pdst.eq(wu.pdst)]
 
         for i in range(self.core_width):
             if i == 0:
@@ -389,7 +457,7 @@ class RenameStage(Elaboratable):
             else:
                 bypass_uop = self.bypass_preg_alloc(m, i, ren2_uops[i],
                                                     ren2_uops[:i],
-                                                    freelist.reqs[:i])
+                                                    ren2_alloc_reqs[:i])
 
             m.d.comb += [
                 self.ren2_uops[i].eq(bypass_uop),

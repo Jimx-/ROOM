@@ -5,6 +5,7 @@ core_params = dict(fetch_width=4,
                    fetch_buffer_size=4,
                    core_width=4,
                    num_pregs=96,
+                   num_rob_rows=16,
                    issue_params={
                        IssueQueueType.INT:
                        dict(dispatch_width=4, num_entries=16, issue_width=4)

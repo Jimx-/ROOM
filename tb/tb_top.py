@@ -40,7 +40,8 @@ class TB:
 
     async def reset(self):
         self.dut.sys_rst.setimmediatevalue(0)
-        await RisingEdge(self.dut.sys_clk)
+        for _ in range(4):
+            await RisingEdge(self.dut.sys_clk)
         self.dut.sys_rst <= 1
         for _ in range(4):
             await RisingEdge(self.dut.sys_clk)
@@ -61,7 +62,7 @@ async def wrapper_test(dut, idle_inserter=None, backpressure_inserter=None):
 
     await tb.reset()
 
-    for _ in range(128):
+    for _ in range(256):
         await RisingEdge(tb.dut.sys_clk)
 
 
