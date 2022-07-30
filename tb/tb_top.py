@@ -40,6 +40,7 @@ class TB:
 
     async def reset(self):
         self.dut.sys_rst.setimmediatevalue(0)
+        await RisingEdge(self.dut.sys_clk)
         self.dut.sys_rst <= 1
         for _ in range(4):
             await RisingEdge(self.dut.sys_clk)
@@ -53,8 +54,9 @@ async def wrapper_test(dut, idle_inserter=None, backpressure_inserter=None):
     tb.set_idle_generator(idle_inserter)
     tb.set_backpressure_generator(backpressure_inserter)
 
-    tb.axi_ram.write_dword(0, 0x697)
-    for i in range(4, 128, 4):
+    # tb.axi_ram.write_dword(0, 0x842a84ae)
+    # tb.axi_ram.write_dword(4, 0x697)
+    for i in range(0, 128, 4):
         tb.axi_ram.write_dword(i, 0x0f868693)
 
     await tb.reset()

@@ -1,10 +1,20 @@
+from room.consts import *
 from room import Wrapper
+
+core_params = dict(fetch_width=4,
+                   fetch_buffer_size=4,
+                   core_width=4,
+                   num_pregs=96,
+                   issue_params={
+                       IssueQueueType.INT:
+                       dict(dispatch_width=4, num_entries=16, issue_width=4)
+                   })
 
 if __name__ == "__main__":
     from amaranth.back import verilog
-    wrapper = Wrapper()
+    wrapper = Wrapper(core_params)
 
-    with open('rtl/wrapper.v', 'w') as f:
+    with open('/tmp/wrapper.v', 'w') as f:
         f.write(
             verilog.convert(wrapper,
                             ports=[

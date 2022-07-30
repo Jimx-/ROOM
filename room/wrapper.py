@@ -1,10 +1,15 @@
+import math
+
 from amaranth import *
 
 from room.interface import OBI, AXI
 from room.core import Core
 
-_iob_layout = [('valid', 1), ('addr', 32), ('wdata', 32), ('wstrb', 4),
-               ('rdata', 32), ('ready', 1)]
+
+def make_iob_layout(data_width=32, addr_width=32):
+    wstrb_width = data_width // 8
+    return [('valid', 1), ('addr', addr_width), ('wdata', data_width),
+            ('wstrb', wstrb_width), ('rdata', data_width), ('ready', 1)]
 
 
 class OBI2IOB(Elaboratable):
@@ -66,30 +71,7 @@ class OBI2IOB(Elaboratable):
                         self.obi.rdata.eq(self.iob.rdata),
                     ]
 
-                    with m.If(self.obi.req == 1):
-                        m.d.comb += [
-                            self.iob.valid.eq(1),
-                            self.iob.addr.eq(self.obi.addr),
-                            self.iob.wdata.eq(self.obi.wdata),
-                        ]
-
-                        with m.If(self.obi.we):
-                            m.d.comb += self.iob.wstrb.eq(self.obi.be)
-                        with m.Else():
-                            m.d.comb += self.iob.wstrb.eq(0)
-
-                        m.d.sync += [
-                            self.addr.eq(self.obi.addr),
-                            self.wdata.eq(self.obi.wdata),
-                            self.be.eq(self.obi.be),
-                            self.we.eq(self.obi.we),
-                        ]
-
-                        m.d.comb += self.obi.gnt.eq(1)
-
-                        m.next = 'ACK'
-                    with m.Else():
-                        m.next = 'IDLE'
+                    m.next = 'IDLE'
                 with m.Else():
                     m.next = 'ACK'
 
@@ -98,17 +80,23 @@ class OBI2IOB(Elaboratable):
 
 class Wrapper(Elaboratable):
 
-    def __init__(self):
-        self.instr_axi = AXI(addr_width=32, data_width=128, id_width=1)
-        self.ibus = OBI()
+    def __init__(self, core_params):
+        self.core_params = core_params
 
-        self.icache_iob = Record(_iob_layout)
+        ibus_data_w = core_params['fetch_width'] * 16
+
+        self.instr_axi = AXI(addr_width=32, data_width=128, id_width=1)
+        self.ibus = OBI(data_width=ibus_data_w)
+
+        self.icache_iob = Record(
+            make_iob_layout(addr_width=32, data_width=ibus_data_w))
 
         self.icache_params = dict(
-            p_WORD_OFF_W=2,
+            p_WORD_OFF_W=math.frexp(128 / ibus_data_w)[1] - 1,
+            p_FE_DATA_W=ibus_data_w,
             p_BE_DATA_W=128,
-            i_clk=ClockSignal('sync'),
-            i_reset=ResetSignal('sync'),
+            i_clk=ClockSignal(),
+            i_reset=ResetSignal(),
 
             # Native Bus.
             i_valid=self.icache_iob.valid,
@@ -162,6 +150,6 @@ class Wrapper(Elaboratable):
         m.submodules.ibus_conv = OBI2IOB(self.ibus, self.icache_iob)
         m.submodules.icache = Instance('iob_cache_axi', **self.icache_params)
 
-        m.submodules.core = Core(self.ibus)
+        m.submodules.core = Core(self.ibus, self.core_params)
 
         return m

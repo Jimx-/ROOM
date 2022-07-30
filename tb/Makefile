@@ -9,7 +9,7 @@ COCOTB_HDL_TIMEPRECISION = 1ps
 DUT      = tb_top
 TOPLEVEL = $(DUT)
 MODULE   = $(DUT)
-VERILOG_SOURCES += $(DUT).v $(wildcard ../rtl/*.v) $(wildcard ../rtl/iob-cache/*.v)
+VERILOG_SOURCES += $(DUT).v /tmp/wrapper.v $(wildcard ../rtl/*.v) $(wildcard ../rtl/iob-cache/*.v)
 
 # module parameters
 ifeq ($(SIM), icarus)
