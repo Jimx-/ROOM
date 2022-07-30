@@ -11,6 +11,9 @@ class RVCDecoder(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        OPV8 = lambda name: Const(
+            getattr(insn, f'Instruction{name}').field_opcode.value, 8)
+
         with m.Switch(self.instr_i[0:2]):
             # C2
             with m.Case(2):
@@ -19,28 +22,17 @@ class RVCDecoder(Elaboratable):
                         with m.If(self.instr_i[12] == 0):
                             with m.If(self.instr_i[2:7] == 0):
                                 m.d.comb += self.instr_o.eq(
-                                    Cat(
-                                        Const(
-                                            insn.InstructionJALR.field_opcode.
-                                            value, 8), Const(0, 8),
+                                    Cat(OPV8('JALR'), Const(0, 8),
                                         self.instr_i[7:12], Const(0, 12)))
                             with m.Else():
                                 with m.If(self.instr_i[7:12] == 0):
                                     m.d.comb += self.instr_o.eq(
-                                        Cat(
-                                            Const(
-                                                insn.InstructionADD.
-                                                field_opcode.value,
-                                                8), self.instr_i[7:12],
+                                        Cat(OPV8('ADD'), self.instr_i[7:12],
                                             Const(0, 8), self.instr_i[2:7],
                                             Const(0, 7)))
                                 with m.Else():
                                     m.d.comb += self.instr_o.eq(
-                                        Cat(
-                                            Const(
-                                                insn.InstructionADD.
-                                                field_opcode.value,
-                                                8), self.instr_i[7:12],
+                                        Cat(OPV8('ADD'), self.instr_i[7:12],
                                             Const(0, 8), self.instr_i[2:7],
                                             Const(0, 7)))
 

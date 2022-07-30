@@ -30,56 +30,63 @@ class DecodeUnit(Elaboratable):
                 (uop.dst_rtype == RegisterType.FIX) & (uop.ldst == 0))),
         ]
 
+        OPV = lambda name: getattr(insn, f'Instruction{name}'
+                                   ).field_opcode.value
+        F3 = lambda name: getattr(insn, f'Instruction{name}'
+                                  ).field_funct3.value
+        F7 = lambda name: getattr(insn, f'Instruction{name}'
+                                  ).field_funct7.value
+
         UOPC = lambda x: uop.opcode.eq(x)
         ILL_INSN = insn_illegal.eq(1)
 
         imm_sel = Signal(ImmSel)
 
+        IMM_SEL_I = imm_sel.eq(ImmSel.I)
+
         with m.Switch(inuop.inst[0:7]):
-            with m.Case(insn.InstructionAUIPC.field_opcode.value):
+            with m.Case(OPV('AUIPC')):
                 pass
 
             # Register-immediate
-            with m.Case(insn.InstructionADDI.field_opcode.value):
+            with m.Case(OPV('ADDI')):
                 m.d.comb += [
                     uop.iq_type.eq(IssueQueueType.INT),
                     uop.dst_rtype.eq(RegisterType.FIX),
                     uop.lrs1_rtype.eq(RegisterType.FIX),
-                    imm_sel.eq(ImmSel.I),
+                    IMM_SEL_I,
                 ]
 
                 with m.Switch(inuop.inst[12:15]):
-                    with m.Case(insn.InstructionADDI.field_funct3.value):
+                    with m.Case(F3('ADDI')):
                         m.d.comb += UOPC(UOpCode.ADDI)
-                    with m.Case(insn.InstructionSLTI.field_funct3.value):
+                    with m.Case(F3('SLTI')):
                         m.d.comb += UOPC(UOpCode.SLTI)
-                    with m.Case(insn.InstructionSLTIU.field_funct3.value):
+                    with m.Case(F3('SLTIU')):
                         m.d.comb += UOPC(UOpCode.SLTIU)
-                    with m.Case(insn.InstructionXORI.field_funct3.value):
+                    with m.Case(F3('XORI')):
                         m.d.comb += UOPC(UOpCode.XORI)
-                    with m.Case(insn.InstructionORI.field_funct3.value):
+                    with m.Case(F3('ORI')):
                         m.d.comb += UOPC(UOpCode.ORI)
-                    with m.Case(insn.InstructionANDI.field_funct3.value):
+                    with m.Case(F3('ANDI')):
                         m.d.comb += UOPC(UOpCode.ANDI)
 
-                    with m.Case(insn.InstructionSLLI.field_funct3.value):
+                    with m.Case(F3('SLLI')):
                         m.d.comb += UOPC(UOpCode.SLLI)
                         with m.If(inuop.inst[25:32] != 0):
                             m.d.comb += ILL_INSN
 
-                    with m.Case(insn.InstructionSRLI.field_funct3.value):
+                    with m.Case(F3('SRLI')):
                         with m.Switch(inuop.inst[25:32]):
-                            with m.Case(
-                                    insn.InstructionSRLI.field_funct7.value):
+                            with m.Case(F7('SRLI')):
                                 m.d.comb += UOPC(UOpCode.SRLI)
-                            with m.Case(
-                                    insn.InstructionSRAI.field_funct7.value):
+                            with m.Case(F7('SRAI')):
                                 m.d.comb += UOPC(UOpCode.SRAI)
                             with m.Default():
                                 m.d.comb += ILL_INSN
 
             # Register-register
-            with m.Case(insn.InstructionADD.field_opcode.value):
+            with m.Case(OPV('ADD')):
                 m.d.comb += [
                     uop.iq_type.eq(IssueQueueType.INT),
                     uop.dst_rtype.eq(RegisterType.FIX),
