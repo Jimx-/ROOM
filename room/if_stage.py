@@ -6,35 +6,47 @@ from room.rvc import RVCDecoder
 from room.types import MicroOp
 
 
-def make_fetch_bundle_layout(fetch_width):
-    return [('pc', 32), ('next_pc', 32), ('insts', 32 * fetch_width),
-            ('exp_insts', 32 * fetch_width), ('mask', fetch_width)]
-
-
-class FetchBundle(Record):
+class FetchBundle:
 
     def __init__(self, fetch_width, name=None):
         self.fetch_width = fetch_width
-        super().__init__(make_fetch_bundle_layout(fetch_width=fetch_width),
-                         name=name)
 
-    def inst(self, i):
-        return self.insts[i * 32:(i + 1) * 32]
+        name = name is None and '' or f'{name}_'
 
-    def exp_inst(self, i):
-        return self.exp_insts[i * 32:(i + 1) * 32]
+        self.pc = Signal(32, name=f'{name}pc')
+        self.next_pc = Signal(32, name=f'{name}next_pc')
+        self.insts = [
+            Signal(32, name=f'{name}inst{i}') for i in range(fetch_width)
+        ]
+        self.exp_insts = [
+            Signal(32, name=f'{name}exp_inst{i}') for i in range(fetch_width)
+        ]
+        self.mask = Signal(fetch_width)
+
+    def eq(self, rhs):
+        ret = [
+            self.pc.eq(rhs.pc),
+            self.next_pc.eq(rhs.next_pc),
+            self.mask.eq(rhs.mask),
+        ]
+        for inst, rinst in zip(self.insts, rhs.insts):
+            ret.append(inst.eq(rinst))
+        for inst, rinst in zip(self.exp_insts, rhs.exp_insts):
+            ret.append(inst.eq(rinst))
+        return ret
 
 
 class FetchBuffer(Elaboratable):
 
     def __init__(self, params):
+        self.params = params
         self.fetch_width = params['fetch_width']
+        self.core_width = params['core_width']
         self.depth = params['fetch_buffer_size']
-        self.layout = make_fetch_bundle_layout(self.fetch_width)
 
         self.w_data = FetchBundle(self.fetch_width)
         self.r_data = [
-            MicroOp(params, name=f'fb_uop{i}') for i in range(self.fetch_width)
+            MicroOp(params, name=f'fb_uop{i}') for i in range(self.core_width)
         ]
         self.w_rdy = Signal()
         self.r_rdy = Signal()
@@ -45,34 +57,112 @@ class FetchBuffer(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        fifo = m.submodules.fifo = SyncFIFO(width=self.w_data.shape().width,
-                                            depth=self.depth)
+        num_entries = self.depth
+        num_rows = self.depth // self.core_width
 
-        flatten_wdata = Cat(
-            *[getattr(self.w_data, name) for name, _ in self.layout])
+        mem = Array(
+            MicroOp(self.params, name=f'mem{i}') for i in range(self.depth))
+
+        head = Signal(num_rows, reset=1)
+        tail = Signal(num_entries, reset=1)
+
+        maybe_full = Signal()
+        do_enq = Signal()
+        do_deq = Signal()
+
+        in_uops = [
+            MicroOp(self.params, name=f'in_uop{i}')
+            for i in range(self.fetch_width)
+        ]
+        in_mask = Signal(self.fetch_width)
+
+        for w in range(self.fetch_width):
+            m.d.comb += [
+                in_mask[w].eq(self.w_data.mask[w] & self.w_en),
+                in_uops[w].inst.eq(self.w_data.insts[w]),
+                in_uops[w].is_rvc.eq(in_uops[w].inst[0:2] != 3),
+            ]
+
+        wr_slots = [
+            Signal(num_entries, name=f'wr_slot{i}')
+            for i in range(self.fetch_width)
+        ]
+        next_slot = tail
+        for wr_slot, mask in zip(wr_slots, in_mask):
+            m.d.comb += wr_slot.eq(next_slot)
+            next_slot = Mux(
+                mask,
+                Cat(next_slot[num_entries - 1], next_slot[:num_entries - 1]),
+                next_slot)
+
+        for w in range(self.fetch_width):
+            for s in range(num_entries):
+                with m.If(do_enq & in_mask[w] & wr_slots[w][s]):
+                    m.d.sync += mem[s].eq(in_uops[w])
+
+        wr_mask = Const(0, num_entries)
+        for w in range(1, self.fetch_width):
+            wr_mask |= Cat(tail[num_entries - w:num_entries],
+                           tail[:num_entries - w])
+
+        might_hit_head = 0
+        at_head = 0
+        for r in range(num_rows):
+            might_hit_head |= head[r] & wr_mask[r * self.core_width]
+            at_head |= head[r] & tail[r * self.core_width]
 
         m.d.comb += [
-            fifo.w_data.eq(flatten_wdata),
-            self.w_rdy.eq(fifo.w_rdy),
-            self.r_rdy.eq(fifo.r_rdy),
-            fifo.w_en.eq(self.w_en),
-            fifo.r_en.eq(self.r_en),
-            fifo.flush.eq(self.flush),
+            do_enq.eq(~(at_head & maybe_full | might_hit_head)),
+            self.w_rdy.eq(do_enq),
         ]
 
-        r_data = FetchBundle(self.fetch_width)
+        tail_collisions = Array(
+            Signal(self.core_width, name=f'tc{i}') for i in range(num_rows))
+        for i in range(num_entries):
+            m.d.comb += tail_collisions[i // self.core_width][
+                i % self.core_width].eq(head[i // self.core_width]
+                                        & (~maybe_full
+                                           | (i % self.core_width != 0))
+                                        & tail[i])
+        slot_hit_tail = Signal(self.core_width)
+        for i in range(num_rows):
+            with m.If(head[i]):
+                m.d.comb += slot_hit_tail.eq(tail_collisions[i])
+        will_hit_tail = slot_hit_tail != 0
 
-        acc = 0
-        for name, width in self.layout:
-            m.d.comb += getattr(r_data, name).eq(fifo.r_data[acc:acc + width])
-            acc += width
+        m.d.comb += do_deq.eq(self.r_en & ~will_hit_tail)
 
-        for i in range(self.fetch_width):
-            uop = self.r_data[i]
-            m.d.comb += [
-                uop.valid.eq(r_data.mask[i]),
-                uop.inst.eq(r_data.exp_inst(i)),
-                uop.is_rvc.eq(r_data.inst(i)[0:2] != 3)
+        hit_mask = slot_hit_tail
+        for i in range(self.core_width):
+            hit_mask |= (hit_mask << 1)
+
+        deq_valids = ~hit_mask[0:self.core_width]
+
+        for i in range(num_rows):
+            with m.If(head[i]):
+                for w in range(self.core_width):
+                    m.d.comb += [
+                        self.r_data[w].eq(mem[i * self.core_width + w]),
+                        self.r_data[w].valid.eq(deq_valids[w]),
+                    ]
+        m.d.comb += self.r_rdy.eq(deq_valids != 0)
+
+        with m.If(do_enq):
+            m.d.sync += tail.eq(next_slot)
+            with m.If(in_mask != 0):
+                m.d.sync += maybe_full.eq(1)
+
+        with m.If(do_deq):
+            m.d.sync += [
+                head.eq(Cat(head[num_rows - 1], head[:num_rows - 1])),
+                maybe_full.eq(0),
+            ]
+
+        with m.If(self.flush):
+            m.d.sync += [
+                head.eq(1),
+                tail.eq(1),
+                maybe_full.eq(0),
             ]
 
         return m
@@ -85,11 +175,12 @@ class IFStage(Elaboratable):
         self.params = params
 
         self.fetch_width = params['fetch_width']
+        self.core_width = params['core_width']
         self.fetch_buffer_size = params['fetch_buffer_size']
 
         self.fetch_packet = [
             MicroOp(params, name=f'fetch_uop{i}')
-            for i in range(self.fetch_width)
+            for i in range(self.core_width)
         ]
         self.fetch_packet_valid = Signal()
         self.fetch_packet_ready = Signal()
@@ -186,18 +277,19 @@ class IFStage(Elaboratable):
 
         f2_insts = [Signal(32) for _ in range(self.fetch_width)]
         f2_exp_insts = [Signal(32) for _ in range(self.fetch_width)]
-        f2_mask = [Signal() for _ in range(self.fetch_width)]
-        f2_is_rvc = [Signal() for _ in range(self.fetch_width)]
-        f2_plus4_mask = [Signal() for _ in range(self.fetch_width)]
+        f2_mask = Signal(self.fetch_width)
+        f2_is_rvc = Signal(self.fetch_width)
+        f2_plus4_mask = Signal(self.fetch_width)
         f2_fetch_bundle = FetchBundle(self.fetch_width)
 
-        for i in range(self.fetch_width):
-            m.d.comb += [
-                f2_fetch_bundle.mask[i].eq(f2_mask[i]),
-                f2_fetch_bundle.inst(i).eq(f2_insts[i]),
-                f2_fetch_bundle.exp_inst(i).eq(f2_exp_insts[i]),
-                f2_fetch_bundle.pc.eq(f2_pc),
-            ]
+        for binst, inst in zip(f2_fetch_bundle.insts, f2_insts):
+            m.d.comb += binst.eq(inst)
+        for binst, inst in zip(f2_fetch_bundle.exp_insts, f2_exp_insts):
+            m.d.comb += binst.eq(inst)
+        m.d.comb += [
+            f2_fetch_bundle.mask.eq(f2_mask),
+            f2_fetch_bundle.pc.eq(f2_pc),
+        ]
 
         for w in range(self.fetch_width):
             valid = Signal()
@@ -308,7 +400,7 @@ class IFStage(Elaboratable):
             self.fetch_packet_valid.eq(fb.r_rdy),
         ]
 
-        for i in range(self.fetch_width):
-            m.d.comb += self.fetch_packet[i].eq(fb.r_data[i])
+        for fp, rd in zip(self.fetch_packet, fb.r_data):
+            m.d.comb += fp.eq(rd)
 
         return m

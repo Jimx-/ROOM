@@ -146,8 +146,7 @@ class DecodeStage(Elaboratable):
 
         m.d.comb += [
             self.fire.eq(self.valids & ~dec_stalls),
-            self.ready.eq((self.fire == self.valids)
-                          & (self.fire != 0)),
+            self.ready.eq(self.fire[-1]),
         ]
         with m.If(self.ready == 1):
             m.d.sync += dec_finished_mask.eq(0)

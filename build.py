@@ -2,7 +2,7 @@ from room.consts import *
 from room import Wrapper
 
 core_params = dict(fetch_width=4,
-                   fetch_buffer_size=4,
+                   fetch_buffer_size=16,
                    core_width=4,
                    num_pregs=96,
                    num_rob_rows=16,
