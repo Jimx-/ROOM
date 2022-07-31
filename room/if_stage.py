@@ -1,6 +1,5 @@
 from amaranth import *
 
-from room.interface import OBI
 from room.fifo import SyncFIFO
 from room.rvc import RVCDecoder
 from room.types import MicroOp
@@ -190,21 +189,16 @@ class IFStage(Elaboratable):
 
         ibus = self.ibus
 
-        # Record number of inflight icache reads
-        count_up = Signal()
-        count_down = Signal()
-        count = Signal(range(2))
-        flush_count = Signal.like(count)
+        def fetch_mask(addr):
+            off = (addr >> 1)[0:Shape.cast(range(self.fetch_width)).width]
+            return (((1 << self.fetch_width) - 1) << off)[0:self.fetch_width]
 
-        m.d.comb += [
-            count_up.eq(self.ibus.req & self.ibus.gnt),
-            count_down.eq(self.ibus.rvalid),
-        ]
+        def fetch_align(addr):
+            lsb_width = Shape.cast(range(ibus.dat_r.width >> 3)).width
+            return Cat(Const(0, lsb_width), addr[lsb_width:])
 
-        with m.If((~count_up) & count_down):
-            m.d.sync += count.eq(count - 1)
-        with m.Elif(count_up & (~count_down)):
-            m.d.sync += count.eq(count + 1)
+        def next_fetch(addr):
+            return fetch_align(addr) + self.fetch_width * 2
 
         #
         # Next PC select
@@ -222,8 +216,9 @@ class IFStage(Elaboratable):
             ]
 
         m.d.comb += [
-            ibus.addr.eq(s0_vpc),
-            ibus.req.eq(s0_valid),
+            ibus.adr.eq(s0_vpc),
+            ibus.cyc.eq(s0_valid),
+            ibus.stb.eq(s0_valid),
         ]
 
         #
@@ -241,10 +236,10 @@ class IFStage(Elaboratable):
         m.d.sync += [
             s1_vpc.eq(Mux(s0_valid, s0_vpc, s1_vpc)),
             s1_valid.eq(s0_valid),
-            s1_trans_ready.eq(ibus.gnt),
+            s1_trans_ready.eq(ibus.ack),
         ]
 
-        with m.If((s1_valid & ~s1_trans_ready) | (ibus.rvalid & ~f2_ready)):
+        with m.If((s1_valid & ~s1_trans_ready) | (ibus.ack & ~f2_ready)):
             m.d.comb += [s0_valid.eq(1), s0_vpc.eq(s1_vpc)]
 
         #
@@ -252,21 +247,21 @@ class IFStage(Elaboratable):
         #
 
         f2_clear = Signal()
-        f2_fifo = m.submodules.f2_fifo = SyncFIFO(width=ibus.rdata.width + 32,
+        f2_fifo = m.submodules.f2_fifo = SyncFIFO(width=ibus.dat_r.width + 32,
                                                   depth=1)
 
         f3_ready = Signal()
 
         m.d.comb += [
             f2_fifo.flush.eq(f2_clear),
-            f2_fifo.w_en.eq(~f1_clear & ibus.rvalid),
-            f2_fifo.w_data.eq(Cat(s1_vpc, ibus.rdata)),
+            f2_fifo.w_en.eq(~f1_clear & ibus.ack),
+            f2_fifo.w_data.eq(Cat(s1_vpc, ibus.dat_r)),
             f2_fifo.r_en.eq(f3_ready),
             f2_ready.eq(f2_fifo.w_rdy),
         ]
 
         f2_pc = Signal(32)
-        f2_data = Signal(ibus.rdata.width)
+        f2_data = Signal(ibus.dat_r.width)
         m.d.comb += [
             f2_pc.eq(f2_fifo.r_data[:32]),
             f2_data.eq(f2_fifo.r_data[32:]),
@@ -275,12 +270,15 @@ class IFStage(Elaboratable):
         f2_prev_half = Signal(16)
         f2_prev_half_valid = Signal()
 
+        f2_imemresp_mask = Signal(self.fetch_width)
         f2_insts = [Signal(32) for _ in range(self.fetch_width)]
         f2_exp_insts = [Signal(32) for _ in range(self.fetch_width)]
         f2_mask = Signal(self.fetch_width)
         f2_is_rvc = Signal(self.fetch_width)
         f2_plus4_mask = Signal(self.fetch_width)
         f2_fetch_bundle = FetchBundle(self.fetch_width)
+
+        m.d.comb += f2_imemresp_mask.eq(fetch_mask(f2_pc))
 
         for binst, inst in zip(f2_fetch_bundle.insts, f2_insts):
             m.d.comb += binst.eq(inst)
@@ -350,7 +348,7 @@ class IFStage(Elaboratable):
 
             m.d.comb += [
                 f2_is_rvc[w].eq(f2_insts[w][0:2] != 3),
-                f2_mask[w].eq(f2_fifo.r_rdy & valid),
+                f2_mask[w].eq(f2_fifo.r_rdy & valid & f2_imemresp_mask[w]),
             ]
 
             if w == 0:
@@ -372,7 +370,7 @@ class IFStage(Elaboratable):
 
         f2_predicted_target = Signal(32)
         m.d.comb += [
-            f2_predicted_target.eq(f2_fetch_bundle.pc + self.fetch_width * 2),
+            f2_predicted_target.eq(next_fetch(f2_fetch_bundle.pc)),
             f2_fetch_bundle.next_pc.eq(f2_predicted_target),
         ]
 

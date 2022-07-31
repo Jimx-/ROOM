@@ -13,14 +13,17 @@ from room.rob import ReorderBuffer
 from room.regfile import RegisterFile, RegisterRead
 from room.ex_stage import ExecUnits
 
+from roomsoc.interconnect import wishbone
+
 
 class Core(Elaboratable):
 
-    def __init__(self, ibus, params):
+    def __init__(self, params):
         self.params = params
         self.core_width = params['core_width']
 
-        self.ibus = ibus
+        self.ibus = wishbone.Interface(data_width=params['fetch_width'] * 16,
+                                       adr_width=32)
 
     def elaborate(self, platform):
         m = Module()

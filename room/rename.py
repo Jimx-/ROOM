@@ -350,9 +350,7 @@ class RenameStage(Elaboratable):
             uop = MicroOp(self.params, f'_ren2_uop_r{i}')
             uop_next = MicroOp(self.params, '_ren2_uop_next{i}')
 
-            with m.If(ResetSignal()):
-                m.d.comb += uop_next.eq(0)
-            with m.Elif(self.kill):
+            with m.If(self.kill):
                 m.d.sync += ren2_valid.eq(0)
             with m.Elif(ren2_ready):
                 m.d.sync += ren2_valid.eq(r1_fire)

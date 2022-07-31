@@ -140,12 +140,6 @@ class ReorderBuffer(Elaboratable):
         do_enq = Signal()
         do_deq = Signal()
 
-        with m.If(ResetSignal()):
-            m.d.comb += [
-                do_enq.eq(0),
-                do_deq.eq(0),
-            ]
-
         partial_row = Signal()
         with m.If(self.enq_valids != 0):
             m.d.sync += partial_row.eq(self.enq_partial_stalls)

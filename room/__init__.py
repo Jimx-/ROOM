@@ -1,1 +1,1 @@
-from room.wrapper import Wrapper
+from room.core import Core
