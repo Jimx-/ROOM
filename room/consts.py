@@ -176,3 +176,19 @@ class ALUOperator(IntEnum):
     SGE = 13
     SLTU = 14
     SGEU = 15
+
+
+class CFIType(IntEnum):
+    X = 0
+    JAL = 1
+    JALR = 2
+    BR = 3
+
+
+class FUType(IntEnum):
+    X = 0
+    ALU = 1
+    JMP = 2
+    MEM = 4
+    MUL = 8
+    DIV = 16

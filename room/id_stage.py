@@ -1,9 +1,54 @@
 from amaranth import *
 import riscvmodel.insn as insn
-from enum import Enum
 
 from room.consts import *
 from room.types import MicroOp
+
+
+class BranchSignals(Record):
+
+    def __init__(self, name=None):
+        super().__init__([
+            ('cfi_type', Shape.cast(CFIType).width),
+            ('target', 32),
+        ],
+                         name=name)
+
+
+class BranchDecoder(Elaboratable):
+
+    def __init__(self):
+        self.inst = Signal(32)
+        self.pc = Signal(32)
+
+        self.out = BranchSignals()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        def compute_jal_target(pc, inst):
+            j_imm32 = Cat(Const(0, 1), inst[21:25], inst[25:31], inst[20],
+                          inst[12:20], Repl(inst[31], 12)).as_signed()
+            return ((pc.as_signed() + j_imm32) & -2)[:32].as_unsigned()
+
+        OPV = lambda name: getattr(insn, f'Instruction{name}'
+                                   ).field_opcode.value
+
+        with m.Switch(self.inst[0:7]):
+            with m.Case(OPV('JAL')):
+                m.d.comb += self.out.cfi_type.eq(CFIType.JAL)
+
+            with m.Case(OPV('JALR')):
+                m.d.comb += self.out.cfi_type.eq(CFIType.JALR)
+
+            with m.Case(OPV('BEQ')):
+                m.d.comb += self.out.cfi_type.eq(CFIType.BR)
+
+        m.d.comb += self.out.target.eq(
+            Mux(self.out.cfi_type == CFIType.BR, 0,
+                compute_jal_target(self.pc, self.inst)))
+
+        return m
 
 
 class DecodeUnit(Elaboratable):
@@ -26,7 +71,7 @@ class DecodeUnit(Elaboratable):
             uop.ldst.eq(inuop.inst[7:12]),
             uop.lrs1.eq(inuop.inst[15:20]),
             uop.lrs2.eq(inuop.inst[20:25]),
-            uop.ldst_valid.eq(uop.dst_rtype != RegisterType.X & ~(
+            uop.ldst_valid.eq((uop.dst_rtype != RegisterType.X) & ~(
                 (uop.dst_rtype == RegisterType.FIX) & (uop.ldst == 0))),
         ]
 
@@ -43,8 +88,18 @@ class DecodeUnit(Elaboratable):
         imm_sel = Signal(ImmSel)
 
         IMM_SEL_I = imm_sel.eq(ImmSel.I)
+        IMM_SEL_J = imm_sel.eq(ImmSel.J)
 
         with m.Switch(inuop.inst[0:7]):
+            with m.Case(OPV('JAL')):
+                m.d.comb += [
+                    UOPC(UOpCode.JAL),
+                    uop.iq_type.eq(IssueQueueType.INT),
+                    uop.fu_type.eq(FUType.JMP),
+                    uop.dst_rtype.eq(RegisterType.FIX),
+                    IMM_SEL_J,
+                ]
+
             with m.Case(OPV('AUIPC')):
                 pass
 
@@ -52,6 +107,7 @@ class DecodeUnit(Elaboratable):
             with m.Case(OPV('ADDI')):
                 m.d.comb += [
                     uop.iq_type.eq(IssueQueueType.INT),
+                    uop.fu_type.eq(FUType.ALU),
                     uop.dst_rtype.eq(RegisterType.FIX),
                     uop.lrs1_rtype.eq(RegisterType.FIX),
                     IMM_SEL_I,

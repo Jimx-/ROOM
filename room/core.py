@@ -191,12 +191,14 @@ class Core(Elaboratable):
         #
 
         iss_uops = []
+        iss_fu_types = []
         iss_valids = Signal(
             sum([
                 p['issue_width'] for p in self.params['issue_params'].values()
             ]))
         for iq in issue_units.values():
             iss_uops.extend(iq.iss_uops)
+            iss_fu_types.extend(iq.fu_types)
         m.d.comb += iss_valids.eq(
             Cat([iq.iss_valids for iq in issue_units.values()]))
 
@@ -213,6 +215,9 @@ class Core(Elaboratable):
         for irr_uop, iss_uop in zip(iregread.iss_uops, iss_uops):
             m.d.comb += irr_uop.eq(iss_uop)
         m.d.comb += iregread.iss_valids.eq(iss_valids)
+
+        for iss_fu_typ, eu in zip(iss_fu_types, exec_units):
+            m.d.comb += iss_fu_typ.eq(eu.fu_types)
 
         for irr_rp, rp in zip(iregread.read_ports, iregfile.read_ports):
             m.d.comb += irr_rp.connect(rp)

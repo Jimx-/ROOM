@@ -95,10 +95,13 @@ class RegReadDecoder(Elaboratable):
         F = lambda f: self.rrd_uop.alu_fn.eq(f)
 
         OPA_RS1 = self.rrd_uop.opa_sel.eq(OpA.RS1)
+        OPA_PC = self.rrd_uop.opa_sel.eq(OpA.PC)
 
         OPB_IMM = self.rrd_uop.opb_sel.eq(OpB.IMM)
+        OPB_NEXT = self.rrd_uop.opb_sel.eq(OpB.NEXT)
 
         IMM_I = self.rrd_uop.imm_sel.eq(ImmSel.I)
+        IMM_J = self.rrd_uop.imm_sel.eq(ImmSel.J)
 
         with m.Switch(self.iss_uop.opcode):
             with m.Case(UOpCode.ADDI):
@@ -107,6 +110,14 @@ class RegReadDecoder(Elaboratable):
                     OPA_RS1,
                     OPB_IMM,
                     IMM_I,
+                ]
+
+            with m.Case(UOpCode.JAL):
+                m.d.comb += [
+                    F(ALUOperator.ADD),
+                    OPA_PC,
+                    OPB_NEXT,
+                    IMM_J,
                 ]
 
         return m

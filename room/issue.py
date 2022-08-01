@@ -2,6 +2,7 @@ from amaranth import *
 from amaranth.lib.coding import Encoder
 from enum import IntEnum
 
+from room.consts import *
 from room.types import MicroOp
 
 
@@ -63,8 +64,7 @@ class IssueSlot(Elaboratable):
 
         slot_uop = MicroOp(self.params, name='slot_uop')
         next_uop = MicroOp(self.params, name='next_uop')
-        m.d.comb += next_uop.eq(
-            Mux(self.in_uop.valid == 1, self.in_uop, slot_uop))
+        m.d.comb += next_uop.eq(Mux(self.in_valid == 1, self.in_uop, slot_uop))
 
         p1 = Signal()
         p2 = Signal()
@@ -118,6 +118,10 @@ class IssueUnit(Elaboratable):
             MicroOp(params, name=f'iss_uop{i}') for i in range(issue_width)
         ]
         self.iss_valids = Signal(issue_width)
+
+        self.fu_types = [
+            Signal(FUType, name=f'fu_type{i}') for i in range(issue_width)
+        ]
 
         self.wakeup_ports = [
             IssueQueueWakeup(num_pregs, name=f'wakeup_port{i}')
@@ -196,14 +200,17 @@ class IssueUnit(Elaboratable):
         for v, slot in zip(req_valids, slots):
             m.d.comb += v.eq(slot.req)
 
-        for iss, iss_valid in zip(self.iss_uops, self.iss_valids):
+        for iss, iss_valid, fu_types in zip(self.iss_uops, self.iss_valids,
+                                            self.fu_types):
+
             port_issued = Signal()
             next_req_valids = Signal(self.num_issue_slots)
 
             for slot, v, next_v in zip(slots, req_valids, next_req_valids):
+                can_allocate = (slot.out_uop.fu_type & fu_types) != 0
                 next_port_issued = Signal()
 
-                with m.If(v & ~port_issued):
+                with m.If(v & ~port_issued & can_allocate):
                     m.d.comb += [
                         iss.eq(slot.out_uop),
                         iss_valid.eq(1),
@@ -211,8 +218,8 @@ class IssueUnit(Elaboratable):
                     ]
 
                 m.d.comb += [
-                    next_port_issued.eq(port_issued | v),
-                    next_v.eq(v & port_issued),
+                    next_port_issued.eq(port_issued | (v & can_allocate)),
+                    next_v.eq(v & (~can_allocate | port_issued)),
                 ]
                 port_issued = next_port_issued
 

@@ -12,8 +12,8 @@ class MicroOp(Record):
 
         super().__init__(
             [('valid', 1), ('opcode', W(UOpCode)), ('inst', 32), ('is_rvc', 1),
-             ('iq_type', W(IssueQueueType)), ('opa_sel', W(OpA)),
-             ('opb_sel', W(OpB)), ('imm_sel', W(ImmSel)),
+             ('iq_type', W(IssueQueueType)), ('fu_type', W(FUType)),
+             ('opa_sel', W(OpA)), ('opb_sel', W(OpB)), ('imm_sel', W(ImmSel)),
              ('alu_fn', W(ALUOperator)), ('issue_uops', 2), ('imm_packed', 20),
              ('rob_idx', range(params['num_rob_rows'] * core_width)),
              ('pdst', range(num_pregs)), ('prs1', range(num_pregs)),

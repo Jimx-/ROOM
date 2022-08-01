@@ -12,12 +12,16 @@ class ExecUnit(Elaboratable):
                  params,
                  irf_read=False,
                  irf_write=False,
+                 has_jmp_unit=False,
                  has_alu=False):
         self.params = params
         self.data_width = data_width
         self.irf_read = irf_read
         self.irf_write = irf_write
+        self.has_jmp_unit = has_jmp_unit
         self.has_alu = has_alu
+
+        self.fu_types = Signal(FUType)
 
         self.req = ExecReq(params, name='req')
 
@@ -31,16 +35,20 @@ class ExecUnit(Elaboratable):
 
 class ALUExecUnit(ExecUnit):
 
-    def __init__(self, params, has_alu=True, name=None):
+    def __init__(self, params, has_jmp_unit=False, has_alu=True, name=None):
         super().__init__(32,
                          params,
                          irf_read=True,
                          irf_write=has_alu,
+                         has_jmp_unit=has_jmp_unit,
                          has_alu=has_alu)
         self.name = name
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
+
+        m.d.comb += self.fu_types.eq((self.has_alu and FUType.ALU or 0)
+                                     | (self.has_jmp_unit and FUType.JMP or 0))
 
         iresp_units = []
 
@@ -68,7 +76,7 @@ class ExecUnits(Elaboratable):
 
         int_width = self.issue_params[IssueQueueType.INT]['issue_width']
         for i in range(int_width):
-            eu = ALUExecUnit(params, name=f'alu_int{i}')
+            eu = ALUExecUnit(params, has_jmp_unit=(i == 0), name=f'alu_int{i}')
             self.exec_units.append(eu)
             self.irf_readers += eu.irf_read
             self.irf_writers += eu.irf_write

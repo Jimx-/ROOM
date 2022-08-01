@@ -30,7 +30,8 @@ class Top(Elaboratable):
         ibus = wishbone.Interface(data_width=core_params['fetch_width'] * 16,
                                   adr_width=30)
 
-        mem_init = [0x0f8686930f868693] * 16
+        mem_init = [0xffdff06f0f868693] + [0x0f8686930f868693] * 16
+        # mem_init = [0x0f8686930f868693] * 16
 
         m.submodules.sram = wishbone.SRAM(
             Memory(width=ibus.data_width,

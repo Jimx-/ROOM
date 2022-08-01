@@ -42,7 +42,7 @@ class ExecResp:
         ]
 
 
-class ExecPipeline(Elaboratable):
+class PipelinedFunctionalUnit(Elaboratable):
 
     def __init__(self, num_stages, params):
         self.params = params
@@ -97,7 +97,7 @@ def generate_imm(ip, sel):
     return Cat(i0, i1_4, i5_10, i11, i12_19, i20_30, sign)
 
 
-class ALU(ExecPipeline):
+class ALU(PipelinedFunctionalUnit):
 
     def __init__(self, params):
         super().__init__(1, params)
@@ -116,8 +116,10 @@ class ALU(ExecPipeline):
             Mux(uop.opa_sel == OpA.RS1, self.req.rs1_data, 0))
 
         m.d.comb += opb_data.eq(
-            Mux(uop.opb_sel == OpB.IMM, imm,
-                Mux(uop.opb_sel == OpB.RS2, self.req.rs2_data, 0)))
+            Mux(
+                uop.opb_sel == OpB.IMM, imm,
+                Mux(uop.opb_sel == OpB.RS2, self.req.rs2_data,
+                    Mux(uop.opb_sel == OpB.NEXT, Mux(uop.is_rvc, 2, 4), 0))))
 
         is_sub = uop.alu_fn[3]
 
