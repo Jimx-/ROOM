@@ -225,24 +225,20 @@ class IFStage(Elaboratable):
                 s0_valid.eq(1),
             ]
 
-        m.d.comb += [
-            ibus.adr.eq(s0_vpc),
-            ibus.cyc.eq(s0_valid),
-            ibus.stb.eq(s0_valid),
-        ]
-
         #
         # ICache Access
         #
 
         s1_vpc = Signal(32)
         s1_valid = Signal()
-        s1_trans_busy = Signal()
-        s1_trans_ready = Signal()
         f1_clear = Signal()
         f2_ready = Signal()
 
-        m.d.comb += f1_clear.eq(ResetSignal())
+        m.d.comb += [
+            ibus.adr.eq(Mux(s0_valid, s0_vpc, s1_vpc)),
+            ibus.cyc.eq((s0_valid | s1_valid) & ~f1_clear),
+            ibus.stb.eq(ibus.cyc),
+        ]
 
         m.d.sync += [
             s1_vpc.eq(Mux(s0_valid, s0_vpc, s1_vpc)),
@@ -250,14 +246,9 @@ class IFStage(Elaboratable):
         ]
 
         with m.If(s0_valid):
-            m.d.sync += s1_trans_busy.eq(1)
-        with m.Elif(ibus.ack | f1_clear):
-            m.d.sync += s1_trans_busy.eq(0)
-
-        m.d.sync += [s1_trans_ready.eq(~s1_trans_busy | f1_clear)]
-
-        with m.If((s1_valid & ~s1_trans_ready) | (ibus.ack & ~f2_ready)):
-            m.d.comb += [s0_valid.eq(1), s0_vpc.eq(s1_vpc)]
+            m.d.sync += s1_valid.eq(1)
+        with m.Elif((ibus.ack & f2_ready) | f1_clear):
+            m.d.sync += s1_valid.eq(0)
 
         #
         # ICache Response
@@ -277,7 +268,7 @@ class IFStage(Elaboratable):
             f2_ready.eq(f2_fifo.w_rdy),
         ]
 
-        s2_valid = f2_fifo.w_rdy
+        s2_valid = f2_fifo.r_rdy
         s2_pc = Signal(32)
         s2_data = Signal(ibus.dat_r.width)
         m.d.comb += [
@@ -390,7 +381,7 @@ class IFStage(Elaboratable):
 
             m.d.comb += [
                 f2_is_rvc[w].eq(f2_insts[w][0:2] != 3),
-                f2_mask[w].eq(f2_fifo.r_rdy & valid & f2_imemresp_mask[w]
+                f2_mask[w].eq(s2_valid & valid & f2_imemresp_mask[w]
                               & ~redirects_found),
                 f2_targets[w].eq(br_sigs.target),
             ]
@@ -433,14 +424,14 @@ class IFStage(Elaboratable):
             f2_fetch_bundle.next_pc.eq(f2_predicted_target),
         ]
 
-        with m.If(f2_fifo.r_rdy & f3_ready):
+        with m.If(s2_valid & f3_ready):
             with m.If(f2_fetch_bundle.cfi_valid):
                 m.d.sync += f2_prev_half_valid.eq(0)
 
             with m.If((s1_valid & (s1_vpc != f2_predicted_target))
                       | ~s1_valid):
                 m.d.comb += [
-                    f1_clear.eq(1),
+                    f1_clear.eq(s1_valid),
                     s0_valid.eq(1),
                     s0_vpc.eq(f2_predicted_target),
                 ]
