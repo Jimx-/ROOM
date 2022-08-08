@@ -11,6 +11,7 @@ core_params = dict(fetch_width=4,
                    core_width=4,
                    num_pregs=96,
                    num_rob_rows=16,
+                   max_br_count=4,
                    issue_params={
                        IssueQueueType.INT:
                        dict(dispatch_width=4, num_entries=16, issue_width=4)
@@ -30,15 +31,25 @@ class Top(Elaboratable):
         ibus = wishbone.Interface(data_width=core_params['fetch_width'] * 16,
                                   adr_width=30)
 
-        mem_init = [0xffdff06f0f868693] + [0x0f8686930f868693] * 16
+        # mem_init = [0xffdff06f0f868693] + [0x0f8686930f868693] * 16
         # mem_init = [0x0f8686930f868693] * 16
+        # mem_init = [
+        #     0x0000011300000093, 0x0000021300000193, 0x0f868693fe0088e3
+        # ] + [0x0f8686930f868693] * 16
 
+        mem_init = [
+            0x0200059300000513,
+            0x0015051300000613,
+            0x00260613feb54ee3,
+            0x0026061300260613,
+            0x0000006f00260613,
+        ]
         m.submodules.sram = wishbone.SRAM(
             Memory(width=ibus.data_width,
                    depth=(1 << 10) // (ibus.data_width >> 3),
                    init=mem_init), ibus)
 
-        core = m.submodules.core = Core(core_params)
+        core = m.submodules.core = Core(Core.validate_params(core_params))
 
         m.d.comb += [
             core.ibus.connect(ibus),

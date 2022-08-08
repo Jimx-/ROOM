@@ -138,6 +138,18 @@ class IssueQueueType(IntEnum):
     MEM = 2
 
 
+class BranchType(IntEnum):
+    X = 0
+    NE = 1
+    EQ = 2
+    GE = 3
+    GEU = 4
+    LT = 5
+    LTU = 6
+    J = 7
+    JR = 8
+
+
 class OpA(IntEnum):
     RS1 = 0
     ZERO = 1
@@ -192,3 +204,9 @@ class FUType(IntEnum):
     MEM = 4
     MUL = 8
     DIV = 16
+
+
+class PCSel(IntEnum):
+    PC_PLUS_4 = 0
+    BRJMP = 1
+    JALR = 2

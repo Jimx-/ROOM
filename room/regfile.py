@@ -4,6 +4,7 @@ from amaranth.hdl.rec import DIR_FANIN, DIR_FANOUT
 from room.consts import *
 from room.types import MicroOp
 from room.alu import ExecReq
+from room.branch import BranchUpdate
 
 
 class RFReadPort(Record):
@@ -94,6 +95,8 @@ class RegReadDecoder(Elaboratable):
 
         F = lambda f: self.rrd_uop.alu_fn.eq(f)
 
+        BT = lambda typ: self.rrd_uop.br_type.eq(typ)
+
         OPA_RS1 = self.rrd_uop.opa_sel.eq(OpA.RS1)
         OPA_PC = self.rrd_uop.opa_sel.eq(OpA.PC)
 
@@ -102,6 +105,7 @@ class RegReadDecoder(Elaboratable):
 
         IMM_I = self.rrd_uop.imm_sel.eq(ImmSel.I)
         IMM_J = self.rrd_uop.imm_sel.eq(ImmSel.J)
+        IMM_B = self.rrd_uop.imm_sel.eq(ImmSel.B)
 
         with m.Switch(self.iss_uop.opcode):
             with m.Case(UOpCode.ADDI):
@@ -118,6 +122,48 @@ class RegReadDecoder(Elaboratable):
                     OPA_PC,
                     OPB_NEXT,
                     IMM_J,
+                ]
+
+            with m.Case(UOpCode.BEQ):
+                m.d.comb += [
+                    F(ALUOperator.SUB),
+                    BT(BranchType.EQ),
+                    IMM_B,
+                ]
+
+            with m.Case(UOpCode.BNE):
+                m.d.comb += [
+                    F(ALUOperator.SUB),
+                    BT(BranchType.NE),
+                    IMM_B,
+                ]
+
+            with m.Case(UOpCode.BGE):
+                m.d.comb += [
+                    F(ALUOperator.SLT),
+                    BT(BranchType.GE),
+                    IMM_B,
+                ]
+
+            with m.Case(UOpCode.BGEU):
+                m.d.comb += [
+                    F(ALUOperator.SLTU),
+                    BT(BranchType.GE),
+                    IMM_B,
+                ]
+
+            with m.Case(UOpCode.BLT):
+                m.d.comb += [
+                    F(ALUOperator.SLT),
+                    BT(BranchType.LT),
+                    IMM_B,
+                ]
+
+            with m.Case(UOpCode.BLTU):
+                m.d.comb += [
+                    F(ALUOperator.SLTU),
+                    BT(BranchType.LTU),
+                    IMM_B,
                 ]
 
         return m
@@ -147,6 +193,8 @@ class RegisterRead(Elaboratable):
             ExecReq(self.params, name=f'exec_req{i}')
             for i in range(self.issue_width)
         ]
+
+        self.br_update = BranchUpdate(params)
 
         self.kill = Signal()
 
@@ -211,6 +259,8 @@ class RegisterRead(Elaboratable):
         for req, rrd_uop, rrd_v in zip(self.exec_reqs, rrd_uops, rrd_valids):
             m.d.sync += [
                 req.uop.eq(rrd_uop),
+                req.uop.br_mask.eq(
+                    self.br_update.get_new_br_mask(rrd_uop.br_mask)),
                 req.valid.eq(rrd_v),
             ]
 

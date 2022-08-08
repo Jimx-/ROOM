@@ -3,6 +3,7 @@ import riscvmodel.insn as insn
 
 from room.consts import *
 from room.types import MicroOp
+from room.branch import BranchMaskAllocator, BranchUpdate
 
 
 class BranchSignals(Record):
@@ -66,8 +67,7 @@ class DecodeUnit(Elaboratable):
         uop = self.out_uop
 
         m.d.comb += [
-            uop.inst.eq(inuop.inst),
-            uop.is_rvc.eq(inuop.is_rvc),
+            uop.eq(inuop),
             uop.ldst.eq(inuop.inst[7:12]),
             uop.lrs1.eq(inuop.inst[15:20]),
             uop.lrs2.eq(inuop.inst[20:25]),
@@ -89,6 +89,7 @@ class DecodeUnit(Elaboratable):
 
         IMM_SEL_I = imm_sel.eq(ImmSel.I)
         IMM_SEL_J = imm_sel.eq(ImmSel.J)
+        IMM_SEL_B = imm_sel.eq(ImmSel.B)
 
         with m.Switch(inuop.inst[0:7]):
             with m.Case(OPV('JAL')):
@@ -98,7 +99,32 @@ class DecodeUnit(Elaboratable):
                     uop.fu_type.eq(FUType.JMP),
                     uop.dst_rtype.eq(RegisterType.FIX),
                     IMM_SEL_J,
+                    uop.is_jal.eq(1),
                 ]
+
+            with m.Case(OPV('BEQ')):
+                m.d.comb += [
+                    uop.iq_type.eq(IssueQueueType.INT),
+                    uop.fu_type.eq(FUType.ALU),
+                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                    uop.lrs2_rtype.eq(RegisterType.FIX),
+                    IMM_SEL_B,
+                    uop.is_br.eq(1),
+                ]
+
+                with m.Switch(inuop.inst[12:15]):
+                    with m.Case(F3('BEQ')):
+                        m.d.comb += UOPC(UOpCode.BEQ)
+                    with m.Case(F3('BNE')):
+                        m.d.comb += UOPC(UOpCode.BNE)
+                    with m.Case(F3('BGE')):
+                        m.d.comb += UOPC(UOpCode.BGE)
+                    with m.Case(F3('BGEU')):
+                        m.d.comb += UOPC(UOpCode.BGEU)
+                    with m.Case(F3('BLT')):
+                        m.d.comb += UOPC(UOpCode.BLT)
+                    with m.Case(F3('BLTU')):
+                        m.d.comb += UOPC(UOpCode.BLTU)
 
             with m.Case(OPV('AUIPC')):
                 pass
@@ -175,7 +201,10 @@ class DecodeStage(Elaboratable):
         self.fire = Signal(self.core_width)
         self.ready = Signal()
 
+        self.redirect_flush = Signal()
         self.dis_ready = Signal()
+
+        self.br_update = BranchUpdate(self.params)
 
     def elaborate(self, platform):
         m = Module()
@@ -194,7 +223,32 @@ class DecodeStage(Elaboratable):
                 self.uops[i].eq(dec.out_uop),
             ]
 
-        dec_hazards = [(x & ~self.dis_ready) for x in self.valids]
+        #
+        # Branch mask allocation
+        #
+
+        br_mask_alloc = m.submodules.br_mask_alloc = BranchMaskAllocator(
+            self.params)
+        m.d.comb += br_mask_alloc.br_update.eq(self.br_update)
+        for w in range(self.core_width):
+            uop = self.uops[w]
+
+            m.d.comb += [
+                br_mask_alloc.is_branch[w].eq(~dec_finished_mask[w]
+                                              & uop.allocate_brtag()),
+                br_mask_alloc.reqs[w].eq(self.fire[w]
+                                         & uop.allocate_brtag()),
+                uop.br_tag.eq(br_mask_alloc.br_tag[w]),
+                uop.br_mask.eq(br_mask_alloc.br_mask[w]),
+            ]
+
+        dec_hazards = [
+            (valid &
+             (~self.dis_ready | br_mask_full |
+              (self.br_update.mispredict_mask != 0)
+              | self.br_update.br_res.mispredict | self.redirect_flush))
+            for valid, br_mask_full in zip(self.valids, br_mask_alloc.full)
+        ]
         dec_stalls = Signal(self.core_width)
         m.d.comb += dec_stalls[0].eq(dec_hazards[0])
         for i in range(1, self.core_width):
@@ -204,7 +258,7 @@ class DecodeStage(Elaboratable):
             self.fire.eq(self.valids & ~dec_stalls),
             self.ready.eq(self.fire[-1]),
         ]
-        with m.If(self.ready == 1):
+        with m.If((self.ready == 1) | self.redirect_flush):
             m.d.sync += dec_finished_mask.eq(0)
         with m.Else():
             m.d.sync += dec_finished_mask.eq(dec_finished_mask | self.fire)

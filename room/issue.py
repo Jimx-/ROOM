@@ -4,6 +4,7 @@ from enum import IntEnum
 
 from room.consts import *
 from room.types import MicroOp
+from room.branch import BranchUpdate
 
 
 class IssueQueueWakeup(Record):
@@ -42,6 +43,7 @@ class IssueSlot(Elaboratable):
             for i in range(num_wakeup_ports)
         ]
 
+        self.br_update = BranchUpdate(params)
         self.kill = Signal()
 
     def elaborate(self, platform):
@@ -87,6 +89,13 @@ class IssueSlot(Elaboratable):
         with m.Elif(self.gnt & (state == IssueSlot.State.VALID_1)):
             m.d.comb += next_state.eq(IssueSlot.State.INVALID)
 
+        with m.If(self.br_update.uop_killed(slot_uop)):
+            m.d.comb += next_state.eq(IssueSlot.State.INVALID)
+
+        with m.If(~self.in_valid):
+            m.d.sync += slot_uop.br_mask.eq(
+                self.br_update.get_new_br_mask(slot_uop.br_mask))
+
         with m.If(state == IssueSlot.State.VALID_1):
             m.d.comb += self.req.eq(p1 & p2 & ~self.kill)
 
@@ -128,6 +137,7 @@ class IssueUnit(Elaboratable):
             for i in range(self.num_wakeup_ports)
         ]
 
+        self.br_update = BranchUpdate(params)
         self.flush_pipeline = Signal()
 
         self.ready = Signal(dispatch_width)
@@ -144,7 +154,10 @@ class IssueUnit(Elaboratable):
             setattr(m.submodules, f'issue_slot{i}', slot)
             slots.append(slot)
 
-            m.d.comb += slot.kill.eq(self.flush_pipeline)
+            m.d.comb += [
+                slot.kill.eq(self.flush_pipeline),
+                slot.br_update.eq(self.br_update),
+            ]
 
             for swu, wu in zip(slot.wakeup_ports, self.wakeup_ports):
                 m.d.comb += swu.eq(wu)

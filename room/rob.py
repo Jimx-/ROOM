@@ -2,6 +2,7 @@ from amaranth import *
 
 from room.alu import ExecResp
 from room.types import MicroOp
+from room.branch import BranchUpdate
 
 
 def _incr(signal, modulo):
@@ -17,9 +18,11 @@ class CommitReq:
         core_width = params['core_width']
 
         self.valids = Signal(core_width,
-                             name=name and f'{name}_valids' or None)
+                             name=(name is not None) and f'{name}_valids'
+                             or None)
         self.uops = [
-            MicroOp(params, name=name and f'{name}_uop{i}' or None)
+            MicroOp(params,
+                    name=(name is not None) and f'{name}_uop{i}' or None)
             for i in range(core_width)
         ]
 
@@ -48,10 +51,15 @@ class ReorderBuffer(Elaboratable):
 
         self.commit_req = CommitReq(params, name='commit_req')
 
+        self.head_idx = Signal(range(self.core_width * self.num_rob_rows))
         self.tail_idx = Signal(range(self.core_width * self.num_rob_rows))
+
+        self.br_update = BranchUpdate(params)
 
         self.ready = Signal()
         self.empty = Signal()
+
+        self.flush = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -126,6 +134,13 @@ class ReorderBuffer(Elaboratable):
                 self.commit_req.uops[w].eq(rob_uop[com_row]),
             ]
 
+            for i in range(self.num_rob_rows):
+                with m.If(self.br_update.uop_killed(rob_uop[i])):
+                    m.d.sync += rob_valid[i].eq(0)
+                with m.Elif(rob_valid[i]):
+                    m.d.sync += rob_uop[i].br_mask.eq(
+                        self.br_update.get_new_br_mask(rob_uop[i].br_mask))
+
             with m.If(will_commit[w]):
                 m.d.sync += rob_valid[rob_head].eq(0)
 
@@ -154,20 +169,29 @@ class ReorderBuffer(Elaboratable):
             ]
             m.d.comb += do_deq.eq(1)
 
-        with m.If((self.enq_valids != 0) & ~self.enq_partial_stalls):
+        with m.If(self.br_update.br_res.mispredict):
+            m.d.sync += [
+                rob_tail.eq(
+                    _incr(get_row(self.br_update.br_res.uop.rob_idx),
+                          self.num_rob_rows)),
+                rob_tail_lsb.eq(0),
+            ]
+        with m.Elif((self.enq_valids != 0) & ~self.enq_partial_stalls):
             m.d.sync += [
                 rob_tail.eq(_incr(rob_tail, self.num_rob_rows)),
                 rob_tail_lsb.eq(0),
             ]
             m.d.comb += do_enq.eq(1)
 
-        m.d.sync += maybe_full.eq(~do_deq & (do_enq | maybe_full))
+        m.d.sync += maybe_full.eq(~do_deq & (do_enq | maybe_full)
+                                  | (self.br_update.mispredict_mask != 0))
         m.d.comb += [
             full.eq((rob_tail == rob_head) & maybe_full),
             empty.eq((rob_tail == rob_head) & (rob_head_valids == 0))
         ]
 
         m.d.comb += [
+            self.head_idx.eq(rob_head_idx),
             self.tail_idx.eq(rob_tail_idx),
             self.ready.eq(~full),
             self.empty.eq(empty),

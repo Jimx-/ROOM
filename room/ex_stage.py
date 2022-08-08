@@ -2,6 +2,8 @@ from amaranth import *
 
 from room.consts import *
 from room.alu import ExecReq, ExecResp, ALU
+from room.if_stage import GetPCResp
+from room.branch import BranchResolution
 from room.types import MicroOp
 
 
@@ -26,6 +28,12 @@ class ExecUnit(Elaboratable):
         self.req = ExecReq(params, name='req')
 
         self.iresp = ExecResp(params, name='iresp')
+
+        self.br_res = has_alu and BranchResolution(params,
+                                                   name='br_res') or None
+        self.get_pc = None
+        if has_jmp_unit:
+            self.get_pc = GetPCResp(name='get_pc')
 
     def elaborate(self, platform):
         m = Module()
@@ -53,10 +61,16 @@ class ALUExecUnit(ExecUnit):
         iresp_units = []
 
         if self.has_alu:
-            alu = m.submodules.alu = ALU(self.params)
+            alu = m.submodules.alu = ALU(self.params, is_jmp=self.has_jmp_unit)
             iresp_units.append(alu)
 
-            m.d.comb += alu.req.eq(self.req)
+            m.d.comb += [
+                alu.req.eq(self.req),
+                self.br_res.eq(alu.br_res),
+            ]
+
+            if self.has_jmp_unit:
+                m.d.comb += alu.get_pc.eq(self.get_pc)
 
         for iu in reversed(iresp_units):
             with m.If(iu.resp.valid):

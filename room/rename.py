@@ -3,6 +3,7 @@ from amaranth.lib.coding import PriorityEncoder, Decoder
 
 from room.consts import *
 from room.types import MicroOp
+from room.branch import BranchUpdate
 from room.rob import CommitReq
 from room.issue import IssueQueueWakeup
 
@@ -41,10 +42,11 @@ class RemapReq(Record):
 
 class MapTable(Elaboratable):
 
-    def __init__(self, core_width, num_lregs, num_pregs):
+    def __init__(self, core_width, num_lregs, num_pregs, max_br_count, params):
         self.core_width = core_width
         self.num_lregs = num_lregs
         self.num_pregs = num_pregs
+        self.max_br_count = max_br_count
 
         self.map_reqs = [
             MapReq(num_lregs, name=f'map_req{i}') for i in range(core_width)
@@ -57,6 +59,14 @@ class MapTable(Elaboratable):
             for i in range(core_width)
         ]
 
+        self.ren_br_valids = Signal(self.core_width)
+        self.ren_br_tags = [
+            Signal(range(self.max_br_count), name=f'ren_br_tag{i}')
+            for i in range(self.core_width)
+        ]
+
+        self.br_update = BranchUpdate(params)
+
     def elaborate(self, platform):
         m = Module()
 
@@ -68,6 +78,11 @@ class MapTable(Elaboratable):
             Signal(range(self.num_pregs), name=f'remap_table_row{i}_col{j}')
             for j in range(self.num_lregs)
         ] for i in range(self.core_width + 1)]
+
+        br_snapshots = Array([
+            Signal(range(self.num_pregs), name=f'br_snapshots_row{i}_col{j}')
+            for j in range(self.num_lregs)
+        ] for i in range(self.max_br_count))
 
         for ldst in range(self.num_lregs):
             m.d.comb += remap_table[0][ldst].eq(map_table[ldst])
@@ -83,8 +98,18 @@ class MapTable(Elaboratable):
                             & (self.remap_reqs[pl].ldst == ldst),
                             self.remap_reqs[pl].pdst, remap_table[pl][ldst]))
 
+        for w in range(self.core_width):
+            with m.If(self.ren_br_valids[w]):
+                for l in range(self.num_lregs):
+                    m.d.sync += br_snapshots[self.ren_br_tags[w]][l].eq(
+                        remap_table[w + 1][l])
+
         for i in range(self.num_lregs):
-            m.d.sync += map_table[i].eq(remap_table[self.core_width][i])
+            with m.If(self.br_update.br_res.mispredict):
+                m.d.sync += map_table[i].eq(
+                    br_snapshots[self.br_update.br_res.uop.br_tag][i])
+            with m.Else():
+                m.d.sync += map_table[i].eq(remap_table[self.core_width][i])
 
         for req, resp in zip(self.map_reqs, self.map_resps):
             m.d.comb += [
@@ -99,9 +124,10 @@ class MapTable(Elaboratable):
 
 class Freelist(Elaboratable):
 
-    def __init__(self, core_width, num_pregs):
+    def __init__(self, core_width, num_pregs, max_br_count, params):
         self.core_width = core_width
         self.num_pregs = num_pregs
+        self.max_br_count = max_br_count
 
         self.reqs = Signal(core_width)
         self.alloc_pregs = [
@@ -116,10 +142,22 @@ class Freelist(Elaboratable):
         ]
         self.dealloc_valids = [Signal() for _ in range(core_width)]
 
+        self.ren_br_valids = Signal(self.core_width)
+        self.ren_br_tags = [
+            Signal(range(self.max_br_count), name=f'ren_br_tag{i}')
+            for i in range(self.core_width)
+        ]
+
+        self.br_update = BranchUpdate(params)
+
     def elaborate(self, platform):
         m = Module()
 
         free_list = Signal(self.num_pregs, reset=~1)
+
+        br_alloc_lists = Array(
+            Signal(self.num_pregs, name=f'br_alloc_list{i}')
+            for i in range(self.max_br_count))
 
         sels = [Signal(self.num_pregs) for _ in range(self.core_width)]
         sel_fire = [Signal() for _ in range(self.core_width)]
@@ -129,6 +167,10 @@ class Freelist(Elaboratable):
             sm |= Mux(f, s, 0)
         sel_mask = Signal(self.num_pregs)
         m.d.comb += sel_mask.eq(sm)
+
+        br_dealloc_mask = Mux(self.br_update.br_res.mispredict,
+                              br_alloc_lists[self.br_update.br_res.uop.br_tag],
+                              0)
 
         masks = [Signal(self.num_pregs) for _ in range(self.core_width)]
         m.d.comb += masks[0].eq(free_list)
@@ -157,7 +199,7 @@ class Freelist(Elaboratable):
                 self.alloc_valids[i].eq(valid),
             ]
 
-        dealloc_mask = 0
+        dealloc_mask = br_dealloc_mask
         for preg, v in zip(self.dealloc_pregs, self.dealloc_valids):
             dec = Decoder(self.num_pregs)
             m.submodules += dec
@@ -170,6 +212,32 @@ class Freelist(Elaboratable):
             free_list.eq((free_list & ~sel_mask | dealloc_mask)
                          & ~Const(1, self.num_pregs)),
         ]
+
+        alloc_masks = [0]
+        for preg, req in reversed(list(zip(self.alloc_pregs, self.reqs))):
+            dec = Decoder(self.num_pregs)
+            m.submodules += dec
+            m.d.comb += dec.i.eq(preg)
+
+            alloc_masks.append(
+                Mux(req, alloc_masks[-1] | dec.o, alloc_masks[-1]))
+        alloc_masks = list(reversed(alloc_masks))
+
+        for b in range(self.max_br_count):
+            br_req = Signal(self.core_width, name=f'br_req{b}')
+
+            for w in range(self.core_width):
+                m.d.comb += br_req[w].eq((self.ren_br_tags[w] == b)
+                                         & self.ren_br_valids[w])
+
+            with m.If(br_req == 0):
+                m.d.sync += br_alloc_lists[b].eq(br_alloc_lists[b]
+                                                 & ~br_dealloc_mask
+                                                 | alloc_masks[0])
+            with m.Else():
+                for w in range(self.core_width):
+                    with m.If(br_req[w] == 1):
+                        m.d.sync += br_alloc_lists[b].eq(alloc_masks[w + 1])
 
         return m
 
@@ -251,6 +319,7 @@ class RenameStage(Elaboratable):
     def __init__(self, num_wakeup_ports, params):
         self.params = params
         self.core_width = params['core_width']
+        self.max_br_count = params['max_br_count']
         self.num_pregs = params['num_pregs']
         self.num_wakeup_ports = num_wakeup_ports
 
@@ -274,6 +343,8 @@ class RenameStage(Elaboratable):
             IssueQueueWakeup(self.num_pregs, name=f'wakeup_port{i}')
             for i in range(self.num_wakeup_ports)
         ]
+
+        self.br_update = BranchUpdate(params)
 
         self.commit = CommitReq(self.params)
 
@@ -335,6 +406,11 @@ class RenameStage(Elaboratable):
         ]
         ren2_valids = Signal(self.core_width)
         ren2_alloc_reqs = Signal(self.core_width)
+        ren2_br_valids = Signal(self.core_width)
+        ren2_br_tags = [
+            Signal(range(self.max_br_count), name=f'ren2_br_tag{i}')
+            for i in range(self.core_width)
+        ]
         m.d.comb += [
             ren2_fire.eq(self.dis_fire),
             ren2_ready.eq(self.dis_ready)
@@ -361,18 +437,33 @@ class RenameStage(Elaboratable):
 
             # If REN1 and REN2 fire at the same cycle, REN1 will read stale mapping
             # invalidated by REN2.
-            m.d.sync += uop.eq(
-                self.bypass_preg_alloc(m, i, uop_next, ren2_uops,
-                                       ren2_alloc_reqs))
+            m.d.sync += [
+                uop.eq(
+                    self.bypass_preg_alloc(m, i, uop_next, ren2_uops,
+                                           ren2_alloc_reqs)),
+                uop.br_mask.eq(self.br_update.get_new_br_mask(
+                    uop_next.br_mask)),
+            ]
 
             m.d.comb += ren2_uop.eq(uop)
 
         m.d.comb += self.ren2_mask.eq(ren2_valids)
 
+        for w in range(self.core_width):
+            m.d.comb += [
+                ren2_br_tags[w].eq(ren2_uops[w].br_tag),
+                ren2_br_valids[w].eq(ren2_fire[w]
+                                     & ren2_uops[w].allocate_brtag()),
+            ]
+
         map_table = m.submodules.map_table = MapTable(self.core_width, 32,
-                                                      self.num_pregs)
+                                                      self.num_pregs,
+                                                      self.max_br_count,
+                                                      self.params)
         freelist = m.submodules.freelist = Freelist(self.core_width,
-                                                    self.num_pregs)
+                                                    self.num_pregs,
+                                                    self.max_br_count,
+                                                    self.params)
         busy_table = m.submodules.busy_table = BusyTable(
             self.num_wakeup_ports, self.params)
 
@@ -409,6 +500,13 @@ class RenameStage(Elaboratable):
                 rem_req.valid.eq(alloc_req),
             ]
 
+        for a, b in zip(map_table.ren_br_tags, ren2_br_tags):
+            m.d.comb += a.eq(b)
+        m.d.comb += [
+            map_table.ren_br_valids.eq(ren2_br_valids),
+            map_table.br_update.eq(self.br_update),
+        ]
+
         #
         # Free list
         #
@@ -428,6 +526,13 @@ class RenameStage(Elaboratable):
             ]
 
         m.d.comb += freelist.reqs.eq(ren2_alloc_reqs)
+
+        for a, b in zip(freelist.ren_br_tags, ren2_br_tags):
+            m.d.comb += a.eq(b)
+        m.d.comb += [
+            freelist.ren_br_valids.eq(ren2_br_valids),
+            freelist.br_update.eq(self.br_update),
+        ]
 
         #
         # Busy table
@@ -459,6 +564,8 @@ class RenameStage(Elaboratable):
 
             m.d.comb += [
                 self.ren2_uops[i].eq(bypass_uop),
+                self.ren2_uops[i].br_mask.eq(
+                    self.br_update.get_new_br_mask(bypass_uop.br_mask)),
                 self.stalls.eq((ren2_uops[i].dst_rtype == RegisterType.FIX)
                                & ~freelist.alloc_valids[i]),
             ]
