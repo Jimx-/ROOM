@@ -210,3 +210,9 @@ class PCSel(IntEnum):
     PC_PLUS_4 = 0
     BRJMP = 1
     JALR = 2
+
+
+class MemoryCommand(IntEnum):
+    X = 0
+    READ = 1
+    WRITE = 2

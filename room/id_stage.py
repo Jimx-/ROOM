@@ -88,6 +88,7 @@ class DecodeUnit(Elaboratable):
         imm_sel = Signal(ImmSel)
 
         IMM_SEL_I = imm_sel.eq(ImmSel.I)
+        IMM_SEL_S = imm_sel.eq(ImmSel.S)
         IMM_SEL_J = imm_sel.eq(ImmSel.J)
         IMM_SEL_B = imm_sel.eq(ImmSel.B)
 
@@ -125,6 +126,34 @@ class DecodeUnit(Elaboratable):
                         m.d.comb += UOPC(UOpCode.BLT)
                     with m.Case(F3('BLTU')):
                         m.d.comb += UOPC(UOpCode.BLTU)
+
+            with m.Case(OPV('SW')):
+                m.d.comb += [
+                    UOPC(UOpCode.STA),
+                    uop.iq_type.eq(IssueQueueType.MEM),
+                    uop.fu_type.eq(FUType.MEM),
+                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                    uop.lrs2_rtype.eq(RegisterType.FIX),
+                    IMM_SEL_S,
+                    uop.uses_stq.eq(1),
+                    uop.mem_cmd.eq(MemoryCommand.WRITE),
+                    uop.mem_size.eq(inuop.inst[12:14]),
+                    uop.mem_signed.eq(inuop.inst[14]),
+                ]
+
+            with m.Case(OPV('LW')):
+                m.d.comb += [
+                    UOPC(UOpCode.LD),
+                    uop.iq_type.eq(IssueQueueType.MEM),
+                    uop.fu_type.eq(FUType.MEM),
+                    uop.dst_rtype.eq(RegisterType.FIX),
+                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                    IMM_SEL_I,
+                    uop.uses_ldq.eq(1),
+                    uop.mem_cmd.eq(MemoryCommand.READ),
+                    uop.mem_size.eq(inuop.inst[12:14]),
+                    uop.mem_signed.eq(inuop.inst[14]),
+                ]
 
             with m.Case(OPV('AUIPC')):
                 pass

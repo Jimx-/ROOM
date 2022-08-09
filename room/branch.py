@@ -51,8 +51,11 @@ class BranchUpdate:
     def get_new_br_mask(self, mask):
         return mask & ~self.resolve_mask
 
+    def br_mask_killed(self, br_mask):
+        return (self.mispredict_mask & br_mask) != 0
+
     def uop_killed(self, uop):
-        return (self.mispredict_mask & uop.br_mask) != 0
+        return self.br_mask_killed(uop.br_mask)
 
 
 class BranchMaskAllocator(Elaboratable):

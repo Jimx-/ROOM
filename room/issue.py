@@ -86,8 +86,20 @@ class IssueSlot(Elaboratable):
 
         with m.If(self.kill):
             m.d.comb += next_state.eq(IssueSlot.State.INVALID)
-        with m.Elif(self.gnt & (state == IssueSlot.State.VALID_1)):
+        with m.Elif(self.gnt & ((state == IssueSlot.State.VALID_1) | (
+            (state == IssueSlot.State.VALID_2) & p1 & p2))):
             m.d.comb += next_state.eq(IssueSlot.State.INVALID)
+        with m.Elif(self.gnt & (state == IssueSlot.State.VALID_2)):
+            m.d.comb += next_state.eq(IssueSlot.State.VALID_1)
+            with m.If(p1):
+                m.d.sync += [
+                    slot_uop.opcode.eq(UOpCode.STD),
+                    slot_uop.lrs1_rtype.eq(RegisterType.X),
+                ]
+            with m.Else():
+                m.d.sync += [
+                    slot_uop.lrs2_rtype.eq(RegisterType.X),
+                ]
 
         with m.If(self.br_update.uop_killed(slot_uop)):
             m.d.comb += next_state.eq(IssueSlot.State.INVALID)
@@ -98,11 +110,24 @@ class IssueSlot(Elaboratable):
 
         with m.If(state == IssueSlot.State.VALID_1):
             m.d.comb += self.req.eq(p1 & p2 & ~self.kill)
+        with m.Elif(state == IssueSlot.State.VALID_2):
+            m.d.comb += self.req.eq((p1 | p2) & ~self.kill)
 
         m.d.comb += [
             self.out_uop.eq(slot_uop),
             self.out_uop.issue_uops.eq(next_state),
         ]
+
+        with m.If(state == IssueSlot.State.VALID_2):
+            with m.If(p1 & p2):
+                pass
+            with m.Elif(p1):
+                m.d.comb += self.out_uop.lrs2_rtype.eq(RegisterType.X)
+            with m.Elif(p1):
+                m.d.comb += [
+                    self.out_uop.opcode.eq(UOpCode.STD),
+                    self.out_uop.lrs1_rtype.eq(RegisterType.X),
+                ]
 
         return m
 
@@ -196,6 +221,10 @@ class IssueUnit(Elaboratable):
                 mux_uop.eq(uop),
                 mux_uop.issue_uops.eq(1),
             ]
+
+            with m.If((uop.opcode == UOpCode.STA)
+                      & (uop.lrs2_rtype == RegisterType.FIX)):
+                m.d.comb += mux_uop.issue_uops.eq(2)
 
         for slot, wen_oh in zip(slots, entry_wen):
             enc = Encoder(self.dispatch_width)

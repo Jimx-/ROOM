@@ -13,6 +13,7 @@ from room.rob import ReorderBuffer
 from room.regfile import RegisterFile, RegisterRead
 from room.ex_stage import ExecUnits
 from room.branch import BranchUpdate, BranchResolution
+from room.lsu import LoadStoreUnit
 
 from roomsoc.interconnect import wishbone
 
@@ -24,15 +25,24 @@ class Core(Elaboratable):
         self.core_width = params['core_width']
 
         self.ibus = wishbone.Interface(data_width=params['fetch_width'] * 16,
-                                       adr_width=32)
+                                       adr_width=32,
+                                       name='ibus')
+        self.dbus = wishbone.Interface(data_width=32,
+                                       adr_width=32,
+                                       name='dbus')
 
     @staticmethod
     def validate_params(params):
         params['fetch_bytes'] = params['fetch_width'] << 1
+        params['mem_width'] = params['issue_params'][
+            IssueQueueType.MEM]['issue_width']
+
         return params
 
     def elaborate(self, platform):
         m = Module()
+
+        mem_width = self.params['mem_width']
 
         #
         # Instruction fetch
@@ -69,7 +79,7 @@ class Core(Elaboratable):
 
         exec_units = m.submodules.exec_units = ExecUnits(self.params)
 
-        num_int_iss_wakeup_ports = exec_units.irf_write_ports
+        num_int_iss_wakeup_ports = exec_units.irf_write_ports + mem_width
         num_int_ren_wakeup_ports = num_int_iss_wakeup_ports
 
         ren_stage = m.submodules.rename_stage = RenameStage(
@@ -87,6 +97,8 @@ class Core(Elaboratable):
         #
         # Dispatcher
         #
+
+        lsu = m.submodules.lsu = LoadStoreUnit(self.dbus, self.params)
 
         dispatcher = m.submodules.dispatcher = Dispatcher(self.params)
 
@@ -110,12 +122,12 @@ class Core(Elaboratable):
         rob_ready = Signal()
         m.d.comb += rob_ready.eq(1)
 
-        dis_hazards = [
-            (v &
-             (~rob_ready | ren_stall | ~iq_ready | if_stage.redirect_flush))
-            for v, ren_stall, iq_ready in zip(dis_valids, ren_stage.stalls,
-                                              dispatcher.ready)
-        ]
+        dis_hazards = [(dis_valids[w] &
+                        (~rob_ready | ren_stage.stalls[w] |
+                         (lsu.ldq_full[w] & dis_uops[w].uses_ldq) |
+                         (lsu.stq_full[w] & dis_uops[w].uses_stq)
+                         | ~dispatcher.ready[w] | if_stage.redirect_flush))
+                       for w in range(self.core_width)]
         dis_stalls = Signal(self.core_width)
         m.d.comb += dis_stalls[0].eq(dis_hazards[0])
         for i in range(1, self.core_width):
@@ -125,6 +137,12 @@ class Core(Elaboratable):
             dis_fire.eq(dis_valids & ~dis_stalls),
             dis_ready.eq(~dis_stalls[-1]),
         ]
+
+        for w in range(self.core_width):
+            m.d.comb += [
+                dis_uops[w].ldq_idx.eq(lsu.dis_ldq_idx[w]),
+                dis_uops[w].stq_idx.eq(lsu.dis_stq_idx[w]),
+            ]
 
         for ren_uop, dis_uop in zip(dispatcher.ren_uops, dis_uops):
             m.d.comb += ren_uop.eq(dis_uop)
@@ -214,7 +232,20 @@ class Core(Elaboratable):
         int_iss_wakeups = []
         int_ren_wakeups = []
 
-        for i, eu in enumerate(exec_units):
+        for w in range(mem_width):
+            resp = lsu.exec_iresps[w]
+
+            wakeup = ExecResp(self.params, name=f'iss_ren_wakeup{w}')
+            m.d.comb += [
+                wakeup.uop.eq(resp.uop),
+                wakeup.valid.eq(resp.valid & resp.uop.rf_wen()
+                                & resp.uop.dst_rtype == RegisterType.FIX),
+            ]
+
+            int_iss_wakeups.append(wakeup)
+            int_ren_wakeups.append(wakeup)
+
+        for i, eu in enumerate(exec_units, mem_width):
             if eu.irf_write:
                 resp = eu.iresp
 
@@ -245,20 +276,24 @@ class Core(Elaboratable):
         # Register read
         #
 
+        iqs_mem_int = [
+            issue_units[typ]
+            for typ in (IssueQueueType.MEM, IssueQueueType.INT)
+        ]
+
         iss_uops = []
         iss_fu_types = []
         iss_valids = Signal(
             sum([
                 p['issue_width'] for p in self.params['issue_params'].values()
             ]))
-        for iq in issue_units.values():
+        for iq in iqs_mem_int:
             iss_uops.extend(iq.iss_uops)
             iss_fu_types.extend(iq.fu_types)
-        m.d.comb += iss_valids.eq(
-            Cat([iq.iss_valids for iq in issue_units.values()]))
+        m.d.comb += iss_valids.eq(Cat([iq.iss_valids for iq in iqs_mem_int]))
 
         iregfile = m.submodules.iregfile = RegisterFile(
-            exec_units.irf_read_ports, exec_units.irf_write_ports,
+            exec_units.irf_read_ports, exec_units.irf_write_ports + mem_width,
             self.params['num_pregs'], 32)
 
         iregread = m.submodules.iregread = RegisterRead(
@@ -295,6 +330,9 @@ class Core(Elaboratable):
             for i in range(self.core_width)
         ]
 
+        for eu in exec_units:
+            m.d.comb += eu.br_update.eq(br_update)
+
         for br_res, eu in zip(br_infos,
                               [eu for eu in exec_units if eu.has_alu]):
             m.d.sync += [
@@ -312,6 +350,27 @@ class Core(Elaboratable):
             m.d.comb += if_stage.get_pc_idx[0].eq(iss_uop.ftq_idx)
 
             m.d.sync += eu.get_pc.pc.eq(if_stage.get_pc[0].pc)
+
+        #
+        # Load/store unit
+        #
+
+        for w in range(self.core_width):
+            m.d.comb += [
+                lsu.dis_valids[w].eq(dis_fire[w]),
+                lsu.dis_uops[w].eq(dis_uops[w]),
+            ]
+
+        for req, eu in zip(lsu.exec_reqs,
+                           [eu for eu in exec_units if eu.has_mem]):
+            m.d.sync += [
+                req.eq(eu.lsu_req),
+            ]
+
+        m.d.comb += [
+            lsu.commit.eq(rob.commit_req),
+            lsu.br_update.eq(br_update),
+        ]
 
         #
         # Branch resolution
@@ -363,8 +422,17 @@ class Core(Elaboratable):
         # Writeback
         #
 
+        for wp, iresp in zip(iregfile.write_ports[:mem_width],
+                             lsu.exec_iresps):
+            m.d.comb += [
+                wp.valid.eq(iresp.valid & iresp.uop.rf_wen()
+                            & iresp.uop.dst_rtype == RegisterType.FIX),
+                wp.addr.eq(iresp.uop.pdst),
+                wp.data.eq(iresp.data),
+            ]
+
         for eu, wp in zip([eu for eu in exec_units if eu.irf_write],
-                          iregfile.write_ports):
+                          iregfile.write_ports[mem_width:]):
             m.d.comb += [
                 wp.valid.eq(eu.iresp.valid & eu.iresp.uop.rf_wen()
                             & eu.iresp.uop.dst_rtype == RegisterType.FIX),
@@ -376,8 +444,15 @@ class Core(Elaboratable):
         # Commit
         #
 
-        for rob_wb, eu in zip(rob.wb_resps,
+        for rob_wb, iresp in zip(rob.wb_resps[:mem_width], lsu.exec_iresps):
+            m.d.comb += rob_wb.eq(iresp)
+
+        for rob_wb, eu in zip(rob.wb_resps[mem_width:],
                               [eu for eu in exec_units if eu.irf_write]):
             m.d.comb += rob_wb.eq(eu.iresp)
+
+        for a, b in zip(rob.lsu_clear_busy_idx, lsu.clear_busy_idx):
+            m.d.comb += a.eq(b)
+        m.d.comb += rob.lsu_clear_busy_valids.eq(lsu.clear_busy_valids)
 
         return m

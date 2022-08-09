@@ -37,6 +37,7 @@ class ReorderBuffer(Elaboratable):
         self.params = params
         self.core_width = params['core_width']
         self.num_rob_rows = params['num_rob_rows']
+        mem_width = params['mem_width']
 
         self.enq_uops = [
             MicroOp(params, name=f'enq_uop{i}') for i in range(self.core_width)
@@ -47,6 +48,12 @@ class ReorderBuffer(Elaboratable):
         self.wb_resps = [
             ExecResp(params, name=f'wb_resp{i}')
             for i in range(num_wakeup_ports)
+        ]
+
+        self.lsu_clear_busy_valids = Signal(mem_width)
+        self.lsu_clear_busy_idx = [
+            Signal(range(self.core_width * self.num_rob_rows),
+                   name=f'lsu_clear_busy_idx{i}') for i in range(mem_width)
         ]
 
         self.commit_req = CommitReq(params, name='commit_req')
@@ -123,9 +130,12 @@ class ReorderBuffer(Elaboratable):
                 uop = wb.uop
                 row_idx = get_row(uop.rob_idx)
                 with m.If(wb.valid & (get_bank(uop.rob_idx) == w)):
-                    m.d.sync += [
-                        rob_busy[row_idx].eq(0),
-                    ]
+                    m.d.sync += rob_busy[row_idx].eq(0)
+
+            for clr_val, clr_idx in zip(self.lsu_clear_busy_valids,
+                                        self.lsu_clear_busy_idx):
+                with m.If(clr_val & (get_bank(clr_idx) == w)):
+                    m.d.sync += rob_busy[get_row(clr_idx)].eq(0)
 
             m.d.comb += [
                 can_commit[w].eq(rob_valid[rob_head]

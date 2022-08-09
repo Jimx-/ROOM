@@ -21,13 +21,8 @@ class ExecReq:
         self.kill = Signal(name=f'{name}kill')
 
     def eq(self, rhs):
-        return [
-            self.uop.eq(rhs.uop),
-            self.valid.eq(rhs.valid),
-            self.rs1_data.eq(rhs.rs1_data),
-            self.rs2_data.eq(rhs.rs2_data),
-            self.kill.eq(rhs.kill),
-        ]
+        attrs = ['uop', 'valid', 'rs1_data', 'rs2_data', 'kill']
+        return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
 class ExecResp:
@@ -39,13 +34,11 @@ class ExecResp:
         self.valid = Signal(name=f'{name}valid')
 
         self.data = Signal(32, name=f'{name}data')
+        self.addr = Signal(32, name=f'{name}addr')
 
     def eq(self, rhs):
-        return [
-            self.uop.eq(rhs.uop),
-            self.valid.eq(rhs.valid),
-            self.data.eq(rhs.data),
-        ]
+        attrs = ['uop', 'valid', 'addr', 'data']
+        return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
 class FunctionalUnit(Elaboratable):
@@ -53,8 +46,8 @@ class FunctionalUnit(Elaboratable):
     def __init__(self, params, is_jmp=False, is_alu=False):
         self.is_jmp = is_jmp
 
-        self.req = ExecReq(params)
-        self.resp = ExecResp(params)
+        self.req = ExecReq(params, name='req')
+        self.resp = ExecResp(params, name='resp')
 
         self.br_update = BranchUpdate(params)
 
@@ -88,6 +81,8 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                                   & ~self.br_update.uop_killed(self.req.uop)
                                   & ~self.req.kill),
                 self.uops[0].eq(self.req.uop),
+                self.uops[0].br_mask.eq(
+                    self.br_update.get_new_br_mask(self.req.uop.br_mask)),
             ]
 
             for i in range(1, self.num_stages):
@@ -97,6 +92,9 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                         & ~self.br_update.uop_killed(self.uops[i - 1])
                         & ~self.req.kill),
                     self.uops[i].eq(self.uops[i - 1]),
+                    self.uops[i].br_mask.eq(
+                        self.br_update.get_new_br_mask(self.uops[i -
+                                                                 1].br_mask)),
                 ]
 
             m.d.comb += [
@@ -104,12 +102,17 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                                    & ~self.br_update.uop_killed(self.uops[
                                        self.num_stages - 1])),
                 self.resp.uop.eq(self.uops[self.num_stages - 1]),
+                self.resp.uop.br_mask.eq(
+                    self.br_update.get_new_br_mask(self.uops[self.num_stages -
+                                                             1].br_mask)),
             ]
         else:
             m.d.comb += [
                 self.resp.valid.eq(self.req.valid
                                    & ~self.br_update.uop_killed(self.req.uop)),
                 self.resp.uop.eq(self.req.uop),
+                self.resp.uop.br_mask.eq(
+                    self.br_update.get_new_br_mask(self.req.uop.br_mask)),
             ]
 
         return m
@@ -245,6 +248,23 @@ class ALU(PipelinedFunctionalUnit):
 
         m.d.comb += [
             self.resp.data.eq(data[self.num_stages - 1]),
+        ]
+
+        return m
+
+
+class AddrGenUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(0, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        m.d.comb += [
+            self.resp.addr.eq(self.req.rs1_data +
+                              self.req.uop.imm_packed[8:20]),
+            self.resp.data.eq(self.req.rs2_data),
         ]
 
         return m
