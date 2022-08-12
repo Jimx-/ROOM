@@ -123,7 +123,7 @@ class IssueSlot(Elaboratable):
                 pass
             with m.Elif(p1):
                 m.d.comb += self.out_uop.lrs2_rtype.eq(RegisterType.X)
-            with m.Elif(p1):
+            with m.Elif(p2):
                 m.d.comb += [
                     self.out_uop.opcode.eq(UOpCode.STD),
                     self.out_uop.lrs1_rtype.eq(RegisterType.X),

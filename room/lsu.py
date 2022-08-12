@@ -60,9 +60,10 @@ class DataCache(Elaboratable):
 
     def __init__(self, params):
         self.mem_width = params['mem_width']
+        self.log_max_size = 2  # 4 bytes
         self.params = params
 
-        self.dbus = wishbone.Interface(data_width=32, adr_width=32)
+        self.dbus = wishbone.Interface(data_width=32, adr_width=30)
 
         self.reqs = Array(
             DCacheReq(params, name=f'req{i}') for i in range(self.mem_width))
@@ -87,12 +88,40 @@ class DataCache(Elaboratable):
 
         uop = MicroOp(self.params)
 
-        adr = Signal.like(self.dbus.adr)
+        req_addr = Signal(32)
         dat_w = Signal.like(self.dbus.dat_w)
         sel = Signal.like(self.dbus.sel)
         we = Signal.like(self.dbus.we)
 
         req_chosen = self.reqs[chosen]
+
+        load_data = Signal(32)
+        res = self.dbus.dat_r
+        for i in range(self.log_max_size - 1, -1, -1):
+            pos = 8 << i
+            shifted = Mux(req_addr[i], res[pos:pos * 2], res[:pos])
+            res = Cat(
+                shifted,
+                Mux(uop.mem_size == i,
+                    Repl(uop.mem_signed & shifted[pos - 1], 32 - pos),
+                    res[pos:]))
+        m.d.comb += load_data.eq(res)
+
+        store_data = Signal(32)
+        for i in range(self.log_max_size + 1):
+            with m.If(req_chosen.uop.mem_size == i):
+                m.d.comb += store_data.eq(
+                    Repl(req_chosen.data[:(8 << i)], 1 <<
+                         (self.log_max_size - i)))
+
+        store_mask = Signal(1 << self.log_max_size)
+        mask = 1
+        for i in range(self.log_max_size):
+            upper = Mux(req_chosen.addr[i], mask, 0) | Mux(
+                req_chosen.uop.mem_size >= (i + 1), (1 << (1 << i)) - 1, 0)
+            lower = Mux(req_chosen.addr[i], 0, mask)
+            mask = Cat(lower, upper)
+        m.d.comb += store_mask.eq(mask)
 
         with m.FSM():
             with m.State('IDLE'):
@@ -101,11 +130,11 @@ class DataCache(Elaboratable):
                 with m.If(req_chosen.valid
                           & ~self.br_update.uop_killed(req_chosen.uop)):
                     m.d.comb += [
-                        self.dbus.adr.eq(req_chosen.addr),
+                        self.dbus.adr.eq(req_chosen.addr[2:]),
                         self.dbus.stb.eq(1),
-                        self.dbus.dat_w.eq(req_chosen.data),
+                        self.dbus.dat_w.eq(store_data),
                         self.dbus.cyc.eq(1),
-                        self.dbus.sel.eq(~0),
+                        self.dbus.sel.eq(store_mask),
                         self.dbus.we.eq(self.reqs[choice].uop.mem_cmd ==
                                         MemoryCommand.WRITE),
                         req_chosen.ready.eq(1),
@@ -116,7 +145,7 @@ class DataCache(Elaboratable):
                         uop.br_mask.eq(
                             self.br_update.get_new_br_mask(
                                 req_chosen.uop.br_mask)),
-                        adr.eq(self.dbus.adr),
+                        req_addr.eq(req_chosen.addr),
                         dat_w.eq(self.dbus.dat_w),
                         sel.eq(self.dbus.sel),
                         we.eq(self.dbus.we),
@@ -128,7 +157,7 @@ class DataCache(Elaboratable):
             with m.State('WAIT_ACK'):
                 m.d.comb += [
                     chosen.eq(last_grant),
-                    self.dbus.adr.eq(adr),
+                    self.dbus.adr.eq(req_addr[2:]),
                     self.dbus.stb.eq(1),
                     self.dbus.dat_w.eq(dat_w),
                     self.dbus.cyc.eq(1),
@@ -146,7 +175,7 @@ class DataCache(Elaboratable):
                 with m.Elif(self.dbus.ack):
                     m.d.comb += [
                         self.resps[chosen].valid.eq(1),
-                        self.resps[chosen].data.eq(self.dbus.dat_r),
+                        self.resps[chosen].data.eq(load_data),
                         self.resps[chosen].uop.eq(uop),
                         self.resps[chosen].uop.br_mask.eq(
                             self.br_update.get_new_br_mask(uop.br_mask)),

@@ -169,7 +169,9 @@ class RegReadDecoder(Elaboratable):
         m.d.comb += [
             self.rrd_uop.is_load.eq(self.iss_uop.opcode == UOpCode.LD),
             self.rrd_uop.is_sta.eq(self.iss_uop.opcode == UOpCode.STA),
-            self.rrd_uop.is_std.eq(self.iss_uop.opcode == UOpCode.STD),
+            self.rrd_uop.is_std.eq((self.iss_uop.opcode == UOpCode.STD) | (
+                (self.iss_uop.opcode == UOpCode.STA)
+                & (self.iss_uop.lrs2_rtype == RegisterType.FIX))),
         ]
 
         return m

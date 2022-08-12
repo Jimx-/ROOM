@@ -24,11 +24,12 @@ class Core(Elaboratable):
         self.params = params
         self.core_width = params['core_width']
 
+        ibus_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
         self.ibus = wishbone.Interface(data_width=params['fetch_width'] * 16,
-                                       adr_width=32,
+                                       adr_width=32 - ibus_addr_shift,
                                        name='ibus')
         self.dbus = wishbone.Interface(data_width=32,
-                                       adr_width=32,
+                                       adr_width=30,
                                        name='dbus')
 
     @staticmethod

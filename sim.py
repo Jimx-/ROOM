@@ -32,8 +32,10 @@ class Top(Elaboratable):
 
         m.d.comb += ResetSignal().eq(self.rst)
 
-        ibus = wishbone.Interface(data_width=core_params['fetch_width'] * 16,
-                                  adr_width=30)
+        ibus_data_width = core_params['fetch_width'] * 16
+        ibus_addr_width = 32 - Shape.cast(range(ibus_data_width >> 3)).width
+        ibus = wishbone.Interface(data_width=ibus_data_width,
+                                  adr_width=ibus_addr_width)
         dbus = wishbone.Interface(data_width=32, adr_width=30)
 
         # mem_init = [0xffdff06f0f868693] + [0x0f8686930f868693] * 16
@@ -50,14 +52,18 @@ class Top(Elaboratable):
         #     0x0000006f00260613,
         # ]
 
-        mem_init = [0x0005a58300800593, 0x0040061300158593, 0x0000006f00b62023]
+        # mem_init = [0x0005a58300800593, 0x0040061300158593, 0x0000006f00b62023]
+
+        # mem_init = [0x1230059300600513, 0x0000006f00b51023]
+
+        mem_init = [0x0005558300800513]
 
         m.submodules.sram_i = wishbone.SRAM(
             Memory(width=ibus.data_width,
                    depth=(1 << 10) // (ibus.data_width >> 3),
                    init=mem_init), ibus)
 
-        dmem_init = [0x0, 0x0, 0x1234, 0x0]
+        dmem_init = [0x0, 0x0, 0x1234f6f8, 0x0]
         m.submodules.sram_d = wishbone.SRAM(
             Memory(width=dbus.data_width,
                    depth=(1 << 10) // (dbus.data_width >> 3),
@@ -67,10 +73,7 @@ class Top(Elaboratable):
 
         m.d.comb += [
             core.ibus.connect(ibus),
-            ibus.adr.eq(
-                core.ibus.adr[Shape.cast(range(ibus.data_width >> 3)).width:]),
             core.dbus.connect(dbus),
-            dbus.adr.eq(core.dbus.adr[2:]),
         ]
 
         return m
@@ -86,7 +89,7 @@ if __name__ == "__main__":
         yield dut.rst.eq(1)
         yield
         yield dut.rst.eq(0)
-        for _ in range(1000):
+        for _ in range(100):
             yield
 
     sim.add_sync_process(process)

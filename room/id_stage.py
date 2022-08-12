@@ -138,7 +138,7 @@ class DecodeUnit(Elaboratable):
                     uop.uses_stq.eq(1),
                     uop.mem_cmd.eq(MemoryCommand.WRITE),
                     uop.mem_size.eq(inuop.inst[12:14]),
-                    uop.mem_signed.eq(inuop.inst[14]),
+                    uop.mem_signed.eq(~inuop.inst[14]),
                 ]
 
             with m.Case(OPV('LW')):
@@ -152,7 +152,7 @@ class DecodeUnit(Elaboratable):
                     uop.uses_ldq.eq(1),
                     uop.mem_cmd.eq(MemoryCommand.READ),
                     uop.mem_size.eq(inuop.inst[12:14]),
-                    uop.mem_signed.eq(inuop.inst[14]),
+                    uop.mem_signed.eq(~inuop.inst[14]),
                 ]
 
             with m.Case(OPV('AUIPC')):

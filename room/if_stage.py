@@ -276,6 +276,7 @@ class IFStage(Elaboratable):
         self.fetch_width = params['fetch_width']
         self.core_width = params['core_width']
         self.fetch_buffer_size = params['fetch_buffer_size']
+        self.fetch_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
         ftq_size = self.fetch_buffer_size
 
         self.fetch_packet = [
@@ -338,8 +339,9 @@ class IFStage(Elaboratable):
         f1_clear = Signal()
         f2_ready = Signal()
 
+        ibus_addr = Mux(s0_valid, s0_vpc, s1_vpc)
         m.d.comb += [
-            ibus.adr.eq(Mux(s0_valid, s0_vpc, s1_vpc)),
+            ibus.adr.eq(ibus_addr[self.fetch_addr_shift:]),
             ibus.cyc.eq((s0_valid | s1_valid) & ~f1_clear),
             ibus.stb.eq(ibus.cyc),
         ]
