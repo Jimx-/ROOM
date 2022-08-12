@@ -91,6 +91,7 @@ class DecodeUnit(Elaboratable):
         IMM_SEL_S = imm_sel.eq(ImmSel.S)
         IMM_SEL_J = imm_sel.eq(ImmSel.J)
         IMM_SEL_B = imm_sel.eq(ImmSel.B)
+        IMM_SEL_U = imm_sel.eq(ImmSel.U)
 
         with m.Switch(inuop.inst[0:7]):
             with m.Case(OPV('JAL')):
@@ -156,7 +157,22 @@ class DecodeUnit(Elaboratable):
                 ]
 
             with m.Case(OPV('AUIPC')):
-                pass
+                m.d.comb += [
+                    UOPC(UOpCode.AUIPC),
+                    uop.iq_type.eq(IssueQueueType.INT),
+                    uop.fu_type.eq(FUType.JMP),
+                    uop.dst_rtype.eq(RegisterType.FIX),
+                    IMM_SEL_U,
+                ]
+
+            with m.Case(OPV('LUI')):
+                m.d.comb += [
+                    UOPC(UOpCode.LUI),
+                    uop.iq_type.eq(IssueQueueType.INT),
+                    uop.fu_type.eq(FUType.ALU),
+                    uop.dst_rtype.eq(RegisterType.FIX),
+                    IMM_SEL_U,
+                ]
 
             # Register-immediate
             with m.Case(OPV('ADDI')):
