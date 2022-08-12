@@ -26,11 +26,15 @@ class Core(Elaboratable):
 
         ibus_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
         self.ibus = wishbone.Interface(data_width=params['fetch_width'] * 16,
-                                       adr_width=32 - ibus_addr_shift,
+                                       addr_width=32 - ibus_addr_shift,
+                                       granularity=8,
                                        name='ibus')
         self.dbus = wishbone.Interface(data_width=32,
-                                       adr_width=30,
+                                       addr_width=30,
+                                       granularity=8,
                                        name='dbus')
+
+        self.periph_buses = [self.ibus, self.dbus]
 
     @staticmethod
     def validate_params(params):

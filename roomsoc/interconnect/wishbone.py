@@ -1,65 +1,120 @@
 from amaranth import *
-from amaranth.hdl.rec import DIR_FANIN, DIR_FANOUT
+from amaranth_soc.wishbone.bus import *
 
 
-def make_wishbone_layout(data_width, adr_width):
-    sel_width = data_width // 8
-    return [("adr", adr_width, DIR_FANOUT), ("dat_w", data_width, DIR_FANOUT),
-            ("dat_r", data_width, DIR_FANIN), ("sel", sel_width, DIR_FANOUT),
-            ("cyc", 1, DIR_FANOUT), ("stb", 1, DIR_FANOUT),
-            ("ack", 1, DIR_FANIN), ("we", 1, DIR_FANOUT),
-            ("cti", 3, DIR_FANOUT), ("bte", 2, DIR_FANOUT),
-            ("err", 1, DIR_FANIN)]
+class DownConverter(Elaboratable):
+
+    def __init__(self, master, slave):
+        self.master = master
+        self.slave = slave
+
+    def elaborate(self, platform):
+        m = Module()
+
+        dw_from = self.master.data_width
+        dw_to = self.slave.data_width
+        ratio = dw_from // dw_to
+
+        counter = Signal(range(ratio))
+        skip = Signal()
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.sync += counter.eq(0)
+
+                with m.If(self.master.cyc & self.master.stb):
+                    m.next = 'CONVERT'
+
+            with m.State('CONVERT'):
+                m.d.comb += self.slave.adr.eq(Cat(counter, self.master.adr))
+
+                for i in range(ratio):
+                    with m.If(counter == i):
+                        m.d.comb += self.slave.sel.eq(
+                            self.master.sel[i * dw_to // 8:])
+
+                    with m.If(~self.master.cyc):
+                        m.d.comb += self.slave.cyc.eq(0)
+                        m.next = 'IDLE'
+                    with m.Elif(self.master.cyc & self.master.stb):
+                        m.d.comb += [
+                            skip.eq(self.slave.sel == 0),
+                            self.slave.we.eq(self.master.we),
+                            self.slave.cyc.eq(~skip),
+                            self.slave.stb.eq(~skip),
+                        ]
+
+                        with m.If(self.slave.ack | skip):
+                            m.d.sync += counter.eq(counter + 1)
+
+                            with m.If(counter == (ratio - 1)):
+                                m.d.comb += self.master.ack.eq(1)
+                                m.next = 'IDLE'
+
+        for i in range(ratio):
+            with m.If(counter == i):
+                m.d.comb += self.slave.dat_w.eq(self.master.dat_w[i * dw_to:])
+
+        dat_r = Signal(dw_from)
+        m.d.comb += self.master.dat_r.eq(Cat(dat_r[dw_to:], self.slave.dat_r))
+        with m.If(self.slave.ack | skip):
+            m.d.sync += dat_r.eq(self.master.dat_r)
+
+        return m
 
 
-class Interface(Record):
+class UpConverter(Elaboratable):
 
-    def __init__(self, data_width=32, adr_width=30, name=None):
-        self.adr_width = adr_width
-        self.data_width = data_width
-        super().__init__(make_wishbone_layout(data_width=data_width,
-                                              adr_width=adr_width),
-                         name=name)
-        self.adr.reset_less = True
-        self.dat_w.reset_less = True
-        self.dat_r.reset_less = True
-        self.sel.reset_less = True
+    def __init__(self, master, slave):
+        self.master = master
+        self.slave = slave
 
-    @staticmethod
-    def like(other):
-        return Interface(other.data_width)
+    def elaborate(self, platform):
+        m = Module()
 
-    def _do_transaction(self):
-        yield self.cyc.eq(1)
-        yield self.stb.eq(1)
-        yield
-        while not (yield self.ack):
-            yield
-        yield self.cyc.eq(0)
-        yield self.stb.eq(0)
+        dw_from = self.master.data_width
+        dw_to = self.slave.data_width
+        ratio = dw_to // dw_from
+        lsb_width = Shape.cast(range(ratio)).width
 
-    def write(self, adr, dat, sel=None, cti=None, bte=None):
-        if sel is None:
-            sel = 2**len(self.sel) - 1
-        yield self.adr.eq(adr)
-        yield self.dat_w.eq(dat)
-        yield self.sel.eq(sel)
-        if cti is not None:
-            yield self.cti.eq(cti)
-        if bte is not None:
-            yield self.bte.eq(bte)
-        yield self.we.eq(1)
-        yield from self._do_transaction()
+        m.d.comb += self.master.connect(
+            self.slave, exclude={'adr', 'sel', 'dat_r', 'dat_w'})
 
-    def read(self, adr, cti=None, bte=None):
-        yield self.adr.eq(adr)
-        yield self.we.eq(0)
-        if cti is not None:
-            yield self.cti.eq(cti)
-        if bte is not None:
-            yield self.bte.eq(bte)
-        yield from self._do_transaction()
-        return (yield self.dat_r)
+        for i in range(ratio):
+            with m.If(self.master.adr[:lsb_width] == i):
+                m.d.comb += [
+                    self.slave.adr.eq(self.master.adr[lsb_width:]),
+                    self.slave.sel[i * dw_from // 8:(i + 1) * dw_from // 8].eq(
+                        self.master.sel),
+                    self.slave.dat_w[i * dw_from:(i + 1) * dw_from].eq(
+                        self.master.dat_w),
+                    self.master.dat_r.eq(self.slave.dat_r[i * dw_from:(i + 1) *
+                                                          dw_from]),
+                ]
+
+        return m
+
+
+class Converter(Elaboratable):
+
+    def __init__(self, master, slave):
+        self.master = master
+        self.slave = slave
+
+    def elaborate(self, platform):
+        m = Module()
+
+        dw_from = self.master.data_width
+        dw_to = self.slave.data_width
+
+        if dw_from > dw_to:
+            m.submodules.downconverter = DownConverter(self.master, self.slave)
+        elif dw_from < dw_to:
+            m.submodules.upconverter = UpConverter(self.master, self.slave)
+        else:
+            m.d.comb += self.master.connect(self.slave)
+
+        return m
 
 
 class SRAM(Elaboratable):

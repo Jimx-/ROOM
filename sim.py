@@ -4,7 +4,25 @@ from amaranth.sim import Simulator
 from room.consts import *
 from room import Core
 
+from roomsoc.soc import SoC
 from roomsoc.interconnect import wishbone
+
+import argparse
+import struct
+
+
+def read_mem_image(filename):
+    image = []
+
+    with open(filename, 'rb') as f:
+        while True:
+            w = f.read(4)
+            if not w:
+                break
+            image.append(struct.unpack('I', w)[0])
+
+    return image
+
 
 core_params = dict(fetch_width=4,
                    fetch_buffer_size=16,
@@ -24,7 +42,9 @@ core_params = dict(fetch_width=4,
 
 class Top(Elaboratable):
 
-    def __init__(self):
+    def __init__(self, sram_image):
+        self.sram_image = sram_image
+
         self.rst = Signal()
 
     def elaborate(self, platform):
@@ -32,12 +52,9 @@ class Top(Elaboratable):
 
         m.d.comb += ResetSignal().eq(self.rst)
 
-        ibus_data_width = core_params['fetch_width'] * 16
-        ibus_addr_width = 32 - Shape.cast(range(ibus_data_width >> 3)).width
-        ibus = wishbone.Interface(data_width=ibus_data_width,
-                                  adr_width=ibus_addr_width)
-        dbus = wishbone.Interface(data_width=32, adr_width=30)
+        ibus = wishbone.Interface(data_width=32, addr_width=30, granularity=8)
 
+        soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
         # mem_init = [0xffdff06f0f868693] + [0x0f8686930f868693] * 16
         # mem_init = [0x0f8686930f868693] * 16
         # mem_init = [
@@ -54,33 +71,56 @@ class Top(Elaboratable):
 
         # mem_init = [0x0005a58300800593, 0x0040061300158593, 0x0000006f00b62023]
 
-        # mem_init = [0x1230059300600513, 0x0000006f00b51023]
-
-        mem_init = [0x0005558300800513]
-
-        m.submodules.sram_i = wishbone.SRAM(
-            Memory(width=ibus.data_width,
-                   depth=(1 << 10) // (ibus.data_width >> 3),
-                   init=mem_init), ibus)
-
-        dmem_init = [0x0, 0x0, 0x1234f6f8, 0x0]
-        m.submodules.sram_d = wishbone.SRAM(
-            Memory(width=dbus.data_width,
-                   depth=(1 << 10) // (dbus.data_width >> 3),
-                   init=dmem_init), dbus)
-
-        core = m.submodules.core = Core(Core.validate_params(core_params))
-
-        m.d.comb += [
-            core.ibus.connect(ibus),
-            core.dbus.connect(dbus),
+        mem_init = [
+            0x00000513,
+            0x02000593,
+            0x00000613,
+            0x00150513,
+            0xfeb54ee3,
+            0x00260613,
+            0x00260613,
+            0x00260613,
+            0x00260613,
+            0x0000006f,
         ]
+
+        # mem_init = [
+        #     0x00600513,
+        #     0x12300593,
+        #     0x00b51023,
+        #     0x0000006f,
+        # ]
+
+        # mem_init = [
+        #     0x00800513,
+        #     0x00055583,
+        #     0x0000006f,
+        # ]
+
+        sram_bus = wishbone.Interface(data_width=32,
+                                      addr_width=30,
+                                      granularity=8)
+        sram = wishbone.SRAM(
+            Memory(width=ibus.data_width,
+                   depth=(8 << 10) // (ibus.data_width >> 3),
+                   init=self.sram_image), sram_bus)
+
+        core = Core(Core.validate_params(core_params))
+
+        soc.add_cpu(core)
+        soc.add_ram(name='sram', ram=sram)
 
         return m
 
 
 if __name__ == "__main__":
-    dut = Top()
+    parser = argparse.ArgumentParser(description='ROOM SoC simulation')
+    parser.add_argument('image', type=str, help='Memory image')
+    args = parser.parse_args()
+
+    image = read_mem_image(args.image)
+
+    dut = Top(image)
 
     sim = Simulator(dut)
     sim.add_clock(1e-6)
@@ -89,7 +129,7 @@ if __name__ == "__main__":
         yield dut.rst.eq(1)
         yield
         yield dut.rst.eq(0)
-        for _ in range(100):
+        for _ in range(1000):
             yield
 
     sim.add_sync_process(process)

@@ -63,7 +63,9 @@ class DataCache(Elaboratable):
         self.log_max_size = 2  # 4 bytes
         self.params = params
 
-        self.dbus = wishbone.Interface(data_width=32, adr_width=30)
+        self.dbus = wishbone.Interface(data_width=32,
+                                       addr_width=30,
+                                       granularity=8)
 
         self.reqs = Array(
             DCacheReq(params, name=f'req{i}') for i in range(self.mem_width))
@@ -134,7 +136,7 @@ class DataCache(Elaboratable):
                         self.dbus.stb.eq(1),
                         self.dbus.dat_w.eq(store_data),
                         self.dbus.cyc.eq(1),
-                        self.dbus.sel.eq(store_mask),
+                        self.dbus.sel.eq(Mux(self.dbus.we, store_mask, ~0)),
                         self.dbus.we.eq(self.reqs[choice].uop.mem_cmd ==
                                         MemoryCommand.WRITE),
                         req_chosen.ready.eq(1),

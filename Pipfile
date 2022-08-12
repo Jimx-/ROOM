@@ -9,6 +9,7 @@ amaranth = "*"
 cocotb = "*"
 cocotbext-axi = "*"
 riscv-model = "*"
+amaranth-soc = {editable = true, git = "https://github.com/amaranth-lang/amaranth-soc"}
 
 [dev-packages]
 

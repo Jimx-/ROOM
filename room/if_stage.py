@@ -344,12 +344,10 @@ class IFStage(Elaboratable):
             ibus.adr.eq(ibus_addr[self.fetch_addr_shift:]),
             ibus.cyc.eq((s0_valid | s1_valid) & ~f1_clear),
             ibus.stb.eq(ibus.cyc),
+            ibus.sel.eq(~0),
         ]
 
-        m.d.sync += [
-            s1_vpc.eq(Mux(s0_valid, s0_vpc, s1_vpc)),
-            s1_valid.eq(s0_valid),
-        ]
+        m.d.sync += s1_vpc.eq(Mux(s0_valid, s0_vpc, s1_vpc))
 
         with m.If(s0_valid):
             m.d.sync += s1_valid.eq(1)

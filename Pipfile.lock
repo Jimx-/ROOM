@@ -1,7 +1,7 @@
 {
     "_meta": {
         "hash": {
-            "sha256": "61afd1e49878953d8f254e6e4ea77a78aa54437edeeb70f9a6c648a3b97e1323"
+            "sha256": "cb97d7745ff4bec1f5c0e34176534f60e50e2d2449fd9cddadc6fbecfa84f36e"
         },
         "pipfile-spec": 6,
         "requires": {
@@ -22,6 +22,11 @@
             ],
             "index": "pypi",
             "version": "==0.3"
+        },
+        "amaranth-soc": {
+            "editable": true,
+            "git": "https://github.com/amaranth-lang/amaranth-soc",
+            "ref": "217d4ea76ad3b3bbf146980d168bc7b3b9d95a18"
         },
         "cocotb": {
             "hashes": [
