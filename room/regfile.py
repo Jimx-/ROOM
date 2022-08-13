@@ -101,6 +101,7 @@ class RegReadDecoder(Elaboratable):
         OPA_PC = self.rrd_uop.opa_sel.eq(OpA.PC)
         OPA_ZERO = self.rrd_uop.opa_sel.eq(OpA.ZERO)
 
+        OPB_RS2 = self.rrd_uop.opb_sel.eq(OpB.RS2)
         OPB_IMM = self.rrd_uop.opb_sel.eq(OpB.IMM)
         OPB_NEXT = self.rrd_uop.opb_sel.eq(OpB.NEXT)
 
@@ -118,13 +119,43 @@ class RegReadDecoder(Elaboratable):
                     IMM_U,
                 ]
 
-            with m.Case(UOpCode.ADDI):
-                m.d.comb += [
-                    F(ALUOperator.ADD),
-                    OPA_RS1,
-                    OPB_IMM,
-                    IMM_I,
-                ]
+            for uopc, alu_op in (
+                (UOpCode.ADDI, ALUOperator.ADD),
+                (UOpCode.ANDI, ALUOperator.AND),
+                (UOpCode.ORI, ALUOperator.OR),
+                (UOpCode.XORI, ALUOperator.XOR),
+                (UOpCode.SLTI, ALUOperator.SLT),
+                (UOpCode.SLTIU, ALUOperator.SLTU),
+                (UOpCode.SLLI, ALUOperator.SL),
+                (UOpCode.SRAI, ALUOperator.SRA),
+                (UOpCode.SRLI, ALUOperator.SR),
+            ):
+                with m.Case(uopc):
+                    m.d.comb += [
+                        F(alu_op),
+                        OPA_RS1,
+                        OPB_IMM,
+                        IMM_I,
+                    ]
+
+            for uopc, alu_op in (
+                (UOpCode.ADD, ALUOperator.ADD),
+                (UOpCode.SUB, ALUOperator.SUB),
+                (UOpCode.AND, ALUOperator.AND),
+                (UOpCode.OR, ALUOperator.OR),
+                (UOpCode.XOR, ALUOperator.XOR),
+                (UOpCode.SLT, ALUOperator.SLT),
+                (UOpCode.SLTU, ALUOperator.SLTU),
+                (UOpCode.SLL, ALUOperator.SL),
+                (UOpCode.SRA, ALUOperator.SRA),
+                (UOpCode.SRL, ALUOperator.SR),
+            ):
+                with m.Case(uopc):
+                    m.d.comb += [
+                        F(alu_op),
+                        OPA_RS1,
+                        OPB_RS2,
+                    ]
 
             with m.Case(UOpCode.JAL):
                 m.d.comb += [

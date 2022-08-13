@@ -216,10 +216,19 @@ class DecodeUnit(Elaboratable):
             with m.Case(OPV('ADD')):
                 m.d.comb += [
                     uop.iq_type.eq(IssueQueueType.INT),
+                    uop.fu_type.eq(FUType.ALU),
                     uop.dst_rtype.eq(RegisterType.FIX),
                     uop.lrs1_rtype.eq(RegisterType.FIX),
                     uop.lrs2_rtype.eq(RegisterType.FIX),
                 ]
+
+                for name in [
+                        'ADD', 'SUB', 'SLT', 'SLTU', 'XOR', 'OR', 'AND', 'SLL',
+                        'SRL', 'SRA'
+                ]:
+                    with m.If((inuop.inst[25:31] == F7(name))
+                              & (inuop.inst[12:15] == F3(name))):
+                        m.d.comb += UOPC(getattr(UOpCode, name))
 
         di20_25 = Mux((imm_sel == ImmSel.B) | (imm_sel == ImmSel.S),
                       inuop.inst[7:12], inuop.inst[20:25])

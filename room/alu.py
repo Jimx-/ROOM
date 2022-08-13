@@ -120,7 +120,7 @@ class PipelinedFunctionalUnit(FunctionalUnit):
 
 def generate_imm(ip, sel):
     sign = ip[-1]
-    i20_30 = Mux(sel == ImmSel.U, ip[8:19], Repl(sign, 10))
+    i20_30 = Mux(sel == ImmSel.U, ip[8:19], Repl(sign, 11))
     i12_19 = Mux((sel == ImmSel.U) | (sel == ImmSel.J), ip[0:8], Repl(sign, 8))
     i11 = Mux(sel == ImmSel.U, 0,
               Mux((sel == ImmSel.J) | (sel == ImmSel.B), ip[8], sign))
@@ -139,6 +139,10 @@ class ALU(PipelinedFunctionalUnit):
         m = super().elaborate(platform)
 
         uop = self.req.uop
+
+        #
+        # Operands
+        #
 
         imm = generate_imm(uop.imm_packed, uop.imm_sel)
 
@@ -161,16 +165,73 @@ class ALU(PipelinedFunctionalUnit):
                 Mux(uop.opb_sel == OpB.RS2, self.req.rs2_data,
                     Mux(uop.opb_sel == OpB.NEXT, Mux(uop.is_rvc, 2, 4), 0))))
 
+        #
+        # ALU
+        #
+
         is_sub = uop.alu_fn[3]
+        is_cmp = uop.alu_fn >= ALUOperator.SLT
+        is_cmp_unsigned = uop.alu_fn[1]
+
+        #
+        # ADD, SUB
+        #
 
         adder_out = Signal(32)
         opb_inv = Mux(is_sub == 1, ~opb_data, opb_data)
+        inv = Signal(32)
+        m.d.comb += inv.eq(opb_inv)
         m.d.comb += adder_out.eq(opa_data + opb_inv + is_sub)
+
+        #
+        # SLT, SLTU
+        #
+
+        opa_xor_opb = opa_data ^ opb_inv
+        slt = Mux(opa_data[-1] == opb_data[-1], adder_out[-1],
+                  Mux(is_cmp_unsigned, opb_data[-1], opa_data[-1]))
+
+        #
+        # SLL, SRL, SRA
+        #
+
+        shamt = opb_data[:5]
+
+        shin_r = Signal(32)
+        shin_l = Signal(32)
+        m.d.comb += shin_r.eq(opa_data)
+        for a, b in zip(shin_l, reversed(shin_r)):
+            m.d.comb += a.eq(b)
+
+        shin = Mux(
+            (uop.alu_fn == ALUOperator.SR) | (uop.alu_fn == ALUOperator.SRA),
+            shin_r, shin_l)
+
+        shout_r = Signal(32)
+        shout_l = Signal(32)
+        m.d.comb += shout_r.eq(
+            Cat(shin, is_sub & shin[-1]).as_signed() >> shamt)
+        for a, b in zip(shout_l, reversed(shout_r)):
+            m.d.comb += a.eq(b)
+        shout = Mux(
+            (uop.alu_fn == ALUOperator.SR) | (uop.alu_fn == ALUOperator.SRA),
+            shout_r, 0) | Mux(uop.alu_fn == ALUOperator.SL, shout_l, 0)
+
+        #
+        # AND, OR, XOR
+        #
+
+        logic = Mux((uop.alu_fn == ALUOperator.XOR) |
+                    (uop.alu_fn == ALUOperator.OR), opa_xor_opb, 0) | Mux(
+                        (uop.alu_fn == ALUOperator.AND) |
+                        (uop.alu_fn == ALUOperator.OR), opa_data & opb_data, 0)
+
+        shift_logic = (is_cmp & slt) | logic | shout
 
         alu_out = Signal(32)
         m.d.comb += alu_out.eq(
             Mux((uop.alu_fn == ALUOperator.ADD) |
-                (uop.alu_fn == ALUOperator.SUB), adder_out, 0))
+                (uop.alu_fn == ALUOperator.SUB), adder_out, shift_logic))
 
         #
         # Branch unit
@@ -235,6 +296,11 @@ class ALU(PipelinedFunctionalUnit):
             self.br_res.pc_sel.eq(pc_sel),
             self.br_res.target_offset.eq(target_offset),
         ]
+
+        #
+        # Output
+        #
+
         data = [Signal(32, name=f's{i}_data') for i in range(self.num_stages)]
 
         m.d.sync += [
