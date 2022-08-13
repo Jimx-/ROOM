@@ -20,6 +20,8 @@ class ExecReq:
 
         self.kill = Signal(name=f'{name}kill')
 
+        self.ready = Signal(name=f'{name}ready')
+
     def eq(self, rhs):
         attrs = ['uop', 'valid', 'rs1_data', 'rs2_data', 'kill']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
@@ -35,6 +37,8 @@ class ExecResp:
 
         self.data = Signal(32, name=f'{name}data')
         self.addr = Signal(32, name=f'{name}addr')
+
+        self.ready = Signal(name=f'{name}ready')
 
     def eq(self, rhs):
         attrs = ['uop', 'valid', 'addr', 'data']
@@ -68,6 +72,8 @@ class PipelinedFunctionalUnit(FunctionalUnit):
 
     def elaborate(self, platform):
         m = Module()
+
+        m.d.comb += self.req.ready.eq(1)
 
         if self.num_stages > 0:
             self.valids = Signal(self.num_stages)
@@ -378,5 +384,142 @@ class MultiplierUnit(PipelinedFunctionalUnit):
             data = next_data
 
         m.d.comb += self.resp.data.eq(data)
+
+        return m
+
+
+class IterativeFunctionalUnit(FunctionalUnit):
+
+    def __init__(self, params):
+        self.params = params
+
+        self.do_kill = Signal()
+
+        super().__init__(params)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        uop = MicroOp(self.params)
+
+        with m.If(self.req.valid & self.req.ready):
+            m.d.comb += self.do_kill.eq(
+                self.req.kill | self.br_update.uop_killed(self.req.uop))
+            m.d.sync += [
+                uop.eq(self.req.uop),
+                uop.br_mask.eq(
+                    self.br_update.get_new_br_mask(self.req.uop.br_mask))
+            ]
+        with m.Else():
+            m.d.comb += self.do_kill.eq(self.req.kill
+                                        | self.br_update.uop_killed(uop))
+            m.d.sync += [
+                uop.br_mask.eq(self.br_update.get_new_br_mask(uop.br_mask))
+            ]
+
+        m.d.comb += self.resp.uop.eq(uop)
+
+        return m
+
+
+class DivUnit(IterativeFunctionalUnit):
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        width = 32
+
+        req = ExecReq(self.params, name='in')
+        count = Signal(range(width + 1))
+        neg_out = Signal()
+        divisor = Signal(width)
+        remainder = Signal(2 * width + 1)
+
+        fn = self.req.uop.alu_fn
+        h = (fn == ALUOperator.REM) | (fn == ALUOperator.REMU)
+        lhs_signed = (fn == ALUOperator.DIV) | (fn == ALUOperator.REM)
+        rhs_signed = lhs_signed
+
+        lhs_sign = self.req.rs1_data[-1] & lhs_signed
+        rhs_sign = self.req.rs2_data[-1] & rhs_signed
+
+        is_hi = Signal()
+        res_hi = Signal()
+        result = Mux(res_hi, remainder[width + 1:], remainder[:width])
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.comb += self.req.ready.eq(1)
+
+                with m.If(self.req.valid & self.req.ready & ~self.do_kill):
+                    m.d.sync += [
+                        req.eq(self.req),
+                        neg_out.eq(Mux(h, lhs_sign, lhs_sign ^ rhs_sign)),
+                        count.eq(0),
+                        divisor.eq(Cat(self.req.rs2_data, rhs_sign)),
+                        remainder.eq(self.req.rs1_data),
+                        is_hi.eq(h),
+                        res_hi.eq(0),
+                    ]
+
+                    with m.If(lhs_sign | rhs_sign):
+                        m.next = 'NEG_IN'
+                    with m.Else():
+                        m.next = 'DIV'
+
+            with m.State('NEG_IN'):
+                with m.If(self.do_kill):
+                    m.next = 'IDLE'
+                with m.Else():
+                    with m.If(remainder[width - 1]):
+                        m.d.sync += remainder.eq(-remainder[:width])
+                    with m.If(divisor[width - 1]):
+                        m.d.sync += divisor.eq(-divisor)
+                    m.next = 'DIV'
+
+            with m.State('DIV'):
+                with m.If(self.do_kill):
+                    m.next = 'IDLE'
+                with m.Else():
+                    d = remainder[width:2 * width + 1] - divisor[:width]
+                    less = d[width]
+                    m.d.sync += [
+                        remainder.eq(
+                            Cat(
+                                ~less, remainder[:width],
+                                Mux(less, remainder[width:2 * width],
+                                    d[:width]))),
+                        count.eq(count + 1),
+                    ]
+
+                    with m.If(count == width):
+                        m.d.sync += res_hi.eq(is_hi)
+
+                        with m.If(neg_out):
+                            m.next = 'NEG_OUT'
+                        with m.Else():
+                            m.next = 'DIV_DONE'
+
+                    with m.If((count == 0) & (divisor == 0) & ~is_hi):
+                        m.d.sync += neg_out.eq(0)
+
+            with m.State('NEG_OUT'):
+                with m.If(self.do_kill):
+                    m.next = 'IDLE'
+                with m.Else():
+                    m.d.sync += [
+                        remainder.eq(-result),
+                        res_hi.eq(0),
+                    ]
+
+                    m.next = 'DIV_DONE'
+
+            with m.State('DIV_DONE'):
+                m.d.comb += self.resp.valid.eq(~self.do_kill)
+
+                with m.If(self.do_kill | (self.resp.valid & self.resp.ready)):
+                    m.next = 'IDLE'
+
+        m.d.comb += self.resp.data.eq(result)
 
         return m

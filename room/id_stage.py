@@ -240,6 +240,14 @@ class DecodeUnit(Elaboratable):
                             uop.fu_type.eq(FUType.MUL),
                         ]
 
+                for name in ['DIV', 'DIVU', 'REM', 'REMU']:
+                    with m.If((inuop.inst[25:31] == F7(name))
+                              & (inuop.inst[12:15] == F3(name))):
+                        m.d.comb += [
+                            UOPC(getattr(UOpCode, name)),
+                            uop.fu_type.eq(FUType.DIV),
+                        ]
+
         di20_25 = Mux((imm_sel == ImmSel.B) | (imm_sel == ImmSel.S),
                       inuop.inst[7:12], inuop.inst[20:25])
         m.d.comb += uop.imm_packed.eq(

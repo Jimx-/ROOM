@@ -194,6 +194,11 @@ class ALUOperator(IntEnum):
     MULHSU = SEQ
     MULHU = SNE
 
+    DIV = XOR
+    DIVU = SR
+    REM = OR
+    REMU = AND
+
 
 class CFIType(IntEnum):
     X = 0

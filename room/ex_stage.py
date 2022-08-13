@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import *
-from room.alu import ExecReq, ExecResp, ALU, AddrGenUnit, MultiplierUnit
+from room.alu import ExecReq, ExecResp, ALU, AddrGenUnit, MultiplierUnit, DivUnit
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
@@ -17,6 +17,7 @@ class ExecUnit(Elaboratable):
                  has_jmp_unit=False,
                  has_alu=False,
                  has_mul=False,
+                 has_div=False,
                  has_mem=False):
         self.params = params
         self.data_width = data_width
@@ -25,6 +26,7 @@ class ExecUnit(Elaboratable):
         self.has_jmp_unit = has_jmp_unit
         self.has_alu = has_alu
         self.has_mul = has_mul
+        self.has_div = has_div
         self.has_mem = has_mem
 
         self.fu_types = Signal(FUType)
@@ -58,6 +60,7 @@ class ALUExecUnit(ExecUnit):
                  has_jmp_unit=False,
                  has_alu=True,
                  has_mul=False,
+                 has_div=False,
                  has_mem=False,
                  name=None):
         super().__init__(32,
@@ -67,14 +70,23 @@ class ALUExecUnit(ExecUnit):
                          has_jmp_unit=has_jmp_unit,
                          has_alu=has_alu,
                          has_mul=has_mul,
+                         has_div=has_div,
                          has_mem=has_mem)
         self.name = name
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
+        div_busy = Signal()
+        fu_type_div = Signal(FUType)
+
+        if self.has_div:
+            with m.If(~div_busy):
+                m.d.comb += fu_type_div.eq(FUType.DIV)
+
         m.d.comb += self.fu_types.eq((self.has_alu and FUType.ALU or 0)
                                      | (self.has_mul and FUType.MUL or 0)
+                                     | fu_type_div
                                      | (self.has_jmp_unit and FUType.JMP or 0)
                                      | (self.has_mem and FUType.MEM or 0))
 
@@ -106,6 +118,24 @@ class ALUExecUnit(ExecUnit):
                                   & (self.req.uop.fu_type == FUType.MUL)),
                 imul.br_update.eq(self.br_update),
             ]
+
+        if self.has_div:
+            div = m.submodules.div = DivUnit(self.params)
+
+            div_resp_busy = 0
+            for iu in iresp_units:
+                div_resp_busy |= iu.resp.valid
+
+            m.d.comb += [
+                div.req.eq(self.req),
+                div.req.valid.eq(self.req.valid
+                                 & (self.req.uop.fu_type == FUType.DIV)),
+                div.br_update.eq(self.br_update),
+                div.resp.ready.eq(~div_resp_busy),
+                div_busy.eq(~div.resp.ready | div.req.valid),
+            ]
+
+            iresp_units.append(div)
 
         if self.has_mem:
             agu = m.submodules.agu = AddrGenUnit(self.params)
@@ -147,6 +177,7 @@ class ExecUnits(Elaboratable):
             eu = ALUExecUnit(params,
                              has_jmp_unit=(i == 0),
                              has_mul=(i == (2 % int_width)),
+                             has_div=(i == (3 % int_width)),
                              name=f'alu_int{i}')
             self.exec_units.append(eu)
             self.irf_readers += eu.irf_read
