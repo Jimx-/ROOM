@@ -334,3 +334,49 @@ class AddrGenUnit(PipelinedFunctionalUnit):
         ]
 
         return m
+
+
+class MultiplierUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, latency, params):
+        self.latency = latency
+
+        super().__init__(latency, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        in_req = ExecReq(self.params, name='in')
+        m.d.sync += in_req.eq(self.req)
+
+        fn = in_req.uop.alu_fn
+        h = (fn == ALUOperator.MULH) | (fn == ALUOperator.MULHU) | (
+            fn == ALUOperator.MULHSU)
+        lhs_signed = (fn == ALUOperator.MULH) | (fn == ALUOperator.MULHSU)
+        rhs_signed = (fn == ALUOperator.MULH)
+
+        lhs = Cat(in_req.rs1_data,
+                  (lhs_signed & in_req.rs1_data[-1])).as_signed()
+        rhs = Cat(in_req.rs2_data,
+                  (rhs_signed & in_req.rs2_data[-1])).as_signed()
+        prod = lhs * rhs
+        muxed = Mux(h, prod[32:64], prod[:32])
+
+        valid = in_req.valid
+        data = muxed
+
+        for _ in range(self.latency - 1):
+            next_valid = Signal()
+            next_data = Signal.like(data)
+
+            m.d.sync += next_valid.eq(valid)
+
+            with m.If(valid):
+                m.d.sync += next_data.eq(data)
+
+            valid = next_valid
+            data = next_data
+
+        m.d.comb += self.resp.data.eq(data)
+
+        return m

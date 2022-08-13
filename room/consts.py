@@ -189,6 +189,11 @@ class ALUOperator(IntEnum):
     SLTU = 14
     SGEU = 15
 
+    MUL = ADD
+    MULH = SL
+    MULHSU = SEQ
+    MULHU = SNE
+
 
 class CFIType(IntEnum):
     X = 0

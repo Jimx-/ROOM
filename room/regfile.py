@@ -157,6 +157,19 @@ class RegReadDecoder(Elaboratable):
                         OPB_RS2,
                     ]
 
+            for uopc, alu_op in (
+                (UOpCode.MUL, ALUOperator.MUL),
+                (UOpCode.MULH, ALUOperator.MULH),
+                (UOpCode.MULHU, ALUOperator.MULHU),
+                (UOpCode.MULHSU, ALUOperator.MULHSU),
+            ):
+                with m.Case(uopc):
+                    m.d.comb += [
+                        F(alu_op),
+                        OPA_RS1,
+                        OPB_RS2,
+                    ]
+
             with m.Case(UOpCode.JAL):
                 m.d.comb += [
                     F(ALUOperator.ADD),

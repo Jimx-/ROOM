@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import *
-from room.alu import ExecReq, ExecResp, ALU, AddrGenUnit
+from room.alu import ExecReq, ExecResp, ALU, AddrGenUnit, MultiplierUnit
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
@@ -16,6 +16,7 @@ class ExecUnit(Elaboratable):
                  irf_write=False,
                  has_jmp_unit=False,
                  has_alu=False,
+                 has_mul=False,
                  has_mem=False):
         self.params = params
         self.data_width = data_width
@@ -23,6 +24,7 @@ class ExecUnit(Elaboratable):
         self.irf_write = irf_write
         self.has_jmp_unit = has_jmp_unit
         self.has_alu = has_alu
+        self.has_mul = has_mul
         self.has_mem = has_mem
 
         self.fu_types = Signal(FUType)
@@ -55,6 +57,7 @@ class ALUExecUnit(ExecUnit):
                  params,
                  has_jmp_unit=False,
                  has_alu=True,
+                 has_mul=False,
                  has_mem=False,
                  name=None):
         super().__init__(32,
@@ -63,6 +66,7 @@ class ALUExecUnit(ExecUnit):
                          irf_write=has_alu,
                          has_jmp_unit=has_jmp_unit,
                          has_alu=has_alu,
+                         has_mul=has_mul,
                          has_mem=has_mem)
         self.name = name
 
@@ -70,6 +74,7 @@ class ALUExecUnit(ExecUnit):
         m = super().elaborate(platform)
 
         m.d.comb += self.fu_types.eq((self.has_alu and FUType.ALU or 0)
+                                     | (self.has_mul and FUType.MUL or 0)
                                      | (self.has_jmp_unit and FUType.JMP or 0)
                                      | (self.has_mem and FUType.MEM or 0))
 
@@ -81,12 +86,26 @@ class ALUExecUnit(ExecUnit):
 
             m.d.comb += [
                 alu.req.eq(self.req),
+                alu.req.valid.eq(self.req.valid
+                                 & ((self.req.uop.fu_type == FUType.ALU)
+                                    | (self.req.uop.fu_type == FUType.JMP))),
                 alu.br_update.eq(self.br_update),
                 self.br_res.eq(alu.br_res),
             ]
 
             if self.has_jmp_unit:
                 m.d.comb += alu.get_pc.eq(self.get_pc)
+
+        if self.has_mul:
+            imul = m.submodules.imul = MultiplierUnit(3, self.params)
+            iresp_units.append(imul)
+
+            m.d.comb += [
+                imul.req.eq(self.req),
+                imul.req.valid.eq(self.req.valid
+                                  & (self.req.uop.fu_type == FUType.MUL)),
+                imul.br_update.eq(self.br_update),
+            ]
 
         if self.has_mem:
             agu = m.submodules.agu = AddrGenUnit(self.params)
@@ -125,7 +144,10 @@ class ExecUnits(Elaboratable):
 
         int_width = self.issue_params[IssueQueueType.INT]['issue_width']
         for i in range(int_width):
-            eu = ALUExecUnit(params, has_jmp_unit=(i == 0), name=f'alu_int{i}')
+            eu = ALUExecUnit(params,
+                             has_jmp_unit=(i == 0),
+                             has_mul=(i == (2 % int_width)),
+                             name=f'alu_int{i}')
             self.exec_units.append(eu)
             self.irf_readers += eu.irf_read
             self.irf_writers += eu.irf_write

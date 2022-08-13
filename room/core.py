@@ -157,8 +157,8 @@ class Core(Elaboratable):
         # ROB
         #
 
-        rob = m.submodules.rob = ReorderBuffer(exec_units.irf_write_ports,
-                                               self.params)
+        rob = m.submodules.rob = ReorderBuffer(
+            exec_units.irf_write_ports + mem_width, self.params)
         rob_flush_d1 = Signal()
         m.d.sync += rob_flush_d1.eq(rob.flush)
 
