@@ -1,6 +1,20 @@
 from amaranth import *
+from amaranth.utils import log2_int
+from amaranth_soc.memory import MemoryMap
 
 from roomsoc.interconnect import wishbone
+
+
+class SoCError(Exception):
+    pass
+
+
+class SoCRegion:
+
+    def __init__(self, origin=None, size=None, mode='rw'):
+        self.origin = origin
+        self.size = size
+        self.mode = mode
 
 
 class BusHelper(Elaboratable):
@@ -11,6 +25,7 @@ class BusHelper(Elaboratable):
 
         self.masters = dict()
         self.slaves = dict()
+        self.regions = dict()
         self.converters = dict()
 
     def add_adapter(self, name, interface, direction='m2s'):
@@ -22,7 +37,8 @@ class BusHelper(Elaboratable):
                 adapted_interface = wishbone.Interface(
                     data_width=self.data_width,
                     addr_width=self.get_addr_width(),
-                    granularity=8)
+                    granularity=8,
+                    name=f'{name}_adapted')
                 if direction == 'm2s':
                     master, slave = interface, adapted_interface
                 else:
@@ -40,6 +56,9 @@ class BusHelper(Elaboratable):
 
         return adapted_interface
 
+    def add_region(self, name, region):
+        self.regions[name] = region
+
     def add_master(self, name=None, master=None):
         if name is None:
             name = f'master{len(self.masters)}'
@@ -48,10 +67,19 @@ class BusHelper(Elaboratable):
 
         print(f'Add {name} as bus master.')
 
-    def add_slave(self, name=None, slave=None):
+    def add_slave(self, name=None, slave=None, region=None):
         if name is None:
             name = f'slave{len(self.slaves)}'
 
+        if region is None:
+            region = self.regions.get(name, None)
+            if region is None:
+                raise SoCError()
+        else:
+            self.add_region(name, region)
+
+        slave.memory_map = MemoryMap(data_width=8,
+                                     addr_width=log2_int(region.size))
         slave = self.add_adapter(name, slave, 's2m')
         self.slaves[name] = slave
 
@@ -81,11 +109,27 @@ class SoC(Elaboratable):
         self.cpu = cpu
 
         for n, cpu_bus in enumerate(self.cpu.periph_buses):
-            self.bus.add_master(name="cpu_bus{}".format(n), master=cpu_bus)
+            self.bus.add_master(name=f'cpu_bus{n}', master=cpu_bus)
 
-    def add_ram(self, name, ram):
-        self.bus.add_slave(name, ram.bus)
+    def add_ram(self, name, origin, size, init=[], mode='rw'):
+        ram_bus = wishbone.Interface(data_width=self.bus.data_width,
+                                     addr_width=log2_int(
+                                         size // (self.bus.data_width >> 3)),
+                                     granularity=8,
+                                     name=f'{name}_bus')
+        ram = wishbone.SRAM(Memory(width=self.bus.data_width,
+                                   depth=size // (self.bus.data_width >> 3),
+                                   init=init),
+                            read_only=(mode == 'r'),
+                            bus=ram_bus)
+
+        self.bus.add_slave(name, ram_bus,
+                           SoCRegion(origin=origin, size=size, mode=mode))
+
         self.peripherals[name] = ram
+
+    def add_rom(self, name, origin, size, init=[], mode='r'):
+        self.add_ram(name, origin, size, init, mode=mode)
 
     def elaborate(self, platform):
         m = Module()
@@ -109,16 +153,14 @@ class SoC(Elaboratable):
             else:
                 master = list(self.bus.masters.values())[0]
 
-            if len(self.bus.slaves) > 1:
-                decoder = m.submodules.bus_decoder = wishbone.Decoder(
-                    data_width=self.bus.data_width,
-                    addr_width=self.bus.get_addr_width(),
-                    granularity=8)
-                for slave in self.bus.slaves.values():
-                    decoder.add(slave)
-                slave = decoder.bus
-            else:
-                slave = list(self.bus.slaves.values())[0]
+            decoder = m.submodules.bus_decoder = wishbone.Decoder(
+                data_width=self.bus.data_width,
+                addr_width=self.bus.get_addr_width(),
+                granularity=8)
+            for name, slave in self.bus.slaves.items():
+                region = self.bus.regions[name]
+                decoder.add(slave, addr=region.origin)
+            slave = decoder.bus
 
             m.d.comb += master.connect(slave)
 

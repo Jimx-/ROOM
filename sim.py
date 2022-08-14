@@ -11,7 +11,7 @@ import argparse
 import struct
 
 
-def read_mem_image(filename):
+def read_rom_image(filename):
     image = []
 
     with open(filename, 'rb') as f:
@@ -42,8 +42,13 @@ core_params = dict(fetch_width=4,
 
 class Top(Elaboratable):
 
-    def __init__(self, sram_image):
-        self.sram_image = sram_image
+    mem_map = {
+        'rom': 0x00000000,
+        'sram': 0x20000000,
+    }
+
+    def __init__(self, rom_image):
+        self.rom_image = rom_image
 
         self.rst = Signal()
 
@@ -97,30 +102,27 @@ class Top(Elaboratable):
         #     0x0000006f,
         # ]
 
-        sram_bus = wishbone.Interface(data_width=32,
-                                      addr_width=30,
-                                      granularity=8)
-        sram = wishbone.SRAM(
-            Memory(width=ibus.data_width,
-                   depth=(8 << 10) // (ibus.data_width >> 3),
-                   init=self.sram_image), sram_bus)
-
         core = Core(Core.validate_params(core_params))
 
         soc.add_cpu(core)
-        soc.add_ram(name='sram', ram=sram)
+
+        soc.add_rom(name='rom',
+                    origin=self.mem_map['rom'],
+                    size=0x1000,
+                    init=self.rom_image)
+        soc.add_ram(name='sram', origin=self.mem_map['sram'], size=0x1000)
 
         return m
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ROOM SoC simulation')
-    parser.add_argument('image', type=str, help='Memory image')
+    parser.add_argument('rom', type=str, help='ROM image')
     args = parser.parse_args()
 
-    image = read_mem_image(args.image)
+    rom = read_rom_image(args.rom)
 
-    dut = Top(image)
+    dut = Top(rom)
 
     sim = Simulator(dut)
     sim.add_clock(1e-6)

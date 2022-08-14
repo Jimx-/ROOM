@@ -119,8 +119,9 @@ class Converter(Elaboratable):
 
 class SRAM(Elaboratable):
 
-    def __init__(self, mem_or_size, bus=None):
+    def __init__(self, mem_or_size, read_only=False, bus=None):
         self.mem_or_size = mem_or_size
+        self.read_only = read_only
 
         if bus is None:
             bus = Interface()
@@ -139,23 +140,29 @@ class SRAM(Elaboratable):
                          depth=self.mem_or_size // (bus_data_width >> 3))
 
         read_port = m.submodules.read_port = mem.read_port()
-        write_port = m.submodules.write_port = mem.write_port(granularity=8)
 
-        m.d.comb += [
-            write_port.en[i].eq(self.bus.cyc & self.bus.stb & self.bus.we
-                                & self.bus.sel[i])
-            for i in range(bus_data_width // 8)
-        ]
+        write_port = None
+        if not self.read_only:
+            write_port = m.submodules.write_port = mem.write_port(
+                granularity=8)
+
+        if not self.read_only:
+            m.d.comb += [
+                write_port.en[i].eq(self.bus.cyc & self.bus.stb & self.bus.we
+                                    & self.bus.sel[i])
+                for i in range(bus_data_width // 8)
+            ]
 
         m.d.comb += [
             read_port.addr.eq(self.bus.adr[:len(read_port.addr)]),
-            write_port.addr.eq(self.bus.adr[:len(write_port.addr)])
+            self.bus.dat_r.eq(read_port.data),
         ]
 
-        m.d.comb += [
-            self.bus.dat_r.eq(read_port.data),
-            write_port.data.eq(self.bus.dat_w),
-        ]
+        if not self.read_only:
+            m.d.comb += [
+                write_port.addr.eq(self.bus.adr[:len(write_port.addr)]),
+                write_port.data.eq(self.bus.dat_w),
+            ]
 
         m.d.sync += [
             self.bus.ack.eq(self.bus.cyc & self.bus.stb & ~self.bus.ack)
