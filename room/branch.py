@@ -16,6 +16,7 @@ class BranchResolution:
         self.taken = Signal(name=f'{name}taken')
         self.pc_sel = Signal(PCSel, name=f'{name}pc_sel')
         self.target_offset = Signal(signed(32), name=f'{name}target_offset')
+        self.jalr_target = Signal(32, name=f'{name}jalr_target')
 
     def eq(self, rhs):
         names = [
@@ -26,6 +27,7 @@ class BranchResolution:
             'taken',
             'pc_sel',
             'target_offset',
+            'jalr_target',
         ]
         return [getattr(self, n).eq(getattr(rhs, n)) for n in names]
 

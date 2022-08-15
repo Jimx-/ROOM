@@ -190,8 +190,8 @@ class Core(Elaboratable):
             uop_pc = if_stage.get_pc[1].pc | uop.pc_lsb
             npc = uop_pc + Mux(uop.is_rvc, 2, 4)
             br_target = uop_pc + br_update.br_res.target_offset
-            bj_addr = Mux(br_update.br_res.cfi_type == CFIType.JALR, 0,
-                          br_target)
+            bj_addr = Mux(br_update.br_res.cfi_type == CFIType.JALR,
+                          br_update.br_res.jalr_target, br_target)
             redirect_target = Mux(br_update.br_res.pc_sel == PCSel.PC_PLUS_4,
                                   npc, bj_addr)
 
@@ -354,7 +354,11 @@ class Core(Elaboratable):
 
             m.d.comb += if_stage.get_pc_idx[0].eq(iss_uop.ftq_idx)
 
-            m.d.sync += eu.get_pc.pc.eq(if_stage.get_pc[0].pc)
+            m.d.sync += [
+                eu.get_pc.pc.eq(if_stage.get_pc[0].pc),
+                eu.get_pc.next_valid.eq(if_stage.get_pc[0].next_valid),
+                eu.get_pc.next_pc.eq(if_stage.get_pc[0].next_pc),
+            ]
 
         #
         # Load/store unit
@@ -416,9 +420,13 @@ class Core(Elaboratable):
 
             oldest_res = next_res
 
+        jmp_unit = [eu for eu in exec_units if eu.has_jmp_unit][0]
+        jalr_target_d1 = Signal(32)
         m.d.sync += [
             br_update.br_res.eq(oldest_res),
             br_update.br_res.mispredict.eq(mispredict_val),
+            jalr_target_d1.eq(jmp_unit.br_res.jalr_target),
+            br_update.br_res.jalr_target.eq(jalr_target_d1),
         ]
 
         m.d.comb += if_stage.get_pc_idx[1].eq(oldest_res.uop.ftq_idx)

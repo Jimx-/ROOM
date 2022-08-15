@@ -303,6 +303,14 @@ class ALU(PipelinedFunctionalUnit):
             self.br_res.target_offset.eq(target_offset),
         ]
 
+        if self.is_jmp:
+            m.d.comb += self.br_res.jalr_target.eq(self.req.rs1_data +
+                                                   target_offset)
+
+            with m.If(pc_sel == PCSel.JALR):
+                m.d.comb += mispredict.eq(~self.get_pc.next_valid | (
+                    self.get_pc.next_pc != self.br_res.jalr_target))
+
         #
         # Output
         #

@@ -104,6 +104,17 @@ class DecodeUnit(Elaboratable):
                     uop.is_jal.eq(1),
                 ]
 
+            with m.Case(OPV('JALR')):
+                m.d.comb += [
+                    UOPC(UOpCode.JALR),
+                    uop.iq_type.eq(IssueQueueType.INT),
+                    uop.fu_type.eq(FUType.JMP),
+                    uop.dst_rtype.eq(RegisterType.FIX),
+                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                    IMM_SEL_I,
+                    uop.is_jalr.eq(1),
+                ]
+
             with m.Case(OPV('BEQ')):
                 m.d.comb += [
                     uop.iq_type.eq(IssueQueueType.INT),

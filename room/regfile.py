@@ -186,9 +186,19 @@ class RegReadDecoder(Elaboratable):
             with m.Case(UOpCode.JAL):
                 m.d.comb += [
                     F(ALUOperator.ADD),
+                    BT(BranchType.J),
                     OPA_PC,
                     OPB_NEXT,
                     IMM_J,
+                ]
+
+            with m.Case(UOpCode.JALR):
+                m.d.comb += [
+                    F(ALUOperator.ADD),
+                    BT(BranchType.JR),
+                    OPA_PC,
+                    OPB_NEXT,
+                    IMM_I,
                 ]
 
             with m.Case(UOpCode.AUIPC):

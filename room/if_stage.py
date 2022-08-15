@@ -258,10 +258,16 @@ class FetchTargetQueue(Elaboratable):
             m.d.sync += w_ptr.eq(_incr(self.redirect_idx, self.ftq_size))
 
         for get_pc_idx, get_pc in zip(self.get_pc_idx, self.get_pc):
+            next_idx = _incr(get_pc_idx, self.ftq_size)
+            next_is_w = (next_idx == w_ptr) & self.w_en & self.w_rdy
+
             m.d.sync += [
                 get_pc.pc.eq(pcs[get_pc_idx] << pc_lsb_w),
                 get_pc.commit_pc.eq(pcs[Mux(self.deq_valid, self.deq_idx,
                                             deq_ptr)] << pc_lsb_w),
+                get_pc.next_valid.eq((next_idx != w_ptr) | next_is_w),
+                get_pc.next_pc.eq(Mux(next_is_w, self.w_data.pc,
+                                      pcs[next_idx])),
             ]
 
         return m
