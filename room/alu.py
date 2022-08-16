@@ -343,7 +343,7 @@ class AddrGenUnit(PipelinedFunctionalUnit):
 
         m.d.comb += [
             self.resp.addr.eq(self.req.rs1_data +
-                              self.req.uop.imm_packed[8:20]),
+                              self.req.uop.imm_packed[8:20].as_signed()),
             self.resp.data.eq(self.req.rs2_data),
         ]
 

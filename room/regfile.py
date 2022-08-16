@@ -233,7 +233,7 @@ class RegReadDecoder(Elaboratable):
             with m.Case(UOpCode.BGEU):
                 m.d.comb += [
                     F(ALUOperator.SLTU),
-                    BT(BranchType.GE),
+                    BT(BranchType.GEU),
                     IMM_B,
                 ]
 

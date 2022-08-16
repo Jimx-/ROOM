@@ -399,6 +399,9 @@ class IFStage(Elaboratable):
         f2_targets = Array(
             Signal(32, name=f'f2_target{i}') for i in range(self.fetch_width))
         f2_plus4_mask = Signal(self.fetch_width)
+        f2_cfi_types = Array(
+            Signal(CFIType, name=f'f2_cfi_type{i}')
+            for i in range(self.fetch_width))
         f2_fetch_bundle = FetchBundle(self.params, name='f2_fetch_bundle')
 
         m.d.comb += f2_imemresp_mask.eq(fetch_mask(s2_pc))
@@ -506,6 +509,8 @@ class IFStage(Elaboratable):
                 (br_sigs.cfi_type == CFIType.JAL)
                 | (br_sigs.cfi_type == CFIType.JALR)))
 
+            m.d.comb += f2_cfi_types[w].eq(br_sigs.cfi_type)
+
             redirects_found |= f2_redirects[w]
 
         last_inst = f2_insts[self.fetch_width - 1][0:16]
@@ -523,6 +528,7 @@ class IFStage(Elaboratable):
             self.fetch_width)
         m.d.comb += [
             f2_prio_enc.i.eq(f2_redirects),
+            f2_fetch_bundle.cfi_type.eq(f2_cfi_types[f2_fetch_bundle.cfi_idx]),
             f2_fetch_bundle.cfi_valid.eq(~f2_prio_enc.n),
             f2_fetch_bundle.cfi_idx.eq(f2_prio_enc.o),
         ]
@@ -530,7 +536,9 @@ class IFStage(Elaboratable):
         f2_predicted_target = Signal(32)
         m.d.comb += [
             f2_predicted_target.eq(
-                Mux(f2_fetch_bundle.cfi_valid,
+                Mux(
+                    f2_fetch_bundle.cfi_valid &
+                    (f2_fetch_bundle.cfi_type != CFIType.JALR),
                     f2_targets[f2_fetch_bundle.cfi_idx],
                     next_fetch(f2_fetch_bundle.pc))),
             f2_fetch_bundle.next_pc.eq(f2_predicted_target),

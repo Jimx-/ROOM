@@ -202,6 +202,9 @@ class LDQEntry:
         self.executed = Signal(name=f'{name}executed')
         self.succeeded = Signal(name=f'{name}succeeded')
 
+        self.st_dep_mask = Signal(params['stq_size'],
+                                  name=f'{name}st_dep_mask')
+
 
 class STQEntry:
 
@@ -315,6 +318,15 @@ class LoadStoreUnit(Elaboratable):
         stq_w_idx = stq_tail
 
         clear_store = Signal()
+        live_store_mask = Signal(self.stq_size)
+        next_live_store_mask = Mux(clear_store,
+                                   live_store_mask & ~(1 << stq_head),
+                                   live_store_mask)
+
+        with m.If(clear_store):
+            for i in range(self.ldq_size):
+                m.d.sync += ldq[i].st_dep_mask.eq(ldq[i].st_dep_mask
+                                                  & ~(1 << stq_head))
 
         for w in range(self.core_width):
             m.d.comb += [
@@ -336,6 +348,7 @@ class LoadStoreUnit(Elaboratable):
                     ldq[ldq_w_idx].addr_valid.eq(0),
                     ldq[ldq_w_idx].executed.eq(0),
                     ldq[ldq_w_idx].succeeded.eq(0),
+                    ldq[ldq_w_idx].st_dep_mask.eq(next_live_store_mask),
                 ]
             with m.Elif(dis_w_stq):
                 m.d.sync += [
@@ -349,6 +362,10 @@ class LoadStoreUnit(Elaboratable):
 
             ldq_w_idx = Mux(dis_w_ldq, _incr(ldq_w_idx, self.ldq_size),
                             ldq_w_idx)
+
+            next_live_store_mask = Mux(dis_w_stq,
+                                       next_live_store_mask | (1 << stq_w_idx),
+                                       next_live_store_mask)
             stq_w_idx = Mux(dis_w_stq, _incr(stq_w_idx, self.stq_size),
                             stq_w_idx)
 
@@ -403,7 +420,8 @@ class LoadStoreUnit(Elaboratable):
                                           & ~ldq_retry_e.executed
                                           & ~ldq_retry_e.succeeded
                                           & ~s1_executing_loads[ldq_retry_idx]
-                                          & (w == 0)),
+                                          & (w == 0)
+                                          & (ldq_retry_e.st_dep_mask == 0)),
                 can_fire_store_commit[w].eq(stq_commit_e.valid
                                             & stq_commit_e.committed
                                             & (w == self.mem_width - 1)),
@@ -577,13 +595,20 @@ class LoadStoreUnit(Elaboratable):
         # Branch mispredict
         #
 
+        st_brkilled_mask = Signal(self.stq_size)
+
         for i in range(self.stq_size):
             with m.If(stq[i].valid):
                 m.d.sync += stq[i].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(stq[i].uop.br_mask))
 
                 with m.If(self.br_update.uop_killed(stq[i].uop)):
-                    m.d.sync += stq[i].valid.eq(0)
+                    m.d.sync += [
+                        stq[i].valid.eq(0),
+                        stq[i].addr_valid.eq(0),
+                        stq[i].data_valid.eq(0),
+                    ]
+                    m.d.comb += st_brkilled_mask[i].eq(1)
 
         for i in range(self.ldq_size):
             with m.If(ldq[i].valid):
@@ -648,5 +673,8 @@ class LoadStoreUnit(Elaboratable):
                 stq[stq_head].succeeded.eq(0),
                 stq_head.eq(_incr(stq_head, self.stq_size)),
             ]
+
+        m.d.sync += live_store_mask.eq(next_live_store_mask
+                                       & ~st_brkilled_mask)
 
         return m

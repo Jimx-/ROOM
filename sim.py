@@ -11,7 +11,7 @@ import argparse
 import struct
 
 
-def read_rom_image(filename):
+def read_mem_image(filename):
     image = []
 
     with open(filename, 'rb') as f:
@@ -47,8 +47,9 @@ class Top(Elaboratable):
         'sram': 0x20000000,
     }
 
-    def __init__(self, rom_image):
+    def __init__(self, rom_image, ram_image=[]):
         self.rom_image = rom_image
+        self.ram_image = ram_image
 
         self.rst = Signal()
 
@@ -65,9 +66,12 @@ class Top(Elaboratable):
 
         soc.add_rom(name='rom',
                     origin=self.mem_map['rom'],
-                    size=0x1000,
+                    size=0x2000,
                     init=self.rom_image)
-        soc.add_ram(name='sram', origin=self.mem_map['sram'], size=0x1000)
+        soc.add_ram(name='sram',
+                    origin=self.mem_map['sram'],
+                    size=0x1000,
+                    init=self.ram_image)
 
         soc.add_controller()
 
@@ -82,11 +86,17 @@ class Top(Elaboratable):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ROOM SoC simulation')
     parser.add_argument('rom', type=str, help='ROM image')
+    parser.add_argument('--ram', type=str, help='RAM image', default=None)
     args = parser.parse_args()
 
-    rom = read_rom_image(args.rom)
+    rom = read_mem_image(args.rom)
 
-    dut = Top(rom)
+    if args.ram is not None:
+        ram = read_mem_image(args.ram)
+    else:
+        ram = []
+
+    dut = Top(rom, ram)
 
     sim = Simulator(dut)
     sim.add_clock(1e-6)
@@ -95,7 +105,7 @@ if __name__ == "__main__":
         yield dut.rst.eq(1)
         yield
         yield dut.rst.eq(0)
-        for _ in range(1000):
+        for _ in range(6000):
             yield
 
     sim.add_sync_process(process)
