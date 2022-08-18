@@ -469,12 +469,12 @@ class LoadStoreUnit(Elaboratable):
 
         stq_commit_e = stq[stq_execute_head]
 
-        can_fire_load_incoming = Signal(self.core_width)
-        can_fire_sta_incoming = Signal(self.core_width)
-        can_fire_std_incoming = Signal(self.core_width)
-        can_fire_stad_incoming = Signal(self.core_width)
-        can_fire_load_retry = Signal(self.core_width)
-        can_fire_store_commit = Signal(self.core_width)
+        can_fire_load_incoming = Signal(self.mem_width)
+        can_fire_sta_incoming = Signal(self.mem_width)
+        can_fire_std_incoming = Signal(self.mem_width)
+        can_fire_stad_incoming = Signal(self.mem_width)
+        can_fire_load_retry = Signal(self.mem_width)
+        can_fire_store_commit = Signal(self.mem_width)
 
         s0_executing_loads = Array(
             Signal(name=f's0_executing{i}') for i in range(self.ldq_size))
@@ -512,8 +512,48 @@ class LoadStoreUnit(Elaboratable):
                                             & (w == self.mem_width - 1)),
             ]
 
+        will_fire_load_incoming = Signal(self.mem_width)
+        will_fire_sta_incoming = Signal(self.mem_width)
+        will_fire_std_incoming = Signal(self.mem_width)
+        will_fire_stad_incoming = Signal(self.mem_width)
+        will_fire_load_retry = Signal(self.mem_width)
+        will_fire_store_commit = Signal(self.mem_width)
+
         for w in range(self.mem_width):
-            with m.If(can_fire_load_incoming[w]):
+            dc_avail = 1
+            cam_avail = 1
+
+            def sched(can_fire, uses_dc, uses_cam, dc_avail, cam_avail):
+                will_fire = can_fire & ~(uses_dc & ~dc_avail) & ~(uses_cam
+                                                                  & ~cam_avail)
+                dc_avail &= ~(will_fire & uses_dc)
+                cam_avail &= ~(will_fire & uses_dc)
+                return will_fire, dc_avail, cam_avail
+
+            will_fire_load_incoming_, dc_avail, cam_avail = sched(
+                can_fire_load_incoming[w], 1, 1, dc_avail, cam_avail)
+            will_fire_stad_incoming_, dc_avail, cam_avail = sched(
+                can_fire_stad_incoming[w], 0, 1, dc_avail, cam_avail)
+            will_fire_sta_incoming_, dc_avail, cam_avail = sched(
+                can_fire_sta_incoming[w], 0, 1, dc_avail, cam_avail)
+            will_fire_std_incoming_, dc_avail, cam_avail = sched(
+                can_fire_std_incoming[w], 0, 0, dc_avail, cam_avail)
+            will_fire_load_retry_, dc_avail, cam_avail = sched(
+                can_fire_load_retry[w], 1, 1, dc_avail, cam_avail)
+            will_fire_store_commit_, _, _ = sched(can_fire_store_commit[w], 1,
+                                                  0, dc_avail, cam_avail)
+
+            m.d.comb += [
+                will_fire_load_incoming[w].eq(will_fire_load_incoming_),
+                will_fire_stad_incoming[w].eq(will_fire_stad_incoming_),
+                will_fire_sta_incoming[w].eq(will_fire_sta_incoming_),
+                will_fire_std_incoming[w].eq(will_fire_std_incoming_),
+                will_fire_load_retry[w].eq(will_fire_load_retry_),
+                will_fire_store_commit[w].eq(will_fire_store_commit_),
+            ]
+
+        for w in range(self.mem_width):
+            with m.If(will_fire_load_incoming[w]):
                 ldq_idx = self.exec_reqs[w].uop.ldq_idx
                 m.d.sync += [
                     ldq[ldq_idx].addr.eq(self.exec_reqs[w].addr),
@@ -521,7 +561,7 @@ class LoadStoreUnit(Elaboratable):
                     ldq[ldq_idx].uop.pdst.eq(self.exec_reqs[w].uop.pdst),
                 ]
 
-            with m.If(can_fire_sta_incoming[w] | can_fire_stad_incoming[w]):
+            with m.If(will_fire_sta_incoming[w] | will_fire_stad_incoming[w]):
                 stq_idx = self.exec_reqs[w].uop.stq_idx
                 m.d.sync += [
                     stq[stq_idx].addr.eq(self.exec_reqs[w].addr),
@@ -529,7 +569,7 @@ class LoadStoreUnit(Elaboratable):
                     stq[stq_idx].uop.pdst.eq(self.exec_reqs[w].uop.pdst),
                 ]
 
-            with m.If(can_fire_std_incoming[w] | can_fire_stad_incoming[w]):
+            with m.If(will_fire_std_incoming[w] | will_fire_stad_incoming[w]):
                 stq_idx = self.exec_reqs[w].uop.stq_idx
                 m.d.sync += [
                     stq[stq_idx].data.eq(self.exec_reqs[w].data),
@@ -543,14 +583,22 @@ class LoadStoreUnit(Elaboratable):
         for w in range(self.mem_width):
             dmem_req = dcache.reqs[w]
 
-            with m.If(can_fire_load_retry[w]):
+            with m.If(will_fire_load_incoming[w]):
+                m.d.comb += [
+                    dmem_req.valid.eq(1),
+                    dmem_req.uop.eq(self.exec_reqs[w].uop),
+                    dmem_req.addr.eq(self.exec_reqs[w].addr),
+                    s0_executing_loads[self.exec_reqs[w].uop.ldq_idx].eq(
+                        dmem_req.ready),
+                ]
+            with m.Elif(will_fire_load_retry[w]):
                 m.d.comb += [
                     dmem_req.valid.eq(1),
                     dmem_req.uop.eq(ldq_retry_e.uop),
                     dmem_req.addr.eq(ldq_retry_e.addr),
                     s0_executing_loads[ldq_retry_idx].eq(dmem_req.ready),
                 ]
-            with m.Elif(can_fire_store_commit[w]):
+            with m.Elif(will_fire_store_commit[w]):
                 m.d.comb += [
                     dmem_req.valid.eq(1),
                     dmem_req.uop.eq(stq_commit_e.uop),
@@ -572,10 +620,16 @@ class LoadStoreUnit(Elaboratable):
 
         dmem_req_fired = Signal(self.mem_width)
 
+        fired_load_incoming = Signal(self.mem_width)
         fired_load_retry = Signal(self.mem_width)
         fired_sta_incoming = Signal(self.mem_width)
         fired_std_incoming = Signal(self.mem_width)
         fired_stad_incoming = Signal(self.mem_width)
+
+        fired_incoming_uop = [
+            MicroOp(self.params, name=f'fired_incoming_uop{i}')
+            for i in range(self.mem_width)
+        ]
 
         fired_ldq_incoming_e = [
             LDQEntry(self.params, name=f'fired_ldq_incoming_e{i}')
@@ -604,19 +658,26 @@ class LoadStoreUnit(Elaboratable):
         for w in range(self.mem_width):
             req_killed = self.br_update.uop_killed(self.exec_reqs[w].uop)
 
-            m.d.comb += [
-                fired_ldq_e[w].eq(fired_ldq_retry_e[w]),
-            ]
+            with m.If(fired_load_incoming[w]):
+                m.d.comb += fired_ldq_e[w].eq(fired_ldq_incoming_e[w])
+            with m.Elif(fired_load_retry[w]):
+                m.d.comb += fired_ldq_e[w].eq(fired_ldq_retry_e[w])
 
             m.d.sync += [
                 dmem_req_fired[w].eq(dcache.reqs[w].valid
                                      & dcache.reqs[w].ready),
-                fired_load_retry[w].eq(can_fire_load_retry[w] & ~req_killed),
-                fired_sta_incoming[w].eq(can_fire_sta_incoming[w]
+                fired_incoming_uop[w].eq(self.exec_reqs[w].uop),
+                fired_incoming_uop[w].br_mask.eq(
+                    self.br_update.get_new_br_mask(
+                        self.exec_reqs[w].uop.br_mask)),
+                fired_load_incoming[w].eq(will_fire_load_incoming[w]
+                                          & ~req_killed),
+                fired_load_retry[w].eq(will_fire_load_retry[w] & ~req_killed),
+                fired_sta_incoming[w].eq(will_fire_sta_incoming[w]
                                          & ~req_killed),
-                fired_std_incoming[w].eq(can_fire_std_incoming[w]
+                fired_std_incoming[w].eq(will_fire_std_incoming[w]
                                          & ~req_killed),
-                fired_stad_incoming[w].eq(can_fire_stad_incoming[w]
+                fired_stad_incoming[w].eq(will_fire_stad_incoming[w]
                                           & ~req_killed),
                 fired_ldq_incoming_e[w].eq(ldq[self.exec_reqs[w].uop.ldq_idx]),
                 fired_ldq_incoming_e[w].uop.br_mask.eq(
@@ -698,7 +759,8 @@ class LoadStoreUnit(Elaboratable):
         # Memory ordering
         #
 
-        do_ld_search = Cat(fired_load_retry[w] for w in range(self.mem_width))
+        do_ld_search = Cat((fired_load_incoming[w] | fired_load_retry[w])
+                           for w in range(self.mem_width))
 
         cam_addr = [
             Signal(32, name=f'cam_addr{i}') for i in range(self.mem_width)
@@ -722,7 +784,9 @@ class LoadStoreUnit(Elaboratable):
                 cam_uop[w].eq(Mux(do_ld_search[w], fired_ldq_e[w].uop, 0)),
                 cam_mask[w].eq(gen_byte_mask(cam_addr[w],
                                              cam_uop[w].mem_size)),
-                cam_ldq_idx[w].eq(Mux(fired_load_retry, s1_ldq_retry_idx, 0)),
+                cam_ldq_idx[w].eq(
+                    Mux(fired_load_incoming[w], fired_incoming_uop[w].ldq_idx,
+                        Mux(fired_load_retry[w], s1_ldq_retry_idx, 0))),
             ]
 
         ldst_addr_matches = [
@@ -749,14 +813,14 @@ class LoadStoreUnit(Elaboratable):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
                             ldst_forward_matches[w][i].eq(1),
-                            dcache.reqs[w].kill.eq(dmem_req_fired),
+                            dcache.reqs[w].kill.eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
                     with m.Elif(((cam_mask[w] & write_mask) != 0)
                                 & addr_matches[w]):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
-                            dcache.reqs[w].kill.eq(dmem_req_fired),
+                            dcache.reqs[w].kill.eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
 
@@ -768,11 +832,11 @@ class LoadStoreUnit(Elaboratable):
 
         wb_forward_valid = Signal(self.mem_width)
         wb_forward_ldq_idx = [
-            Signal(range(self.ldq_size), name=f'mem_forward_ldq_idx{i}')
+            Signal(range(self.ldq_size), name=f'wb_forward_ldq_idx{i}')
             for i in range(self.mem_width)
         ]
         wb_forward_stq_idx = [
-            Signal(range(self.stq_size), name=f'mem_forward_stq_idx{i}')
+            Signal(range(self.stq_size), name=f'wb_forward_stq_idx{i}')
             for i in range(self.mem_width)
         ]
 
@@ -837,7 +901,7 @@ class LoadStoreUnit(Elaboratable):
                     store_gen.addr.eq(stq_e.addr),
                     store_gen.data_in.eq(stq_e.data),
                     load_gen.typ.eq(ldq_e.uop.mem_size),
-                    load_gen.typ.eq(ldq_e.uop.mem_signed),
+                    load_gen.signed.eq(ldq_e.uop.mem_signed),
                     load_gen.addr.eq(ldq_e.addr),
                     load_gen.data_in.eq(store_gen.data_out),
                 ]
