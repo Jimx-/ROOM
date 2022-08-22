@@ -5,7 +5,7 @@ from room.consts import *
 from room import Core
 
 from roomsoc.soc import SoC
-from roomsoc.interconnect import wishbone
+from roomsoc.interconnect import axi
 
 import argparse
 import struct
@@ -51,6 +51,10 @@ class Top(Elaboratable):
         self.rom_image = rom_image
         self.ram_image = ram_image
 
+        self.axil_master = axi.AXILiteInterface(data_width=32,
+                                                addr_width=32,
+                                                name='axil_master')
+
         self.rst = Signal()
 
     def elaborate(self, platform):
@@ -58,11 +62,11 @@ class Top(Elaboratable):
 
         m.d.comb += ResetSignal().eq(self.rst)
 
-        ibus = wishbone.Interface(data_width=32, addr_width=30, granularity=8)
-
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
         core = Core(Core.validate_params(core_params))
+
+        soc.bus.add_master(name='axil_master', master=self.axil_master)
 
         soc.add_rom(name='rom',
                     origin=self.mem_map['rom'],

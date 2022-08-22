@@ -3,12 +3,13 @@ from amaranth.utils import log2_int
 from amaranth_soc.memory import MemoryMap
 
 from roomsoc.peripheral import Peripheral
-from roomsoc.interconnect import wishbone
+from roomsoc.interconnect import wishbone, axi
 
 
 class BusHelper(Elaboratable):
 
-    def __init__(self, data_width=32, addr_width=32):
+    def __init__(self, standard='wishbone', data_width=32, addr_width=32):
+        self.standard = standard
         self.data_width = data_width
         self.addr_width = addr_width
 
@@ -22,6 +23,33 @@ class BusHelper(Elaboratable):
 
     def add_adapter(self, name, interface, direction='m2s'):
 
+        def add_bus_standard_converter(interface, direction):
+            main_bus_cls = {
+                'wishbone': wishbone.Interface,
+                'axi-lite': axi.AXILiteInterface,
+            }[self.standard]
+
+            if isinstance(interface, main_bus_cls):
+                return interface
+
+            adapted_interface = main_bus_cls(data_width=self.data_width,
+                                             addr_width=self.get_addr_width(),
+                                             granularity=8,
+                                             name=f'{name}_bus_adapted')
+
+            if direction == 'm2s':
+                master, slave = interface, adapted_interface
+            else:
+                master, slave = adapted_interface, interface
+
+            bridge_cls = {
+                (axi.AXILiteInterface, wishbone.Interface):
+                axi.AXILite2Wishbone,
+            }[type(master), type(slave)]
+            self.converters[f'{name}_bridge'] = bridge_cls(master, slave)
+
+            return adapted_interface
+
         def add_data_width_converter(interface, direction):
             if interface.data_width == self.data_width:
                 return interface
@@ -30,20 +58,26 @@ class BusHelper(Elaboratable):
                     data_width=self.data_width,
                     addr_width=self.get_addr_width(),
                     granularity=8,
-                    name=f'{name}_adapted')
+                    name=f'{name}_dw_adapted')
                 if direction == 'm2s':
                     master, slave = interface, adapted_interface
                 else:
                     master, slave = adapted_interface, interface
 
-                self.converters[f'{name}_converter'] = wishbone.Converter(
+                self.converters[f'{name}_dw_converter'] = wishbone.Converter(
                     master=master, slave=slave)
                 return adapted_interface
 
         adapted_interface = add_data_width_converter(interface, direction)
+        adapted_interface = add_bus_standard_converter(adapted_interface,
+                                                       direction)
 
+        bus_names = {
+            wishbone.Interface: "Wishbone",
+            axi.AXILiteInterface: "AXI-Lite",
+        }
         print(
-            f'Bus {name} adapted from Wishbone {interface.data_width}-bit to Wishbone {self.data_width}-bit.'
+            f'Bus {name} adapted from {bus_names[type(interface)]} {interface.data_width}-bit to {bus_names[type(adapted_interface)]} {self.data_width}-bit.'
         )
 
         return adapted_interface

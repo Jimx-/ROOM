@@ -312,7 +312,7 @@ class STQEntry:
 
 def _incr(signal, modulo):
     if modulo == 2**len(signal):
-        return signal + 1
+        return (signal + 1)[:len(signal)]
     else:
         return Mux(signal == modulo - 1, 0, signal + 1)
 
@@ -395,9 +395,6 @@ class LoadStoreUnit(Elaboratable):
         stq_commit_head = Signal.like(stq_head)
         stq_execute_head = Signal.like(stq_head)
 
-        ldq_w_idx = ldq_tail
-        stq_w_idx = stq_tail
-
         clear_store = Signal()
         live_store_mask = Signal(self.stq_size)
         next_live_store_mask = Mux(clear_store,
@@ -408,6 +405,9 @@ class LoadStoreUnit(Elaboratable):
             for i in range(self.ldq_size):
                 m.d.sync += ldq[i].st_dep_mask.eq(ldq[i].st_dep_mask
                                                   & ~(1 << stq_head))
+
+        ldq_w_idx = ldq_tail
+        stq_w_idx = stq_tail
 
         for w in range(self.core_width):
             m.d.comb += [
@@ -424,21 +424,22 @@ class LoadStoreUnit(Elaboratable):
 
             with m.If(dis_w_ldq):
                 m.d.sync += [
-                    ldq[ldq_w_idx].valid.eq(1),
-                    ldq[ldq_w_idx].uop.eq(self.dis_uops[w]),
-                    ldq[ldq_w_idx].addr_valid.eq(0),
-                    ldq[ldq_w_idx].executed.eq(0),
-                    ldq[ldq_w_idx].succeeded.eq(0),
-                    ldq[ldq_w_idx].st_dep_mask.eq(next_live_store_mask),
+                    ldq[self.dis_ldq_idx[w]].valid.eq(1),
+                    ldq[self.dis_ldq_idx[w]].uop.eq(self.dis_uops[w]),
+                    ldq[self.dis_ldq_idx[w]].addr_valid.eq(0),
+                    ldq[self.dis_ldq_idx[w]].executed.eq(0),
+                    ldq[self.dis_ldq_idx[w]].succeeded.eq(0),
+                    ldq[self.dis_ldq_idx[w]].st_dep_mask.eq(
+                        next_live_store_mask),
                 ]
             with m.Elif(dis_w_stq):
                 m.d.sync += [
-                    stq[stq_w_idx].valid.eq(1),
-                    stq[stq_w_idx].uop.eq(self.dis_uops[w]),
-                    stq[stq_w_idx].addr_valid.eq(0),
-                    stq[stq_w_idx].data_valid.eq(0),
-                    stq[stq_w_idx].committed.eq(0),
-                    stq[stq_w_idx].succeeded.eq(0),
+                    stq[self.dis_stq_idx[w]].valid.eq(1),
+                    stq[self.dis_stq_idx[w]].uop.eq(self.dis_uops[w]),
+                    stq[self.dis_stq_idx[w]].addr_valid.eq(0),
+                    stq[self.dis_stq_idx[w]].data_valid.eq(0),
+                    stq[self.dis_stq_idx[w]].committed.eq(0),
+                    stq[self.dis_stq_idx[w]].succeeded.eq(0),
                 ]
 
             ldq_w_idx = Mux(dis_w_ldq, _incr(ldq_w_idx, self.ldq_size),

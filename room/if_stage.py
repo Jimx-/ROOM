@@ -328,9 +328,14 @@ class IFStage(Elaboratable):
         s0_vpc = Signal(32)
         s0_valid = Signal()
 
+        reset = Signal(reset=1)
         reset_d1 = Signal(reset_less=True)
-        m.d.sync += reset_d1.eq(ResetSignal())
-        with m.If(reset_d1 & ~ResetSignal()):
+        m.d.sync += [
+            reset.eq(0),
+            reset_d1.eq(reset),
+        ]
+
+        with m.If(reset_d1 & ~reset):
             m.d.comb += [
                 s0_vpc.eq(0),
                 s0_valid.eq(1),
