@@ -6,6 +6,7 @@ from room import Core
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
+from roomsoc.peripheral.uart import UART
 
 import argparse
 import struct
@@ -47,9 +48,10 @@ class Top(Elaboratable):
         'sram': 0x20000000,
     }
 
-    def __init__(self, rom_image, ram_image=[]):
+    def __init__(self, rom_image, ram_image=[], clk_freq=1e6):
         self.rom_image = rom_image
         self.ram_image = ram_image
+        self.clk_freq = clk_freq
 
         self.axil_master = axi.AXILiteInterface(data_width=32,
                                                 addr_width=32,
@@ -80,6 +82,9 @@ class Top(Elaboratable):
         soc.add_controller()
 
         soc.add_cpu(core)
+
+        uart = UART(divisor=int(self.clk_freq // 115200))
+        soc.add_peripheral('uart', uart)
 
         for res, start, size in soc.resources():
             print(res.name, hex(start), size)

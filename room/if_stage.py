@@ -1,8 +1,8 @@
 from amaranth import *
 from amaranth.lib.coding import PriorityEncoder
+from amaranth.lib.fifo import SyncFIFO
 
 from room.consts import *
-from room.fifo import SyncFIFO
 from room.rvc import RVCDecoder
 from room.id_stage import BranchDecoder
 from room.types import MicroOp
@@ -370,13 +370,12 @@ class IFStage(Elaboratable):
         #
 
         f2_clear = Signal()
-        f2_fifo = m.submodules.f2_fifo = SyncFIFO(width=ibus.dat_r.width + 32,
-                                                  depth=1)
+        f2_fifo = m.submodules.f2_fifo = ResetInserter(f2_clear)(SyncFIFO(
+            width=ibus.dat_r.width + 32, depth=1))
 
         f3_ready = Signal()
 
         m.d.comb += [
-            f2_fifo.flush.eq(f2_clear),
             f2_fifo.w_en.eq(~f1_clear & ibus.ack),
             f2_fifo.w_data.eq(Cat(s1_vpc, ibus.dat_r)),
             f2_fifo.r_en.eq(f3_ready),

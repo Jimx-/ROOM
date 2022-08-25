@@ -1,7 +1,7 @@
 {
     "_meta": {
         "hash": {
-            "sha256": "cb97d7745ff4bec1f5c0e34176534f60e50e2d2449fd9cddadc6fbecfa84f36e"
+            "sha256": "8480258c9408302505c671d49ff686f0afa2f2bd862f681590f158e50138e296"
         },
         "pipfile-spec": 6,
         "requires": {
@@ -27,6 +27,11 @@
             "editable": true,
             "git": "https://github.com/amaranth-lang/amaranth-soc",
             "ref": "217d4ea76ad3b3bbf146980d168bc7b3b9d95a18"
+        },
+        "amaranth-stdio": {
+            "editable": true,
+            "git": "https://github.com/amaranth-lang/amaranth-stdio",
+            "ref": "ae74f176b6ca32b24ab08325159a19318711a5a9"
         },
         "cocotb": {
             "hashes": [
