@@ -1,12 +1,13 @@
 from amaranth import *
+from amaranth.build import *
+from amaranth.vendor.xilinx import XilinxPlatform
 
 from room.consts import *
+from room.debug import JTAGInterface
 from room import Core
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
-
-import struct
 
 core_params = dict(fetch_width=2,
                    fetch_buffer_size=16,
@@ -39,12 +40,15 @@ class Top(Elaboratable):
                                                 addr_width=30,
                                                 name='axil_master')
 
+        self.jtag = JTAGInterface()
+
     def elaborate(self, platform):
         m = Module()
 
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
         core = Core(Core.validate_params(core_params))
+        m.d.comb += core.jtag.connect(self.jtag)
 
         soc.bus.add_master(name='axil_master', master=self.axil_master)
 
@@ -93,5 +97,9 @@ if __name__ == "__main__":
                                 top.axil_master.b.valid,
                                 top.axil_master.b.resp,
                                 top.axil_master.b.ready,
+                                top.jtag.tck,
+                                top.jtag.tdi,
+                                top.jtag.tdo,
+                                top.jtag.tms,
                             ],
                             name='soc_wrapper'))

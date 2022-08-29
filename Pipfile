@@ -6,11 +6,10 @@ name = "pypi"
 
 [packages]
 amaranth = "*"
-cocotb = "*"
-cocotbext-axi = "*"
 riscv-model = "*"
 amaranth-soc = {editable = true, git = "https://github.com/amaranth-lang/amaranth-soc"}
 amaranth-stdio = {editable = true, git = "https://github.com/amaranth-lang/amaranth-stdio"}
+jtagtap = {editable = true, git = "https://github.com/Jimx-/jtagtap"}
 
 [dev-packages]
 
