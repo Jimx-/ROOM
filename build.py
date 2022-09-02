@@ -3,13 +3,31 @@ from amaranth.build import *
 from amaranth.vendor.xilinx import XilinxPlatform
 
 from room.consts import *
-from room.debug import JTAGInterface
+from room.debug import JTAGInterface, DebugUnit
 from room import Core
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
+from roomsoc.peripheral.uart import UART
 
-core_params = dict(fetch_width=2,
+import argparse
+import struct
+
+
+def read_mem_image(filename):
+    image = []
+
+    with open(filename, 'rb') as f:
+        while True:
+            w = f.read(4)
+            if not w:
+                break
+            image.append(struct.unpack('I', w)[0])
+
+    return image
+
+
+core_params = dict(fetch_width=4,
                    fetch_buffer_size=16,
                    core_width=2,
                    num_pregs=96,
@@ -32,9 +50,10 @@ class Top(Elaboratable):
         'sram': 0x20000000,
     }
 
-    def __init__(self, rom_image=[], ram_image=[]):
+    def __init__(self, clk_freq, rom_image=[], ram_image=[]):
         self.rom_image = rom_image
         self.ram_image = ram_image
+        self.clk_freq = clk_freq
 
         self.axil_master = axi.AXILiteInterface(data_width=32,
                                                 addr_width=30,
@@ -42,13 +61,21 @@ class Top(Elaboratable):
 
         self.jtag = JTAGInterface()
 
+        self.uart = UART(divisor=int(self.clk_freq // 115200))
+
     def elaborate(self, platform):
         m = Module()
 
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
         core = Core(Core.validate_params(core_params))
-        m.d.comb += core.jtag.connect(self.jtag)
+
+        m.domains += ClockDomain('debug')
+        m.d.comb += ClockSignal('debug').eq(self.jtag.tck)
+
+        debug_unit = m.submodules.debug_unit = DomainRenamer('debug')(
+            DebugUnit())
+        m.d.comb += debug_unit.jtag.connect(self.jtag)
 
         soc.bus.add_master(name='axil_master', master=self.axil_master)
 
@@ -66,15 +93,42 @@ class Top(Elaboratable):
 
         soc.add_cpu(core)
 
+        soc.add_peripheral('uart', self.uart)
+
         for res, start, size in soc.resources():
             print(res.name, hex(start), size)
 
         return m
 
 
+class KC705Platform(XilinxPlatform):
+    device = "xc7k325t"
+    package = "ffg676"
+    speed = "2"
+    resources = []
+    connectors = []
+
+
 if __name__ == "__main__":
     from amaranth.back import verilog
-    top = Top()
+
+    parser = argparse.ArgumentParser(description='ROOM SoC simulation')
+    parser.add_argument('rom', type=str, help='ROM image')
+    parser.add_argument('--ram', type=str, help='RAM image', default=None)
+    parser.add_argument('--freq',
+                        type=int,
+                        help='SoC clock frequency',
+                        default=50e6)
+    args = parser.parse_args()
+
+    rom = read_mem_image(args.rom)
+
+    if args.ram is not None:
+        ram = read_mem_image(args.ram)
+    else:
+        ram = []
+
+    top = Top(args.freq, rom_image=rom)
 
     with open('/tmp/soc_wrapper.v', 'w') as f:
         f.write(
@@ -101,5 +155,8 @@ if __name__ == "__main__":
                                 top.jtag.tdi,
                                 top.jtag.tdo,
                                 top.jtag.tms,
+                                top.uart.tx,
+                                top.uart.rx,
                             ],
+                            platform=KC705Platform(),
                             name='soc_wrapper'))

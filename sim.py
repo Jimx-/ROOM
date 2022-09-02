@@ -3,6 +3,7 @@ from amaranth.sim import Simulator
 
 from room.consts import *
 from room import Core
+from room.debug import JTAGInterface, DebugUnit
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
@@ -48,7 +49,7 @@ class Top(Elaboratable):
         'sram': 0x20000000,
     }
 
-    def __init__(self, rom_image, ram_image=[], clk_freq=1e6):
+    def __init__(self, clk_freq, rom_image, ram_image=[]):
         self.rom_image = rom_image
         self.ram_image = ram_image
         self.clk_freq = clk_freq
@@ -56,6 +57,8 @@ class Top(Elaboratable):
         self.axil_master = axi.AXILiteInterface(data_width=32,
                                                 addr_width=32,
                                                 name='axil_master')
+
+        self.jtag = JTAGInterface()
 
         self.rst = Signal()
 
@@ -96,6 +99,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ROOM SoC simulation')
     parser.add_argument('rom', type=str, help='ROM image')
     parser.add_argument('--ram', type=str, help='RAM image', default=None)
+    parser.add_argument('--freq',
+                        type=int,
+                        help='SoC clock frequency',
+                        default=1e6)
     args = parser.parse_args()
 
     rom = read_mem_image(args.rom)
@@ -105,16 +112,16 @@ if __name__ == "__main__":
     else:
         ram = []
 
-    dut = Top(rom, ram)
+    dut = Top(args.freq, rom, ram)
 
     sim = Simulator(dut)
-    sim.add_clock(1e-6)
+    sim.add_clock(1.0 / args.freq)
 
     def process():
         yield dut.rst.eq(1)
         yield
         yield dut.rst.eq(0)
-        for _ in range(6000):
+        for _ in range(100):
             yield
 
     sim.add_sync_process(process)

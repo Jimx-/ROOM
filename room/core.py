@@ -15,8 +15,6 @@ from room.ex_stage import ExecUnits
 from room.branch import BranchUpdate, BranchResolution
 from room.lsu import LoadStoreUnit
 
-from room.debug import JTAGInterface, DebugUnit
-
 from roomsoc.interconnect import wishbone
 
 
@@ -37,8 +35,6 @@ class Core(Elaboratable):
                                        name='dbus')
 
         self.periph_buses = [self.ibus, self.dbus]
-
-        self.jtag = JTAGInterface()
 
     @staticmethod
     def validate_params(params):
@@ -471,12 +467,5 @@ class Core(Elaboratable):
         for a, b in zip(rob.lsu_clear_busy_idx, lsu.clear_busy_idx):
             m.d.comb += a.eq(b)
         m.d.comb += rob.lsu_clear_busy_valids.eq(lsu.clear_busy_valids)
-
-        #
-        # Debug module
-        #
-
-        dm = m.submodules.debug_unit = DebugUnit()
-        m.d.comb += dm.jtag.connect(self.jtag)
 
         return m
