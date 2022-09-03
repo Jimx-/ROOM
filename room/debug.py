@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth.lib.fifo import AsyncFIFO
 
 from room.jtag import JTAGInterface, JTAGTap, JTAGReg
 
@@ -16,6 +17,11 @@ _dmi_layout = [
     ("op", 2),
     ("data", 32),
     ("addr", 7),
+]
+
+_dmi_resp_layout = [
+    ('data', 32),
+    ('resp', 2),
 ]
 
 
@@ -158,10 +164,153 @@ reg_map = {
 }
 
 
+class DmiError(IntEnum):
+    NONE = 0
+    RESERVED = 1
+    OP_FAILED = 2
+    BUSY = 3
+
+
+class DebugTransportModule(Elaboratable):
+
+    def __init__(self):
+        self.jtag = JTAGInterface()
+
+        self.dmi_req = Record(_dmi_layout)
+        self.dmi_req_valid = Signal()
+        self.dmi_req_ready = Signal()
+
+        self.dmi_resp = Record(_dmi_resp_layout)
+        self.dmi_resp_valid = Signal()
+        self.dmi_resp_ready = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.domains += ClockDomain('jtag')
+        m.d.comb += ClockSignal('jtag').eq(self.jtag.tck)
+
+        tap = m.submodules.tap = DomainRenamer('jtag')(JTAGTap({
+            JTAGReg.IDCODE: [("value", 32)],
+            JTAGReg.DTMCS:
+            _dtmcs_layout,
+            JTAGReg.DMI:
+            _dmi_layout,
+        }))
+
+        dmi_error = Signal(DmiError)
+        dmi_busy_error = Signal()
+
+        dtmcs = Record(_dtmcs_layout)
+        m.d.comb += [
+            dtmcs.version.eq(1),
+            dtmcs.abits.eq(7),
+            dtmcs.dmistat.eq(dmi_error),
+            dtmcs.idle.eq(7),
+        ]
+
+        m.d.comb += [
+            tap.port.connect(self.jtag),
+            tap.regs[JTAGReg.IDCODE].r.eq(0x913),
+            tap.regs[JTAGReg.DTMCS].r.eq(dtmcs),
+        ]
+
+        dtmcs_reg = tap.regs[JTAGReg.DTMCS]
+        dmi_reg = tap.regs[JTAGReg.DMI]
+
+        req_fifo_params = dict(width=len(self.dmi_req),
+                               depth=8,
+                               r_domain='sync',
+                               w_domain='jtag')
+        resp_fifo_params = dict(width=len(self.dmi_resp),
+                                depth=8,
+                                r_domain='jtag',
+                                w_domain='sync')
+
+        if platform is None or getattr(
+                platform, 'get_async_fifo', None) is None or not callable(
+                    getattr(platform, 'get_async_fifo')):
+            req_fifo = m.submodules.req_fifo = AsyncFIFO(**req_fifo_params)
+            resp_fifo = m.submodules.resp_fifo = AsyncFIFO(**resp_fifo_params)
+        else:
+            req_fifo = m.submodules.req_fifo = platform.get_async_fifo(
+                **req_fifo_params)
+            resp_fifo = m.submodules.resp_fifo = platform.get_async_fifo(
+                **resp_fifo_params)
+
+        resp_data = Record(self.dmi_resp.layout)
+
+        with m.FSM(domain='jtag'):
+            with m.State('IDLE'):
+                with m.If(dmi_reg.update & (dmi_error == DmiError.NONE)):
+                    m.d.jtag += req_fifo.w_data.eq(dmi_reg.w)
+
+                    with m.If(dmi_reg.w.op == DmiOp.READ):
+                        m.next = 'READ'
+                    with m.Elif(dmi_reg.w.op == DmiOp.WRITE):
+                        m.next = 'WRITE'
+
+            with m.State('READ'):
+                with m.If(dmi_reg.update | dmi_reg.capture):
+                    m.d.comb += dmi_busy_error.eq(1)
+
+                m.d.comb += req_fifo.w_en.eq(1)
+
+                with m.If(req_fifo.w_rdy):
+                    m.next = 'READ_WAIT'
+
+            with m.State('READ_WAIT'):
+                with m.If(dmi_reg.update | dmi_reg.capture):
+                    m.d.comb += dmi_busy_error.eq(1)
+
+                with m.If(resp_fifo.r_rdy):
+                    m.d.comb += resp_fifo.r_en.eq(1)
+                    m.d.jtag += dmi_reg.r.data.eq(resp_data.data)
+
+                    m.next = 'IDLE'
+
+            with m.State('WRITE'):
+                with m.If(dmi_reg.update):
+                    m.d.comb += dmi_busy_error.eq(1)
+
+                m.d.comb += req_fifo.w_en.eq(1)
+
+                with m.If(req_fifo.w_rdy):
+                    m.next = 'IDLE'
+
+        with m.If(dmi_busy_error):
+            m.d.jtag += dmi_error.eq(DmiError.BUSY)
+        m.d.comb += dmi_reg.r.op.eq(
+            Mux(dmi_error != DmiError.NONE, dmi_error,
+                Mux(dmi_busy_error, DmiError.BUSY, DmiError.NONE)))
+
+        with m.If(dtmcs_reg.update & dtmcs_reg.w.dmireset):
+            m.d.jtag += dmi_error.eq(DmiError.NONE)
+
+        m.d.comb += [
+            self.dmi_req.eq(req_fifo.r_data),
+            self.dmi_req_valid.eq(req_fifo.r_rdy),
+            req_fifo.r_en.eq(self.dmi_req_ready),
+            resp_fifo.w_data.eq(self.dmi_resp),
+            resp_fifo.w_en.eq(self.dmi_resp_valid),
+            self.dmi_resp_ready.eq(resp_fifo.w_rdy),
+            resp_data.eq(resp_fifo.r_data),
+        ]
+
+        return m
+
+
 class DebugRegisterFile(Elaboratable):
 
-    def __init__(self, dmi):
-        self.dmi = dmi
+    def __init__(self):
+        self.dmi_req = Record(_dmi_layout)
+        self.dmi_req_valid = Signal()
+        self.dmi_req_ready = Signal()
+
+        self.dmi_resp = Record(_dmi_resp_layout)
+        self.dmi_resp_valid = Signal()
+        self.dmi_resp_ready = Signal()
+
         self.ports = dict()
 
     def reg_port(self, addr, name=None, src_loc_at=0):
@@ -186,7 +335,7 @@ class DebugRegisterFile(Elaboratable):
 
         def do_read(addr, port):
             rec = Record(port.w.layout)
-            m.d.sync += self.dmi.r.data.eq(rec)
+            m.d.sync += self.dmi_resp.data.eq(rec)
             for name, _, mode, _ in reg_map[addr]:
                 dst = getattr(rec, name)
                 src = getattr(port.w, name)
@@ -198,7 +347,7 @@ class DebugRegisterFile(Elaboratable):
 
         def do_write(addr, port):
             rec = Record(port.r.layout)
-            m.d.comb += rec.eq(self.dmi.w.data)
+            m.d.comb += rec.eq(self.dmi_req.data)
             for name, _, mode, _ in reg_map[addr]:
                 dst = getattr(port.r, name)
                 src = getattr(rec, name)
@@ -211,14 +360,23 @@ class DebugRegisterFile(Elaboratable):
 
             m.d.sync += port.update.eq(1)
 
-        with m.If(self.dmi.update):
-            with m.Switch(self.dmi.w.addr):
+        with m.If(self.dmi_req_valid):
+            m.d.comb += self.dmi_req_ready.eq(1)
+
+            with m.Switch(self.dmi_req.addr):
                 for addr, port in self.ports.items():
                     with m.Case(addr):
-                        with m.If(self.dmi.w.op == DmiOp.READ):
+                        with m.If(self.dmi_req.op == DmiOp.READ):
                             do_read(addr, port)
-                        with m.Elif(self.dmi.w.op == DmiOp.WRITE):
+                        with m.Elif(self.dmi_req.op == DmiOp.WRITE):
                             do_write(addr, port)
+
+                with m.Default():
+                    with m.If(self.dmi_req.op == DmiOp.READ):
+                        m.d.sync += self.dmi_resp.data.eq(0)
+
+        m.d.sync += self.dmi_resp_valid.eq(self.dmi_req_valid
+                                           & (self.dmi_req.op == DmiOp.READ))
 
         for port in self.ports.values():
             with m.If(port.update):
@@ -268,11 +426,21 @@ class DebugController(Elaboratable):
                 )
             ]
 
+        with m.If(self.abstractcs.update):
+            m.d.sync += self.abstractcs.w.cmderr.eq(self.abstractcs.r.cmderr)
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += self.abstractcs.w.cmderr.eq(0)
+
+        with m.If(self.data0.update):
+            m.d.sync += self.data0.w.eq(self.data0.r)
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += self.data0.w.eq(0)
+
         m.d.comb += [
             self.dmstatus.w.version.eq(Version.V013),
             self.dmstatus.w.authenticated.eq(1),
-            self.dmstatus.w.allhalted.eq(1),
-            self.dmstatus.w.anyhalted.eq(1),
+            # self.dmstatus.w.allrunning.eq(1),
+            # self.dmstatus.w.anyrunning.eq(1),
             self.haltsum0.w[0].eq(self.dmstatus.w.allhalted),
         ]
 
@@ -411,20 +579,19 @@ class DebugUnit(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        tap = m.submodules.tap = JTAGTap({
-            JTAGReg.IDCODE: [("value", 32)],
-            JTAGReg.DTMCS: _dtmcs_layout,
-            JTAGReg.DMI: _dmi_layout,
-        })
-        regfile = m.submodules.regfile = DebugRegisterFile(
-            tap.regs[JTAGReg.DMI])
+        dtm = m.submodules.dtm = DebugTransportModule()
+        regfile = m.submodules.regfile = DebugRegisterFile()
         m.submodules.controller = DebugController(regfile)
         sba = m.submodules.sb_access = SystemBusAccess(regfile)
 
         m.d.comb += [
-            tap.port.connect(self.jtag),
-            tap.regs[JTAGReg.IDCODE].r.eq(0x913),
-            tap.regs[JTAGReg.DTMCS].r.eq(0x71),
+            dtm.jtag.connect(self.jtag),
+            regfile.dmi_req.eq(dtm.dmi_req),
+            regfile.dmi_req_valid.eq(dtm.dmi_req_valid),
+            dtm.dmi_req_ready.eq(regfile.dmi_req_ready),
+            dtm.dmi_resp.eq(regfile.dmi_resp),
+            dtm.dmi_resp_valid.eq(regfile.dmi_resp_valid),
+            regfile.dmi_resp_ready.eq(dtm.dmi_resp_ready),
         ]
 
         m.d.comb += sba.bus.connect(self.dbus)

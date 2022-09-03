@@ -3,7 +3,6 @@ from amaranth.sim import Simulator
 
 from room.consts import *
 from room import Core
-from room.debug import JTAGInterface, DebugUnit
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
@@ -57,8 +56,6 @@ class Top(Elaboratable):
         self.axil_master = axi.AXILiteInterface(data_width=32,
                                                 addr_width=32,
                                                 name='axil_master')
-
-        self.jtag = JTAGInterface()
 
         self.rst = Signal()
 

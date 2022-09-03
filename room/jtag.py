@@ -34,6 +34,7 @@ class JTAGInterface(Record):
         return b
 
     def write_tms(self, tms):
+        yield Settle()
         yield self.tms.eq(tms)
         yield from self.tick()
 
@@ -110,7 +111,6 @@ class JTAGInterface(Record):
 
     def read_dmi(self, addr, wait_cycles=10):
         write_data = ((addr & 0x7f) << 34) | 1
-        print(''.join(list(reversed(bin(write_data)))))
         yield from self.set_ir(5, JTAGReg.DMI)
         yield from self.shift_dr()
         yield from self.write_bits(write_data, 41, 1)
@@ -120,7 +120,6 @@ class JTAGInterface(Record):
             yield from self.tick()
 
         write_data = ((addr & 0x7f) << 34)
-        print(''.join(list(reversed(bin(write_data)))))
         yield from self.shift_dr()
         data_out = yield from self.rw_bits(write_data, 41, 1)
         yield from self.update_dr(False)

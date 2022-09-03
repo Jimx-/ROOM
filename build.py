@@ -1,6 +1,5 @@
 from amaranth import *
 from amaranth.build import *
-from amaranth.vendor.xilinx import XilinxPlatform
 
 from room.consts import *
 from room.debug import JTAGInterface, DebugUnit
@@ -9,6 +8,7 @@ from room import Core
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
 from roomsoc.peripheral.uart import UART
+from roomsoc.platform.kc705 import KC705Platform
 
 import argparse
 import struct
@@ -70,14 +70,11 @@ class Top(Elaboratable):
 
         core = Core(Core.validate_params(core_params))
 
-        m.domains += ClockDomain('debug')
-        m.d.comb += ClockSignal('debug').eq(self.jtag.tck)
-
-        debug_unit = m.submodules.debug_unit = DomainRenamer('debug')(
-            DebugUnit())
+        debug_unit = m.submodules.debug_unit = DebugUnit()
         m.d.comb += debug_unit.jtag.connect(self.jtag)
 
         soc.bus.add_master(name='axil_master', master=self.axil_master)
+        soc.bus.add_master(name='dm_master', master=debug_unit.dbus)
 
         soc.add_rom(name='rom',
                     origin=self.mem_map['rom'],
@@ -99,14 +96,6 @@ class Top(Elaboratable):
             print(res.name, hex(start), size)
 
         return m
-
-
-class KC705Platform(XilinxPlatform):
-    device = "xc7k325t"
-    package = "ffg676"
-    speed = "2"
-    resources = []
-    connectors = []
 
 
 if __name__ == "__main__":
