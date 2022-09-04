@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import *
-from room.alu import ExecReq, ExecResp, ALU, AddrGenUnit, MultiplierUnit, DivUnit
+from room.alu import ExecReq, ExecResp, ALU, AddrGenUnit, MultiplierUnit, DivUnit, generate_imm
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
@@ -18,7 +18,8 @@ class ExecUnit(Elaboratable):
                  has_alu=False,
                  has_mul=False,
                  has_div=False,
-                 has_mem=False):
+                 has_mem=False,
+                 has_csr=False):
         self.params = params
         self.data_width = data_width
         self.irf_read = irf_read
@@ -28,6 +29,7 @@ class ExecUnit(Elaboratable):
         self.has_mul = has_mul
         self.has_div = has_div
         self.has_mem = has_mem
+        self.has_csr = has_csr
 
         self.fu_types = Signal(FUType)
 
@@ -62,6 +64,7 @@ class ALUExecUnit(ExecUnit):
                  has_mul=False,
                  has_div=False,
                  has_mem=False,
+                 has_csr=False,
                  name=None):
         super().__init__(32,
                          params,
@@ -71,7 +74,8 @@ class ALUExecUnit(ExecUnit):
                          has_alu=has_alu,
                          has_mul=has_mul,
                          has_div=has_div,
-                         has_mem=has_mem)
+                         has_mem=has_mem,
+                         has_csr=has_csr)
         self.name = name
 
     def elaborate(self, platform):
@@ -84,11 +88,12 @@ class ALUExecUnit(ExecUnit):
             with m.If(~div_busy):
                 m.d.comb += fu_type_div.eq(FUType.DIV)
 
-        m.d.comb += self.fu_types.eq((self.has_alu and FUType.ALU or 0)
-                                     | (self.has_mul and FUType.MUL or 0)
+        m.d.comb += self.fu_types.eq((FUType.ALU if self.has_alu else 0)
+                                     | (FUType.MUL if self.has_mul else 0)
                                      | fu_type_div
-                                     | (self.has_jmp_unit and FUType.JMP or 0)
-                                     | (self.has_mem and FUType.MEM or 0))
+                                     | (FUType.JMP if self.has_jmp_unit else 0)
+                                     | (FUType.MEM if self.has_mem else 0)
+                                     | (FUType.CSR if self.has_csr else 0))
 
         iresp_units = []
 
@@ -100,7 +105,8 @@ class ALUExecUnit(ExecUnit):
                 alu.req.eq(self.req),
                 alu.req.valid.eq(self.req.valid
                                  & ((self.req.uop.fu_type == FUType.ALU)
-                                    | (self.req.uop.fu_type == FUType.JMP))),
+                                    | (self.req.uop.fu_type == FUType.JMP)
+                                    | (self.req.uop.fu_type == FUType.CSR))),
                 alu.br_update.eq(self.br_update),
                 self.br_res.eq(alu.br_res),
             ]
@@ -146,9 +152,17 @@ class ALUExecUnit(ExecUnit):
                 self.lsu_req.eq(agu.resp),
             ]
 
-        for iu in reversed(iresp_units):
-            with m.If(iu.resp.valid):
-                m.d.comb += self.iresp.eq(iu.resp)
+        if self.irf_write:
+            for iu in reversed(iresp_units):
+                with m.If(iu.resp.valid):
+                    m.d.comb += self.iresp.eq(iu.resp)
+
+            if self.has_alu:
+                m.d.comb += [
+                    self.iresp.uop.csr_addr.eq(
+                        generate_imm(alu.resp.uop.imm_packed, ImmSel.I)),
+                    self.iresp.uop.csr_cmd.eq(alu.resp.uop.csr_cmd),
+                ]
 
         return m
 
@@ -176,6 +190,7 @@ class ExecUnits(Elaboratable):
         for i in range(int_width):
             eu = ALUExecUnit(params,
                              has_jmp_unit=(i == 0),
+                             has_csr=(i == (1 % int_width)),
                              has_mul=(i == (2 % int_width)),
                              has_div=(i == (3 % int_width)),
                              name=f'alu_int{i}')

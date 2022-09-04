@@ -259,6 +259,34 @@ class DecodeUnit(Elaboratable):
                             uop.fu_type.eq(FUType.DIV),
                         ]
 
+            # System
+            with m.Case(OPV('EBREAK')):
+                with m.If(inuop.inst[12:15] == 0):
+                    pass
+                with m.Else():
+                    m.d.comb += [
+                        uop.iq_type.eq(IssueQueueType.INT),
+                        uop.fu_type.eq(FUType.CSR),
+                        uop.dst_rtype.eq(RegisterType.FIX),
+                        IMM_SEL_I,
+                    ]
+
+                    for name in ['CSRRW', 'CSRRS', 'CSRRC']:
+                        with m.If(inuop.inst[12:14] == (F3(name) & 3)):
+                            m.d.comb += uop.csr_cmd.eq(
+                                getattr(CSRCommand, name[-1]))
+
+                            with m.If(inuop.inst[14] == 1):
+                                m.d.comb += [
+                                    UOPC(getattr(UOpCode, name + 'I')),
+                                    uop.lrs1_rtype.eq(RegisterType.PAS),
+                                ]
+                            with m.Else():
+                                m.d.comb += [
+                                    UOPC(getattr(UOpCode, name)),
+                                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                                ]
+
         di20_25 = Mux((imm_sel == ImmSel.B) | (imm_sel == ImmSel.S),
                       inuop.inst[7:12], inuop.inst[20:25])
         m.d.comb += uop.imm_packed.eq(

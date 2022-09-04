@@ -104,6 +104,8 @@ class RegReadDecoder(Elaboratable):
         OPB_RS2 = self.rrd_uop.opb_sel.eq(OpB.RS2)
         OPB_IMM = self.rrd_uop.opb_sel.eq(OpB.IMM)
         OPB_NEXT = self.rrd_uop.opb_sel.eq(OpB.NEXT)
+        OPB_ZERO = self.rrd_uop.opb_sel.eq(OpB.ZERO)
+        OPB_IMMC = self.rrd_uop.opb_sel.eq(OpB.IMMC)
 
         IMM_I = self.rrd_uop.imm_sel.eq(ImmSel.I)
         IMM_J = self.rrd_uop.imm_sel.eq(ImmSel.J)
@@ -249,6 +251,22 @@ class RegReadDecoder(Elaboratable):
                     F(ALUOperator.SLTU),
                     BT(BranchType.LTU),
                     IMM_B,
+                ]
+
+            with m.Case(UOpCode.CSRRW, UOpCode.CSRRS, UOpCode.CSRRC):
+                m.d.comb += [
+                    F(ALUOperator.ADD),
+                    OPA_RS1,
+                    OPB_ZERO,
+                    IMM_I,
+                ]
+
+            with m.Case(UOpCode.CSRRWI, UOpCode.CSRRSI, UOpCode.CSRRCI):
+                m.d.comb += [
+                    F(ALUOperator.ADD),
+                    OPA_ZERO,
+                    OPB_IMMC,
+                    IMM_I,
                 ]
 
         m.d.comb += [

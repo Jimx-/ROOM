@@ -168,8 +168,11 @@ class ALU(PipelinedFunctionalUnit):
         m.d.comb += opb_data.eq(
             Mux(
                 uop.opb_sel == OpB.IMM, imm,
-                Mux(uop.opb_sel == OpB.RS2, self.req.rs2_data,
-                    Mux(uop.opb_sel == OpB.NEXT, Mux(uop.is_rvc, 2, 4), 0))))
+                Mux(
+                    uop.opb_sel == OpB.IMMC, self.req.uop.prs1[:5],
+                    Mux(uop.opb_sel == OpB.RS2, self.req.rs2_data,
+                        Mux(uop.opb_sel == OpB.NEXT, Mux(uop.is_rvc, 2, 4),
+                            0)))))
 
         #
         # ALU

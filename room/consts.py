@@ -131,6 +131,8 @@ class UOpCode(IntEnum):
 class RegisterType(IntEnum):
     X = 0
     FIX = 1
+    FLT = 2
+    PAS = 3
 
 
 class IssueQueueType(IntEnum):
@@ -214,6 +216,7 @@ class FUType(IntEnum):
     MEM = 4
     MUL = 8
     DIV = 16
+    CSR = 32
 
 
 class PCSel(IntEnum):
@@ -226,3 +229,12 @@ class MemoryCommand(IntEnum):
     X = 0
     READ = 1
     WRITE = 2
+
+
+class CSRCommand(IntEnum):
+    X = 0
+    R = 2
+    I = 4
+    W = 5
+    S = 6
+    C = 7

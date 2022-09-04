@@ -14,6 +14,7 @@ from room.regfile import RegisterFile, RegisterRead
 from room.ex_stage import ExecUnits
 from room.branch import BranchUpdate, BranchResolution
 from room.lsu import LoadStoreUnit
+from room.csr import CSRFile
 
 from roomsoc.interconnect import wishbone
 
@@ -48,6 +49,8 @@ class Core(Elaboratable):
         m = Module()
 
         mem_width = self.params['mem_width']
+
+        csr = m.submodules.csr = CSRFile()
 
         #
         # Instruction fetch
@@ -142,6 +145,11 @@ class Core(Elaboratable):
             dis_fire.eq(dis_valids & ~dis_stalls),
             dis_ready.eq(~dis_stalls[-1]),
         ]
+
+        for w in range(self.core_width):
+            m.d.comb += dis_uops[w].prs1.eq(
+                Mux(ren_stage.ren2_uops[w].lrs1_rtype == RegisterType.FIX,
+                    ren_stage.ren2_uops[w].prs1, ren_stage.ren2_uops[w].lrs1))
 
         for w in range(self.core_width):
             m.d.comb += [
@@ -323,6 +331,21 @@ class Core(Elaboratable):
         ]
 
         #
+        # CSR register file
+        #
+
+        csr_port = csr.access_port()
+        csr_exec_unit = [eu for eu in exec_units if eu.has_csr][0]
+
+        m.d.comb += [
+            csr_port.addr.eq(csr_exec_unit.iresp.uop.csr_addr),
+            csr_port.cmd.eq(
+                csr_exec_unit.iresp.uop.csr_cmd
+                & ~Mux(csr_exec_unit.iresp.valid, 0, CSRCommand.I)),
+            csr_port.w_data.eq(csr_exec_unit.iresp.data),
+        ]
+
+        #
         # Execute
         #
 
@@ -450,8 +473,14 @@ class Core(Elaboratable):
                 wp.valid.eq(eu.iresp.valid & eu.iresp.uop.rf_wen()
                             & eu.iresp.uop.dst_rtype == RegisterType.FIX),
                 wp.addr.eq(eu.iresp.uop.pdst),
-                wp.data.eq(eu.iresp.data),
             ]
+
+            if eu.has_csr:
+                m.d.comb += wp.data.eq(
+                    Mux(eu.iresp.uop.csr_cmd != CSRCommand.X, csr_port.r_data,
+                        eu.iresp.data))
+            else:
+                m.d.comb += wp.data.eq(eu.iresp.data)
 
         #
         # Commit
