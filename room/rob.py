@@ -101,6 +101,7 @@ class ReorderBuffer(Elaboratable):
         maybe_full = Signal()
         full = Signal()
         empty = Signal()
+        state_is_normal = Signal()
 
         can_commit = Signal(self.core_width)
         will_commit = Signal(self.core_width)
@@ -200,10 +201,23 @@ class ReorderBuffer(Elaboratable):
             empty.eq((rob_tail == rob_head) & (rob_head_valids == 0))
         ]
 
+        with m.FSM():
+            with m.State('NORMAL'):
+                m.d.comb += state_is_normal.eq(1)
+
+                for w in range(self.core_width):
+                    with m.If(self.enq_valids[w]
+                              & self.enq_uops[w].clear_pipeline):
+                        m.next = 'WAIT_EMPTY'
+
+            with m.State('WAIT_EMPTY'):
+                with m.If(empty):
+                    m.next = 'NORMAL'
+
         m.d.comb += [
             self.head_idx.eq(rob_head_idx),
             self.tail_idx.eq(rob_tail_idx),
-            self.ready.eq(~full),
+            self.ready.eq(state_is_normal & ~full),
             self.empty.eq(empty),
         ]
 

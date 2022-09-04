@@ -128,13 +128,30 @@ class Core(Elaboratable):
             m.d.comb += dis_uop.eq(ren2_uop)
 
         rob_ready = Signal()
-        m.d.comb += rob_ready.eq(1)
+        rob_empty = Signal()
+
+        dis_prior_valid = Signal(self.core_width)
+        dis_prior_unique = Signal(self.core_width)
+        for w in range(1, self.core_width):
+            m.d.comb += [
+                dis_prior_valid[w].eq(dis_prior_valid[w - 1]
+                                      | dis_valids[w - 1]),
+                dis_prior_unique[w].eq(dis_prior_unique[w - 1]
+                                       | (dis_valids[w - 1]
+                                          & dis_uops[w - 1].clear_pipeline)),
+            ]
+
+        wait_for_empty_pipeline = Signal(self.core_width)
+        for w in range(self.core_width):
+            m.d.comb += wait_for_empty_pipeline[w].eq(
+                dis_uops[w].clear_pipeline & (~rob_empty | dis_prior_valid[w]))
 
         dis_hazards = [(dis_valids[w] &
                         (~rob_ready | ren_stage.stalls[w] |
                          (lsu.ldq_full[w] & dis_uops[w].uses_ldq) |
                          (lsu.stq_full[w] & dis_uops[w].uses_stq)
-                         | ~dispatcher.ready[w] | if_stage.redirect_flush))
+                         | ~dispatcher.ready[w] | wait_for_empty_pipeline[w]
+                         | dis_prior_unique[w] | if_stage.redirect_flush))
                        for w in range(self.core_width)]
         dis_stalls = Signal(self.core_width)
         m.d.comb += dis_stalls[0].eq(dis_hazards[0])
@@ -177,6 +194,7 @@ class Core(Elaboratable):
             rob.enq_partial_stalls.eq(dis_stalls[-1]),
             rob.br_update.eq(br_update),
             rob_ready.eq(rob.ready),
+            rob_empty.eq(rob.empty),
         ]
 
         m.d.comb += ren_stage.commit.eq(rob.commit_req)

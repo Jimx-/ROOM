@@ -261,6 +261,11 @@ class DecodeUnit(Elaboratable):
 
             # System
             with m.Case(OPV('EBREAK')):
+                m.d.comb += [
+                    uop.clear_pipeline.eq(1),
+                    uop.flush_on_commit.eq(1),
+                ]
+
                 with m.If(inuop.inst[12:15] == 0):
                     pass
                 with m.Else():
