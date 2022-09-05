@@ -281,8 +281,13 @@ class DecodeUnit(Elaboratable):
 
                     for name in ['CSRRW', 'CSRRS', 'CSRRC']:
                         with m.If(inuop.inst[12:14] == (F3(name) & 3)):
-                            m.d.comb += uop.csr_cmd.eq(
-                                getattr(CSRCommand, name[-1]))
+                            if name[-1] == 'S' or name[-1] == 'C':
+                                m.d.comb += uop.csr_cmd.eq(
+                                    getattr(CSRCommand, name[-1])
+                                    & ~Mux(uop.lrs1 == 0, CSRCommand.I, 0))
+                            else:
+                                m.d.comb += uop.csr_cmd.eq(
+                                    getattr(CSRCommand, name[-1]))
 
                             with m.If(inuop.inst[14] == 1):
                                 m.d.comb += [
