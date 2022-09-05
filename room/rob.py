@@ -40,8 +40,13 @@ class CommitReq:
             name=(name is not None) and f'{name}_rollback_valids' or None)
 
     def eq(self, rhs):
-        return [self.valids.eq(rhs.valids)
-                ] + [luop.eq(ruop) for luop, ruop in zip(self.uops, rhs.uops)]
+        return [
+            getattr(self, name).eq(getattr(rhs, name)) for name in (
+                'valids',
+                'rollback',
+                'rollback_valids',
+            )
+        ] + [luop.eq(ruop) for luop, ruop in zip(self.uops, rhs.uops)]
 
 
 class CommitExceptionReq(Record):

@@ -140,7 +140,9 @@ class Freelist(Elaboratable):
             Signal(range(num_pregs), name=f'dealloc_preg{i}')
             for i in range(core_width)
         ]
-        self.dealloc_valids = [Signal() for _ in range(core_width)]
+        self.dealloc_valids = [
+            Signal(name=f'dealloc_valid{i}') for i in range(core_width)
+        ]
 
         self.ren_br_valids = Signal(self.core_width)
         self.ren_br_tags = [
@@ -468,11 +470,17 @@ class RenameStage(Elaboratable):
             self.num_wakeup_ports, self.params)
 
         commit_valids = Signal(self.core_width)
+        rollback_valids = Signal(self.core_width)
 
-        for v, cuop, cv in zip(commit_valids, self.commit.uops,
-                               self.commit.valids):
-            m.d.comb += v.eq(cuop.ldst_valid
-                             & (cuop.dst_rtype == RegisterType.FIX) & cv)
+        for cv, rv, cuop, ccv, crv in zip(commit_valids, rollback_valids,
+                                          self.commit.uops, self.commit.valids,
+                                          self.commit.rollback_valids):
+            m.d.comb += [
+                cv.eq(cuop.ldst_valid
+                      & (cuop.dst_rtype == RegisterType.FIX) & ccv),
+                rv.eq(cuop.ldst_valid
+                      & (cuop.dst_rtype == RegisterType.FIX) & crv),
+            ]
 
         #
         # Map table
@@ -492,12 +500,16 @@ class RenameStage(Elaboratable):
                 ren1_uop.stale_pdst.eq(map_resp.stale_pdst),
             ]
 
-        for rem_req, ren2_uop, alloc_req in zip(map_table.remap_reqs,
-                                                ren2_uops, ren2_alloc_reqs):
+        for rem_req, ren2_uop, alloc_req, com_uop, rbk_valid in zip(
+                map_table.remap_reqs, ren2_uops, ren2_alloc_reqs,
+                reversed(self.commit.uops), reversed(rollback_valids)):
             m.d.comb += [
-                rem_req.ldst.eq(ren2_uop.ldst),
-                rem_req.pdst.eq(ren2_uop.pdst),
-                rem_req.valid.eq(alloc_req),
+                rem_req.ldst.eq(
+                    Mux(self.commit.rollback, com_uop.ldst, ren2_uop.ldst)),
+                rem_req.pdst.eq(
+                    Mux(self.commit.rollback, com_uop.stale_pdst,
+                        ren2_uop.pdst)),
+                rem_req.valid.eq(alloc_req | rbk_valid),
             ]
 
         for a, b in zip(map_table.ren_br_tags, ren2_br_tags):
@@ -518,11 +530,13 @@ class RenameStage(Elaboratable):
         for uop, preg in zip(ren2_uops, freelist.alloc_pregs):
             m.d.comb += uop.pdst.eq(Mux(uop.ldst != 0, preg, 0))
 
-        for preg, uop, v, cv in zip(freelist.dealloc_pregs, self.commit.uops,
-                                    freelist.dealloc_valids, commit_valids):
+        for preg, uop, v, cv, rv in zip(freelist.dealloc_pregs,
+                                        self.commit.uops,
+                                        freelist.dealloc_valids, commit_valids,
+                                        rollback_valids):
             m.d.comb += [
-                preg.eq(uop.stale_pdst),
-                v.eq(cv),
+                preg.eq(Mux(self.commit.rollback, uop.pdst, uop.stale_pdst)),
+                v.eq(cv | rv),
             ]
 
         m.d.comb += freelist.reqs.eq(ren2_alloc_reqs)
