@@ -58,6 +58,9 @@ class DecodeUnit(Elaboratable):
         self.in_uop = MicroOp(params)
         self.out_uop = MicroOp(params)
 
+        self.interrupt = Signal()
+        self.interrupt_cause = Signal(32)
+
     def elaborate(self, platform):
         m = Module()
 
@@ -297,6 +300,12 @@ class DecodeUnit(Elaboratable):
         m.d.comb += uop.imm_packed.eq(
             Cat(inuop.inst[12:20], di20_25, inuop.inst[25:32]))
 
+        with m.If(self.interrupt):
+            m.d.comb += [
+                uop.exception.eq(1),
+                uop.exc_cause.eq(self.interrupt_cause),
+            ]
+
         return m
 
 
@@ -317,10 +326,14 @@ class DecodeStage(Elaboratable):
         self.fire = Signal(self.core_width)
         self.ready = Signal()
 
+        self.rollback = Signal()
         self.redirect_flush = Signal()
         self.dis_ready = Signal()
 
         self.br_update = BranchUpdate(self.params)
+
+        self.interrupt = Signal()
+        self.interrupt_cause = Signal(32)
 
     def elaborate(self, platform):
         m = Module()
@@ -337,6 +350,8 @@ class DecodeStage(Elaboratable):
                                   & ~dec_finished_mask[i]),
                 dec.in_uop.eq(self.fetch_packet[i]),
                 self.uops[i].eq(dec.out_uop),
+                dec.interrupt.eq(self.interrupt),
+                dec.interrupt_cause.eq(self.interrupt_cause),
             ]
 
         #
@@ -360,7 +375,7 @@ class DecodeStage(Elaboratable):
 
         dec_hazards = [
             (valid &
-             (~self.dis_ready | br_mask_full |
+             (~self.dis_ready | br_mask_full | self.rollback |
               (self.br_update.mispredict_mask != 0)
               | self.br_update.br_res.mispredict | self.redirect_flush))
             for valid, br_mask_full in zip(self.valids, br_mask_alloc.full)

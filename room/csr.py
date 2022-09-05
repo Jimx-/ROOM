@@ -7,7 +7,7 @@ from amaranth.utils import bits_for
 
 from room.consts import *
 
-__all__ = ["CSRAccess", "CSR", "CSRFile"]
+__all__ = ["CSRAccess", "CSR", "AutoCSR", "CSRFile"]
 
 
 class CSRAccess(Enum):
@@ -43,34 +43,20 @@ class CSR(Record):
                          src_loc_at=1 + src_loc_at)
 
 
+class AutoCSR:
+
+    def iter_csrs(self):
+        for v in vars(self).values():
+            if isinstance(v, CSR):
+                yield v
+            elif hasattr(v, "iter_csrs"):
+                yield from v.iter_csrs()
+
+
 misa_layout = [
     ("extensions", 26, CSRAccess.RW),
     ("zero", 4, CSRAccess.RO),
     ("mxl", 2, CSRAccess.RW),
-]
-
-mstatus_layout = [
-    ("uie", 1, CSRAccess.RO),  # User Interrupt Enable
-    ("sie", 1, CSRAccess.RO),  # Supervisor Interrupt Enable
-    ("zero0", 1, CSRAccess.RO),
-    ("mie", 1, CSRAccess.RW),  # Machine Interrupt Enable
-    ("upie", 1, CSRAccess.RO),  # User Previous Interrupt Enable
-    ("spie", 1, CSRAccess.RO),  # Supervisor Previous Interrupt Enable
-    ("zero1", 1, CSRAccess.RO),
-    ("mpie", 1, CSRAccess.RW),  # Machine Previous Interrupt Enable
-    ("spp", 1, CSRAccess.RO),  # Supervisor Previous Privilege
-    ("zero2", 2, CSRAccess.RO),
-    ("mpp", 2, CSRAccess.RW),  # Machine Previous Privilege
-    ("fs", 2, CSRAccess.RO),  # FPU Status
-    ("xs", 2, CSRAccess.RO),  # user-mode eXtensions Status
-    ("mprv", 1, CSRAccess.RO),  # Modify PRiVilege
-    ("sum", 1, CSRAccess.RO),  # Supervisor User Memory access
-    ("mxr", 1, CSRAccess.RO),  # Make eXecutable Readable
-    ("tvm", 1, CSRAccess.RO),  # Trap Virtual Memory
-    ("tw", 1, CSRAccess.RO),  # Timeout Wait
-    ("tsr", 1, CSRAccess.RO),  # Trap SRET
-    ("zero3", 8, CSRAccess.RO),
-    ("sd", 1, CSRAccess.RO),  # State Dirty (set if XS or FS are set to dirty)
 ]
 
 
@@ -83,10 +69,9 @@ class CSRFile(Elaboratable):
         self._ports = []
 
         self.misa = CSR(csrnames.misa, misa_layout)
-        self.mstatus = CSR(csrnames.mstatus, mstatus_layout)
         self.mscratch = CSR(csrnames.mscratch, [('value', 32, CSRAccess.RW)])
 
-        self.add_csrs([self.misa, self.mstatus, self.mscratch])
+        self.add_csrs([self.misa, self.mscratch])
 
     def add_csrs(self, csrs):
         for csr in csrs:

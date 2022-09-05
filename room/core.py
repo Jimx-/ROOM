@@ -15,6 +15,7 @@ from room.ex_stage import ExecUnits
 from room.branch import BranchUpdate, BranchResolution
 from room.lsu import LoadStoreUnit
 from room.csr import CSRFile
+from room.exc import ExceptionUnit, CoreInterrupts
 
 from roomsoc.interconnect import wishbone
 
@@ -24,6 +25,8 @@ class Core(Elaboratable):
     def __init__(self, params):
         self.params = params
         self.core_width = params['core_width']
+
+        self.interrupts = CoreInterrupts()
 
         ibus_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
         self.ibus = wishbone.Interface(data_width=params['fetch_width'] * 16,
@@ -53,6 +56,15 @@ class Core(Elaboratable):
         csr = m.submodules.csr = CSRFile()
 
         #
+        # Exception
+        #
+
+        exc_unit = m.submodules.exc_unit = ExceptionUnit()
+        csr.add_csrs(exc_unit.iter_csrs())
+
+        m.d.comb += exc_unit.interrupts.eq(self.interrupts)
+
+        #
         # Instruction fetch
         #
 
@@ -79,6 +91,8 @@ class Core(Elaboratable):
             dec_stage.redirect_flush.eq(if_stage.redirect_flush),
             dec_ready.eq(dec_stage.ready),
             if_stage.fetch_packet_ready.eq(dec_ready),
+            dec_stage.interrupt.eq(exc_unit.interrupt),
+            dec_stage.interrupt_cause.eq(exc_unit.interrupt_cause),
         ]
 
         #
@@ -197,6 +211,8 @@ class Core(Elaboratable):
             rob_empty.eq(rob.empty),
         ]
 
+        m.d.comb += dec_stage.rollback.eq(rob.commit_req.rollback)
+
         m.d.comb += ren_stage.commit.eq(rob.commit_req)
 
         for w, dis_uop in enumerate(dis_uops):
@@ -235,8 +251,11 @@ class Core(Elaboratable):
             with m.If(rob.commit_req.valids[w]):
                 m.d.comb += com_ftq_idx.eq(rob.commit_req.uops[w].ftq_idx)
         m.d.comb += [
-            if_stage.commit.eq(com_ftq_idx),
-            if_stage.commit_valid.eq(rob.commit_req.valids != 0),
+            if_stage.commit.eq(
+                Mux(rob.commit_exc.valid, rob.commit_exc.ftq_idx,
+                    com_ftq_idx)),
+            if_stage.commit_valid.eq((rob.commit_req.valids != 0)
+                                     | rob.commit_exc.valid),
         ]
 
         #
@@ -514,5 +533,16 @@ class Core(Elaboratable):
         for a, b in zip(rob.lsu_clear_busy_idx, lsu.clear_busy_idx):
             m.d.comb += a.eq(b)
         m.d.comb += rob.lsu_clear_busy_valids.eq(lsu.clear_busy_valids)
+
+        #
+        # Exception
+        #
+
+        m.d.sync += [
+            exc_unit.exception.eq(rob.commit_exc.valid),
+            exc_unit.cause.eq(rob.commit_exc.cause),
+            exc_unit.epc.eq(if_stage.get_pc[0].commit_pc +
+                            rob.commit_exc.pc_lsb),
+        ]
 
         return m

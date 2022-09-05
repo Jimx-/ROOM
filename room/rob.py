@@ -7,9 +7,16 @@ from room.branch import BranchUpdate
 
 def _incr(signal, modulo):
     if modulo == 2**len(signal):
-        return signal + 1
+        return (signal + 1)[:len(signal)]
     else:
         return Mux(signal == modulo - 1, 0, signal + 1)
+
+
+def _decr(signal, modulo):
+    if modulo == 2**len(signal):
+        return (signal - 1)[:len(signal)]
+    else:
+        return Mux(signal == 0, modulo - 1, signal - 1)
 
 
 class CommitReq:
@@ -26,9 +33,29 @@ class CommitReq:
             for i in range(core_width)
         ]
 
+        self.rollback = Signal(
+            name=(name is not None) and f'{name}_rollback' or None)
+        self.rollback_valids = Signal(
+            core_width,
+            name=(name is not None) and f'{name}_rollback_valids' or None)
+
     def eq(self, rhs):
         return [self.valids.eq(rhs.valids)
                 ] + [luop.eq(ruop) for luop, ruop in zip(self.uops, rhs.uops)]
+
+
+class CommitExceptionReq(Record):
+
+    def __init__(self, params, name=None):
+        _uop = MicroOp(params)
+
+        super().__init__([
+            ('valid', 1),
+            ('ftq_idx', _uop.ftq_idx.width),
+            ('pc_lsb', _uop.pc_lsb.width),
+            ('cause', 32),
+        ],
+                         name=name)
 
 
 class ReorderBuffer(Elaboratable):
@@ -57,6 +84,8 @@ class ReorderBuffer(Elaboratable):
         ]
 
         self.commit_req = CommitReq(params, name='commit_req')
+
+        self.commit_exc = CommitExceptionReq(params)
 
         self.head_idx = Signal(range(self.core_width * self.num_rob_rows))
         self.tail_idx = Signal(range(self.core_width * self.num_rob_rows))
@@ -101,9 +130,15 @@ class ReorderBuffer(Elaboratable):
         maybe_full = Signal()
         full = Signal()
         empty = Signal()
+
         state_is_normal = Signal()
+        state_is_wait_empty = Signal()
+        state_is_rollback = Signal()
+
+        commit_idx = Mux(state_is_rollback, rob_tail, rob_head)
 
         can_commit = Signal(self.core_width)
+        can_throw_exception = Signal(self.core_width)
         will_commit = Signal(self.core_width)
 
         rob_head_valids = Signal(self.core_width)
@@ -119,12 +154,16 @@ class ReorderBuffer(Elaboratable):
             rob_uop = Array(
                 MicroOp(self.params, name=f'rob_bank{w}_uop{i}')
                 for i in range(self.num_rob_rows))
+            rob_exception = Array(
+                Signal(name=f'rob_bank{w}_exception{i}')
+                for i in range(self.num_rob_rows))
 
             with m.If(self.enq_valids[w]):
                 m.d.sync += [
                     rob_valid[rob_tail].eq(1),
                     rob_busy[rob_tail].eq(1),
                     rob_uop[rob_tail].eq(self.enq_uops[w]),
+                    rob_exception[rob_tail].eq(self.enq_uops[w].exception),
                 ]
 
             for wb in self.wb_resps:
@@ -139,11 +178,23 @@ class ReorderBuffer(Elaboratable):
                     m.d.sync += rob_busy[get_row(clr_idx)].eq(0)
 
             m.d.comb += [
+                can_throw_exception[w].eq(rob_valid[rob_head]
+                                          & rob_exception[rob_head]),
                 can_commit[w].eq(rob_valid[rob_head]
                                  & ~rob_busy[rob_head]),
                 self.commit_req.valids[w].eq(will_commit[w]),
                 self.commit_req.uops[w].eq(rob_uop[com_row]),
             ]
+
+            rollback_row = state_is_rollback & ~full
+            m.d.comb += self.commit_req.rollback_valids[w].eq(
+                rollback_row & rob_valid[commit_idx])
+
+            with m.If(rollback_row):
+                m.d.sync += [
+                    rob_valid[commit_idx].eq(0),
+                    rob_exception[commit_idx].eq(0),
+                ]
 
             for i in range(self.num_rob_rows):
                 with m.If(self.br_update.uop_killed(rob_uop[i])):
@@ -158,10 +209,52 @@ class ReorderBuffer(Elaboratable):
             m.d.comb += rob_head_valids[w].eq(rob_valid[rob_head])
             m.d.comb += rob_head_busy[w].eq(rob_busy[rob_head])
 
-        block_commit = 0
+        exception_thrown = Signal()
+        exception_thrown_d1 = Signal()
+        exception_thrown_d2 = Signal()
+
+        will_throw_exception = Signal()
+        block_commit = (~state_is_normal & ~state_is_wait_empty
+                        ) | exception_thrown_d1 | exception_thrown_d2
+        block_exc = 0
         for w in range(self.core_width):
-            m.d.comb += will_commit[w].eq(can_commit[w] & ~block_commit)
+            next_throw_exception = Signal()
+
+            m.d.comb += [
+                next_throw_exception.eq((can_throw_exception[w] & ~block_commit
+                                         & ~block_exc) | will_throw_exception),
+                will_commit[w].eq(can_commit[w] & ~can_throw_exception[w]
+                                  & ~block_commit)
+            ]
             block_commit |= (rob_head_valids[w] & ~can_commit[w])
+            block_exc = will_commit[w]
+
+            will_throw_exception = next_throw_exception
+
+        #
+        # Exception
+        #
+
+        m.d.comb += exception_thrown.eq(will_throw_exception)
+        m.d.sync += [
+            exception_thrown_d1.eq(exception_thrown),
+            exception_thrown_d2.eq(exception_thrown_d1),
+        ]
+
+        m.d.comb += [
+            self.commit_req.rollback.eq(state_is_rollback),
+            self.commit_exc.valid.eq(exception_thrown),
+        ]
+
+        for w in reversed(range(self.core_width)):
+            with m.If(rob_head_valids[w]):
+                m.d.comb += [
+                    self.commit_exc.ftq_idx.eq(
+                        self.commit_req.uops[w].ftq_idx),
+                    self.commit_exc.pc_lsb.eq(self.commit_req.uops[w].pc_lsb),
+                    self.commit_exc.cause.eq(
+                        self.commit_req.uops[w].exc_cause),
+                ]
 
         do_enq = Signal()
         do_deq = Signal()
@@ -180,7 +273,16 @@ class ReorderBuffer(Elaboratable):
             ]
             m.d.comb += do_deq.eq(1)
 
-        with m.If(self.br_update.br_res.mispredict):
+        with m.If(state_is_rollback & ((rob_tail != rob_head) | maybe_full)):
+            m.d.sync += [
+                rob_tail.eq(_decr(rob_tail, self.num_rob_rows)),
+                rob_tail_lsb.eq(self.core_width - 1)
+            ]
+            m.d.comb += do_deq.eq(1)
+        with m.Elif(state_is_rollback
+                    & ~((rob_tail != rob_head) | maybe_full)):
+            m.d.sync += rob_tail_lsb.eq(rob_head_lsb)
+        with m.Elif(self.br_update.br_res.mispredict):
             m.d.sync += [
                 rob_tail.eq(
                     _incr(get_row(self.br_update.br_res.uop.rob_idx),
@@ -205,13 +307,26 @@ class ReorderBuffer(Elaboratable):
             with m.State('NORMAL'):
                 m.d.comb += state_is_normal.eq(1)
 
-                for w in range(self.core_width):
-                    with m.If(self.enq_valids[w]
-                              & self.enq_uops[w].clear_pipeline):
-                        m.next = 'WAIT_EMPTY'
+                with m.If(exception_thrown_d2):
+                    m.next = 'ROLLBACK'
+                with m.Else():
+                    for w in range(self.core_width):
+                        with m.If(self.enq_valids[w]
+                                  & self.enq_uops[w].clear_pipeline):
+                            m.next = 'WAIT_EMPTY'
+
+            with m.State('ROLLBACK'):
+                m.d.comb += state_is_rollback.eq(1)
+
+                with m.If(empty):
+                    m.next = 'NORMAL'
 
             with m.State('WAIT_EMPTY'):
-                with m.If(empty):
+                m.d.comb += state_is_wait_empty.eq(1)
+
+                with m.If(exception_thrown_d1):
+                    m.next = 'ROLLBACK'
+                with m.Elif(empty):
                     m.next = 'NORMAL'
 
         m.d.comb += [

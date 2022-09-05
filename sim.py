@@ -59,6 +59,8 @@ class Top(Elaboratable):
 
         self.rst = Signal()
 
+        self.debug_int = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -67,6 +69,7 @@ class Top(Elaboratable):
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
         core = Core(Core.validate_params(core_params))
+        m.d.comb += core.interrupts.debug.eq(self.debug_int)
 
         soc.bus.add_master(name='axil_master', master=self.axil_master)
 
@@ -118,7 +121,10 @@ if __name__ == "__main__":
         yield dut.rst.eq(1)
         yield
         yield dut.rst.eq(0)
-        for _ in range(100):
+        for _ in range(50):
+            yield
+        yield dut.debug_int.eq(1)
+        for _ in range(50):
             yield
 
     sim.add_sync_process(process)
