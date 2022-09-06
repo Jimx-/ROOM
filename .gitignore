@@ -5,3 +5,5 @@ rtl/wrapper.v
 results.xml
 sim_build
 *.vcd
+
+debug_rom*

@@ -149,7 +149,7 @@ if __name__ == "__main__":
             yield
 
     def process_debug():
-        for _ in range(100):
+        for _ in range(10):
             yield
         yield from dut.jtag.write_dmi(0x10, 1)
         r = yield from dut.jtag.read_dmi(0x11)
