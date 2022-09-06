@@ -147,6 +147,7 @@ class DataCache(Elaboratable):
             DCacheResp(params, name=f'resp{i}') for i in range(self.mem_width))
 
         self.br_update = BranchUpdate(params)
+        self.exception = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -191,7 +192,8 @@ class DataCache(Elaboratable):
                 m.d.comb += chosen.eq(choice),
 
                 with m.If(req_chosen.valid
-                          & ~self.br_update.uop_killed(req_chosen.uop)):
+                          & ~self.br_update.uop_killed(req_chosen.uop)
+                          & ~self.exception):
                     m.d.comb += [
                         self.dbus.adr.eq(req_chosen.addr[2:]),
                         self.dbus.stb.eq(1),
@@ -234,7 +236,8 @@ class DataCache(Elaboratable):
                         uop.br_mask)),
                 ]
 
-                with m.If(req_chosen.kill | self.br_update.uop_killed(uop)):
+                with m.If(req_chosen.kill | self.br_update.uop_killed(uop)
+                          | self.exception):
                     m.next = 'IDLE'
                 with m.Elif(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
                     m.d.comb += [
@@ -369,6 +372,7 @@ class LoadStoreUnit(Elaboratable):
         ]
 
         self.commit = CommitReq(params)
+        self.exception = Signal()
 
         self.br_update = BranchUpdate(params)
 
@@ -580,6 +584,8 @@ class LoadStoreUnit(Elaboratable):
         #
         # Memory access
         #
+
+        m.d.comb += dcache.exception.eq(self.exception)
 
         for w in range(self.mem_width):
             dmem_req = dcache.reqs[w]
@@ -1000,7 +1006,38 @@ class LoadStoreUnit(Elaboratable):
                 stq_head.eq(_incr(stq_head, self.stq_size)),
             ]
 
+        #
+        # Exception
+        #
+
+        st_exc_killed_mask = Signal(self.stq_size)
+
+        with m.If(self.exception):
+            m.d.sync += [
+                ldq_head.eq(0),
+                ldq_tail.eq(0),
+            ]
+
+            for i in range(self.ldq_size):
+                m.d.sync += [
+                    ldq[i].valid.eq(0),
+                    ldq[i].addr_valid.eq(0),
+                    ldq[i].executed.eq(0),
+                ]
+
+            m.d.sync += stq_tail.eq(stq_commit_head)
+            for i in range(self.stq_size):
+                with m.If(~stq[i].committed & ~stq[i].succeeded):
+                    m.d.sync += [
+                        stq[i].valid.eq(0),
+                        stq[i].addr_valid.eq(0),
+                        stq[i].data_valid.eq(0),
+                    ]
+
+                    m.d.comb += st_exc_killed_mask[i].eq(1)
+
         m.d.sync += live_store_mask.eq(next_live_store_mask
-                                       & ~st_brkilled_mask)
+                                       & ~st_brkilled_mask
+                                       & ~st_exc_killed_mask)
 
         return m

@@ -68,10 +68,11 @@ class CSRFile(Elaboratable):
         self._csr_map = OrderedDict()
         self._ports = []
 
+        self.mhartid = CSR(csrnames.mhartid, [('value', 32, CSRAccess.RO)])
         self.misa = CSR(csrnames.misa, misa_layout)
         self.mscratch = CSR(csrnames.mscratch, [('value', 32, CSRAccess.RW)])
 
-        self.add_csrs([self.misa, self.mscratch])
+        self.add_csrs([self.mhartid, self.misa, self.mscratch])
 
     def add_csrs(self, csrs):
         for csr in csrs:

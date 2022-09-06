@@ -1,13 +1,13 @@
 from amaranth import *
 from amaranth.lib.fifo import AsyncFIFO
 
-from room.jtag import JTAGInterface, JTAGTap, JTAGReg
-
 from roomsoc.interconnect import wishbone
+from .jtag import JTAGInterface, JTAGTap, JTAGReg
+from .peripheral import Peripheral
 
 from enum import Enum, IntEnum
 
-__all__ = ('DebugUnit', )
+__all__ = ('DebugModule', )
 
 _dtmcs_layout = [("version", 4), ("abits", 6), ("dmistat", 2), ("idle", 3),
                  ("zero0", 1), ("dmireset", 1), ("dmihardreset", 1),
@@ -389,7 +389,9 @@ class DebugRegisterFile(Elaboratable):
 
 class DebugController(Elaboratable):
 
-    def __init__(self, debugrf):
+    def __init__(self, debugrf, csr_bank):
+        self.debug_int = Signal()
+
         self.dmstatus = debugrf.reg_port(DebugReg.DMSTATUS)
         self.dmcontrol = debugrf.reg_port(DebugReg.DMCONTROL)
         self.hartinfo = debugrf.reg_port(DebugReg.HARTINFO)
@@ -398,8 +400,14 @@ class DebugController(Elaboratable):
         self.data0 = debugrf.reg_port(DebugReg.DATA0)
         self.haltsum0 = debugrf.reg_port(DebugReg.HALTSUM0)
 
+        self._halted = csr_bank.csr(32, 'w', addr=DebugModuleCSR.HALTED)
+        self._going = csr_bank.csr(32, 'r', addr=DebugModuleCSR.GOING)
+        self._resuming = csr_bank.csr(32, 'r', addr=DebugModuleCSR.RESUMING)
+
     def elaborate(self, platform):
         m = Module()
+
+        hart_halted = Signal()
 
         with m.If(self.dmcontrol.update):
             m.d.sync += self.dmcontrol.w.dmactive.eq(self.dmcontrol.r.dmactive)
@@ -409,6 +417,7 @@ class DebugController(Elaboratable):
                     self.dmcontrol.w.ndmreset.eq(self.dmcontrol.r.ndmreset),
                     self.dmcontrol.w.hartsello.eq(self.dmcontrol.r.hartsello),
                     self.dmcontrol.w.hartreset.eq(self.dmcontrol.r.hartreset),
+                    self.dmcontrol.w.haltreq.eq(self.dmcontrol.r.haltreq),
                     self.dmcontrol.w.resumereq.eq(self.dmcontrol.r.resumereq),
                 ]
 
@@ -426,6 +435,12 @@ class DebugController(Elaboratable):
                 )
             ]
 
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += self.debug_int.eq(0)
+        with m.Else():
+            with m.If(self.dmcontrol.update):
+                m.d.sync += self.debug_int.eq(self.dmcontrol.r.haltreq)
+
         with m.If(self.abstractcs.update):
             m.d.sync += self.abstractcs.w.cmderr.eq(self.abstractcs.r.cmderr)
         with m.If(~self.dmcontrol.w.dmactive):
@@ -439,10 +454,15 @@ class DebugController(Elaboratable):
         m.d.comb += [
             self.dmstatus.w.version.eq(Version.V013),
             self.dmstatus.w.authenticated.eq(1),
-            # self.dmstatus.w.allrunning.eq(1),
-            # self.dmstatus.w.anyrunning.eq(1),
+            self.dmstatus.w.allrunning.eq(~hart_halted),
+            self.dmstatus.w.anyrunning.eq(~hart_halted),
+            self.dmstatus.w.allhalted.eq(hart_halted),
+            self.dmstatus.w.anyhalted.eq(hart_halted),
             self.haltsum0.w[0].eq(self.dmstatus.w.allhalted),
         ]
+
+        with m.If(self._halted.w_stb):
+            m.d.sync += hart_halted.eq(1)
 
         return m
 
@@ -567,21 +587,55 @@ class SystemBusAccess(Elaboratable):
         return m
 
 
-class DebugUnit(Elaboratable):
+class DebugModuleCSR(IntEnum):
+    HALTED = 0x0
+    GOING = 0x4
+    RESUMING = 0x8
 
-    def __init__(self):
+    ROM_BASE = 0x800
+
+
+class DebugModule(Peripheral, Elaboratable):
+
+    def __init__(self, rom_init, *, name=None):
+        super().__init__(name=name)
+
+        self.rom_init = rom_init
+
         self.jtag = JTAGInterface()
+        self.debug_int = Signal()
 
         self.dbus = wishbone.Interface(addr_width=30,
                                        data_width=32,
                                        granularity=8)
 
+        self._rom_bus = self.window(addr_width=Shape.cast(range(
+            len(rom_init))).width,
+                                    data_width=32,
+                                    granularity=8,
+                                    addr=DebugModuleCSR.ROM_BASE)
+
+        bank = self.csr_bank()
+        self._regfile = DebugRegisterFile()
+        self._controller = DebugController(self._regfile, bank)
+
+        self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
+        self.bus = self._bridge.bus
+
     def elaborate(self, platform):
         m = Module()
+        m.submodules.bridge = self._bridge
+
+        m.submodules.rom = wishbone.SRAM(Memory(
+            width=self._rom_bus.data_width,
+            depth=2**self._rom_bus.addr_width,
+            init=self.rom_init),
+                                         read_only=True,
+                                         bus=self._rom_bus)
 
         dtm = m.submodules.dtm = DebugTransportModule()
-        regfile = m.submodules.regfile = DebugRegisterFile()
-        m.submodules.controller = DebugController(regfile)
+        regfile = m.submodules.regfile = self._regfile
+        controller = m.submodules.controller = self._controller
         sba = m.submodules.sb_access = SystemBusAccess(regfile)
 
         m.d.comb += [
@@ -593,6 +647,8 @@ class DebugUnit(Elaboratable):
             dtm.dmi_resp_valid.eq(regfile.dmi_resp_valid),
             regfile.dmi_resp_ready.eq(dtm.dmi_resp_ready),
         ]
+
+        m.d.comb += self.debug_int.eq(controller.debug_int)
 
         m.d.comb += sba.bus.connect(self.dbus)
 

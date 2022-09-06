@@ -27,6 +27,7 @@ class Core(Elaboratable):
         self.core_width = params['core_width']
 
         self.interrupts = CoreInterrupts()
+        self.debug_entry = Signal(32)
 
         ibus_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
         self.ibus = wishbone.Interface(data_width=params['fetch_width'] * 16,
@@ -198,7 +199,7 @@ class Core(Elaboratable):
 
         rob = m.submodules.rob = ReorderBuffer(
             exec_units.irf_write_ports + mem_width, self.params)
-        rob_flush_d1 = Signal()
+        rob_flush_d1 = Record(rob.flush.layout)
         m.d.sync += rob_flush_d1.eq(rob.flush)
 
         for enq_uop, dis_uop in zip(rob.enq_uops, dis_uops):
@@ -227,7 +228,14 @@ class Core(Elaboratable):
         # Frontend redirect
         #
 
-        with m.If(br_update.br_res.mispredict & ~rob_flush_d1):
+        with m.If(rob_flush_d1.valid):
+            m.d.comb += [
+                if_stage.redirect_valid.eq(1),
+                if_stage.redirect_flush.eq(1),
+                if_stage.redirect_pc.eq(exc_unit.exc_vector),
+                if_stage.redirect_ftq_idx.eq(rob_flush_d1.ftq_idx),
+            ]
+        with m.Elif(br_update.br_res.mispredict & ~rob_flush_d1.valid):
             uop = br_update.br_res.uop
             uop_pc = if_stage.get_pc[1].pc | uop.pc_lsb
             npc = uop_pc + Mux(uop.is_rvc, 2, 4)
@@ -272,7 +280,7 @@ class Core(Elaboratable):
                 iq.dis_valids.eq(dvalids),
                 dready.eq(iq.ready),
                 iq.br_update.eq(br_update),
-                iq.flush_pipeline.eq(rob_flush_d1),
+                iq.flush_pipeline.eq(rob_flush_d1.valid),
             ]
 
         #
@@ -364,7 +372,7 @@ class Core(Elaboratable):
 
         m.d.comb += [
             iregread.br_update.eq(br_update),
-            iregread.kill.eq(rob_flush_d1),
+            iregread.kill.eq(rob_flush_d1.valid),
         ]
 
         #
@@ -402,7 +410,7 @@ class Core(Elaboratable):
                               [eu for eu in exec_units if eu.has_alu]):
             m.d.sync += [
                 br_res.eq(eu.br_res),
-                br_res.valid.eq(eu.br_res.valid & ~rob.flush),
+                br_res.valid.eq(eu.br_res.valid & ~rob.flush.valid),
             ]
 
         #
@@ -439,6 +447,7 @@ class Core(Elaboratable):
         m.d.comb += [
             lsu.commit.eq(rob.commit_req),
             lsu.br_update.eq(br_update),
+            lsu.exception.eq(rob_flush_d1.valid),
         ]
 
         #
@@ -539,6 +548,7 @@ class Core(Elaboratable):
         #
 
         m.d.sync += [
+            exc_unit.debug_entry.eq(self.debug_entry),
             exc_unit.exception.eq(rob.commit_exc.valid),
             exc_unit.cause.eq(rob.commit_exc.cause),
             exc_unit.epc.eq(if_stage.get_pc[0].commit_pc +

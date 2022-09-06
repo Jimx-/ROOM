@@ -2,12 +2,12 @@ from amaranth import *
 from amaranth.build import *
 
 from room.consts import *
-from room.debug import JTAGInterface, DebugUnit
 from room import Core
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
 from roomsoc.peripheral.uart import UART
+from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 from roomsoc.platform.kc705 import KC705Platform
 
 import argparse
@@ -50,8 +50,9 @@ class Top(Elaboratable):
         'sram': 0x20000000,
     }
 
-    def __init__(self, clk_freq, rom_image=[], ram_image=[]):
+    def __init__(self, clk_freq, rom_image, debug_rom_image, ram_image=[]):
         self.rom_image = rom_image
+        self.debug_rom_image = debug_rom_image
         self.ram_image = ram_image
         self.clk_freq = clk_freq
 
@@ -70,17 +71,23 @@ class Top(Elaboratable):
 
         core = Core(Core.validate_params(core_params))
 
-        debug_unit = m.submodules.debug_unit = DebugUnit()
-        m.d.comb += debug_unit.jtag.connect(self.jtag)
+        debug_module = DebugModule(self.debug_rom_image)
+        m.d.comb += [
+            debug_module.jtag.connect(self.jtag),
+            core.interrupts.debug.eq(debug_module.debug_int),
+        ]
 
         soc.bus.add_master(name='axil_master', master=self.axil_master)
-        soc.bus.add_master(name='dm_master', master=debug_unit.dbus)
+        soc.bus.add_master(name='dm_master', master=debug_module.dbus)
 
         soc.add_rom(name='rom',
                     origin=self.mem_map['rom'],
                     size=0x2000,
                     init=self.rom_image,
                     mode='rw')
+
+        soc.add_peripheral('dm', debug_module)
+
         soc.add_ram(name='sram',
                     origin=self.mem_map['sram'],
                     size=0x1000,
@@ -92,8 +99,15 @@ class Top(Elaboratable):
 
         soc.add_peripheral('uart', self.uart)
 
+        dm_base = 0
+
         for res, start, size in soc.resources():
+            if res.name == 'debug_module_halted':
+                dm_base = start
+
             print(res.name, hex(start), size)
+
+        m.d.comb += core.debug_entry.eq(dm_base + 0x800)
 
         return m
 
@@ -103,6 +117,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='ROOM SoC simulation')
     parser.add_argument('rom', type=str, help='ROM image')
+    parser.add_argument('debug_rom', type=str, help='Debug ROM image')
     parser.add_argument('--ram', type=str, help='RAM image', default=None)
     parser.add_argument('--freq',
                         type=int,
@@ -111,13 +126,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     rom = read_mem_image(args.rom)
+    debug_rom = read_mem_image(args.debug_rom)
 
     if args.ram is not None:
         ram = read_mem_image(args.ram)
     else:
         ram = []
 
-    top = Top(args.freq, rom_image=rom)
+    top = Top(args.freq, rom_image=rom, debug_rom_image=debug_rom)
 
     with open('/tmp/soc_wrapper.v', 'w') as f:
         f.write(

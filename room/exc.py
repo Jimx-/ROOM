@@ -95,7 +95,9 @@ class ExceptionUnit(Elaboratable, AutoCSR):
 
         self.interrupt = Signal()
         self.interrupt_cause = Signal(32)
+        self.exc_vector = Signal(32)
 
+        self.debug_entry = Signal(32)
         self.exception = Signal()
         self.cause = Signal(32)
         self.epc = Signal(32)
@@ -141,6 +143,8 @@ class ExceptionUnit(Elaboratable, AutoCSR):
 
         is_debug_int = cause.interrupt & (cause.ecode == Cause.DEBUG_INTERRUPT)
         trap_to_debug = is_debug_int
+
+        m.d.comb += self.exc_vector.eq(Mux(trap_to_debug, self.debug_entry, 0))
 
         with m.If(self.exception):
             with m.If(trap_to_debug):

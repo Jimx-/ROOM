@@ -1,8 +1,10 @@
 from amaranth import *
 from amaranth import tracer
+from amaranth.utils import log2_int
 
 from amaranth_soc import wishbone, csr
 from amaranth_soc.csr.wishbone import WishboneCSRBridge
+from amaranth_soc.memory import MemoryMap
 
 
 class Peripheral:
@@ -12,6 +14,7 @@ class Peripheral:
                                                 src_loc_at).lstrip("_")
 
         self._csr_banks = []
+        self._windows = []
 
         self._bus = None
 
@@ -35,6 +38,24 @@ class Peripheral:
         self._csr_banks.append((bank, addr, alignment))
         return bank
 
+    def window(self,
+               *,
+               addr_width,
+               data_width,
+               granularity=None,
+               alignment=0,
+               addr=None,
+               sparse=None):
+        window = wishbone.Interface(addr_width=addr_width,
+                                    data_width=data_width,
+                                    granularity=granularity)
+        granularity_bits = log2_int(data_width // window.granularity)
+        window.memory_map = MemoryMap(addr_width=addr_width + granularity_bits,
+                                      data_width=window.granularity,
+                                      alignment=alignment)
+        self._windows.append((window, addr, sparse))
+        return window
+
     def bridge(self, *, data_width=8, granularity=None, alignment=0):
         return PeripheralBridge(self,
                                 data_width=data_width,
@@ -44,6 +65,10 @@ class Peripheral:
     def iter_csr_banks(self):
         for bank, addr, alignment in self._csr_banks:
             yield bank, addr, alignment
+
+    def iter_windows(self):
+        for window, addr, sparse in self._windows:
+            yield window, addr, sparse
 
 
 class CSRBank:
@@ -101,6 +126,12 @@ class PeripheralBridge(Elaboratable):
                                  addr=bank_addr,
                                  extend=True)
             self.csr_subs.append((csr_mux, csr_bridge))
+
+        for window, window_addr, window_sparse in periph.iter_windows():
+            self.bus_decoder.add(window,
+                                 addr=window_addr,
+                                 sparse=window_sparse,
+                                 extend=True)
 
         self.bus = self.bus_decoder.bus
 

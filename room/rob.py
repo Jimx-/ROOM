@@ -100,7 +100,7 @@ class ReorderBuffer(Elaboratable):
         self.ready = Signal()
         self.empty = Signal()
 
-        self.flush = Signal()
+        self.flush = CommitExceptionReq(params)
 
     def elaborate(self, platform):
         m = Module()
@@ -251,15 +251,22 @@ class ReorderBuffer(Elaboratable):
             self.commit_exc.valid.eq(exception_thrown),
         ]
 
+        commit_exc_uop = MicroOp(self.params, name='commit_exc_uop')
         for w in reversed(range(self.core_width)):
             with m.If(rob_head_valids[w]):
-                m.d.comb += [
-                    self.commit_exc.ftq_idx.eq(
-                        self.commit_req.uops[w].ftq_idx),
-                    self.commit_exc.pc_lsb.eq(self.commit_req.uops[w].pc_lsb),
-                    self.commit_exc.cause.eq(
-                        self.commit_req.uops[w].exc_cause),
-                ]
+                m.d.comb += commit_exc_uop.eq(self.commit_req.uops[w])
+
+        m.d.comb += [
+            self.commit_exc.ftq_idx.eq(commit_exc_uop.ftq_idx),
+            self.commit_exc.pc_lsb.eq(commit_exc_uop.pc_lsb),
+            self.commit_exc.cause.eq(commit_exc_uop.exc_cause),
+        ]
+
+        flush_uop = commit_exc_uop
+        m.d.comb += [
+            self.flush.valid.eq(exception_thrown),
+            self.flush.ftq_idx.eq(flush_uop.ftq_idx),
+        ]
 
         do_enq = Signal()
         do_deq = Signal()
