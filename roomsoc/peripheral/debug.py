@@ -1,5 +1,7 @@
 from amaranth import *
 from amaranth.lib.fifo import AsyncFIFO
+import riscvmodel.insn as insn
+import riscvmodel.csrnames as csrnames
 
 from roomsoc.interconnect import wishbone
 from .jtag import JTAGInterface, JTAGTap, JTAGReg
@@ -387,7 +389,123 @@ class DebugRegisterFile(Elaboratable):
         return m
 
 
+class DebugModuleCSR(IntEnum):
+    HALTED = 0x0
+    GOING = 0x4
+    RESUMING = 0x8
+
+    TRAMPOLINE = 0x300
+    ABSTRACT = 0x320
+    DATA = 0x380
+
+    FLAGS = 0x400
+
+    ROM_BASE = 0x800
+
+
 class DebugController(Elaboratable):
+
+    class GenerateI(Elaboratable):
+
+        def __init__(self, insn):
+            self.insn = insn
+
+            self.rd = Signal(5)
+            self.rs1 = Signal(5)
+            self.imm = Signal(12)
+            self.inst = Signal(32)
+
+        def elaborate(self, platform):
+            m = Module()
+
+            m.d.comb += [
+                self.inst[:7].eq(self.insn.field_opcode.value),
+                self.inst[7:12].eq(self.rd),
+                self.inst[12:15].eq(self.insn.field_funct3.value),
+                self.inst[15:20].eq(self.rs1),
+                self.inst[20:].eq(self.imm),
+            ]
+
+            return m
+
+    class GenerateS(Elaboratable):
+
+        def __init__(self, insn):
+            self.insn = insn
+
+            self.rs1 = Signal(5)
+            self.rs2 = Signal(5)
+            self.imm = Signal(12)
+            self.inst = Signal(32)
+
+        def elaborate(self, platform):
+            m = Module()
+
+            m.d.comb += [
+                self.inst[:7].eq(self.insn.field_opcode.value),
+                self.inst[7:12].eq(self.imm[:5]),
+                self.inst[12:15].eq(self.insn.field_funct3.value),
+                self.inst[15:20].eq(self.rs1),
+                self.inst[20:25].eq(self.rs2),
+                self.inst[25:].eq(self.imm[5:]),
+            ]
+
+            return m
+
+    class GenerateGPRAccess(Elaboratable):
+
+        def __init__(self):
+            self.cmd = Record(cmd_access_reg_layout)
+            self.insts = Signal(32 * 4)
+
+        def elaborate(self, platform):
+            m = Module()
+
+            base = Mux(self.cmd.regno[0], 8, 9)
+
+            gen_ld = DebugController.GenerateI(insn.InstructionLW)
+            m.submodules += gen_ld
+            m.d.comb += [
+                gen_ld.rd.eq(self.cmd.regno),
+                gen_ld.rs1.eq(base),
+                gen_ld.imm.eq((DebugModuleCSR.DATA - DebugModuleCSR.ROM_BASE)
+                              & 0xfff),
+            ]
+
+            gen_st = DebugController.GenerateS(insn.InstructionSW)
+            m.submodules += gen_st
+            m.d.comb += [
+                gen_st.rs1.eq(base),
+                gen_st.rs2.eq(self.cmd.regno),
+                gen_st.imm.eq((DebugModuleCSR.DATA - DebugModuleCSR.ROM_BASE)
+                              & 0xfff),
+            ]
+
+            gen_csr = DebugController.GenerateI(insn.InstructionCSRRW)
+            m.submodules += gen_csr
+            m.d.comb += [
+                gen_csr.rd.eq(base),
+                gen_csr.rs1.eq(base),
+                gen_csr.imm.eq(csrnames.dscratch1),
+            ]
+
+            nop = insn.InstructionADDI.field_opcode.value
+
+            # Instruction 1: CSRRW s1,dscratch1,s1 or CSRRW s0,dscratch1,s0
+            m.d.comb += self.insts[:32].eq(gen_csr.inst)
+
+            # Instruction 2: LW regno,DebugModuleCSR.DATA(s{0,1}) or SW regno,DebugModuleCSR.DATA(s{0,1})
+            m.d.comb += self.insts[32:64].eq(
+                Mux(self.cmd.transfer,
+                    Mux(self.cmd.write, gen_ld.inst, gen_st.inst), nop))
+
+            # Instruction 3: CSRRW s1,dscratch1,s1 or CSRRW s0,dscratch1,s0
+            m.d.comb += self.insts[64:96].eq(gen_csr.inst)
+
+            # Instruction 4:
+            m.d.comb += self.insts[96:].eq(0x6f)
+
+            return m
 
     def __init__(self, debugrf, csr_bank):
         self.debug_int = Signal()
@@ -401,8 +519,17 @@ class DebugController(Elaboratable):
         self.haltsum0 = debugrf.reg_port(DebugReg.HALTSUM0)
 
         self._halted = csr_bank.csr(32, 'w', addr=DebugModuleCSR.HALTED)
-        self._going = csr_bank.csr(32, 'r', addr=DebugModuleCSR.GOING)
+        self._going = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.GOING)
         self._resuming = csr_bank.csr(32, 'r', addr=DebugModuleCSR.RESUMING)
+        self._trampoline = csr_bank.csr(32,
+                                        'r',
+                                        addr=DebugModuleCSR.TRAMPOLINE)
+        self._flags = csr_bank.csr(8, 'r', addr=DebugModuleCSR.FLAGS)
+
+        self._abstract_rom = csr_bank.csr(32 * 4,
+                                          'r',
+                                          addr=DebugModuleCSR.ABSTRACT)
+        self._shadowed_data = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.DATA)
 
     def elaborate(self, platform):
         m = Module()
@@ -446,10 +573,18 @@ class DebugController(Elaboratable):
         with m.If(~self.dmcontrol.w.dmactive):
             m.d.sync += self.abstractcs.w.cmderr.eq(0)
 
+        abstract_data = Signal(32)
+        m.d.comb += [
+            self.data0.w.eq(abstract_data),
+            self._shadowed_data.r_data.eq(abstract_data),
+        ]
+
         with m.If(self.data0.update):
-            m.d.sync += self.data0.w.eq(self.data0.r)
+            m.d.sync += abstract_data.eq(self.data0.r)
+        with m.Elif(self._shadowed_data.w_stb):
+            m.d.sync += abstract_data.eq(self._shadowed_data.w_data)
         with m.If(~self.dmcontrol.w.dmactive):
-            m.d.sync += self.data0.w.eq(0)
+            m.d.sync += abstract_data.eq(0)
 
         m.d.comb += [
             self.dmstatus.w.version.eq(Version.V013),
@@ -463,6 +598,64 @@ class DebugController(Elaboratable):
 
         with m.If(self._halted.w_stb):
             m.d.sync += hart_halted.eq(1)
+
+        go_req = Signal()
+        go_abstract = Signal()
+
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += go_req.eq(0)
+        with m.Elif(go_abstract):
+            m.d.sync += go_req.eq(1)
+        with m.Elif(self._going.w_stb):
+            m.d.sync += go_req.eq(0)
+
+        m.d.comb += self._flags.r_data[0].eq(go_req)
+
+        #
+        # Abstract command instruction generation
+        #
+
+        cmd_access_reg = Record(cmd_access_reg_layout)
+        m.d.comb += cmd_access_reg.eq(self.command.r.control)
+
+        # JAL from DebugModuleCSR.TRAMPOLINE to DebugModuleCSR.ABSTRACT
+        m.d.comb += self._trampoline.r_data.eq(
+            insn.InstructionJAL.field_opcode.value
+            | (((DebugModuleCSR.ABSTRACT -
+                 DebugModuleCSR.TRAMPOLINE) >> 1) << 21))
+
+        gen_gpr_access = DebugController.GenerateGPRAccess()
+        m.submodules += gen_gpr_access
+        m.d.comb += gen_gpr_access.cmd.eq(cmd_access_reg)
+
+        with m.If(go_abstract):
+            m.d.sync += self._abstract_rom.r_data.eq(gen_gpr_access.insts)
+
+        # Abstract command FSM
+        #
+
+        with m.FSM():
+            with m.State('WAIT'):
+                with m.If(self.command.update):
+                    m.d.sync += self.abstractcs.w.busy.eq(1)
+                    m.next = 'CMD_START'
+
+            with m.State('CMD_START'):
+                with m.Switch(self.command.r.cmdtype):
+                    with m.Case(Command.ACCESS_REG):
+                        m.d.comb += go_abstract.eq(1)
+                        m.next = 'CMD_EXEC'
+                    with m.Case():
+                        m.d.sync += self.abstractcs.w.cmderr.eq(
+                            Error.UNSUPPORTED)
+                        m.next = 'CMD_DONE'
+
+            with m.State('CMD_EXEC'):
+                pass
+
+            with m.State('CMD_DONE'):
+                m.d.sync += self.abstractcs.w.busy.eq(0)
+                m.next = 'WAIT'
 
         return m
 
@@ -585,14 +778,6 @@ class SystemBusAccess(Elaboratable):
                     m.next = "IDLE"
 
         return m
-
-
-class DebugModuleCSR(IntEnum):
-    HALTED = 0x0
-    GOING = 0x4
-    RESUMING = 0x8
-
-    ROM_BASE = 0x800
 
 
 class DebugModule(Peripheral, Elaboratable):

@@ -107,6 +107,8 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         self.mcause = CSR(csrnames.mcause, mcause_layout)
 
         self.dpc = CSR(csrnames.dpc, [('value', 32, CSRAccess.RW)])
+        self.dscratch0 = CSR(csrnames.dscratch0, [('value', 32, CSRAccess.RW)])
+        self.dscratch1 = CSR(csrnames.dscratch1, [('value', 32, CSRAccess.RW)])
 
     def elaborate(self, platform):
         m = Module()
@@ -153,5 +155,10 @@ class ExceptionUnit(Elaboratable, AutoCSR):
                         debug_mode.eq(1),
                         self.dpc.r.eq(self.epc),
                     ]
+
+        with m.If(self.dscratch0.we):
+            m.d.sync += self.dscratch0.r.eq(self.dscratch0.w)
+        with m.If(self.dscratch1.we):
+            m.d.sync += self.dscratch1.r.eq(self.dscratch1.w)
 
         return m
