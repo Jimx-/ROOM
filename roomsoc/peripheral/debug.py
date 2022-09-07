@@ -507,6 +507,92 @@ class DebugController(Elaboratable):
 
             return m
 
+    class GenerateCSRAccess(Elaboratable):
+
+        def __init__(self):
+            self.cmd = Record(cmd_access_reg_layout)
+            self.insts = Signal(32 * 7)
+
+        def elaborate(self, platform):
+            m = Module()
+
+            gen_csrr = DebugController.GenerateI(insn.InstructionCSRRS)
+            m.submodules += gen_csrr
+            m.d.comb += [
+                gen_csrr.rd.eq(8),
+                gen_csrr.imm.eq(self.cmd.regno),
+            ]
+
+            gen_csrw = DebugController.GenerateI(insn.InstructionCSRRW)
+            m.submodules += gen_csrw
+            m.d.comb += [
+                gen_csrw.rs1.eq(8),
+                gen_csrw.imm.eq(self.cmd.regno),
+            ]
+
+            gen_st = DebugController.GenerateS(insn.InstructionSW)
+            m.submodules += gen_st
+            m.d.comb += [
+                gen_st.rs1.eq(9),
+                gen_st.rs2.eq(8),
+                gen_st.imm.eq((DebugModuleCSR.DATA - DebugModuleCSR.ROM_BASE)
+                              & 0xfff),
+            ]
+
+            gen_ld = DebugController.GenerateI(insn.InstructionLW)
+            m.submodules += gen_ld
+            m.d.comb += [
+                gen_ld.rd.eq(8),
+                gen_ld.rs1.eq(9),
+                gen_ld.imm.eq((DebugModuleCSR.DATA - DebugModuleCSR.ROM_BASE)
+                              & 0xfff),
+            ]
+
+            gen_csr_s0 = DebugController.GenerateI(insn.InstructionCSRRW)
+            m.submodules += gen_csr_s0
+            m.d.comb += [
+                gen_csr_s0.rd.eq(8),
+                gen_csr_s0.rs1.eq(8),
+                gen_csr_s0.imm.eq(csrnames.dscratch0),
+            ]
+
+            gen_csr_s1 = DebugController.GenerateI(insn.InstructionCSRRW)
+            m.submodules += gen_csr_s1
+            m.d.comb += [
+                gen_csr_s1.rd.eq(9),
+                gen_csr_s1.rs1.eq(9),
+                gen_csr_s1.imm.eq(csrnames.dscratch1),
+            ]
+
+            nop = insn.InstructionADDI.field_opcode.value
+
+            # Instrution 1: CSRRW s0,dscratch0,s0
+            m.d.comb += self.insts[:32].eq(gen_csr_s0.inst)
+
+            # Instrution 2: CSRRW s1,dscratch1,s1
+            m.d.comb += self.insts[32:64].eq(gen_csr_s1.inst)
+
+            # Instrution 3: CSRR s0,regno or LD s0,DebugModuleCSR.DATA(s1)
+            m.d.comb += self.insts[64:96].eq(
+                Mux(self.cmd.transfer,
+                    Mux(self.cmd.write, gen_ld.inst, gen_csrr.inst), nop))
+
+            # Instrution 4: SW s0,DebugModuleCSR.DATA(s1) or CSRW regno,s0
+            m.d.comb += self.insts[96:128].eq(
+                Mux(self.cmd.transfer,
+                    Mux(self.cmd.write, gen_csrw.inst, gen_st.inst), nop))
+
+            # Instrution 5: CSRRW s1,dscratch1,s1
+            m.d.comb += self.insts[128:160].eq(gen_csr_s1.inst)
+
+            # Instrution 6: CSRRW s0,dscratch0,s0
+            m.d.comb += self.insts[160:192].eq(gen_csr_s0.inst)
+
+            # Instrution 7:
+            m.d.comb += self.insts[192:224].eq(0x6f)
+
+            return m
+
     def __init__(self, debugrf, csr_bank):
         self.debug_int = Signal()
 
@@ -526,7 +612,7 @@ class DebugController(Elaboratable):
                                         addr=DebugModuleCSR.TRAMPOLINE)
         self._flags = csr_bank.csr(8, 'r', addr=DebugModuleCSR.FLAGS)
 
-        self._abstract_rom = csr_bank.csr(32 * 4,
+        self._abstract_rom = csr_bank.csr(32 * 7,
                                           'r',
                                           addr=DebugModuleCSR.ABSTRACT)
         self._shadowed_data = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.DATA)
@@ -628,8 +714,15 @@ class DebugController(Elaboratable):
         m.submodules += gen_gpr_access
         m.d.comb += gen_gpr_access.cmd.eq(cmd_access_reg)
 
+        gen_csr_access = DebugController.GenerateCSRAccess()
+        m.submodules += gen_csr_access
+        m.d.comb += gen_csr_access.cmd.eq(cmd_access_reg)
+
         with m.If(go_abstract):
-            m.d.sync += self._abstract_rom.r_data.eq(gen_gpr_access.insts)
+            with m.If(cmd_access_reg.regno.matches("0000------------")):
+                m.d.sync += self._abstract_rom.r_data.eq(gen_csr_access.insts)
+            with m.Elif(cmd_access_reg.regno.matches("00010000000-----")):
+                m.d.sync += self._abstract_rom.r_data.eq(gen_gpr_access.insts)
 
         # Abstract command FSM
         #
