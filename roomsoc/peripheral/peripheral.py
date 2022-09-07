@@ -3,8 +3,9 @@ from amaranth import tracer
 from amaranth.utils import log2_int
 
 from amaranth_soc import wishbone, csr
-from amaranth_soc.csr.wishbone import WishboneCSRBridge
 from amaranth_soc.memory import MemoryMap
+
+from roomsoc.interconnect.csr import WishboneCSRBridge
 
 
 class Peripheral:

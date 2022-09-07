@@ -151,19 +151,19 @@ sbcs_layout = [("sbaccess8", 1, RegMode.R, True),
 
 flat_layout = [("value", 32, RegMode.RW, 0)]
 
-reg_map = {
-    DebugReg.DMSTATUS: dmstatus_layout,
-    DebugReg.DMCONTROL: dmcontrol_layout,
-    DebugReg.HARTINFO: flat_layout,
-    DebugReg.ABSTRACTCS: abstractcs_layout,
-    DebugReg.COMMAND: command_layout,
-    DebugReg.SBCS: sbcs_layout,
-    DebugReg.SBADDRESS0: flat_layout,
-    DebugReg.SBDATA0: flat_layout,
-    DebugReg.DATA0: flat_layout,
-    DebugReg.HALTSUM0: flat_layout,
-    DebugReg.HALTSUM1: flat_layout,
-}
+reg_map = dict([
+    (DebugReg.DMSTATUS, dmstatus_layout),
+    (DebugReg.DMCONTROL, dmcontrol_layout),
+    (DebugReg.HARTINFO, flat_layout),
+    (DebugReg.ABSTRACTCS, abstractcs_layout),
+    (DebugReg.COMMAND, command_layout),
+    (DebugReg.SBCS, sbcs_layout),
+    (DebugReg.SBADDRESS0, flat_layout),
+    (DebugReg.SBDATA0, flat_layout),
+    (DebugReg.DATA0, flat_layout),
+    (DebugReg.HALTSUM0, flat_layout),
+    (DebugReg.HALTSUM1, flat_layout),
+] + [(DebugReg.PROGBUF0 + i, flat_layout) for i in range(16)])
 
 
 class DmiError(IntEnum):
@@ -395,7 +395,8 @@ class DebugModuleCSR(IntEnum):
     RESUMING = 0x8
 
     TRAMPOLINE = 0x300
-    ABSTRACT = 0x320
+    PROGBUF = 0x340
+    ABSTRACT = PROGBUF - 4 * 7
     DATA = 0x380
 
     FLAGS = 0x400
@@ -456,7 +457,7 @@ class DebugController(Elaboratable):
 
         def __init__(self):
             self.cmd = Record(cmd_access_reg_layout)
-            self.insts = Signal(32 * 4)
+            self.insts = Signal(32 * 7)
 
         def elaborate(self, platform):
             m = Module()
@@ -489,6 +490,11 @@ class DebugController(Elaboratable):
                 gen_csr.imm.eq(csrnames.dscratch1),
             ]
 
+            gen_ebreak = DebugController.GenerateI(insn.InstructionEBREAK)
+            m.submodules += gen_ebreak
+            m.d.comb += gen_ebreak.imm.eq(
+                insn.InstructionEBREAK.field_imm.value)
+
             nop = insn.InstructionADDI.field_opcode.value
 
             # Instruction 1: CSRRW s1,dscratch1,s1 or CSRRW s0,dscratch1,s0
@@ -502,8 +508,18 @@ class DebugController(Elaboratable):
             # Instruction 3: CSRRW s1,dscratch1,s1 or CSRRW s0,dscratch1,s0
             m.d.comb += self.insts[64:96].eq(gen_csr.inst)
 
-            # Instruction 4:
-            m.d.comb += self.insts[96:].eq(0x6f)
+            # Instruction 4: EBREAK or NOP (for postexec)
+            m.d.comb += self.insts[96:128].eq(
+                Mux(self.cmd.postexec, nop, gen_ebreak.inst))
+
+            # Instrution 5: NOP
+            m.d.comb += self.insts[128:160].eq(nop)
+
+            # Instrution 6: NOP
+            m.d.comb += self.insts[160:192].eq(nop)
+
+            # Instrution 7: NOP
+            m.d.comb += self.insts[192:224].eq(nop)
 
             return m
 
@@ -564,6 +580,11 @@ class DebugController(Elaboratable):
                 gen_csr_s1.imm.eq(csrnames.dscratch1),
             ]
 
+            gen_ebreak = DebugController.GenerateI(insn.InstructionEBREAK)
+            m.submodules += gen_ebreak
+            m.d.comb += gen_ebreak.imm.eq(
+                insn.InstructionEBREAK.field_imm.value)
+
             nop = insn.InstructionADDI.field_opcode.value
 
             # Instrution 1: CSRRW s0,dscratch0,s0
@@ -588,12 +609,15 @@ class DebugController(Elaboratable):
             # Instrution 6: CSRRW s0,dscratch0,s0
             m.d.comb += self.insts[160:192].eq(gen_csr_s0.inst)
 
-            # Instrution 7:
-            m.d.comb += self.insts[192:224].eq(0x6f)
+            # Instrution 7: EBREAK or NOP (for postexec)
+            m.d.comb += self.insts[192:224].eq(
+                Mux(self.cmd.postexec, nop, gen_ebreak.inst))
 
             return m
 
-    def __init__(self, debugrf, csr_bank):
+    def __init__(self, debugrf, csr_bank, progbuf_size=16):
+        self.progbuf_size = progbuf_size
+
         self.debug_int = Signal()
 
         self.dmstatus = debugrf.reg_port(DebugReg.DMSTATUS)
@@ -603,6 +627,11 @@ class DebugController(Elaboratable):
         self.command = debugrf.reg_port(DebugReg.COMMAND)
         self.data0 = debugrf.reg_port(DebugReg.DATA0)
         self.haltsum0 = debugrf.reg_port(DebugReg.HALTSUM0)
+
+        self.progbuf = [
+            debugrf.reg_port(DebugReg.PROGBUF0 + i)
+            for i in range(progbuf_size)
+        ]
 
         self._halted = csr_bank.csr(32, 'w', addr=DebugModuleCSR.HALTED)
         self._going = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.GOING)
@@ -615,6 +644,9 @@ class DebugController(Elaboratable):
         self._abstract_rom = csr_bank.csr(32 * 7,
                                           'r',
                                           addr=DebugModuleCSR.ABSTRACT)
+        self._progbuf = csr_bank.csr(32 * self.progbuf_size,
+                                     'r',
+                                     addr=DebugModuleCSR.PROGBUF)
         self._shadowed_data = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.DATA)
 
     def elaborate(self, platform):
@@ -654,10 +686,30 @@ class DebugController(Elaboratable):
             with m.If(self.dmcontrol.update):
                 m.d.sync += self.debug_int.eq(self.dmcontrol.r.haltreq)
 
-        with m.If(self.abstractcs.update):
-            m.d.sync += self.abstractcs.w.cmderr.eq(self.abstractcs.r.cmderr)
+        m.d.comb += self.abstractcs.w.progbufsize.eq(self.progbuf_size)
+
+        cmderr_busy = Signal()
+        cmderr_unsupported = Signal()
+        cmderr_exception = Signal()
         with m.If(~self.dmcontrol.w.dmactive):
             m.d.sync += self.abstractcs.w.cmderr.eq(0)
+        with m.Else():
+            with m.If(cmderr_busy):
+                m.d.sync += self.abstractcs.w.cmderr.eq(Error.BUSY)
+            with m.Elif(cmderr_unsupported):
+                m.d.sync += self.abstractcs.w.cmderr.eq(Error.UNSUPPORTED)
+            with m.Elif(cmderr_exception):
+                m.d.sync += self.abstractcs.w.cmderr.eq(Error.EXCEPTION)
+            with m.Elif(self.abstractcs.update):
+                m.d.sync += self.abstractcs.w.cmderr.eq(
+                    self.abstractcs.r.cmderr)
+
+        for i in range(self.progbuf_size):
+            with m.If(self.progbuf[i].update):
+                m.d.sync += self.progbuf[i].w.eq(self.progbuf[i].r)
+
+            m.d.comb += self._progbuf.r_data[i * 32:(i + 1) * 32].eq(
+                self.progbuf[i].w)
 
         abstract_data = Signal(32)
         m.d.comb += [
@@ -669,8 +721,6 @@ class DebugController(Elaboratable):
             m.d.sync += abstract_data.eq(self.data0.r)
         with m.Elif(self._shadowed_data.w_stb):
             m.d.sync += abstract_data.eq(self._shadowed_data.w_data)
-        with m.If(~self.dmcontrol.w.dmactive):
-            m.d.sync += abstract_data.eq(0)
 
         m.d.comb += [
             self.dmstatus.w.version.eq(Version.V013),
@@ -727,8 +777,15 @@ class DebugController(Elaboratable):
         # Abstract command FSM
         #
 
+        cmd_idle = Signal()
+        m.d.comb += cmderr_busy.eq((self.abstractcs.update
+                                    | self.command.update | self.data0.update
+                                    | self.data0.capture) & ~cmd_idle)
+
         with m.FSM():
             with m.State('WAIT'):
+                m.d.comb += cmd_idle.eq(1)
+
                 with m.If(self.command.update):
                     m.d.sync += self.abstractcs.w.busy.eq(1)
                     m.next = 'CMD_START'
@@ -736,15 +793,21 @@ class DebugController(Elaboratable):
             with m.State('CMD_START'):
                 with m.Switch(self.command.r.cmdtype):
                     with m.Case(Command.ACCESS_REG):
-                        m.d.comb += go_abstract.eq(1)
-                        m.next = 'CMD_EXEC'
+                        with m.If((cmd_access_reg.aarsize != 2)
+                                  | cmd_access_reg.aarpostincrement):
+                            m.d.comb += cmderr_unsupported.eq(1)
+                            m.next = 'CMD_DONE'
+                        with m.Else():
+                            m.d.comb += go_abstract.eq(1)
+                            m.next = 'CMD_EXEC'
                     with m.Case():
-                        m.d.sync += self.abstractcs.w.cmderr.eq(
-                            Error.UNSUPPORTED)
+                        m.d.comb += cmderr_unsupported.eq(1)
                         m.next = 'CMD_DONE'
 
             with m.State('CMD_EXEC'):
-                pass
+                with m.If(~go_req & self._halted.w_stb):
+                    # EBREAK
+                    m.next = 'CMD_DONE'
 
             with m.State('CMD_DONE'):
                 m.d.sync += self.abstractcs.w.busy.eq(0)

@@ -1,5 +1,6 @@
 from amaranth import *
 from amaranth.lib.coding import PriorityEncoder
+import riscvmodel.insn as insn
 import riscvmodel.csrnames as csrnames
 from enum import IntEnum
 
@@ -98,6 +99,10 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         self.exc_vector = Signal(32)
 
         self.debug_entry = Signal(32)
+
+        self.system_insn = Signal()
+        self.system_insn_imm = Signal(12)
+
         self.exception = Signal()
         self.cause = Signal(32)
         self.epc = Signal(32)
@@ -140,15 +145,24 @@ class ExceptionUnit(Elaboratable, AutoCSR):
             self.interrupt_cause.eq(interrupt_cause),
         ]
 
+        insn_break = Signal()
+        with m.If(self.system_insn):
+            with m.Switch(self.system_insn_imm):
+                with m.Case(insn.InstructionEBREAK.field_imm.value):
+                    m.d.comb += insn_break.eq(1)
+
         cause = Record([l[:2] for l in mcause_layout])
         m.d.comb += cause.eq(self.cause)
 
         is_debug_int = cause.interrupt & (cause.ecode == Cause.DEBUG_INTERRUPT)
-        trap_to_debug = is_debug_int
+        is_debug_break = ~cause.interrupt & insn_break
+        trap_to_debug = is_debug_int | is_debug_break | debug_mode
 
         m.d.comb += self.exc_vector.eq(Mux(trap_to_debug, self.debug_entry, 0))
 
-        with m.If(self.exception):
+        exception = insn_break | self.exception
+
+        with m.If(exception):
             with m.If(trap_to_debug):
                 with m.If(~debug_mode):
                     m.d.sync += [

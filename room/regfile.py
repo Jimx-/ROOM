@@ -269,6 +269,14 @@ class RegReadDecoder(Elaboratable):
                     IMM_I,
                 ]
 
+            with m.Case(UOpCode.ERET):
+                m.d.comb += [
+                    F(ALUOperator.ADD),
+                    OPA_ZERO,
+                    OPB_IMMC,
+                    IMM_I,
+                ]
+
         m.d.comb += [
             self.rrd_uop.is_load.eq(self.iss_uop.opcode == UOpCode.LD),
             self.rrd_uop.is_sta.eq(self.iss_uop.opcode == UOpCode.STA),

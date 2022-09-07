@@ -193,7 +193,7 @@ class DataCache(Elaboratable):
 
                 with m.If(req_chosen.valid
                           & ~self.br_update.uop_killed(req_chosen.uop)
-                          & ~self.exception):
+                          & ~(self.exception & req_chosen.uop.uses_ldq)):
                     m.d.comb += [
                         self.dbus.adr.eq(req_chosen.addr[2:]),
                         self.dbus.stb.eq(1),
@@ -201,8 +201,8 @@ class DataCache(Elaboratable):
                         self.dbus.cyc.eq(1),
                         self.dbus.sel.eq(Mux(self.dbus.we, store_gen.mask,
                                              ~0)),
-                        self.dbus.we.eq(self.reqs[choice].uop.mem_cmd ==
-                                        MemoryCommand.WRITE),
+                        self.dbus.we.eq(
+                            req_chosen.uop.mem_cmd == MemoryCommand.WRITE),
                         req_chosen.ready.eq(1),
                     ]
 
@@ -237,7 +237,7 @@ class DataCache(Elaboratable):
                 ]
 
                 with m.If(req_chosen.kill | self.br_update.uop_killed(uop)
-                          | self.exception):
+                          | (self.exception & uop.uses_ldq)):
                     m.next = 'IDLE'
                 with m.Elif(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
                     m.d.comb += [

@@ -84,6 +84,8 @@ class DecodeUnit(Elaboratable):
                                   ).field_funct3.value
         F7 = lambda name: getattr(insn, f'Instruction{name}'
                                   ).field_funct7.value
+        OPIMM = lambda name: getattr(insn, f'Instruction{name}'
+                                     ).field_imm.value
 
         UOPC = lambda x: uop.opcode.eq(x)
         ILL_INSN = insn_illegal.eq(1)
@@ -270,7 +272,38 @@ class DecodeUnit(Elaboratable):
                 ]
 
                 with m.If(inuop.inst[12:15] == 0):
-                    pass
+                    with m.If((uop.ldst == 0) & (uop.lrs1 == 0)):
+                        with m.Switch(inuop.inst[20:]):
+                            for name in ['ECALL', 'EBREAK']:
+                                with m.Case(OPIMM(name)):
+                                    m.d.comb += [
+                                        UOPC(UOpCode.ERET),
+                                        uop.iq_type.eq(IssueQueueType.INT),
+                                        uop.fu_type.eq(FUType.CSR),
+                                        IMM_SEL_I,
+                                        uop.csr_cmd.eq(CSRCommand.I),
+                                        uop.is_ecall.eq(1),
+                                    ]
+
+                            for name in ['SRET', 'MRET']:
+                                with m.Case(OPIMM(name)):
+                                    m.d.comb += [
+                                        UOPC(UOpCode.ERET),
+                                        uop.iq_type.eq(IssueQueueType.INT),
+                                        uop.fu_type.eq(FUType.CSR),
+                                        IMM_SEL_I,
+                                        uop.csr_cmd.eq(CSRCommand.I),
+                                    ]
+
+                            with m.Case(0x7b2):  # DRET
+                                m.d.comb += [
+                                    UOPC(UOpCode.ERET),
+                                    uop.iq_type.eq(IssueQueueType.INT),
+                                    uop.fu_type.eq(FUType.CSR),
+                                    IMM_SEL_I,
+                                    uop.csr_cmd.eq(CSRCommand.I),
+                                ]
+
                 with m.Else():
                     m.d.comb += [
                         uop.iq_type.eq(IssueQueueType.INT),

@@ -145,7 +145,7 @@ if __name__ == "__main__":
         yield dut.rst.eq(1)
         yield
         yield dut.rst.eq(0)
-        for _ in range(200):
+        for _ in range(100):
             yield
 
     def process_debug():
@@ -159,9 +159,26 @@ if __name__ == "__main__":
         yield from dut.jtag.write_dmi(0x10, 0x80000001)
         for _ in range(100):
             yield
-        yield from dut.jtag.write_dmi(0x17, 0x00021002)
+        yield from dut.jtag.write_dmi(0x4, 0x1234)
         for _ in range(100):
             yield
+        yield from dut.jtag.write_dmi(0x17, 0x00231002)
+        for _ in range(200):
+            yield
+
+        yield from dut.jtag.write_dmi(0x4, 0)
+        for _ in range(100):
+            yield
+        r = yield from dut.jtag.read_dmi(0x4)
+        print(hex(r))
+
+        yield from dut.jtag.write_dmi(0x17, 0x00221002)
+        for _ in range(200):
+            yield
+        r = yield from dut.jtag.read_dmi(0x4)
+        print(hex(r))
+        r = yield from dut.jtag.read_dmi(0x16)
+        print(hex(r))
 
     sim.add_sync_process(process)
     sim.add_sync_process(process_debug, domain='debug')

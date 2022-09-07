@@ -1,8 +1,18 @@
 from amaranth import *
+from enum import IntEnum
 
+from room.consts import *
 from room.alu import ExecResp
 from room.types import MicroOp
 from room.branch import BranchUpdate
+
+
+class FlushType(IntEnum):
+    NONE = 0
+    EXCEPT = 1
+    ERET = 2
+    REFETCH = 3
+    NEXT = 4
 
 
 def _incr(signal, modulo):
@@ -58,7 +68,9 @@ class CommitExceptionReq(Record):
             ('valid', 1),
             ('ftq_idx', _uop.ftq_idx.width),
             ('pc_lsb', _uop.pc_lsb.width),
+            ('is_rvc', 1),
             ('cause', 32),
+            ('flush_type', Shape.cast(FlushType).width),
         ],
                          name=name)
 
@@ -259,14 +271,37 @@ class ReorderBuffer(Elaboratable):
         m.d.comb += [
             self.commit_exc.ftq_idx.eq(commit_exc_uop.ftq_idx),
             self.commit_exc.pc_lsb.eq(commit_exc_uop.pc_lsb),
+            self.commit_exc.is_rvc.eq(commit_exc_uop.is_rvc),
             self.commit_exc.cause.eq(commit_exc_uop.exc_cause),
         ]
 
-        flush_uop = commit_exc_uop
+        flush_commit_mask = Signal(self.core_width)
+        for w in range(self.core_width):
+            m.d.comb += flush_commit_mask[w].eq(
+                self.commit_req.valids[w]
+                & self.commit_req.uops[w].flush_on_commit)
+
+        flush_uop = MicroOp(self.params, name='flush_uop')
+        m.d.comb += flush_uop.eq(commit_exc_uop)
+        for w in reversed(range(self.core_width)):
+            with m.If(flush_commit_mask[w]):
+                m.d.comb += flush_uop.eq(self.commit_req.uops[w])
+
+        flush_commit = flush_commit_mask != 0
         m.d.comb += [
-            self.flush.valid.eq(exception_thrown),
+            self.flush.valid.eq(exception_thrown | flush_commit),
             self.flush.ftq_idx.eq(flush_uop.ftq_idx),
+            self.flush.pc_lsb.eq(flush_uop.pc_lsb),
+            self.flush.is_rvc.eq(flush_uop.is_rvc),
         ]
+
+        with m.If(self.flush.valid):
+            with m.If(exception_thrown):
+                m.d.comb += self.flush.flush_type.eq(FlushType.EXCEPT)
+            with m.Elif(flush_commit & (flush_uop.opcode == UOpCode.ERET)):
+                m.d.comb += self.flush.flush_type.eq(FlushType.ERET)
+            with m.Else():
+                m.d.comb += self.flush.flush_type.eq(FlushType.NEXT)
 
         do_enq = Signal()
         do_deq = Signal()

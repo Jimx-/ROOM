@@ -9,7 +9,7 @@ from room.id_stage import DecodeStage
 from room.rename import RenameStage
 from room.dispatch import Dispatcher
 from room.issue import IssueUnit
-from room.rob import ReorderBuffer
+from room.rob import ReorderBuffer, FlushType
 from room.regfile import RegisterFile, RegisterRead
 from room.ex_stage import ExecUnits
 from room.branch import BranchUpdate, BranchResolution
@@ -232,9 +232,19 @@ class Core(Elaboratable):
             m.d.comb += [
                 if_stage.redirect_valid.eq(1),
                 if_stage.redirect_flush.eq(1),
-                if_stage.redirect_pc.eq(exc_unit.exc_vector),
                 if_stage.redirect_ftq_idx.eq(rob_flush_d1.ftq_idx),
             ]
+
+            flush_pc = if_stage.get_pc[0].pc + rob_flush_d1.pc_lsb
+            with m.Switch(rob_flush_d1.flush_type):
+                with m.Case(FlushType.EXCEPT, FlushType.ERET):
+                    m.d.comb += if_stage.redirect_pc.eq(exc_unit.exc_vector)
+                with m.Case(FlushType.NEXT):
+                    m.d.comb += if_stage.redirect_pc.eq(
+                        flush_pc + Mux(rob_flush_d1.is_rvc, 2, 4))
+                with m.Case(FlushType.REFETCH):
+                    m.d.comb += if_stage.redirect_pc.eq(flush_pc)
+
         with m.Elif(br_update.br_res.mispredict & ~rob_flush_d1.valid):
             uop = br_update.br_res.uop
             uop_pc = if_stage.get_pc[1].pc | uop.pc_lsb
@@ -417,12 +427,23 @@ class Core(Elaboratable):
         # Get PC for jump unit
         #
 
-        for eu, iss_uop in zip(exec_units, iss_uops):
+        jmp_pc_req = Signal.like(iss_uops[0].ftq_idx)
+        jmp_pc_valid = Signal()
+
+        with m.If(jmp_pc_valid):
+            m.d.comb += if_stage.get_pc_idx[0].eq(jmp_pc_req)
+        with m.Elif(rob.flush.valid):
+            m.d.comb += if_stage.get_pc_idx[0].eq(rob.flush.ftq_idx)
+
+        for eu, iss_uop, iss_valid in zip(exec_units, iss_uops, iss_valids):
             if not eu.has_jmp_unit: continue
 
-            m.d.comb += if_stage.get_pc_idx[0].eq(iss_uop.ftq_idx)
-
             m.d.sync += [
+                jmp_pc_valid.eq(iss_valid & (iss_uop.fu_type == FUType.JMP)),
+                jmp_pc_req.eq(iss_uop.ftq_idx),
+            ]
+
+            m.d.comb += [
                 eu.get_pc.pc.eq(if_stage.get_pc[0].pc),
                 eu.get_pc.next_valid.eq(if_stage.get_pc[0].next_valid),
                 eu.get_pc.next_pc.eq(if_stage.get_pc[0].next_pc),
@@ -547,8 +568,13 @@ class Core(Elaboratable):
         # Exception
         #
 
-        m.d.sync += [
+        m.d.comb += [
             exc_unit.debug_entry.eq(self.debug_entry),
+            exc_unit.system_insn.eq(csr_port.cmd == CSRCommand.I),
+            exc_unit.system_insn_imm.eq(csr_port.addr),
+        ]
+
+        m.d.sync += [
             exc_unit.exception.eq(rob.commit_exc.valid),
             exc_unit.cause.eq(rob.commit_exc.cause),
             exc_unit.epc.eq(if_stage.get_pc[0].commit_pc +
