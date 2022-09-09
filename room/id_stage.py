@@ -4,6 +4,7 @@ import riscvmodel.insn as insn
 from room.consts import *
 from room.types import MicroOp
 from room.branch import BranchMaskAllocator, BranchUpdate
+from room.exc import Cause
 
 
 class BranchSignals(Record):
@@ -390,11 +391,18 @@ class DecodeStage(Elaboratable):
 
         self.interrupt = Signal()
         self.interrupt_cause = Signal(32)
+        self.single_step = Signal()
 
     def elaborate(self, platform):
         m = Module()
 
         dec_finished_mask = Signal(self.core_width)
+
+        single_stepped = Signal()
+        with m.If(~self.single_step):
+            m.d.sync += single_stepped.eq(0)
+        with m.Elif(self.fire[0]):
+            m.d.sync += single_stepped.eq(1)
 
         for i in range(self.core_width):
             dec = DecodeUnit(self.params)
@@ -409,6 +417,12 @@ class DecodeStage(Elaboratable):
                 dec.interrupt.eq(self.interrupt),
                 dec.interrupt_cause.eq(self.interrupt_cause),
             ]
+
+            with m.If(self.single_step & (single_stepped if (i == 0) else 1)):
+                m.d.comb += [
+                    dec.interrupt.eq(1),
+                    dec.interrupt_cause.eq(Cause.DEBUG_INTERRUPT),
+                ]
 
         #
         # Branch mask allocation

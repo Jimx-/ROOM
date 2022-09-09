@@ -122,9 +122,12 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         self.system_insn = Signal()
         self.system_insn_imm = Signal(12)
 
+        self.commit = Signal()
         self.exception = Signal()
         self.cause = Signal(32)
         self.epc = Signal(32)
+
+        self.single_step = Signal()
 
         self.mstatus = CSR(csrnames.mstatus, mstatus_layout)
         self.mip = CSR(csrnames.mip, mip_layout)
@@ -170,7 +173,10 @@ class ExceptionUnit(Elaboratable, AutoCSR):
             self.dcsr.r.prv.eq(3),
         ]
         with m.If(self.dcsr.we):
-            m.d.sync += self.dcsr.r.ebreakm.eq(self.dcsr.w.ebreakm)
+            m.d.sync += [
+                self.dcsr.r.step.eq(self.dcsr.w.step),
+                self.dcsr.r.ebreakm.eq(self.dcsr.w.ebreakm),
+            ]
         with m.If(self.dpc.we):
             m.d.sync += self.dpc.r.eq(self.dpc.w)
         with m.If(self.dscratch0.we):
@@ -191,11 +197,21 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         cause = Record([l[:2] for l in mcause_layout])
         m.d.comb += cause.eq(self.cause)
 
+        single_stepped = Signal()
+
         is_debug_int = cause.interrupt & (cause.ecode == Cause.DEBUG_INTERRUPT)
         is_debug_break = ~cause.interrupt & insn_break
-        trap_to_debug = is_debug_int | is_debug_break | debug_mode
+        trap_to_debug = single_stepped | is_debug_int | is_debug_break | debug_mode
 
-        m.d.comb += self.exc_vector.eq(Mux(trap_to_debug, self.debug_entry, 0))
+        m.d.comb += [
+            self.exc_vector.eq(Mux(trap_to_debug, self.debug_entry, 0)),
+            self.single_step.eq(self.dcsr.r.step & ~debug_mode),
+        ]
+
+        with m.If(~self.single_step):
+            m.d.sync += single_stepped.eq(0)
+        with m.Elif(self.commit | self.exception):
+            m.d.sync += single_stepped.eq(1)
 
         exception = insn_break | self.exception
 
@@ -204,7 +220,8 @@ class ExceptionUnit(Elaboratable, AutoCSR):
                 with m.If(~debug_mode):
                     m.d.sync += [
                         debug_mode.eq(1),
-                        self.dcsr.r.cause.eq(Mux(is_debug_int, 3, 1)),
+                        self.dcsr.r.cause.eq(
+                            Mux(single_stepped, 4, Mux(is_debug_int, 3, 1))),
                         self.dpc.r.eq(self.epc),
                     ]
 

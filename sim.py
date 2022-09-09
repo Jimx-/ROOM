@@ -159,6 +159,14 @@ if __name__ == "__main__":
             yield
         r = yield from dut.jtag.read_dmi(0x11)
         print(hex(r))
+
+        yield from dut.jtag.write_dmi(0x4, 0x4)
+        for _ in range(100):
+            yield
+        yield from dut.jtag.write_dmi(0x17, 0x002307b0)
+        for _ in range(200):
+            yield
+
         yield from dut.jtag.write_dmi(0x10, 0x40000001)
         for _ in range(100):
             yield

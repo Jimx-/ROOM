@@ -94,6 +94,7 @@ class Core(Elaboratable):
             if_stage.fetch_packet_ready.eq(dec_ready),
             dec_stage.interrupt.eq(exc_unit.interrupt),
             dec_stage.interrupt_cause.eq(exc_unit.interrupt_cause),
+            dec_stage.single_step.eq(exc_unit.single_step),
         ]
 
         #
@@ -582,6 +583,7 @@ class Core(Elaboratable):
             exc_unit.debug_entry.eq(self.debug_entry),
             exc_unit.system_insn.eq(csr_port.cmd == CSRCommand.I),
             exc_unit.system_insn_imm.eq(csr_port.addr),
+            exc_unit.commit.eq(rob.commit_req.valids[0]),
         ]
 
         m.d.sync += [
