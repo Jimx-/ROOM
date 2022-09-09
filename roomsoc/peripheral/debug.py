@@ -71,6 +71,7 @@ class DebugReg(IntEnum):
     HALTSUM1 = 0x13
     ABSTRACTCS = 0x16
     COMMAND = 0x17
+    ABSTRACTAUTO = 0x18
     PROGBUF0 = 0x20
     HALTSUM2 = 0x34
     HALTSUM3 = 0x35
@@ -135,6 +136,10 @@ cmd_access_reg_layout = [
 command_layout = [("control", 24, RegMode.W, 0),
                   ("cmdtype", 8, RegMode.W, Command.ACCESS_REG)]
 
+abstractauto_layout = [("autoexecdata", 12, RegMode.RW, 0),
+                       ("zero0", 4, RegMode.R, 0),
+                       ("autoexecprogbuf", 16, RegMode.RW, 0)]
+
 sbcs_layout = [("sbaccess8", 1, RegMode.R, True),
                ("sbaccess16", 1, RegMode.R, True),
                ("sbaccess32", 1, RegMode.R, True),
@@ -157,6 +162,7 @@ reg_map = dict([
     (DebugReg.HARTINFO, flat_layout),
     (DebugReg.ABSTRACTCS, abstractcs_layout),
     (DebugReg.COMMAND, command_layout),
+    (DebugReg.ABSTRACTAUTO, abstractauto_layout),
     (DebugReg.SBCS, sbcs_layout),
     (DebugReg.SBADDRESS0, flat_layout),
     (DebugReg.SBDATA0, flat_layout),
@@ -625,6 +631,7 @@ class DebugController(Elaboratable):
         self.hartinfo = debugrf.reg_port(DebugReg.HARTINFO)
         self.abstractcs = debugrf.reg_port(DebugReg.ABSTRACTCS)
         self.command = debugrf.reg_port(DebugReg.COMMAND)
+        self.abstractauto = debugrf.reg_port(DebugReg.ABSTRACTAUTO)
         self.data0 = debugrf.reg_port(DebugReg.DATA0)
         self.haltsum0 = debugrf.reg_port(DebugReg.HALTSUM0)
 
@@ -686,9 +693,8 @@ class DebugController(Elaboratable):
 
         with m.If(~self.dmcontrol.w.dmactive):
             m.d.sync += self.debug_int.eq(0)
-        with m.Else():
-            with m.If(self.dmcontrol.update):
-                m.d.sync += self.debug_int.eq(self.dmcontrol.r.haltreq)
+        with m.Elif(self.dmcontrol.update):
+            m.d.sync += self.debug_int.eq(self.dmcontrol.r.haltreq)
 
         #
         # Resume request
@@ -713,6 +719,18 @@ class DebugController(Elaboratable):
                 m.d.comb += hart_resume_ack.eq(0)
             with m.Else():
                 m.d.comb += hart_resume_ack.eq(~hart_resuming)
+
+        m.d.comb += [
+            self.dmstatus.w.version.eq(Version.V013),
+            self.dmstatus.w.authenticated.eq(1),
+            self.dmstatus.w.allrunning.eq(~hart_halted),
+            self.dmstatus.w.anyrunning.eq(~hart_halted),
+            self.dmstatus.w.allhalted.eq(hart_halted),
+            self.dmstatus.w.anyhalted.eq(hart_halted),
+            self.dmstatus.w.anyresumeack.eq(hart_resume_ack),
+            self.dmstatus.w.allresumeack.eq(hart_resume_ack),
+            self.haltsum0.w[0].eq(self.dmstatus.w.allhalted),
+        ]
 
         m.d.comb += self.abstractcs.w.progbufsize.eq(self.progbuf_size)
 
@@ -753,17 +771,18 @@ class DebugController(Elaboratable):
         with m.If(~self.dmcontrol.w.dmactive):
             m.d.sync += abstract_data.eq(0)
 
-        m.d.comb += [
-            self.dmstatus.w.version.eq(Version.V013),
-            self.dmstatus.w.authenticated.eq(1),
-            self.dmstatus.w.allrunning.eq(~hart_halted),
-            self.dmstatus.w.anyrunning.eq(~hart_halted),
-            self.dmstatus.w.allhalted.eq(hart_halted),
-            self.dmstatus.w.anyhalted.eq(hart_halted),
-            self.dmstatus.w.anyresumeack.eq(hart_resume_ack),
-            self.dmstatus.w.allresumeack.eq(hart_resume_ack),
-            self.haltsum0.w[0].eq(self.dmstatus.w.allhalted),
-        ]
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += self.abstractauto.w.eq(0)
+        with m.Elif(self.abstractauto.update):
+            m.d.sync += self.abstractauto.w.eq(self.abstractauto.r)
+
+        autoexec_progbuf = Signal(self.progbuf_size)
+        for i in range(self.progbuf_size):
+            m.d.comb += autoexec_progbuf[i].eq(
+                (self.progbuf[i].update | self.progbuf[i].capture)
+                & self.abstractauto.w.autoexecprogbuf[i])
+        autoexec_data = (self.data0.update | self.data0.capture
+                         ) & self.abstractauto.w.autoexecdata[0]
 
         go_req = Signal()
         go_abstract = Signal()
@@ -812,7 +831,9 @@ class DebugController(Elaboratable):
         #
 
         m.d.comb += cmderr_busy.eq((self.abstractcs.update
-                                    | self.command.update | self.data0.update
+                                    | self.command.update
+                                    | self.abstractauto.update
+                                    | self.data0.update
                                     | self.data0.capture) & ~cmd_idle)
 
         with m.FSM():
@@ -825,6 +846,10 @@ class DebugController(Elaboratable):
                         self.abstractcs.w.busy.eq(1),
                         command.eq(self.command.r),
                     ]
+                    m.next = 'CMD_START'
+
+                with m.Elif((autoexec_progbuf != 0) | autoexec_data):
+                    m.d.sync += self.abstractcs.w.busy.eq(1)
                     m.next = 'CMD_START'
 
             with m.State('CMD_START'):

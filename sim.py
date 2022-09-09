@@ -160,10 +160,19 @@ if __name__ == "__main__":
         r = yield from dut.jtag.read_dmi(0x11)
         print(hex(r))
 
+        # Write 0x4 to DCSR
         yield from dut.jtag.write_dmi(0x4, 0x4)
         for _ in range(100):
             yield
         yield from dut.jtag.write_dmi(0x17, 0x002307b0)
+        for _ in range(200):
+            yield
+
+        # Write 0x0 to DPC
+        yield from dut.jtag.write_dmi(0x4, 0x0)
+        for _ in range(100):
+            yield
+        yield from dut.jtag.write_dmi(0x17, 0x002307b1)
         for _ in range(200):
             yield
 
@@ -176,6 +185,12 @@ if __name__ == "__main__":
         for _ in range(100):
             yield
         r = yield from dut.jtag.read_dmi(0x11)
+        print(hex(r))
+
+        yield from dut.jtag.write_dmi(0x17, 0x00221001)
+        for _ in range(200):
+            yield
+        r = yield from dut.jtag.read_dmi(0x16)
         print(hex(r))
 
     sim.add_sync_process(process)
