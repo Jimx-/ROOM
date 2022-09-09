@@ -178,7 +178,8 @@ class ReorderBuffer(Elaboratable):
             with m.If(self.enq_valids[w]):
                 m.d.sync += [
                     rob_valid[rob_tail].eq(1),
-                    rob_busy[rob_tail].eq(1),
+                    rob_busy[rob_tail].eq(~(self.enq_uops[w].is_fence
+                                            | self.enq_uops[w].is_fencei)),
                     rob_uop[rob_tail].eq(self.enq_uops[w]),
                     rob_exception[rob_tail].eq(self.enq_uops[w].exception),
                 ]

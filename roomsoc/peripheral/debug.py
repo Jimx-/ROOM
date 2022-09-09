@@ -688,13 +688,14 @@ class DebugController(Elaboratable):
 
         m.d.comb += self.abstractcs.w.progbufsize.eq(self.progbuf_size)
 
+        cmd_idle = Signal()
         cmderr_busy = Signal()
         cmderr_unsupported = Signal()
         cmderr_exception = Signal()
         with m.If(~self.dmcontrol.w.dmactive):
-            m.d.sync += self.abstractcs.w.cmderr.eq(0)
+            m.d.sync += self.abstractcs.w.cmderr.eq(Error.NONE)
         with m.Else():
-            with m.If(cmderr_busy):
+            with m.If(cmderr_busy & (self.abstractcs.w.cmderr == Error.NONE)):
                 m.d.sync += self.abstractcs.w.cmderr.eq(Error.BUSY)
             with m.Elif(cmderr_unsupported):
                 m.d.sync += self.abstractcs.w.cmderr.eq(Error.UNSUPPORTED)
@@ -717,10 +718,12 @@ class DebugController(Elaboratable):
             self._shadowed_data.r_data.eq(abstract_data),
         ]
 
-        with m.If(self.data0.update):
+        with m.If(self.data0.update & cmd_idle):
             m.d.sync += abstract_data.eq(self.data0.r)
         with m.Elif(self._shadowed_data.w_stb):
             m.d.sync += abstract_data.eq(self._shadowed_data.w_data)
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += abstract_data.eq(0)
 
         m.d.comb += [
             self.dmstatus.w.version.eq(Version.V013),
@@ -751,8 +754,9 @@ class DebugController(Elaboratable):
         # Abstract command instruction generation
         #
 
+        command = Record([l[:2] for l in command_layout])
         cmd_access_reg = Record(cmd_access_reg_layout)
-        m.d.comb += cmd_access_reg.eq(self.command.r.control)
+        m.d.comb += cmd_access_reg.eq(command.control)
 
         # JAL from DebugModuleCSR.TRAMPOLINE to DebugModuleCSR.ABSTRACT
         m.d.comb += self._trampoline.r_data.eq(
@@ -777,7 +781,6 @@ class DebugController(Elaboratable):
         # Abstract command FSM
         #
 
-        cmd_idle = Signal()
         m.d.comb += cmderr_busy.eq((self.abstractcs.update
                                     | self.command.update | self.data0.update
                                     | self.data0.capture) & ~cmd_idle)
@@ -786,16 +789,20 @@ class DebugController(Elaboratable):
             with m.State('WAIT'):
                 m.d.comb += cmd_idle.eq(1)
 
-                with m.If(self.command.update):
-                    m.d.sync += self.abstractcs.w.busy.eq(1)
+                with m.If(self.command.update
+                          & (self.abstractcs.w.cmderr == Error.NONE)):
+                    m.d.sync += [
+                        self.abstractcs.w.busy.eq(1),
+                        command.eq(self.command.r),
+                    ]
                     m.next = 'CMD_START'
 
             with m.State('CMD_START'):
-                with m.Switch(self.command.r.cmdtype):
+                with m.Switch(command.cmdtype):
                     with m.Case(Command.ACCESS_REG):
                         with m.If((cmd_access_reg.aarsize != 2)
                                   | cmd_access_reg.aarpostincrement):
-                            m.d.comb += cmderr_unsupported.eq(1)
+                            m.d.comb += cmderr_exception.eq(1)
                             m.next = 'CMD_DONE'
                         with m.Else():
                             m.d.comb += go_abstract.eq(1)

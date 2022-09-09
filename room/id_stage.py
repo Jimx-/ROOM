@@ -332,6 +332,24 @@ class DecodeUnit(Elaboratable):
                                     UOPC(getattr(UOpCode, name)),
                                     uop.lrs1_rtype.eq(RegisterType.FIX),
                                 ]
+            # Fence
+            with m.Case(OPV('FENCE')):
+                m.d.comb += [
+                    uop.iq_type.eq(IssueQueueType.INT),
+                ]
+
+                with m.Switch(inuop.inst[12:15]):
+                    with m.Case(F3('FENCE')):
+                        m.d.comb += [
+                            UOPC(UOpCode.FENCE),
+                            uop.is_fence.eq(1),
+                        ]
+
+                    with m.Case(F3('FENCEI')):
+                        m.d.comb += [
+                            UOPC(UOpCode.FENCEI),
+                            uop.is_fencei.eq(1),
+                        ]
 
         di20_25 = Mux((imm_sel == ImmSel.B) | (imm_sel == ImmSel.S),
                       inuop.inst[7:12], inuop.inst[20:25])

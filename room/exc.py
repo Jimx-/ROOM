@@ -88,6 +88,25 @@ mcause_layout = [
     ("interrupt", 1, CSRAccess.RW),
 ]
 
+dcsr_layout = [
+    ("prv", 2, CSRAccess.RW),  # Privilege level before Debug Mode was entered
+    ("step", 1,
+     CSRAccess.RW),  # Execute a single instruction and re-enter Debug Mode
+    ("nmip", 1, CSRAccess.RO),  # A non-maskable interrupt is pending
+    ("mprven", 1, CSRAccess.RW),  # Use mstatus.mprv in Debug Mode
+    ("zero0", 1, CSRAccess.RO),
+    ("cause", 3, CSRAccess.RO),  # Explains why Debug Mode was entered
+    ("stoptime", 1, CSRAccess.RW),  # Stop timer increment during Debug Mode
+    ("stopcount", 1, CSRAccess.RW),  # Stop counter increment during Debug Mode
+    ("stepie", 1, CSRAccess.RW),  # Enable interrupts during single stepping
+    ("ebreaku", 1, CSRAccess.RW),  # EBREAKs in U-mode enter Debug Mode
+    ("ebreaks", 1, CSRAccess.RW),  # EBREAKs in S-mode enter Debug Mode
+    ("zero1", 1, CSRAccess.RO),
+    ("ebreakm", 1, CSRAccess.RW),  # EBREAKs in M-mode enter Debug Mode
+    ("zero2", 12, CSRAccess.RO),
+    ("xdebugver", 4, CSRAccess.RO),  # External Debug specification version
+]
+
 
 class ExceptionUnit(Elaboratable, AutoCSR):
 
@@ -111,6 +130,7 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         self.mip = CSR(csrnames.mip, mip_layout)
         self.mcause = CSR(csrnames.mcause, mcause_layout)
 
+        self.dcsr = CSR(csrnames.dcsr, dcsr_layout)
         self.dpc = CSR(csrnames.dpc, [('value', 32, CSRAccess.RW)])
         self.dscratch0 = CSR(csrnames.dscratch0, [('value', 32, CSRAccess.RW)])
         self.dscratch1 = CSR(csrnames.dscratch1, [('value', 32, CSRAccess.RW)])
@@ -145,6 +165,19 @@ class ExceptionUnit(Elaboratable, AutoCSR):
             self.interrupt_cause.eq(interrupt_cause),
         ]
 
+        m.d.comb += [
+            self.dcsr.r.xdebugver.eq(4),
+            self.dcsr.r.prv.eq(3),
+        ]
+        with m.If(self.dcsr.we):
+            m.d.sync += self.dcsr.r.ebreakm.eq(self.dcsr.w.ebreakm)
+        with m.If(self.dpc.we):
+            m.d.sync += self.dpc.r.eq(self.dpc.w)
+        with m.If(self.dscratch0.we):
+            m.d.sync += self.dscratch0.r.eq(self.dscratch0.w)
+        with m.If(self.dscratch1.we):
+            m.d.sync += self.dscratch1.r.eq(self.dscratch1.w)
+
         insn_break = Signal()
         with m.If(self.system_insn):
             with m.Switch(self.system_insn_imm):
@@ -167,12 +200,8 @@ class ExceptionUnit(Elaboratable, AutoCSR):
                 with m.If(~debug_mode):
                     m.d.sync += [
                         debug_mode.eq(1),
+                        self.dcsr.r.cause.eq(Mux(is_debug_int, 3, 1)),
                         self.dpc.r.eq(self.epc),
                     ]
-
-        with m.If(self.dscratch0.we):
-            m.d.sync += self.dscratch0.r.eq(self.dscratch0.w)
-        with m.If(self.dscratch1.we):
-            m.d.sync += self.dscratch1.r.eq(self.dscratch1.w)
 
         return m

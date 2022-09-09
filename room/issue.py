@@ -212,7 +212,10 @@ class IssueUnit(Elaboratable):
             for i in range(self.num_issue_slots)
         ]
         for wen_oh, tmp in zip(entry_wen, entry_wen_array):
-            m.d.comb += wen_oh.eq(tmp & self.dis_valids)
+            for w in range(self.dispatch_width):
+                m.d.comb += wen_oh[w].eq(tmp[w] & self.dis_valids[w]
+                                         & ~self.dis_uops[w].is_fence
+                                         & ~self.dis_uops[w].is_fencei)
 
         dis_uops_mux = Array(
             MicroOp(self.params) for _ in range(self.dispatch_width))
