@@ -337,7 +337,8 @@ class RegisterRead(Elaboratable):
 
             m.d.sync += [
                 rrd_uop.eq(dec.rrd_uop),
-                rrd_v.eq(dec.rrd_valid),
+                rrd_v.eq(dec.rrd_valid
+                         & ~self.br_update.uop_killed(dec.rrd_uop)),
             ]
 
         rrd_rs1_data = [
@@ -376,11 +377,13 @@ class RegisterRead(Elaboratable):
                 m.d.sync += req.rs2_data.eq(rs2_data)
 
         for req, rrd_uop, rrd_v in zip(self.exec_reqs, rrd_uops, rrd_valids):
+            rrd_killed = self.kill | self.br_update.uop_killed(rrd_uop)
+
             m.d.sync += [
                 req.uop.eq(rrd_uop),
                 req.uop.br_mask.eq(
                     self.br_update.get_new_br_mask(rrd_uop.br_mask)),
-                req.valid.eq(rrd_v),
+                req.valid.eq(rrd_v & ~rrd_killed),
             ]
 
         return m

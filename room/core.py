@@ -417,7 +417,10 @@ class Core(Elaboratable):
 
         for eu, req in zip([eu for eu in exec_units if eu.irf_read],
                            iregread.exec_reqs):
-            m.d.comb += eu.req.eq(req)
+            m.d.comb += [
+                eu.req.eq(req),
+                eu.req.kill.eq(rob_flush_d1.valid),
+            ]
 
         br_infos = [
             BranchResolution(self.params, name=f'br_res{i}')
@@ -579,7 +582,10 @@ class Core(Elaboratable):
         # Exception
         #
 
+        commit_exc_pc_lsb_d1 = Signal.like(rob.commit_exc.pc_lsb)
         m.d.comb += [
+            exc_unit.epc.eq(if_stage.get_pc[0].commit_pc +
+                            commit_exc_pc_lsb_d1),
             exc_unit.debug_entry.eq(self.debug_entry),
             exc_unit.system_insn.eq(csr_port.cmd == CSRCommand.I),
             exc_unit.system_insn_imm.eq(csr_port.addr),
@@ -587,10 +593,9 @@ class Core(Elaboratable):
         ]
 
         m.d.sync += [
+            commit_exc_pc_lsb_d1.eq(rob.commit_exc.pc_lsb),
             exc_unit.exception.eq(rob.commit_exc.valid),
             exc_unit.cause.eq(rob.commit_exc.cause),
-            exc_unit.epc.eq(if_stage.get_pc[0].commit_pc +
-                            rob.commit_exc.pc_lsb),
         ]
 
         return m

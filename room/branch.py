@@ -75,7 +75,7 @@ class BranchMaskAllocator(Elaboratable):
         ]
 
         self.br_mask = [
-            Signal(self.max_br_count, name=f'br_tag{i}')
+            Signal(self.max_br_count, name=f'br_mask{i}')
             for i in range(self.core_width)
         ]
 

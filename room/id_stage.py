@@ -402,6 +402,7 @@ class DecodeStage(Elaboratable):
         with m.If(~self.single_step):
             m.d.sync += single_stepped.eq(0)
         with m.Elif(self.fire[0]):
+            # Only allow one instruction to get past decode
             m.d.sync += single_stepped.eq(1)
 
         for i in range(self.core_width):

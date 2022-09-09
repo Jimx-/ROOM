@@ -142,8 +142,6 @@ class ReorderBuffer(Elaboratable):
             rob_head_idx = Cat(rob_head_lsb, rob_head)
             rob_tail_idx = Cat(rob_tail_lsb, rob_tail)
 
-        com_row = rob_head
-
         maybe_full = Signal()
         full = Signal()
         empty = Signal()
@@ -201,7 +199,7 @@ class ReorderBuffer(Elaboratable):
                 can_commit[w].eq(rob_valid[rob_head]
                                  & ~rob_busy[rob_head]),
                 self.commit_req.valids[w].eq(will_commit[w]),
-                self.commit_req.uops[w].eq(rob_uop[com_row]),
+                self.commit_req.uops[w].eq(rob_uop[commit_idx]),
             ]
 
             rollback_row = state_is_rollback & ~full
