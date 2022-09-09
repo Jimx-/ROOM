@@ -179,10 +179,14 @@ class ExceptionUnit(Elaboratable, AutoCSR):
             m.d.sync += self.dscratch1.r.eq(self.dscratch1.w)
 
         insn_break = Signal()
+        insn_dret = Signal()
+        insn_ret = insn_dret
         with m.If(self.system_insn):
             with m.Switch(self.system_insn_imm):
                 with m.Case(insn.InstructionEBREAK.field_imm.value):
                     m.d.comb += insn_break.eq(1)
+                with m.Case(0x7b2):  # DRET
+                    m.d.comb += insn_dret.eq(1)
 
         cause = Record([l[:2] for l in mcause_layout])
         m.d.comb += cause.eq(self.cause)
@@ -203,5 +207,10 @@ class ExceptionUnit(Elaboratable, AutoCSR):
                         self.dcsr.r.cause.eq(Mux(is_debug_int, 3, 1)),
                         self.dpc.r.eq(self.epc),
                     ]
+
+        with m.If(insn_ret):
+            with m.If(insn_dret):
+                m.d.sync += debug_mode.eq(0)
+                m.d.comb += self.exc_vector.eq(self.dpc.r)
 
         return m

@@ -635,7 +635,7 @@ class DebugController(Elaboratable):
 
         self._halted = csr_bank.csr(32, 'w', addr=DebugModuleCSR.HALTED)
         self._going = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.GOING)
-        self._resuming = csr_bank.csr(32, 'r', addr=DebugModuleCSR.RESUMING)
+        self._resuming = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.RESUMING)
         self._trampoline = csr_bank.csr(32,
                                         'r',
                                         addr=DebugModuleCSR.TRAMPOLINE)
@@ -653,6 +653,7 @@ class DebugController(Elaboratable):
         m = Module()
 
         hart_halted = Signal()
+        hart_resume_ack = Signal()
 
         with m.If(self.dmcontrol.update):
             m.d.sync += self.dmcontrol.w.dmactive.eq(self.dmcontrol.r.dmactive)
@@ -663,7 +664,6 @@ class DebugController(Elaboratable):
                     self.dmcontrol.w.hartsello.eq(self.dmcontrol.r.hartsello),
                     self.dmcontrol.w.hartreset.eq(self.dmcontrol.r.hartreset),
                     self.dmcontrol.w.haltreq.eq(self.dmcontrol.r.haltreq),
-                    self.dmcontrol.w.resumereq.eq(self.dmcontrol.r.resumereq),
                 ]
 
         with m.If(~self.dmcontrol.w.dmactive):
@@ -680,11 +680,39 @@ class DebugController(Elaboratable):
                 )
             ]
 
+        #
+        # Halt request
+        #
+
         with m.If(~self.dmcontrol.w.dmactive):
             m.d.sync += self.debug_int.eq(0)
         with m.Else():
             with m.If(self.dmcontrol.update):
                 m.d.sync += self.debug_int.eq(self.dmcontrol.r.haltreq)
+
+        #
+        # Resume request
+        #
+
+        hart_resuming = Signal()
+        resume_req = self.dmcontrol.update & self.dmcontrol.r.resumereq
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += hart_resuming.eq(0)
+        with m.Else():
+            with m.If(self._halted.w_stb):
+                m.d.sync += hart_halted.eq(1)
+            with m.Elif(self._resuming.w_stb):
+                m.d.sync += hart_halted.eq(0)
+
+            with m.If(resume_req):
+                m.d.sync += hart_resuming.eq(1)
+            with m.Elif(self._resuming.w_stb):
+                m.d.sync += hart_resuming.eq(0)
+
+            with m.If(resume_req):
+                m.d.comb += hart_resume_ack.eq(0)
+            with m.Else():
+                m.d.comb += hart_resume_ack.eq(~hart_resuming)
 
         m.d.comb += self.abstractcs.w.progbufsize.eq(self.progbuf_size)
 
@@ -732,11 +760,10 @@ class DebugController(Elaboratable):
             self.dmstatus.w.anyrunning.eq(~hart_halted),
             self.dmstatus.w.allhalted.eq(hart_halted),
             self.dmstatus.w.anyhalted.eq(hart_halted),
+            self.dmstatus.w.anyresumeack.eq(hart_resume_ack),
+            self.dmstatus.w.allresumeack.eq(hart_resume_ack),
             self.haltsum0.w[0].eq(self.dmstatus.w.allhalted),
         ]
-
-        with m.If(self._halted.w_stb):
-            m.d.sync += hart_halted.eq(1)
 
         go_req = Signal()
         go_abstract = Signal()
@@ -748,7 +775,10 @@ class DebugController(Elaboratable):
         with m.Elif(self._going.w_stb):
             m.d.sync += go_req.eq(0)
 
-        m.d.comb += self._flags.r_data[0].eq(go_req)
+        m.d.comb += [
+            self._flags.r_data[0].eq(go_req),
+            self._flags.r_data[1].eq(hart_resuming),
+        ]
 
         #
         # Abstract command instruction generation

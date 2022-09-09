@@ -228,6 +228,14 @@ class Core(Elaboratable):
         # Frontend redirect
         #
 
+        # Delay exception vector for 2 cycles
+        evec_d1 = Signal.like(exc_unit.exc_vector)
+        evec_d2 = Signal.like(exc_unit.exc_vector)
+        m.d.sync += [
+            evec_d1.eq(exc_unit.exc_vector),
+            evec_d2.eq(evec_d1),
+        ]
+
         with m.If(rob_flush_d1.valid):
             m.d.comb += [
                 if_stage.redirect_valid.eq(1),
@@ -237,8 +245,10 @@ class Core(Elaboratable):
 
             flush_pc = if_stage.get_pc[0].pc + rob_flush_d1.pc_lsb
             with m.Switch(rob_flush_d1.flush_type):
-                with m.Case(FlushType.EXCEPT, FlushType.ERET):
+                with m.Case(FlushType.EXCEPT):
                     m.d.comb += if_stage.redirect_pc.eq(exc_unit.exc_vector)
+                with m.Case(FlushType.ERET):
+                    m.d.comb += if_stage.redirect_pc.eq(evec_d2)
                 with m.Case(FlushType.NEXT):
                     m.d.comb += if_stage.redirect_pc.eq(
                         flush_pc + Mux(rob_flush_d1.is_rvc, 2, 4))
