@@ -6,4 +6,15 @@ results.xml
 sim_build
 *.vcd
 
+# Generated files
+include/generated/
+
+# Object files
+*.o
+*.d
+
+# Debug ROM
 debug_rom*
+
+# ZSBL
+zsbl.*

@@ -109,6 +109,9 @@ class Top(Elaboratable):
 
         m.d.comb += core.debug_entry.eq(dm_base + 0x800)
 
+        with open('include/generated/platform.h', 'w') as f:
+            soc.generate_platform_header(file=f)
+
         return m
 
 

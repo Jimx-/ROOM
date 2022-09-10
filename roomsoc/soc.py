@@ -241,3 +241,28 @@ class SoC(Elaboratable):
 
                 size = res.end - res.start
                 yield res.resource, peripheral_start + res.start, size
+
+    def generate_platform_header(self, macro_name='PLATFORM', file=None):
+
+        def emit(s):
+            print(s, file=file)
+
+        emit('/* Auto-generated; do not edit. */')
+        emit('\n')
+
+        emit(f'#ifndef _{macro_name}_H_')
+        emit(f'#define _{macro_name}_H_')
+        emit('')
+
+        emit('/*')
+        emit(' * Peripherals')
+        emit(' */')
+        for resource, address, size in self.resources():
+            name = resource.name
+
+            emit(f'#define {name.upper()}_ADDRESS 0x{address:08x}UL')
+            emit(f'#define {name.upper()}_SIZE {size}')
+            emit('')
+
+        emit('')
+        emit('#endif')
