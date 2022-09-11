@@ -72,7 +72,11 @@ class CSRFile(Elaboratable):
         self.misa = CSR(csrnames.misa, misa_layout)
         self.mscratch = CSR(csrnames.mscratch, [('value', 32, CSRAccess.RW)])
 
+        self.mcycle = CSR(csrnames.mcycle, [('value', 32, CSRAccess.RW)])
+        self.mcycleh = CSR(csrnames.mcycleh, [('value', 32, CSRAccess.RW)])
+
         self.add_csrs([self.mhartid, self.misa, self.mscratch])
+        self.add_csrs([self.mcycle, self.mcycleh])
 
     def add_csrs(self, csrs):
         for csr in csrs:
@@ -109,6 +113,13 @@ class CSRFile(Elaboratable):
 
         with m.If(self.mscratch.we):
             m.d.sync += self.mscratch.r.eq(self.mscratch.w)
+
+        cycles = Signal(64)
+        m.d.sync += cycles.eq(cycles + 1)
+        m.d.comb += [
+            self.mcycle.r.eq(cycles[:32]),
+            self.mcycleh.r.eq(cycles[32:]),
+        ]
 
         for p in self._ports:
             with m.Switch(p.addr):

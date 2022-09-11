@@ -8,6 +8,7 @@ from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
+from roomsoc.peripheral.sdc import SDController
 from roomsoc.platform.kc705 import KC705Platform
 
 import argparse
@@ -64,6 +65,8 @@ class Top(Elaboratable):
 
         self.uart = UART(divisor=int(self.clk_freq // 115200))
 
+        self.sdc = SDController()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -82,7 +85,7 @@ class Top(Elaboratable):
 
         soc.add_rom(name='rom',
                     origin=self.mem_map['rom'],
-                    size=0x2000,
+                    size=0x20000,
                     init=self.rom_image,
                     mode='rw')
 
@@ -98,6 +101,7 @@ class Top(Elaboratable):
         soc.add_cpu(core)
 
         soc.add_peripheral('uart', self.uart)
+        soc.add_peripheral('sdc', self.sdc)
 
         dm_base = 0
 
@@ -165,6 +169,13 @@ if __name__ == "__main__":
                                 top.jtag.tms,
                                 top.uart.tx,
                                 top.uart.rx,
+                                top.sdc.sdio_clk,
+                                top.sdc.sdio_cmd_i,
+                                top.sdc.sdio_cmd_o,
+                                top.sdc.sdio_cmd_t,
+                                top.sdc.sdio_data_i,
+                                top.sdc.sdio_data_o,
+                                top.sdc.sdio_data_t,
                             ],
                             platform=KC705Platform(),
                             name='soc_wrapper'))
