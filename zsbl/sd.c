@@ -92,6 +92,8 @@ static int finish_data(void* buf, unsigned int blocks)
 
                 for (i = 0; i < (blocks << 7); i++) {
                     data = mmio_read32((void*)SDC_BUFFER_ADDRESS);
+                    data = ((data >> 24) & 0xff) | ((data << 8) & 0xff0000) |
+                           ((data >> 8) & 0xff00) | ((data << 24) & 0xff000000);
                     *(unsigned int*)(buf + (i << 2)) = data;
                 }
             }
@@ -258,5 +260,27 @@ int sd_init(void)
     /* Set block length */
     if (send_cmd(CMD16, 512, NULL) < 0) return -1;
 
+    return 0;
+}
+
+int sd_read_sector(unsigned int sector, unsigned char* buffer,
+                   unsigned int sector_count)
+{
+    while (sector_count > 0) {
+        unsigned int bcnt = 1;
+        unsigned int bytes = bcnt * 512;
+
+        if (send_data_cmd(CMD17, sector, NULL, buffer, bcnt) < 0) return 0;
+        sector += 1;
+        sector_count -= 1;
+        buffer += bytes;
+    }
+
+    return 1;
+}
+
+int sd_write_sector(unsigned int sector, unsigned char* buffer,
+                    unsigned int sector_count)
+{
     return 0;
 }

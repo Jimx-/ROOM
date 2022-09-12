@@ -1,5 +1,6 @@
 #include "serial.h"
 #include "sd.h"
+#include "fat_filelib.h"
 
 #include <stdint.h>
 
@@ -30,8 +31,14 @@ int main()
 
     sd_init();
 
-    for (;;)
-        ;
+    fl_init();
+
+    if (fl_attach_media(sd_read_sector, sd_write_sector) != FAT_INIT_OK) {
+        serial_printf("ERROR: Failed to init file system\n");
+        return -1;
+    }
+
+    fl_listdirectory("/");
 
     return 0;
 }

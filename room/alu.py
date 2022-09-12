@@ -138,8 +138,8 @@ def generate_imm(ip, sel):
 
 class ALU(PipelinedFunctionalUnit):
 
-    def __init__(self, params, is_jmp=False):
-        super().__init__(1, params, is_jmp=is_jmp, is_alu=True)
+    def __init__(self, params, is_jmp=False, num_stages=1):
+        super().__init__(num_stages, params, is_jmp=is_jmp, is_alu=True)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)

@@ -3,4 +3,7 @@
 .text
 _start:
     la   sp, _stack_top
-    tail main
+    call main
+
+_hang:
+    j _hang

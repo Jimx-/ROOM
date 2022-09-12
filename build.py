@@ -93,7 +93,7 @@ class Top(Elaboratable):
 
         soc.add_ram(name='sram',
                     origin=self.mem_map['sram'],
-                    size=0x1000,
+                    size=0x20000,
                     init=self.ram_image)
 
         soc.add_controller()

@@ -98,7 +98,9 @@ class ALUExecUnit(ExecUnit):
         iresp_units = []
 
         if self.has_alu:
-            alu = m.submodules.alu = ALU(self.params, is_jmp=self.has_jmp_unit)
+            alu = m.submodules.alu = ALU(self.params,
+                                         is_jmp=self.has_jmp_unit,
+                                         num_stages=3 if self.has_mul else 1)
             iresp_units.append(alu)
 
             m.d.comb += [

@@ -3,10 +3,12 @@ LD	= $(RISCV)/bin/riscv64-unknown-elf-ld
 OBJCOPY	= $(RISCV)/bin/riscv64-unknown-elf-objcopy
 
 CFLAGS	= -march=rv32im -mabi=ilp32 -nostdlib -nostartfiles -g
-CFLAGS	+= -I../include/ -I$(RISCV)/riscv64-unknown-elf/include/
+CFLAGS	+= -I../include/ -Ifat/src/ -I$(RISCV)/riscv64-unknown-elf/include/
 LDFLAGS	= -melf32lriscv -Tlinker.ld
 
-SRCS	= start.S main.c serial.c vsprintf.c sd.c
+SRCS	= start.S main.c serial.c memset.S memcpy.S string.c vsprintf.c sd.c
+SRCS	+= fat/src/fat_access.c fat/src/fat_filelib.c fat/src/fat_misc.c fat/src/fat_table.c \
+			fat/src/fat_cache.c fat/src/fat_format.c fat/src/fat_string.c fat/src/fat_write.c
 OBJS	= $(patsubst %.c, %.o, $(patsubst %.S, %.o, $(patsubst %.asm, %.o, $(SRCS))))
 DEPS	= $(OBJS:.o=.d)
 

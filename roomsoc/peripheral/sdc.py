@@ -622,6 +622,7 @@ class SDDataPHY(Elaboratable):
                         crc_enable.eq(0),
                         crc_clear.eq(1),
                         data_index.eq(0),
+                        crc_bit.eq(15),
                         self.fifo_we.eq(0),
                         self.fifo_re.eq(0),
                         bus_4bit.eq(self.bus_4bit),
@@ -640,6 +641,7 @@ class SDDataPHY(Elaboratable):
                         last_din.eq(0),
                         xfr_count.eq(0),
                         data_index.eq(0),
+                        crc_bit.eq(15),
                     ]
 
                     with m.If(~data_in[0]):

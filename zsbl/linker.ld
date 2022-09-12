@@ -3,13 +3,13 @@ ENTRY( _start )
 
 MEMORY
 {
-  ROM   (rx)  : ORIGIN = 0x00000000, LENGTH = 16K
-  RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 4K
+  ROM   (rx)  : ORIGIN = 0x00000000, LENGTH = 32K
+  RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 32K
 }
 
 SECTIONS
 {
-  __stack_size = DEFINED(__stack_size) ? __stack_size : 128;
+  __stack_size = DEFINED(__stack_size) ? __stack_size : 0x1000;
 
   .text :
   {
@@ -57,7 +57,7 @@ SECTIONS
   PROVIDE( _end = . );
   PROVIDE( end = . );
 
-  .stack ORIGIN(RAM) + LENGTH(RAM) - __stack_size :
+  .stack ORIGIN(RAM) + LENGTH(RAM) - __stack_size:
   {
     PROVIDE( _heap_end = . );
     . = __stack_size;

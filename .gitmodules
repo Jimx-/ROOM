@@ -1,0 +1,3 @@
+[submodule "zsbl/fat"]
+	path = zsbl/fat
+	url = https://github.com/ultraembedded/fat_io_lib.git
