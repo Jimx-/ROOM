@@ -76,6 +76,35 @@ static int finish_cmd(unsigned int cmd, unsigned int response[4])
     return -1;
 }
 
+static int finish_data(void* buf, unsigned int blocks)
+{
+    unsigned int status;
+
+    for (;;) {
+        status = mmio_read32((void*)SDC_DATA_ISR_ADDRESS);
+
+        if (status) {
+            mmio_write32((void*)SDC_DATA_ISR_ADDRESS, 0);
+
+            if (status & SDC_ISR_CC) {
+                unsigned int data;
+                int i;
+
+                for (i = 0; i < (blocks << 7); i++) {
+                    data = mmio_read32((void*)SDC_BUFFER_ADDRESS);
+                    *(unsigned int*)(buf + (i << 2)) = data;
+                }
+            }
+
+            if (status == SDC_ISR_CC) return 0;
+
+            break;
+        }
+    }
+
+    return -1;
+}
+
 static int send_data_cmd(unsigned int cmd, unsigned int arg,
                          unsigned int response[4], void* buf,
                          unsigned int blocks)
@@ -148,10 +177,23 @@ static int send_data_cmd(unsigned int cmd, unsigned int arg,
         break;
     }
 
+    if (blocks) {
+        command |= 1 << 5;
+        if ((intptr_t)buf & 3) {
+            return -1;
+        }
+
+        mmio_write32((void*)SDC_BLKSIZE_ADDRESS, 511);
+        mmio_write32((void*)SDC_BLKCNT_ADDRESS, blocks - 1);
+    }
+
     mmio_write32((void*)SDC_COMMAND_ADDRESS, command);
     mmio_write32((void*)SDC_ARGUMENT_ADDRESS, arg);
 
-    return finish_cmd(cmd, response);
+    if (finish_cmd(cmd, response) < 0) return -1;
+    if (blocks) return finish_data(buf, blocks);
+
+    return 0;
 }
 
 int sd_init(void)
@@ -160,6 +202,13 @@ int sd_init(void)
     unsigned int response[4];
     unsigned int rca;
 
+    /* SD controller soft reset */
+    mmio_write32((void*)SDC_RESET_ADDRESS, 1);
+    mmio_write32((void*)SDC_DIVISOR_ADDRESS, 0x7c);
+    mmio_write32((void*)SDC_RESET_ADDRESS, 0);
+    usleep(5000);
+
+    /* Reset SD card */
     ctrl = mmio_read32((void*)SDC_CTRL_SETTING_ADDRESS);
     ctrl |= SDC_CTRL_SD_RESET;
     mmio_write32((void*)SDC_CTRL_SETTING_ADDRESS, ctrl);
@@ -168,6 +217,7 @@ int sd_init(void)
     mmio_write32((void*)SDC_CTRL_SETTING_ADDRESS, ctrl);
     usleep(100000);
 
+    /* Go idle */
     send_cmd(CMD0, 0, NULL);
 
     if (send_cmd(CMD8, 0x1AA, response) == 0) {
@@ -191,7 +241,22 @@ int sd_init(void)
     if (send_cmd(CMD3, rca << 16, response) < 0) return -1;
     rca = response[0] >> 16;
 
-    if (send_cmd(CMD7, rca << 16, response) < 0) return -1;
+    /* Select card */
+    if (send_cmd(CMD7, rca << 16, NULL) < 0) return -1;
+
+    /* 12.5 MHz */
+    mmio_write32((void*)SDC_DIVISOR_ADDRESS, 4);
+    usleep(10000);
+
+    /* 4-bit mode */
+    ctrl = mmio_read32((void*)SDC_CTRL_SETTING_ADDRESS);
+    ctrl |= SDC_CTRL_SD_4BIT;
+    mmio_write32((void*)SDC_CTRL_SETTING_ADDRESS, ctrl);
+    if (send_cmd(CMD55, rca << 16, NULL) < 0 || send_cmd(ACMD6, 2, NULL) < 0)
+        return -1;
+
+    /* Set block length */
+    if (send_cmd(CMD16, 512, NULL) < 0) return -1;
 
     return 0;
 }

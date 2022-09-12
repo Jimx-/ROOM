@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth.lib.fifo import SyncFIFO
 from enum import IntEnum
 
 from .peripheral import Peripheral
@@ -12,11 +13,17 @@ class SDControllerReg(IntEnum):
     RESP2 = 0x10
     RESP3 = 0x14
     CONTROLLER = 0x18
+    BUFFER = 0x1c
     CMD_TIMEOUT = 0x20
     DIVISOR = 0x24
     RESET = 0x28
+    DATA_TIMEOUT = 0x2c
     CMD_ISR = 0x34
     CMD_IER = 0x38
+    DATA_ISR = 0x3c
+    DATA_IER = 0x40
+    BLKSIZE = 0x44
+    BLKCNT = 0x48
 
 
 class CommandIntStatus(IntEnum):
@@ -25,6 +32,14 @@ class CommandIntStatus(IntEnum):
     TIMEOUT = 2
     CRC_ERR = 3
     IDX_ERR = 4
+
+
+class DataIntStatus(IntEnum):
+    COMPLETED = 0
+    ERROR = 1
+    TIMEOUT = 2
+    CRC_ERR = 3
+    FIFO_ERR = 4
 
 
 class SDCommandMaster(Elaboratable):
@@ -392,6 +407,321 @@ class SDCommandPHY(Elaboratable):
         return m
 
 
+class SDDataMaster(Elaboratable):
+
+    class State(IntEnum):
+        IDLE = 0
+        START_RX = 1
+        START_TX = 2
+        TRANSFER = 3
+
+    def __init__(self):
+        self.clock_posedge = Signal()
+
+        self.start_tx = Signal()
+        self.start_rx = Signal()
+        self.timeout = Signal(32)
+
+        self.data_read = Signal()
+        self.data_write = Signal()
+
+        self.tx_fifo_en = Signal()
+        self.rx_fifo_en = Signal()
+        self.fifo_empty = Signal()
+        self.fifo_full = Signal()
+
+        self.xfr_complete = Signal()
+        self.crc_error = Signal()
+
+        self.int_status = Signal(8)
+        self.int_status_rst = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        state = Signal(self.State)
+
+        timeout_enable = Signal()
+        timeout_counter = Signal(32)
+
+        with m.If(self.clock_posedge):
+            with m.Switch(state):
+                with m.Case(self.State.IDLE):
+                    m.d.sync += [
+                        self.tx_fifo_en.eq(0),
+                        self.rx_fifo_en.eq(0),
+                        self.data_read.eq(0),
+                        self.data_write.eq(0),
+                        timeout_enable.eq(self.timeout != 0),
+                        timeout_counter.eq(0),
+                    ]
+
+                    with m.If(self.start_rx):
+                        m.d.sync += state.eq(self.State.START_RX)
+
+                with m.Case(self.State.START_RX):
+                    m.d.sync += [
+                        self.tx_fifo_en.eq(0),
+                        self.rx_fifo_en.eq(1),
+                        self.data_read.eq(1),
+                    ]
+
+                    with m.If(~self.xfr_complete):
+                        m.d.sync += state.eq(self.State.TRANSFER)
+
+                with m.Case(self.State.TRANSFER):
+                    m.d.sync += [
+                        self.data_read.eq(0),
+                        self.data_write.eq(0),
+                    ]
+
+                    with m.If((self.tx_fifo_en & self.fifo_empty)
+                              | (self.rx_fifo_en & self.fifo_full)):
+                        m.d.sync += [
+                            self.int_status[DataIntStatus.ERROR].eq(1),
+                            self.int_status[DataIntStatus.FIFO_ERR].eq(1),
+                            self.data_read.eq(1),
+                            self.data_write.eq(1),
+                            state.eq(self.State.IDLE),
+                        ]
+
+                    with m.Elif(timeout_enable
+                                & (timeout_counter >= self.timeout)):
+                        m.d.sync += [
+                            self.int_status[DataIntStatus.ERROR].eq(1),
+                            self.int_status[DataIntStatus.TIMEOUT].eq(1),
+                            self.data_read.eq(1),
+                            self.data_write.eq(1),
+                            state.eq(self.State.IDLE),
+                        ]
+
+                    with m.Elif(self.xfr_complete):
+                        m.d.sync += [
+                            state.eq(self.State.IDLE),
+                            self.int_status[DataIntStatus.COMPLETED].eq(1),
+                        ]
+
+                        with m.If(self.crc_error):
+                            m.d.sync += [
+                                self.int_status[DataIntStatus.ERROR].eq(1),
+                                self.int_status[DataIntStatus.CRC_ERR].eq(1),
+                            ]
+
+                    with m.Elif(timeout_enable):
+                        m.d.sync += timeout_counter.eq(timeout_counter + 1)
+
+        with m.If(self.int_status_rst):
+            m.d.sync += self.int_status.eq(0)
+
+        return m
+
+
+class DataCRC16(Elaboratable):
+
+    def __init__(self):
+        self.bit = Signal()
+        self.en = Signal()
+        self.clear = Signal()
+
+        self.crc = Signal(16)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        inv = self.bit ^ self.crc[-1]
+
+        with m.If(self.en):
+            for i in range(1, 16):
+                m.d.sync += self.crc[i].eq(self.crc[i - 1])
+
+            m.d.sync += [
+                self.crc[12].eq(self.crc[11] ^ inv),
+                self.crc[5].eq(self.crc[4] ^ inv),
+                self.crc[0].eq(inv),
+            ]
+
+        with m.If(self.clear):
+            m.d.sync += self.crc.eq(0)
+
+        return m
+
+
+class SDDataPHY(Elaboratable):
+
+    class State(IntEnum):
+        IDLE = 0
+        READ_WAIT = 1
+        READ_DATA = 2
+
+    def __init__(self):
+        self.clock_posedge = Signal()
+        self.clock_data_in = Signal()
+
+        self.fifo_wdata = Signal(32)
+        self.fifo_we = Signal()
+        self.fifo_rdata = Signal(32)
+        self.fifo_re = Signal()
+
+        self.dat_i = Signal(4)
+        self.dat_o = Signal(4)
+        self.dat_oe = Signal(4)
+
+        self.start_tx = Signal()
+        self.start_rx = Signal()
+        self.block_size = Signal(12)
+        self.block_count = Signal(16)
+        self.bus_4bit = Signal()
+        self.crc_error = Signal()
+        self.busy = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        state = Signal(self.State)
+        m.d.comb += self.busy.eq(state != self.State.IDLE)
+
+        data_in = Signal(4)
+        with m.If(self.clock_data_in):
+            m.d.sync += data_in.eq(self.dat_i)
+
+        last_din = Signal(4)
+
+        crc_enable = Signal()
+        crc_clear = Signal()
+        crc_out = []
+        for i in range(4):
+            crc = DataCRC16()
+            m.submodules += crc
+
+            crc_val = Array(Signal() for _ in range(16))
+            m.d.comb += [
+                crc.bit.eq(last_din[i]),
+                crc.en.eq(self.clock_posedge & crc_enable),
+                crc.clear.eq(crc_clear),
+                Cat(*crc_val).eq(crc.crc),
+            ]
+
+            crc_out.append(crc_val)
+
+        data_index = Signal(range(32))
+        block_count = Signal.like(self.block_count)
+        bus_4bit = Signal()
+        data_cycles = Signal(16)
+        xfr_count = Signal.like(data_cycles)
+        crc_bit = Signal(range(16))
+
+        data_out = Array(Signal() for _ in range(32))
+        m.d.comb += self.fifo_wdata.eq(Cat(*data_out))
+
+        with m.If(self.clock_posedge):
+            with m.Switch(state):
+                with m.Case(self.State.IDLE):
+                    m.d.sync += [
+                        self.dat_oe.eq(0),
+                        self.dat_o.eq(0b1111),
+                        crc_enable.eq(0),
+                        crc_clear.eq(1),
+                        data_index.eq(0),
+                        self.fifo_we.eq(0),
+                        self.fifo_re.eq(0),
+                        bus_4bit.eq(self.bus_4bit),
+                        block_count.eq(self.block_count),
+                        data_cycles.eq(
+                            Mux(self.bus_4bit, (self.block_size << 1) + 2,
+                                (self.block_size << 3) + 8)),
+                    ]
+
+                    with m.If(self.start_rx & ~self.start_tx):
+                        m.d.sync += state.eq(self.State.READ_WAIT)
+
+                with m.Case(self.State.READ_WAIT):
+                    m.d.sync += [
+                        self.dat_oe.eq(0),
+                        last_din.eq(0),
+                        xfr_count.eq(0),
+                        data_index.eq(0),
+                    ]
+
+                    with m.If(~data_in[0]):
+                        m.d.sync += [
+                            crc_clear.eq(0),
+                            crc_enable.eq(1),
+                            state.eq(self.State.READ_DATA),
+                        ]
+
+                with m.Case(self.State.READ_DATA):
+                    m.d.sync += [
+                        last_din.eq(data_in),
+                        xfr_count.eq(xfr_count + 1),
+                    ]
+
+                    with m.If(xfr_count < data_cycles):
+                        with m.If(bus_4bit):
+                            m.d.sync += [
+                                self.fifo_we.eq((data_index[:3] == 7)
+                                                |
+                                                ((xfr_count == data_cycles - 1)
+                                                 & ~block_count)),
+                                data_out[31 - (data_index[:3] << 2)].eq(
+                                    data_in[3]),
+                                data_out[30 - (data_index[:3] << 2)].eq(
+                                    data_in[2]),
+                                data_out[29 - (data_index[:3] << 2)].eq(
+                                    data_in[1]),
+                                data_out[28 - (data_index[:3] << 2)].eq(
+                                    data_in[0]),
+                            ]
+                        with m.Else():
+                            m.d.sync += [
+                                self.fifo_we.eq((data_index == 31)
+                                                |
+                                                ((xfr_count == data_cycles - 1)
+                                                 & ~block_count)),
+                                data_out[31 - data_index].eq(data_in[0]),
+                            ]
+
+                        m.d.sync += [
+                            data_index.eq(data_index + 1),
+                            self.crc_error.eq(0),
+                        ]
+
+                    with m.Elif(xfr_count == data_cycles):
+                        m.d.sync += [
+                            crc_enable.eq(0),
+                            self.fifo_we.eq(0),
+                        ]
+
+                    with m.Elif(xfr_count <= data_cycles + 16):
+                        with m.If(crc_out[0][crc_bit] != last_din[0]):
+                            m.d.sync += self.crc_error.eq(1)
+                        with m.If(bus_4bit):
+                            with m.If(crc_out[1][crc_bit] != last_din[1]):
+                                m.d.sync += self.crc_error.eq(1)
+                            with m.If(crc_out[2][crc_bit] != last_din[2]):
+                                m.d.sync += self.crc_error.eq(1)
+                            with m.If(crc_out[3][crc_bit] != last_din[3]):
+                                m.d.sync += self.crc_error.eq(1)
+
+                        with m.If(crc_bit == 0):
+                            m.d.sync += crc_clear.eq(1)
+                        with m.Else():
+                            m.d.sync += crc_bit.eq(crc_bit - 1)
+
+                    with m.Elif((block_count != 0) & ~self.crc_error):
+                        m.d.sync += [
+                            block_count.eq(block_count - 1),
+                            state.eq(self.State.READ_WAIT),
+                        ]
+
+                    with m.Else():
+                        m.d.sync += state.eq(self.State.IDLE)
+
+            with m.If(self.start_rx & self.start_tx):
+                m.d.sync += state.eq(self.State.IDLE)
+
+        return m
+
+
 class SDController(Peripheral, Elaboratable):
 
     def __init__(self, *, name=None):
@@ -407,13 +737,22 @@ class SDController(Peripheral, Elaboratable):
         self._ctrl_setting = bank.csr(32,
                                       'rw',
                                       addr=SDControllerReg.CONTROLLER)
+        self._buffer = bank.csr(32, 'rw', addr=SDControllerReg.BUFFER)
         self._cmd_timeout = bank.csr(32,
                                      'rw',
                                      addr=SDControllerReg.CMD_TIMEOUT)
         self._divisor = bank.csr(8, 'rw', addr=SDControllerReg.DIVISOR)
         self._reset = bank.csr(8, 'rw', addr=SDControllerReg.RESET)
+        self._data_timeout = bank.csr(32,
+                                      'rw',
+                                      addr=SDControllerReg.DATA_TIMEOUT)
         self._cmd_isr = bank.csr(8, 'rw', addr=SDControllerReg.CMD_ISR)
         self._cmd_ier = bank.csr(8, 'rw', addr=SDControllerReg.CMD_IER)
+        self._data_isr = bank.csr(8, 'rw', addr=SDControllerReg.DATA_ISR)
+        self._data_ier = bank.csr(8, 'rw', addr=SDControllerReg.DATA_IER)
+
+        self._blksize = bank.csr(12, 'rw', addr=SDControllerReg.BLKSIZE)
+        self._blkcnt = bank.csr(16, 'rw', addr=SDControllerReg.BLKCNT)
 
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
@@ -515,6 +854,8 @@ class SDController(Peripheral, Elaboratable):
 
         with m.If(self._cmd_timeout.w_stb):
             m.d.sync += self._cmd_timeout.r_data.eq(self._cmd_timeout.w_data)
+        with m.If(self._data_timeout.w_stb):
+            m.d.sync += self._data_timeout.r_data.eq(self._data_timeout.w_data)
 
         self._divisor.r_data.reset = 124
         with m.If(self._divisor.w_stb):
@@ -528,11 +869,26 @@ class SDController(Peripheral, Elaboratable):
         with m.If(self._cmd_isr.w_stb):
             m.d.sync += cmd_int_rst.eq(1)
 
+        data_int_rst = Signal()
+        with m.If(clock_posedge):
+            m.d.sync += data_int_rst.eq(0)
+        with m.If(self._data_isr.w_stb):
+            m.d.sync += data_int_rst.eq(1)
+
+        with m.If(self._blksize.w_stb):
+            m.d.sync += self._blksize.r_data.eq(self._blksize.w_data)
+        with m.If(self._blkcnt.w_stb):
+            m.d.sync += self._blkcnt.r_data.eq(self._blkcnt.w_data)
+
         m.domains += ClockDomain('ctrl')
         m.d.comb += [
             ClockSignal('ctrl').eq(ClockSignal()),
             ResetSignal('ctrl').eq(ResetSignal() | ctrl_rst),
         ]
+
+        #
+        # Control plane
+        #
 
         cmd_master = m.submodules.cmd_master = DomainRenamer('ctrl')(
             SDCommandMaster())
@@ -583,5 +939,74 @@ class SDController(Peripheral, Elaboratable):
             self.start.eq(cmd_master.start_xfr),
             self.finish.eq(cmd_phy.finish),
         ]
+
+        start_data_tx = Signal()
+        start_data_rx = Signal()
+
+        with m.If(ctrl_rst):
+            m.d.sync += [
+                start_data_tx.eq(0),
+                start_data_rx.eq(0),
+            ]
+        with m.Elif(clock_posedge):
+            m.d.sync += [
+                start_data_tx.eq(0),
+                start_data_rx.eq(0),
+            ]
+
+            with m.If(cmd_start):
+                with m.Switch(self._command.r_data[5:7]):
+                    with m.Case(0b01):
+                        m.d.sync += start_data_rx.eq(1)
+                    with m.Case(0b10, 0b11):
+                        m.d.sync += start_data_tx.eq(1)
+
+        #
+        # Data plane
+        #
+
+        data_fifo = m.submodules.data_fifo = DomainRenamer('ctrl')(SyncFIFO(
+            width=32, depth=256))
+
+        data_master = m.submodules.data_master = DomainRenamer('ctrl')(
+            SDDataMaster())
+
+        m.d.comb += [
+            data_master.clock_posedge.eq(clock_posedge),
+            data_master.start_tx.eq(start_data_tx),
+            data_master.start_rx.eq(start_data_rx),
+            data_master.fifo_empty.eq(~data_fifo.r_rdy),
+            data_master.fifo_full.eq(~data_fifo.w_rdy),
+            data_master.timeout.eq(self._data_timeout.r_data),
+            self._data_isr.r_data.eq(data_master.int_status),
+            data_master.int_status_rst.eq(data_int_rst),
+        ]
+
+        data_phy = m.submodules.data_phy = DomainRenamer('ctrl')(SDDataPHY())
+        m.d.comb += [
+            data_phy.clock_posedge.eq(clock_posedge),
+            data_phy.clock_data_in.eq(clock_data_in),
+            data_phy.dat_i.eq(self.sdio_data_i),
+            sdio_data_o.eq(data_phy.dat_o),
+            sdio_data_oe.eq(data_phy.dat_oe),
+            data_phy.start_tx.eq(data_master.data_write),
+            data_phy.start_rx.eq(data_master.data_read),
+            data_phy.block_size.eq(self._blksize.r_data),
+            data_phy.block_count.eq(self._blkcnt.r_data),
+            data_phy.bus_4bit.eq(self._ctrl_setting.r_data[0]),
+            data_master.crc_error.eq(data_phy.crc_error),
+            data_master.xfr_complete.eq(~data_phy.busy),
+        ]
+
+        m.d.comb += [
+            data_phy.fifo_rdata.eq(data_fifo.r_data),
+            data_fifo.r_en.eq(clock_posedge & data_phy.fifo_re),
+            data_fifo.w_data.eq(data_phy.fifo_wdata),
+            data_fifo.w_en.eq(clock_posedge & data_phy.fifo_we),
+        ]
+
+        m.d.comb += self._buffer.r_data.eq(data_fifo.r_data)
+        with m.If(self._buffer.r_stb):
+            m.d.comb += data_fifo.r_en.eq(1)
 
         return m
