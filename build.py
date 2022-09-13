@@ -36,6 +36,7 @@ core_params = dict(fetch_width=4,
                    max_br_count=4,
                    ldq_size=16,
                    stq_size=16,
+                   num_breakpoints=1,
                    issue_params={
                        IssueQueueType.MEM:
                        dict(dispatch_width=2, num_entries=16, issue_width=2),

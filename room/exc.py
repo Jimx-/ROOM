@@ -30,6 +30,7 @@ class Cause(IntEnum):
     FETCH_PAGE_FAULT = 12
     LOAD_PAGE_FAULT = 13
     STORE_PAGE_FAULT = 15
+    DEBUG_TRIGGER = 16
     # interrupts
     U_SOFTWARE_INTERRUPT = 0
     S_SOFTWARE_INTERRUPT = 1
@@ -117,6 +118,7 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         self.interrupt_cause = Signal(32)
         self.exc_vector = Signal(32)
 
+        self.debug_mode = Signal()
         self.debug_entry = Signal(32)
 
         self.system_insn = Signal()
@@ -141,8 +143,6 @@ class ExceptionUnit(Elaboratable, AutoCSR):
     def elaborate(self, platform):
         m = Module()
 
-        debug_mode = Signal()
-
         m.d.comb += [
             self.mip.r.meip.eq(self.interrupts.meip),
             self.mip.r.mtip.eq(self.interrupts.mtip),
@@ -164,7 +164,7 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         ]
 
         m.d.comb += [
-            self.interrupt.eq(~interrupt_pe.n & ~debug_mode),
+            self.interrupt.eq(~interrupt_pe.n & ~self.debug_mode),
             self.interrupt_cause.eq(interrupt_cause),
         ]
 
@@ -200,12 +200,14 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         single_stepped = Signal()
 
         is_debug_int = cause.interrupt & (cause.ecode == Cause.DEBUG_INTERRUPT)
+        is_debug_trigger = ~cause.interrupt & (cause.ecode
+                                               == Cause.DEBUG_TRIGGER)
         is_debug_break = ~cause.interrupt & insn_break
-        trap_to_debug = single_stepped | is_debug_int | is_debug_break | debug_mode
+        trap_to_debug = single_stepped | is_debug_int | is_debug_trigger | is_debug_break | self.debug_mode
 
         m.d.comb += [
             self.exc_vector.eq(Mux(trap_to_debug, self.debug_entry, 0)),
-            self.single_step.eq(self.dcsr.r.step & ~debug_mode),
+            self.single_step.eq(self.dcsr.r.step & ~self.debug_mode),
         ]
 
         with m.If(~self.single_step):
@@ -217,9 +219,9 @@ class ExceptionUnit(Elaboratable, AutoCSR):
 
         with m.If(exception):
             with m.If(trap_to_debug):
-                with m.If(~debug_mode):
+                with m.If(~self.debug_mode):
                     m.d.sync += [
-                        debug_mode.eq(1),
+                        self.debug_mode.eq(1),
                         self.dcsr.r.cause.eq(
                             Mux(single_stepped, 4, Mux(is_debug_int, 3, 1))),
                         self.dpc.r.eq(self.epc),
@@ -227,7 +229,7 @@ class ExceptionUnit(Elaboratable, AutoCSR):
 
         with m.If(insn_ret):
             with m.If(insn_dret):
-                m.d.sync += debug_mode.eq(0)
+                m.d.sync += self.debug_mode.eq(0)
                 m.d.comb += self.exc_vector.eq(self.dpc.r)
 
         return m

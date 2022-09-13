@@ -35,10 +35,10 @@ class MicroOp(Record):
              ('mem_size', 2), ('mem_signed', 1), ('uses_ldq', 1),
              ('uses_stq', 1), ('is_fence', 1), ('is_fencei', 1),
              ('is_ecall', 1), ('clear_pipeline', 1), ('flush_on_commit', 1),
-             ('exception', 1), ('exc_cause', 32), ('ldst', 5), ('lrs1', 5),
-             ('lrs2', 5), ('lrs3', 5), ('ldst_valid', 1),
-             ('dst_rtype', W(RegisterType)), ('lrs1_rtype', W(RegisterType)),
-             ('lrs2_rtype', W(RegisterType))],
+             ('bp_exc_if', 1), ('bp_debug_if', 1), ('exception', 1),
+             ('exc_cause', 32), ('ldst', 5), ('lrs1', 5), ('lrs2', 5),
+             ('lrs3', 5), ('ldst_valid', 1), ('dst_rtype', W(RegisterType)),
+             ('lrs1_rtype', W(RegisterType)), ('lrs2_rtype', W(RegisterType))],
             name=name)
 
     def allocate_brtag(self):

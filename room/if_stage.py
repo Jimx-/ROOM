@@ -6,6 +6,7 @@ from room.consts import *
 from room.rvc import RVCDecoder
 from room.id_stage import BranchDecoder
 from room.types import MicroOp
+from room.breakpoint import Breakpoint, BreakpointMatcher
 
 
 class GetPCResp(Record):
@@ -43,6 +44,9 @@ class FetchBundle:
 
         self.ftq_idx = Signal(range(ftq_size), name=f'{name}ftq_size')
 
+        self.bp_exc_if = Signal(fetch_width, name=f'{name}bp_exc_if')
+        self.bp_debug_if = Signal(fetch_width, name=f'{name}bp_debug_if')
+
     def eq(self, rhs):
         ret = [
             self.pc.eq(rhs.pc),
@@ -52,6 +56,8 @@ class FetchBundle:
             self.cfi_idx.eq(rhs.cfi_idx),
             self.cfi_type.eq(rhs.cfi_type),
             self.ftq_idx.eq(rhs.ftq_idx),
+            self.bp_exc_if.eq(rhs.bp_exc_if),
+            self.bp_debug_if.eq(rhs.bp_debug_if),
         ]
         for inst, rinst in zip(self.insts, rhs.insts):
             ret.append(inst.eq(rinst))
@@ -110,6 +116,8 @@ class FetchBuffer(Elaboratable):
                 in_uops[w].is_rvc.eq(in_uops[w].inst[0:2] != 3),
                 in_uops[w].taken.eq((self.w_data.cfi_idx == w)
                                     & self.w_data.cfi_valid),
+                in_uops[w].bp_exc_if.eq(self.w_data.bp_exc_if[w]),
+                in_uops[w].bp_debug_if.eq(self.w_data.bp_debug_if[w]),
             ]
 
         wr_slots = [
@@ -284,6 +292,7 @@ class IFStage(Elaboratable):
         self.fetch_buffer_size = params['fetch_buffer_size']
         self.fetch_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
         ftq_size = self.fetch_buffer_size
+        self.num_breakpoints = params['num_breakpoints']
 
         self.fetch_packet = [
             MicroOp(params, name=f'fetch_uop{i}')
@@ -304,6 +313,10 @@ class IFStage(Elaboratable):
         self.redirect_pc = Signal(32)
         self.redirect_flush = Signal()
         self.redirect_ftq_idx = Signal(range(ftq_size))
+
+        self.bp = [
+            Breakpoint(name=f'bp{i}') for i in range(self.num_breakpoints)
+        ]
 
     def elaborate(self, platform):
         m = Module()
@@ -423,6 +436,11 @@ class IFStage(Elaboratable):
         for w in range(self.fetch_width):
             valid = Signal()
 
+            bp_matcher = BreakpointMatcher(self.params)
+            m.submodules += bp_matcher
+            for m_bp, bp in zip(bp_matcher.bp, self.bp):
+                m.d.comb += m_bp.eq(bp)
+
             if w == 0:
                 inst0 = Cat(f2_prev_half, s2_data[0:16])
                 inst1 = s2_data[0:32]
@@ -450,6 +468,7 @@ class IFStage(Elaboratable):
                     m.d.comb += [
                         f2_insts[w].eq(inst1),
                         f2_exp_insts[w].eq(dec1.instr_o),
+                        bp_matcher.pc.eq(pc1),
                     ]
                     br_sigs = br_dec1.out
 
@@ -468,6 +487,7 @@ class IFStage(Elaboratable):
                     br_dec.inst.eq(dec.instr_o),
                     br_dec.pc.eq(pc),
                     f2_exp_insts[w].eq(dec.instr_o),
+                    bp_matcher.pc.eq(pc),
                 ]
 
                 br_sigs = br_dec.out
@@ -514,6 +534,11 @@ class IFStage(Elaboratable):
                 | (br_sigs.cfi_type == CFIType.JALR)))
 
             m.d.comb += f2_cfi_types[w].eq(br_sigs.cfi_type)
+
+            m.d.comb += [
+                f2_fetch_bundle.bp_exc_if[w].eq(bp_matcher.exc_if),
+                f2_fetch_bundle.bp_debug_if[w].eq(bp_matcher.debug_if),
+            ]
 
             redirects_found |= f2_redirects[w]
 

@@ -34,6 +34,7 @@ core_params = dict(fetch_width=4,
                    max_br_count=4,
                    ldq_size=16,
                    stq_size=16,
+                   num_breakpoints=1,
                    issue_params={
                        IssueQueueType.MEM:
                        dict(dispatch_width=4, num_entries=16, issue_width=2),
@@ -160,6 +161,13 @@ if __name__ == "__main__":
         r = yield from dut.jtag.read_dmi(0x11)
         print(hex(r))
 
+        yield from dut.jtag.write_dmi(0x4, 0x20000ff0)
+        for _ in range(100):
+            yield
+        yield from dut.jtag.write_dmi(0x17, 0x00231002)
+        for _ in range(200):
+            yield
+
         # Write 0x4 to DCSR
         yield from dut.jtag.write_dmi(0x4, 0x4)
         for _ in range(100):
@@ -169,7 +177,7 @@ if __name__ == "__main__":
             yield
 
         # Write 0x0 to DPC
-        yield from dut.jtag.write_dmi(0x4, 0x0)
+        yield from dut.jtag.write_dmi(0x4, 0x10)
         for _ in range(100):
             yield
         yield from dut.jtag.write_dmi(0x17, 0x002307b1)

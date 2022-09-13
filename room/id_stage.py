@@ -362,6 +362,16 @@ class DecodeUnit(Elaboratable):
                 uop.exception.eq(1),
                 uop.exc_cause.eq(self.interrupt_cause),
             ]
+        with m.Elif(inuop.bp_debug_if):
+            m.d.comb += [
+                uop.exception.eq(1),
+                uop.exc_cause.eq(Cause.DEBUG_TRIGGER),
+            ]
+        with m.Elif(inuop.bp_exc_if):
+            m.d.comb += [
+                uop.exception.eq(1),
+                uop.exc_cause.eq(Cause.BREAKPOINT),
+            ]
 
         return m
 
@@ -388,6 +398,7 @@ class DecodeStage(Elaboratable):
         self.dis_ready = Signal()
 
         self.br_update = BranchUpdate(self.params)
+        self.flush_pipeline = Signal()
 
         self.interrupt = Signal()
         self.interrupt_cause = Signal(32)
@@ -436,6 +447,7 @@ class DecodeStage(Elaboratable):
             uop = self.uops[w]
 
             m.d.comb += [
+                br_mask_alloc.flush.eq(self.flush_pipeline),
                 br_mask_alloc.is_branch[w].eq(~dec_finished_mask[w]
                                               & uop.allocate_brtag()),
                 br_mask_alloc.reqs[w].eq(self.fire[w]

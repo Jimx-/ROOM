@@ -16,6 +16,7 @@ from room.branch import BranchUpdate, BranchResolution
 from room.lsu import LoadStoreUnit
 from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts
+from room.breakpoint import BreakpointUnit
 
 from roomsoc.interconnect import wishbone
 
@@ -66,10 +67,22 @@ class Core(Elaboratable):
         m.d.comb += exc_unit.interrupts.eq(self.interrupts)
 
         #
+        # Breakpoint unit
+        #
+
+        bp_unit = m.submodules.bp_unit = BreakpointUnit(self.params)
+        csr.add_csrs(bp_unit.iter_csrs())
+
+        m.d.comb += bp_unit.debug.eq(exc_unit.debug_mode)
+
+        #
         # Instruction fetch
         #
 
         if_stage = m.submodules.if_stage = IFStage(self.ibus, self.params)
+
+        for if_bp, bp in zip(if_stage.bp, bp_unit.bp):
+            m.d.comb += if_bp.eq(bp)
 
         dec_ready = Signal()
 
@@ -213,7 +226,10 @@ class Core(Elaboratable):
             rob_empty.eq(rob.empty),
         ]
 
-        m.d.comb += dec_stage.rollback.eq(rob.commit_req.rollback)
+        m.d.comb += [
+            dec_stage.rollback.eq(rob.commit_req.rollback),
+            dec_stage.flush_pipeline.eq(rob_flush_d1.valid),
+        ]
 
         m.d.comb += ren_stage.commit.eq(rob.commit_req)
 
