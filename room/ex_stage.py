@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import *
-from room.alu import ExecReq, ExecResp, ALU, AddrGenUnit, MultiplierUnit, DivUnit, generate_imm
+from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, generate_imm
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
@@ -98,9 +98,10 @@ class ALUExecUnit(ExecUnit):
         iresp_units = []
 
         if self.has_alu:
-            alu = m.submodules.alu = ALU(self.params,
-                                         is_jmp=self.has_jmp_unit,
-                                         num_stages=3 if self.has_mul else 1)
+            alu = m.submodules.alu = ALUUnit(
+                self.params,
+                is_jmp=self.has_jmp_unit,
+                num_stages=3 if self.has_mul else 1)
             iresp_units.append(alu)
 
             m.d.comb += [

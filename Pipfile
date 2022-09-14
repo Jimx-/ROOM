@@ -9,9 +9,10 @@ amaranth = "*"
 riscv-model = "*"
 amaranth-soc = {editable = true, git = "https://github.com/amaranth-lang/amaranth-soc"}
 amaranth-stdio = {editable = true, git = "https://github.com/amaranth-lang/amaranth-stdio"}
-jtagtap = {editable = true, git = "https://github.com/Jimx-/jtagtap"}
+markupsafe = "==2.0.1"
 
 [dev-packages]
+pytest = "*"
 
 [requires]
 python_version = "3.10"

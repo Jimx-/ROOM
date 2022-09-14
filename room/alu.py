@@ -139,7 +139,87 @@ def generate_imm(ip, sel):
     return Cat(i0, i1_4, i5_10, i11, i12_19, i20_30, sign)
 
 
-class ALU(PipelinedFunctionalUnit):
+class ALU(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.fn = Signal(ALUOperator)
+        self.in1 = Signal(width)
+        self.in2 = Signal(width)
+        self.out = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        is_sub = self.fn[3]
+        is_cmp = self.fn >= ALUOperator.SLT
+        is_cmp_unsigned = self.fn[1]
+
+        #
+        # ADD, SUB
+        #
+
+        adder_out = Signal(self.width)
+        in2_inv = Mux(is_sub == 1, ~self.in2, self.in2)
+        inv = Signal(self.width)
+        m.d.comb += inv.eq(in2_inv)
+        m.d.comb += adder_out.eq(self.in1 + in2_inv + is_sub)
+
+        #
+        # SLT, SLTU
+        #
+
+        in1_xor_in2 = self.in1 ^ in2_inv
+        slt = Mux(self.in1[-1] == self.in2[-1], adder_out[-1],
+                  Mux(is_cmp_unsigned, self.in2[-1], self.in1[-1]))
+
+        #
+        # SLL, SRL, SRA
+        #
+
+        if self.width == 32:
+            shamt = self.in2[:5]
+        else:
+            shamt = self.in2[:6]
+
+        shin_r = Signal(self.width)
+        shin_l = Signal(self.width)
+        m.d.comb += shin_r.eq(self.in1)
+        for a, b in zip(shin_l, reversed(shin_r)):
+            m.d.comb += a.eq(b)
+
+        shin = Mux((self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA),
+                   shin_r, shin_l)
+
+        shout_r = Signal(self.width)
+        shout_l = Signal(self.width)
+        m.d.comb += shout_r.eq(
+            Cat(shin, is_sub & shin[-1]).as_signed() >> shamt)
+        for a, b in zip(shout_l, reversed(shout_r)):
+            m.d.comb += a.eq(b)
+        shout = Mux((self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA),
+                    shout_r, 0) | Mux(self.fn == ALUOperator.SL, shout_l, 0)
+
+        #
+        # AND, OR, XOR
+        #
+
+        logic = Mux((self.fn == ALUOperator.XOR) |
+                    (self.fn == ALUOperator.OR), in1_xor_in2, 0) | Mux(
+                        (self.fn == ALUOperator.AND) |
+                        (self.fn == ALUOperator.OR), self.in1 & self.in2, 0)
+
+        shift_logic = (is_cmp & slt) | logic | shout
+
+        m.d.comb += self.out.eq(
+            Mux((self.fn == ALUOperator.ADD) | (self.fn == ALUOperator.SUB),
+                adder_out, shift_logic))
+
+        return m
+
+
+class ALUUnit(PipelinedFunctionalUnit):
 
     def __init__(self, params, is_jmp=False, num_stages=1):
         self.xlen = params['xlen']
@@ -183,69 +263,12 @@ class ALU(PipelinedFunctionalUnit):
         # ALU
         #
 
-        is_sub = uop.alu_fn[3]
-        is_cmp = uop.alu_fn >= ALUOperator.SLT
-        is_cmp_unsigned = uop.alu_fn[1]
-
-        #
-        # ADD, SUB
-        #
-
-        adder_out = Signal(self.xlen)
-        opb_inv = Mux(is_sub == 1, ~opb_data, opb_data)
-        inv = Signal(self.xlen)
-        m.d.comb += inv.eq(opb_inv)
-        m.d.comb += adder_out.eq(opa_data + opb_inv + is_sub)
-
-        #
-        # SLT, SLTU
-        #
-
-        opa_xor_opb = opa_data ^ opb_inv
-        slt = Mux(opa_data[-1] == opb_data[-1], adder_out[-1],
-                  Mux(is_cmp_unsigned, opb_data[-1], opa_data[-1]))
-
-        #
-        # SLL, SRL, SRA
-        #
-
-        shamt = opb_data[:5]
-
-        shin_r = Signal(self.xlen)
-        shin_l = Signal(self.xlen)
-        m.d.comb += shin_r.eq(opa_data)
-        for a, b in zip(shin_l, reversed(shin_r)):
-            m.d.comb += a.eq(b)
-
-        shin = Mux(
-            (uop.alu_fn == ALUOperator.SR) | (uop.alu_fn == ALUOperator.SRA),
-            shin_r, shin_l)
-
-        shout_r = Signal(self.xlen)
-        shout_l = Signal(self.xlen)
-        m.d.comb += shout_r.eq(
-            Cat(shin, is_sub & shin[-1]).as_signed() >> shamt)
-        for a, b in zip(shout_l, reversed(shout_r)):
-            m.d.comb += a.eq(b)
-        shout = Mux(
-            (uop.alu_fn == ALUOperator.SR) | (uop.alu_fn == ALUOperator.SRA),
-            shout_r, 0) | Mux(uop.alu_fn == ALUOperator.SL, shout_l, 0)
-
-        #
-        # AND, OR, XOR
-        #
-
-        logic = Mux((uop.alu_fn == ALUOperator.XOR) |
-                    (uop.alu_fn == ALUOperator.OR), opa_xor_opb, 0) | Mux(
-                        (uop.alu_fn == ALUOperator.AND) |
-                        (uop.alu_fn == ALUOperator.OR), opa_data & opb_data, 0)
-
-        shift_logic = (is_cmp & slt) | logic | shout
-
-        alu_out = Signal(self.xlen)
-        m.d.comb += alu_out.eq(
-            Mux((uop.alu_fn == ALUOperator.ADD) |
-                (uop.alu_fn == ALUOperator.SUB), adder_out, shift_logic))
+        alu = m.submodules.alu = ALU(self.xlen)
+        m.d.comb += [
+            alu.in1.eq(opa_data),
+            alu.in2.eq(opb_data),
+            alu.fn.eq(uop.alu_fn),
+        ]
 
         #
         # Branch unit
@@ -329,7 +352,7 @@ class ALU(PipelinedFunctionalUnit):
         ]
 
         m.d.sync += [
-            data[0].eq(alu_out),
+            data[0].eq(alu.out),
         ]
 
         for i in range(1, self.num_stages):
@@ -442,29 +465,49 @@ class IterativeFunctionalUnit(FunctionalUnit):
         return m
 
 
-class DivUnit(IterativeFunctionalUnit):
+class DivReq(Record):
 
-    def __init__(self, width, params):
+    def __init__(self, width, name=None, src_loc_at=0):
+        super().__init__([
+            ('fn', Shape.cast(ALUOperator).width),
+            ('in1', width),
+            ('in2', width),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
+class IntDiv(Elaboratable):
+
+    def __init__(self, width):
         self.width = width
 
-        super().__init__(params)
+        self.req = DivReq(width)
+        self.req_valid = Signal()
+        self.req_ready = Signal()
+
+        self.resp_data = Signal(width)
+        self.resp_valid = Signal()
+        self.resp_ready = Signal()
+
+        self.kill = Signal()
 
     def elaborate(self, platform):
-        m = super().elaborate(platform)
+        m = Module()
 
-        req = ExecReq(self.params, name='in')
+        req = DivReq(self.width, name='in')
         count = Signal(range(self.width + 1))
         neg_out = Signal()
         divisor = Signal(self.width)
         remainder = Signal(2 * self.width + 1)
 
-        fn = self.req.uop.alu_fn
+        fn = self.req.fn
         h = (fn == ALUOperator.REM) | (fn == ALUOperator.REMU)
         lhs_signed = (fn == ALUOperator.DIV) | (fn == ALUOperator.REM)
         rhs_signed = lhs_signed
 
-        lhs_sign = self.req.rs1_data[-1] & lhs_signed
-        rhs_sign = self.req.rs2_data[-1] & rhs_signed
+        lhs_sign = self.req.in1[-1] & lhs_signed
+        rhs_sign = self.req.in2[-1] & rhs_signed
 
         is_hi = Signal()
         res_hi = Signal()
@@ -473,15 +516,15 @@ class DivUnit(IterativeFunctionalUnit):
 
         with m.FSM():
             with m.State('IDLE'):
-                m.d.comb += self.req.ready.eq(1)
+                m.d.comb += self.req_ready.eq(1)
 
-                with m.If(self.req.valid & self.req.ready & ~self.do_kill):
+                with m.If(self.req_valid & self.req_ready & ~self.kill):
                     m.d.sync += [
                         req.eq(self.req),
                         neg_out.eq(Mux(h, lhs_sign, lhs_sign ^ rhs_sign)),
                         count.eq(0),
-                        divisor.eq(Cat(self.req.rs2_data, rhs_sign)),
-                        remainder.eq(self.req.rs1_data),
+                        divisor.eq(Cat(self.req.in2, rhs_sign)),
+                        remainder.eq(self.req.in1),
                         is_hi.eq(h),
                         res_hi.eq(0),
                     ]
@@ -492,17 +535,18 @@ class DivUnit(IterativeFunctionalUnit):
                         m.next = 'DIV'
 
             with m.State('NEG_IN'):
-                with m.If(self.do_kill):
+                with m.If(self.kill):
                     m.next = 'IDLE'
                 with m.Else():
                     with m.If(remainder[self.width - 1]):
-                        m.d.sync += remainder.eq(-remainder[:self.width])
+                        m.d.sync += remainder[:self.width].eq(
+                            -remainder[:self.width])
                     with m.If(divisor[self.width - 1]):
                         m.d.sync += divisor.eq(-divisor)
                     m.next = 'DIV'
 
             with m.State('DIV'):
-                with m.If(self.do_kill):
+                with m.If(self.kill):
                     m.next = 'IDLE'
                 with m.Else():
                     d = remainder[self.width:2 * self.width +
@@ -529,7 +573,7 @@ class DivUnit(IterativeFunctionalUnit):
                         m.d.sync += neg_out.eq(0)
 
             with m.State('NEG_OUT'):
-                with m.If(self.do_kill):
+                with m.If(self.kill):
                     m.next = 'IDLE'
                 with m.Else():
                     m.d.sync += [
@@ -540,11 +584,38 @@ class DivUnit(IterativeFunctionalUnit):
                     m.next = 'DIV_DONE'
 
             with m.State('DIV_DONE'):
-                m.d.comb += self.resp.valid.eq(~self.do_kill)
+                m.d.comb += self.resp_valid.eq(~self.kill)
 
-                with m.If(self.do_kill | (self.resp.valid & self.resp.ready)):
+                with m.If(self.kill | (self.resp_valid & self.resp_ready)):
                     m.next = 'IDLE'
 
-        m.d.comb += self.resp.data.eq(result)
+        m.d.comb += self.resp_data.eq(result)
+
+        return m
+
+
+class DivUnit(IterativeFunctionalUnit):
+
+    def __init__(self, width, params):
+        self.width = width
+
+        super().__init__(params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        div = m.submodules.div = IntDiv(self.width)
+
+        m.d.comb += [
+            div.req.fn.eq(self.req.uop.alu_fn),
+            div.req.in1.eq(self.req.rs1_data),
+            div.req.in2.eq(self.req.rs2_data),
+            div.req_valid.eq(self.req.valid),
+            self.req.ready.eq(div.req_ready),
+            self.resp.data.eq(div.resp_data),
+            self.resp.valid.eq(div.resp_valid),
+            div.resp_ready.eq(self.resp.ready),
+            div.kill.eq(self.do_kill),
+        ]
 
         return m
