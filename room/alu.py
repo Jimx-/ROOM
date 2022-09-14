@@ -11,12 +11,13 @@ class ExecReq:
 
     def __init__(self, params, name=None):
         name = (name is not None) and f'{name}_' or ''
+        self.xlen = params['xlen']
 
         self.uop = MicroOp(params, name=f'{name}uop')
         self.valid = Signal(name=f'{name}valid')
 
-        self.rs1_data = Signal(32, name=f'{name}rs1_data')
-        self.rs2_data = Signal(32, name=f'{name}rs2_data')
+        self.rs1_data = Signal(self.xlen, name=f'{name}rs1_data')
+        self.rs2_data = Signal(self.xlen, name=f'{name}rs2_data')
 
         self.kill = Signal(name=f'{name}kill')
 
@@ -31,12 +32,14 @@ class ExecResp:
 
     def __init__(self, params, name=None):
         name = (name is not None) and f'{name}_' or ''
+        self.xlen = params['xlen']
+        self.vaddr_bits = params['vaddr_bits']
 
         self.uop = MicroOp(params, name=f'{name}uop')
         self.valid = Signal(name=f'{name}valid')
 
-        self.data = Signal(32, name=f'{name}data')
-        self.addr = Signal(32, name=f'{name}addr')
+        self.data = Signal(self.xlen, name=f'{name}data')
+        self.addr = Signal(self.vaddr_bits + 1, name=f'{name}addr')
 
         self.ready = Signal(name=f'{name}ready')
 
@@ -139,6 +142,8 @@ def generate_imm(ip, sel):
 class ALU(PipelinedFunctionalUnit):
 
     def __init__(self, params, is_jmp=False, num_stages=1):
+        self.xlen = params['xlen']
+
         super().__init__(num_stages, params, is_jmp=is_jmp, is_alu=True)
 
     def elaborate(self, platform):
@@ -152,8 +157,8 @@ class ALU(PipelinedFunctionalUnit):
 
         imm = generate_imm(uop.imm_packed, uop.imm_sel)
 
-        opa_data = Signal(32)
-        opb_data = Signal(32)
+        opa_data = Signal(self.xlen)
+        opb_data = Signal(self.xlen)
 
         if self.is_jmp:
             uop_pc = self.get_pc.pc | uop.pc_lsb
@@ -186,9 +191,9 @@ class ALU(PipelinedFunctionalUnit):
         # ADD, SUB
         #
 
-        adder_out = Signal(32)
+        adder_out = Signal(self.xlen)
         opb_inv = Mux(is_sub == 1, ~opb_data, opb_data)
-        inv = Signal(32)
+        inv = Signal(self.xlen)
         m.d.comb += inv.eq(opb_inv)
         m.d.comb += adder_out.eq(opa_data + opb_inv + is_sub)
 
@@ -206,8 +211,8 @@ class ALU(PipelinedFunctionalUnit):
 
         shamt = opb_data[:5]
 
-        shin_r = Signal(32)
-        shin_l = Signal(32)
+        shin_r = Signal(self.xlen)
+        shin_l = Signal(self.xlen)
         m.d.comb += shin_r.eq(opa_data)
         for a, b in zip(shin_l, reversed(shin_r)):
             m.d.comb += a.eq(b)
@@ -216,8 +221,8 @@ class ALU(PipelinedFunctionalUnit):
             (uop.alu_fn == ALUOperator.SR) | (uop.alu_fn == ALUOperator.SRA),
             shin_r, shin_l)
 
-        shout_r = Signal(32)
-        shout_l = Signal(32)
+        shout_r = Signal(self.xlen)
+        shout_l = Signal(self.xlen)
         m.d.comb += shout_r.eq(
             Cat(shin, is_sub & shin[-1]).as_signed() >> shamt)
         for a, b in zip(shout_l, reversed(shout_r)):
@@ -237,7 +242,7 @@ class ALU(PipelinedFunctionalUnit):
 
         shift_logic = (is_cmp & slt) | logic | shout
 
-        alu_out = Signal(32)
+        alu_out = Signal(self.xlen)
         m.d.comb += alu_out.eq(
             Mux((uop.alu_fn == ALUOperator.ADD) |
                 (uop.alu_fn == ALUOperator.SUB), adder_out, shift_logic))
@@ -318,7 +323,10 @@ class ALU(PipelinedFunctionalUnit):
         # Output
         #
 
-        data = [Signal(32, name=f's{i}_data') for i in range(self.num_stages)]
+        data = [
+            Signal(self.xlen, name=f's{i}_data')
+            for i in range(self.num_stages)
+        ]
 
         m.d.sync += [
             data[0].eq(alu_out),
@@ -355,7 +363,8 @@ class AddrGenUnit(PipelinedFunctionalUnit):
 
 class MultiplierUnit(PipelinedFunctionalUnit):
 
-    def __init__(self, latency, params):
+    def __init__(self, width, latency, params):
+        self.width = width
         self.latency = latency
 
         super().__init__(latency, params)
@@ -377,7 +386,7 @@ class MultiplierUnit(PipelinedFunctionalUnit):
         rhs = Cat(in_req.rs2_data,
                   (rhs_signed & in_req.rs2_data[-1])).as_signed()
         prod = lhs * rhs
-        muxed = Mux(h, prod[32:64], prod[:32])
+        muxed = Mux(h, prod[self.width:self.width * 2], prod[:self.width])
 
         valid = in_req.valid
         data = muxed
@@ -435,16 +444,19 @@ class IterativeFunctionalUnit(FunctionalUnit):
 
 class DivUnit(IterativeFunctionalUnit):
 
+    def __init__(self, width, params):
+        self.width = width
+
+        super().__init__(params)
+
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
-        width = 32
-
         req = ExecReq(self.params, name='in')
-        count = Signal(range(width + 1))
+        count = Signal(range(self.width + 1))
         neg_out = Signal()
-        divisor = Signal(width)
-        remainder = Signal(2 * width + 1)
+        divisor = Signal(self.width)
+        remainder = Signal(2 * self.width + 1)
 
         fn = self.req.uop.alu_fn
         h = (fn == ALUOperator.REM) | (fn == ALUOperator.REMU)
@@ -456,7 +468,8 @@ class DivUnit(IterativeFunctionalUnit):
 
         is_hi = Signal()
         res_hi = Signal()
-        result = Mux(res_hi, remainder[width + 1:], remainder[:width])
+        result = Mux(res_hi, remainder[self.width + 1:],
+                     remainder[:self.width])
 
         with m.FSM():
             with m.State('IDLE'):
@@ -482,9 +495,9 @@ class DivUnit(IterativeFunctionalUnit):
                 with m.If(self.do_kill):
                     m.next = 'IDLE'
                 with m.Else():
-                    with m.If(remainder[width - 1]):
-                        m.d.sync += remainder.eq(-remainder[:width])
-                    with m.If(divisor[width - 1]):
+                    with m.If(remainder[self.width - 1]):
+                        m.d.sync += remainder.eq(-remainder[:self.width])
+                    with m.If(divisor[self.width - 1]):
                         m.d.sync += divisor.eq(-divisor)
                     m.next = 'DIV'
 
@@ -492,18 +505,19 @@ class DivUnit(IterativeFunctionalUnit):
                 with m.If(self.do_kill):
                     m.next = 'IDLE'
                 with m.Else():
-                    d = remainder[width:2 * width + 1] - divisor[:width]
-                    less = d[width]
+                    d = remainder[self.width:2 * self.width +
+                                  1] - divisor[:self.width]
+                    less = d[self.width]
                     m.d.sync += [
                         remainder.eq(
                             Cat(
-                                ~less, remainder[:width],
-                                Mux(less, remainder[width:2 * width],
-                                    d[:width]))),
+                                ~less, remainder[:self.width],
+                                Mux(less, remainder[self.width:2 * self.width],
+                                    d[:self.width]))),
                         count.eq(count + 1),
                     ]
 
-                    with m.If(count == width):
+                    with m.If(count == self.width):
                         m.d.sync += res_hi.eq(is_hi)
 
                         with m.If(neg_out):

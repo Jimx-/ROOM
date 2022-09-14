@@ -26,7 +26,9 @@ def read_mem_image(filename):
     return image
 
 
-core_params = dict(fetch_width=4,
+core_params = dict(xlen=32,
+                   vaddr_bits=32,
+                   fetch_width=4,
                    fetch_buffer_size=16,
                    core_width=4,
                    num_pregs=96,

@@ -27,17 +27,15 @@ tdata1_layout = [
     ('type', 4, CSRAccess.RO),
 ]
 
-breakpoint_layout = [
-    ('control', mcontrol_layout),
-    ('dmode', 1),
-    ('address', 32),
-]
-
 
 class Breakpoint(Record):
 
-    def __init__(self, name=None, src_loc_at=0):
-        super().__init__(breakpoint_layout,
+    def __init__(self, vaddr_bits, name=None, src_loc_at=0):
+        super().__init__([
+            ('control', mcontrol_layout),
+            ('dmode', 1),
+            ('address', vaddr_bits),
+        ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
 
@@ -53,7 +51,8 @@ class BreakpointUnit(Elaboratable, AutoCSR):
         self.debug = Signal()
 
         self.bp = [
-            Breakpoint(name=f'bp{i}') for i in range(self.num_breakpoints)
+            Breakpoint(vaddr_bits=params['vaddr_bits_extended'], name=f'bp{i}')
+            for i in range(self.num_breakpoints)
         ]
 
         self.tselect = CSR(csrnames.tselect, [('value', 32, CSRAccess.RW)])
@@ -102,13 +101,15 @@ class BreakpointUnit(Elaboratable, AutoCSR):
 class BreakpointMatcher(Elaboratable):
 
     def __init__(self, params):
+        self.vaddr_bits = params['vaddr_bits_extended']
         self.num_breakpoints = params['num_breakpoints']
 
         self.bp = [
-            Breakpoint(name=f'bp{i}') for i in range(self.num_breakpoints)
+            Breakpoint(vaddr_bits=self.vaddr_bits, name=f'bp{i}')
+            for i in range(self.num_breakpoints)
         ]
 
-        self.pc = Signal(32)
+        self.pc = Signal(self.vaddr_bits)
 
         self.exc_if = Signal()
         self.debug_if = Signal()

@@ -16,7 +16,8 @@ class BranchResolution:
         self.taken = Signal(name=f'{name}taken')
         self.pc_sel = Signal(PCSel, name=f'{name}pc_sel')
         self.target_offset = Signal(signed(32), name=f'{name}target_offset')
-        self.jalr_target = Signal(32, name=f'{name}jalr_target')
+        self.jalr_target = Signal(params['vaddr_bits_extended'],
+                                  name=f'{name}jalr_target')
 
     def eq(self, rhs):
         names = [

@@ -9,21 +9,21 @@ from room.exc import Cause
 
 class BranchSignals(Record):
 
-    def __init__(self, name=None):
+    def __init__(self, vaddr_bits, name=None):
         super().__init__([
             ('cfi_type', Shape.cast(CFIType).width),
-            ('target', 32),
+            ('target', vaddr_bits),
         ],
                          name=name)
 
 
 class BranchDecoder(Elaboratable):
 
-    def __init__(self):
+    def __init__(self, vaddr_bits):
         self.inst = Signal(32)
-        self.pc = Signal(32)
+        self.pc = Signal(vaddr_bits)
 
-        self.out = BranchSignals()
+        self.out = BranchSignals(vaddr_bits=vaddr_bits)
 
     def elaborate(self, platform):
         m = Module()
@@ -31,7 +31,7 @@ class BranchDecoder(Elaboratable):
         def compute_jal_target(pc, inst):
             j_imm32 = Cat(Const(0, 1), inst[21:25], inst[25:31], inst[20],
                           inst[12:20], Repl(inst[31], 12)).as_signed()
-            return ((pc.as_signed() + j_imm32) & -2)[:32].as_unsigned()
+            return ((pc.as_signed() + j_imm32) & -2)[:len(pc)].as_unsigned()
 
         OPV = lambda name: getattr(insn, f'Instruction{name}'
                                    ).field_opcode.value

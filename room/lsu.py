@@ -55,7 +55,7 @@ class DCacheReq:
         self.kill = Signal(name=f'{name}kill')
 
         self.addr = Signal(32, name=f'{name}addr')
-        self.data = Signal(32, name=f'{name}data')
+        self.data = Signal(params['xlen'], name=f'{name}data')
 
         self.ready = Signal(name=f'{name}ready')
 
@@ -67,7 +67,7 @@ class DCacheResp:
 
         self.valid = Signal(name=f'{name}valid')
         self.uop = MicroOp(params, name=f'{name}uop')
-        self.data = Signal(32, name=f'{name}data')
+        self.data = Signal(params['xlen'], name=f'{name}data')
 
 
 class StoreGen(Elaboratable):
@@ -261,7 +261,7 @@ class LDQEntry:
         self.valid = Signal(name=f'{name}valid')
         self.uop = MicroOp(params, name=f'{name}uop')
 
-        self.addr = Signal(32, name=f'{name}addr')
+        self.addr = Signal(params['vaddr_bits_extended'], name=f'{name}addr')
         self.addr_valid = Signal(name=f'{name}addr_valid')
 
         self.executed = Signal(name=f'{name}executed')
@@ -291,9 +291,9 @@ class STQEntry:
         self.valid = Signal(name=f'{name}valid')
         self.uop = MicroOp(params, name=f'{name}uop')
 
-        self.addr = Signal(32, name=f'{name}addr')
+        self.addr = Signal(params['vaddr_bits_extended'], name=f'{name}addr')
         self.addr_valid = Signal(name=f'{name}addr_valid')
-        self.data = Signal(32, name=f'{name}data')
+        self.data = Signal(params['xlen'], name=f'{name}data')
         self.data_valid = Signal(name=f'{name}data_valid')
 
         self.committed = Signal(name=f'{name}committed')

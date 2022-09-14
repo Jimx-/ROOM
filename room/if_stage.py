@@ -287,6 +287,7 @@ class IFStage(Elaboratable):
         self.ibus = ibus
         self.params = params
 
+        self.vaddr_bits = params['vaddr_bits_extended']
         self.fetch_width = params['fetch_width']
         self.core_width = params['core_width']
         self.fetch_buffer_size = params['fetch_buffer_size']
@@ -315,7 +316,8 @@ class IFStage(Elaboratable):
         self.redirect_ftq_idx = Signal(range(ftq_size))
 
         self.bp = [
-            Breakpoint(name=f'bp{i}') for i in range(self.num_breakpoints)
+            Breakpoint(vaddr_bits=self.vaddr_bits, name=f'bp{i}')
+            for i in range(self.num_breakpoints)
         ]
 
     def elaborate(self, platform):
@@ -446,8 +448,8 @@ class IFStage(Elaboratable):
                 inst1 = s2_data[0:32]
                 dec0 = RVCDecoder()
                 dec1 = RVCDecoder()
-                br_dec0 = BranchDecoder()
-                br_dec1 = BranchDecoder()
+                br_dec0 = BranchDecoder(self.vaddr_bits)
+                br_dec1 = BranchDecoder(self.vaddr_bits)
                 m.submodules += [dec0, dec1, br_dec0, br_dec1]
 
                 pc0 = f2_aligned_pc - 2
@@ -478,7 +480,7 @@ class IFStage(Elaboratable):
                 inst = Signal(32)
                 pc = f2_aligned_pc + (w * 2)
                 dec = RVCDecoder()
-                br_dec = BranchDecoder()
+                br_dec = BranchDecoder(self.vaddr_bits)
                 m.submodules += [dec, br_dec]
 
                 m.d.comb += [

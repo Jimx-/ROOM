@@ -66,7 +66,7 @@ class ALUExecUnit(ExecUnit):
                  has_mem=False,
                  has_csr=False,
                  name=None):
-        super().__init__(32,
+        super().__init__(params['xlen'],
                          params,
                          irf_read=True,
                          irf_write=has_alu,
@@ -117,7 +117,8 @@ class ALUExecUnit(ExecUnit):
                 m.d.comb += alu.get_pc.eq(self.get_pc)
 
         if self.has_mul:
-            imul = m.submodules.imul = MultiplierUnit(3, self.params)
+            imul = m.submodules.imul = MultiplierUnit(self.data_width, 3,
+                                                      self.params)
             iresp_units.append(imul)
 
             m.d.comb += [
@@ -128,7 +129,7 @@ class ALUExecUnit(ExecUnit):
             ]
 
         if self.has_div:
-            div = m.submodules.div = DivUnit(self.params)
+            div = m.submodules.div = DivUnit(self.data_width, self.params)
 
             div_resp_busy = 0
             for iu in iresp_units:

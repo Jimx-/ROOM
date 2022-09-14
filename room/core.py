@@ -25,6 +25,7 @@ class Core(Elaboratable):
 
     def __init__(self, params):
         self.params = params
+        self.xlen = params['xlen']
         self.core_width = params['core_width']
 
         self.interrupts = CoreInterrupts()
@@ -44,6 +45,10 @@ class Core(Elaboratable):
 
     @staticmethod
     def validate_params(params):
+        xlen = params['xlen']
+        vaddr_bits = params['vaddr_bits']
+        params['vaddr_bits_extended'] = vaddr_bits + (vaddr_bits < xlen)
+
         params['fetch_bytes'] = params['fetch_width'] << 1
         params['mem_width'] = params['issue_params'][
             IssueQueueType.MEM]['issue_width']
@@ -413,10 +418,13 @@ class Core(Elaboratable):
             self.params['num_pregs'], 32)
 
         iregread = m.submodules.iregread = RegisterRead(
-            sum([
+            issue_width=sum([
                 p['issue_width'] for p in self.params['issue_params'].values()
-            ]), exec_units.irf_read_ports, [2] * exec_units.irf_readers,
-            self.params)
+            ]),
+            num_rports=exec_units.irf_read_ports,
+            rports_array=[2] * exec_units.irf_readers,
+            reg_width=self.xlen,
+            params=self.params)
 
         for irr_uop, iss_uop in zip(iregread.iss_uops, iss_uops):
             m.d.comb += irr_uop.eq(iss_uop)

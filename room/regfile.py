@@ -290,12 +290,13 @@ class RegReadDecoder(Elaboratable):
 
 class RegisterRead(Elaboratable):
 
-    def __init__(self, issue_width, num_rports, rports_array, params):
+    def __init__(self, issue_width, num_rports, rports_array, reg_width,
+                 params):
         num_regs = params['num_pregs']
         self.issue_width = issue_width
         self.params = params
         self.rports_array = rports_array
-        self.data_width = 32
+        self.data_width = reg_width
 
         self.iss_uops = [
             MicroOp(params, name=f'iss_uop{i}') for i in range(issue_width)
