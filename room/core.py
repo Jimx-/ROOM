@@ -303,6 +303,27 @@ class Core(Elaboratable):
                                      | rob.commit_exc.valid),
         ]
 
+        # ECALL needs to write PC into CSR before commit
+        ecall_commit = Signal.like(if_stage.commit)
+        ecall_commit_valid = Signal.like(if_stage.commit_valid)
+        m.d.sync += [
+            ecall_commit.eq(0),
+            ecall_commit_valid.eq(0),
+        ]
+
+        for w in reversed(range(self.core_width)):
+            with m.If(dis_fire[w] & dis_uops[w].is_ecall):
+                m.d.sync += [
+                    ecall_commit.eq(dis_uops[w].ftq_idx),
+                    ecall_commit_valid.eq(1),
+                ]
+
+        with m.If(ecall_commit_valid):
+            m.d.comb += [
+                if_stage.commit.eq(ecall_commit),
+                if_stage.commit_valid.eq(1),
+            ]
+
         #
         # Issue queue
         #
