@@ -1,7 +1,7 @@
 from amaranth.sim import Settle
 import pytest
 
-from room.alu import ALU, ALUOperator, IntDiv
+from room.alu import ALU, ALUOperator, Multiplier, IntDiv
 from room.test import run_test
 
 
@@ -346,6 +346,161 @@ def test_alu_xor(xlen):
         run_test(dut, alu_unittest(dut, a, b, ALUOperator.XOR, expected))
 
 
+def mul_unittest(mul, a, b, fn, expected):
+
+    def proc():
+        yield mul.req.in1.eq(a)
+        yield mul.req.in2.eq(b)
+        yield mul.req.fn.eq(fn)
+        yield mul.req_valid.eq(1)
+        yield
+
+        for _ in range(3):
+            yield
+
+        out = yield mul.resp_data
+        assert out == expected
+
+    return proc
+
+
+@pytest.mark.parametrize("xlen", [32, 64])
+def test_mul_mul(xlen):
+    dut = Multiplier(xlen, 3)
+
+    cases = [
+        (0x0000000000007e00, 0x6db6db6db6db6db7, 0x0000000000001200),
+        (0x0000000000007fc0, 0x6db6db6db6db6db7, 0x0000000000001240),
+        (0x00000000, 0x00000000, 0x00000000),
+        (0x00000001, 0x00000001, 0x00000001),
+        (0x00000003, 0x00000007, 0x00000015),
+        (0x0000000000000000, 0xffffffffffff8000, 0x0000000000000000),
+        (0xffffffff80000000, 0x00000000, 0x0000000000000000),
+        (0xffffffff80000000, 0xffffffffffff8000, 0x0000400000000000),
+        (0xaaaaaaaaaaaaaaab, 0x000000000002fe7d, 0x000000000000ff7f),
+        (0x000000000002fe7d, 0xaaaaaaaaaaaaaaab, 0x000000000000ff7f),
+    ]
+
+    if xlen == 32:
+        cases += [
+            (0xff000000, 0xff000000, 0x00000000),
+            (0xffffffff, 0xffffffff, 0x00000001),
+            (0xffffffff, 0x00000001, 0xffffffff),
+            (0x00000001, 0xffffffff, 0xffffffff),
+        ]
+
+    for a, b, expected in cases:
+        a = mask_xlen(a, xlen)
+        b = mask_xlen(b, xlen)
+        expected = mask_xlen(expected, xlen)
+
+        run_test(dut,
+                 mul_unittest(dut, a, b, ALUOperator.MUL, expected),
+                 sync=True)
+
+
+@pytest.mark.parametrize("xlen", [32, 64])
+def test_mul_mulh(xlen):
+    dut = Multiplier(xlen, 3)
+
+    cases = [
+        (0x00000000, 0x00000000, 0x00000000),
+        (0x00000001, 0x00000001, 0x00000000),
+        (0x00000003, 0x00000007, 0x00000000),
+        (0x0000000000000000, 0xffffffffffff8000, 0x0000000000000000),
+        (0xffffffff80000000, 0x00000000, 0x0000000000000000),
+        (0xffffffff80000000, 0xffffffffffff8000 if xlen == 64 else 0,
+         0x0000000000000000),
+    ]
+
+    if xlen == 32:
+        cases += [
+            (0xaaaaaaab, 0x0002fe7d, 0xffff0081),
+            (0x0002fe7d, 0xaaaaaaab, 0xffff0081),
+            (0xff000000, 0xff000000, 0x00010000),
+            (0xffffffff, 0xffffffff, 0x00000000),
+            (0xffffffff, 0x00000001, 0xffffffff),
+            (0x00000001, 0xffffffff, 0xffffffff),
+        ]
+
+    for a, b, expected in cases:
+        a = mask_xlen(a, xlen)
+        b = mask_xlen(b, xlen)
+        expected = mask_xlen(expected, xlen)
+
+        run_test(dut,
+                 mul_unittest(dut, a, b, ALUOperator.MULH, expected),
+                 sync=True)
+
+
+@pytest.mark.parametrize("xlen", [32, 64])
+def test_mul_mulhsu(xlen):
+    dut = Multiplier(xlen, 3)
+
+    cases = [
+        (0x00000000, 0x00000000, 0x00000000),
+        (0x00000001, 0x00000001, 0x00000000),
+        (0x00000003, 0x00000007, 0x00000000),
+        (0x0000000000000000, 0xffffffffffff8000, 0x0000000000000000),
+        (0xffffffff80000000, 0x00000000, 0x0000000000000000),
+        (0xffffffff80000000, 0xffffffffffff8000,
+         0xffffffff80000000 if xlen == 64 else 0x80004000),
+    ]
+
+    if xlen == 32:
+        cases += [
+            (0xaaaaaaab, 0x0002fe7d, 0xffff0081),
+            (0x0002fe7d, 0xaaaaaaab, 0x0001fefe),
+            (0xff000000, 0xff000000, 0xff010000),
+            (0xffffffff, 0xffffffff, 0xffffffff),
+            (0xffffffff, 0x00000001, 0xffffffff),
+            (0x00000001, 0xffffffff, 0x00000000),
+        ]
+
+    for a, b, expected in cases:
+        a = mask_xlen(a, xlen)
+        b = mask_xlen(b, xlen)
+        expected = mask_xlen(expected, xlen)
+
+        run_test(dut,
+                 mul_unittest(dut, a, b, ALUOperator.MULHSU, expected),
+                 sync=True)
+
+
+@pytest.mark.parametrize("xlen", [32, 64])
+def test_mul_mulhu(xlen):
+    dut = Multiplier(xlen, 3)
+
+    cases = [
+        (0x00000000, 0x00000000, 0x00000000),
+        (0x00000001, 0x00000001, 0x00000000),
+        (0x00000003, 0x00000007, 0x00000000),
+        (0x0000000000000000, 0xffffffffffff8000, 0x0000000000000000),
+        (0xffffffff80000000, 0x00000000, 0x0000000000000000),
+        (0xffffffff80000000, 0xffffffffffff8000,
+         0xffffffff7fff8000 if xlen == 64 else 0x7fffc000),
+        (0xaaaaaaaaaaaaaaab, 0x000000000002fe7d, 0x000000000001fefe),
+        (0x000000000002fe7d, 0xaaaaaaaaaaaaaaab, 0x000000000001fefe),
+    ]
+
+    if xlen == 32:
+        cases += [
+            (0xff000000, 0xff000000, 0xfe010000),
+            (0xffffffff, 0xffffffff, 0xfffffffe),
+            (0xffffffff, 0x00000001, 0x00000000),
+            (0x00000001, 0xffffffff, 0x00000000),
+        ]
+
+    for a, b, expected in cases:
+        a = mask_xlen(a, xlen)
+        b = mask_xlen(b, xlen)
+        expected = mask_xlen(expected, xlen)
+
+        run_test(dut,
+                 mul_unittest(dut, a, b, ALUOperator.MULHU, expected),
+                 sync=True)
+
+
 def div_unittest(div, a, b, fn, expected):
 
     def proc():
@@ -361,8 +516,6 @@ def div_unittest(div, a, b, fn, expected):
         out = yield div.resp_data
         yield div.resp_ready.eq(1)
         yield
-        if out != expected:
-            print(hex(a), hex(b), hex(expected), hex(out))
         assert out == expected
 
     return proc

@@ -384,34 +384,51 @@ class AddrGenUnit(PipelinedFunctionalUnit):
         return m
 
 
-class MultiplierUnit(PipelinedFunctionalUnit):
+class MulDivReq(Record):
 
-    def __init__(self, width, latency, params):
+    def __init__(self, width, name=None, src_loc_at=0):
+        super().__init__([
+            ('fn', Shape.cast(ALUOperator).width),
+            ('in1', width),
+            ('in2', width),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
+class Multiplier(Elaboratable):
+
+    def __init__(self, width, latency):
         self.width = width
         self.latency = latency
 
-        super().__init__(latency, params)
+        self.req = MulDivReq(width)
+        self.req_valid = Signal()
+
+        self.resp_data = Signal(width)
 
     def elaborate(self, platform):
-        m = super().elaborate(platform)
+        m = Module()
 
-        in_req = ExecReq(self.params, name='in')
-        m.d.sync += in_req.eq(self.req)
+        in_req = MulDivReq(self.width, name='in')
+        in_valid = Signal()
+        m.d.sync += [
+            in_req.eq(self.req),
+            in_valid.eq(self.req_valid),
+        ]
 
-        fn = in_req.uop.alu_fn
+        fn = in_req.fn
         h = (fn == ALUOperator.MULH) | (fn == ALUOperator.MULHU) | (
             fn == ALUOperator.MULHSU)
         lhs_signed = (fn == ALUOperator.MULH) | (fn == ALUOperator.MULHSU)
         rhs_signed = (fn == ALUOperator.MULH)
 
-        lhs = Cat(in_req.rs1_data,
-                  (lhs_signed & in_req.rs1_data[-1])).as_signed()
-        rhs = Cat(in_req.rs2_data,
-                  (rhs_signed & in_req.rs2_data[-1])).as_signed()
+        lhs = Cat(in_req.in1, (lhs_signed & in_req.in1[-1])).as_signed()
+        rhs = Cat(in_req.in2, (rhs_signed & in_req.in2[-1])).as_signed()
         prod = lhs * rhs
         muxed = Mux(h, prod[self.width:self.width * 2], prod[:self.width])
 
-        valid = in_req.valid
+        valid = in_valid
         data = muxed
 
         for _ in range(self.latency - 1):
@@ -426,7 +443,31 @@ class MultiplierUnit(PipelinedFunctionalUnit):
             valid = next_valid
             data = next_data
 
-        m.d.comb += self.resp.data.eq(data)
+        m.d.comb += self.resp_data.eq(data)
+
+        return m
+
+
+class MultiplierUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, width, latency, params):
+        self.width = width
+        self.latency = latency
+
+        super().__init__(latency, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        mul = m.submodules.mul = Multiplier(self.width, self.latency)
+        m.d.comb += [
+            mul.req.fn.eq(self.req.uop.alu_fn),
+            mul.req.in1.eq(self.req.rs1_data),
+            mul.req.in2.eq(self.req.rs2_data),
+            mul.req_valid.eq(self.req.valid),
+        ]
+
+        m.d.comb += self.resp.data.eq(mul.resp_data)
 
         return m
 
@@ -465,24 +506,12 @@ class IterativeFunctionalUnit(FunctionalUnit):
         return m
 
 
-class DivReq(Record):
-
-    def __init__(self, width, name=None, src_loc_at=0):
-        super().__init__([
-            ('fn', Shape.cast(ALUOperator).width),
-            ('in1', width),
-            ('in2', width),
-        ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
-
-
 class IntDiv(Elaboratable):
 
     def __init__(self, width):
         self.width = width
 
-        self.req = DivReq(width)
+        self.req = MulDivReq(width)
         self.req_valid = Signal()
         self.req_ready = Signal()
 
@@ -495,7 +524,7 @@ class IntDiv(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        req = DivReq(self.width, name='in')
+        req = MulDivReq(self.width, name='in')
         count = Signal(range(self.width + 1))
         neg_out = Signal()
         divisor = Signal(self.width)
