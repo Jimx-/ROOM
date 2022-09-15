@@ -169,3 +169,38 @@ class SRAM(Elaboratable):
         ]
 
         return m
+
+
+class Timeout(Elaboratable):
+
+    def __init__(self, master, cycles):
+        self.cycles = cycles
+
+        self.master = master
+        self.bus = Interface(data_width=master.data_width,
+                             addr_width=master.addr_width,
+                             granularity=master.granularity)
+
+        self.error_addr = Signal.like(master.adr)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        counter = Signal(range(self.cycles + 1))
+
+        m.d.comb += self.master.connect(self.bus)
+
+        with m.If(self.master.cyc & self.master.stb & ~self.master.ack):
+            m.d.sync += counter.eq(counter + 1)
+        with m.Else():
+            m.d.sync += counter.eq(0)
+
+        with m.If(counter >= self.cycles):
+            m.d.comb += [
+                self.master.dat_r.eq(~0),
+                self.master.ack.eq(1),
+            ]
+
+            m.d.sync += self.error_addr.eq(self.master.adr)
+
+        return m

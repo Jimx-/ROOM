@@ -141,6 +141,9 @@ class SoCController(Peripheral, Elaboratable):
         if with_scratch:
             self._scratch = bank.csr(32, 'r')
 
+        self._bus_error_addr = bank.csr(32, 'r')
+        self.bus_error_addr = Signal(32)
+
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
 
@@ -157,6 +160,8 @@ class SoCController(Peripheral, Elaboratable):
 
         if self.with_scratch:
             m.d.comb += self._scratch.r_data.eq(0x12345678)
+
+        m.d.comb += self._bus_error_addr.r_data.eq(self.bus_error_addr)
 
         return m
 
@@ -210,7 +215,8 @@ class SoC(Elaboratable):
         return periph
 
     def add_controller(self, name='ctrl', **kwargs):
-        self.add_peripheral(name, SoCController(name=name, **kwargs))
+        self.ctrl = SoCController(name=name, **kwargs)
+        self.add_peripheral(name, self.ctrl)
 
     def elaborate(self, platform):
         m = Module()
@@ -236,7 +242,11 @@ class SoC(Elaboratable):
 
             slave = self.bus.decoder.bus
 
-            m.d.comb += master.connect(slave)
+            timeout = m.submodules.timeout = wishbone.Timeout(master, 128)
+            m.d.comb += [
+                timeout.bus.connect(slave),
+                self.ctrl.bus_error_addr.eq(timeout.error_addr),
+            ]
 
         return m
 

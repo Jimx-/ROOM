@@ -346,7 +346,6 @@ def gen_byte_mask(addr, size):
 class LoadStoreUnit(Elaboratable):
 
     def __init__(self, dbus, params):
-        self.xlen = params['xlen']
         self.core_width = params['core_width']
         self.ldq_size = params['ldq_size']
         self.stq_size = params['stq_size']
@@ -916,8 +915,8 @@ class LoadStoreUnit(Elaboratable):
                 data_valid = stq_e.data_valid
                 live = ~self.br_update.uop_killed(ldq_e.uop)
 
-                load_gen = LoadGen(max_size=self.xlen // 8)
-                store_gen = StoreGen(max_size=self.xlen // 8)
+                load_gen = LoadGen(max_size=8)
+                store_gen = StoreGen(max_size=8)
                 m.submodules += [load_gen, store_gen]
 
                 m.d.comb += [
