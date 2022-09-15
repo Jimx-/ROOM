@@ -13,7 +13,7 @@ import argparse
 import struct
 
 
-def read_mem_image(filename):
+def read_mem_image(filename, word_len=32):
     image = []
 
     with open(filename, 'rb') as f:
@@ -22,6 +22,11 @@ def read_mem_image(filename):
             if not w:
                 break
             image.append(struct.unpack('I', w)[0])
+
+    if word_len == 64:
+        if len(image) & 1:
+            image.append(0)
+        image = [((hi << 32) | lo) for lo, hi in zip(*(iter(image), ) * 2)]
 
     return image
 

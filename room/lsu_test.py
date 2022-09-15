@@ -21,7 +21,7 @@ def load_gen_unittest(dut, typ, addr, data_in, data_expected):
 
 
 @pytest.mark.parametrize("xlen", [32, 64])
-def load_store_gen(xlen):
+def test_load_gen(xlen):
     dut = LoadGen(xlen // 8)
 
     log_max_size = log2_int(xlen // 8)
@@ -53,7 +53,6 @@ def store_gen_unittest(dut, typ, addr, data_in, shift):
             if mask & (1 << i):
                 bit_mask |= 0xff << (i << 3)
 
-        print(hex(data_out), hex(bit_mask), mask)
         assert (data_out & bit_mask) >> shift == data_in
 
     return proc

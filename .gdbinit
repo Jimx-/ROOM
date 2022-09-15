@@ -1,3 +1,5 @@
 set arch riscv:rv32
-set mem inaccessible-by-default off
+mem 0 0x20000 rw
+mem 0x20000000 0x20020000 rw
+mem 0x20020000 0x20021000 rw
 target extended-remote localhost:3333

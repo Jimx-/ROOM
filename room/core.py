@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth.utils import log2_int
 
 from room.consts import *
 from room.alu import ExecResp
@@ -36,8 +37,9 @@ class Core(Elaboratable):
                                        addr_width=32 - ibus_addr_shift,
                                        granularity=8,
                                        name='ibus')
-        self.dbus = wishbone.Interface(data_width=32,
-                                       addr_width=30,
+        self.dbus = wishbone.Interface(data_width=self.xlen,
+                                       addr_width=32 -
+                                       log2_int(self.xlen // 8),
                                        granularity=8,
                                        name='dbus')
 
@@ -60,7 +62,7 @@ class Core(Elaboratable):
 
         mem_width = self.params['mem_width']
 
-        csr = m.submodules.csr = CSRFile()
+        csr = m.submodules.csr = CSRFile(width=32)
 
         #
         # Exception
@@ -414,8 +416,10 @@ class Core(Elaboratable):
         m.d.comb += iss_valids.eq(Cat([iq.iss_valids for iq in iqs_mem_int]))
 
         iregfile = m.submodules.iregfile = RegisterFile(
-            exec_units.irf_read_ports, exec_units.irf_write_ports + mem_width,
-            self.params['num_pregs'], 32)
+            rports=exec_units.irf_read_ports,
+            wports=exec_units.irf_write_ports + mem_width,
+            num_regs=self.params['num_pregs'],
+            data_width=self.xlen)
 
         iregread = m.submodules.iregread = RegisterRead(
             issue_width=sum([

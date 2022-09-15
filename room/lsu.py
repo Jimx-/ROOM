@@ -76,7 +76,7 @@ class StoreGen(Elaboratable):
         self.log_max_size = log2_int(max_size)
 
         self.typ = Signal(2)
-        self.addr = Signal(max_size)
+        self.addr = Signal(self.log_max_size)
         self.data_in = Signal(max_size * 8)
 
         self.mask = Signal(max_size)
@@ -109,7 +109,7 @@ class LoadGen(Elaboratable):
 
         self.typ = Signal(2)
         self.signed = Signal()
-        self.addr = Signal(max_size)
+        self.addr = Signal(self.log_max_size)
         self.data_in = Signal(max_size * 8)
 
         self.data_out = Signal(max_size * 8)
@@ -117,14 +117,28 @@ class LoadGen(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        res = self.data_in
+        res = Signal.like(self.data_in)
+        m.d.comb += res.eq(self.data_in)
+
         for i in range(self.log_max_size - 1, -1, -1):
+            next_res = Signal.like(res)
+
             pos = 8 << i
-            shifted = Mux(self.addr[i], res[pos:pos * 2], res[:pos])
-            res = Cat(
-                shifted,
-                Mux(self.typ == i,
-                    Repl(self.signed & shifted[pos - 1], 32 - pos), res[pos:]))
+
+            shifted = Signal(pos)
+            m.d.comb += shifted.eq(
+                Mux(self.addr[i], res[pos:pos * 2], res[:pos]))
+
+            m.d.comb += next_res.eq(
+                Cat(
+                    shifted,
+                    Mux(
+                        self.typ == i,
+                        Repl(self.signed & shifted[pos - 1],
+                             (2**self.log_max_size) * 8 - pos), res[pos:])))
+
+            res = next_res
+
         m.d.comb += self.data_out.eq(res)
 
         return m
@@ -133,11 +147,11 @@ class LoadGen(Elaboratable):
 class DataCache(Elaboratable):
 
     def __init__(self, params):
+        self.xlen = params['xlen']
         self.mem_width = params['mem_width']
-        self.log_max_size = 2  # 4 bytes
         self.params = params
 
-        self.dbus = wishbone.Interface(data_width=32,
+        self.dbus = wishbone.Interface(data_width=self.xlen,
                                        addr_width=30,
                                        granularity=8)
 
@@ -151,6 +165,8 @@ class DataCache(Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
+
+        granularity_bits = log2_int(self.xlen // 8)
 
         last_grant = Signal(range(self.mem_width))
         choice = Signal.like(last_grant)
@@ -172,7 +188,7 @@ class DataCache(Elaboratable):
 
         req_chosen = self.reqs[chosen]
 
-        load_gen = m.submodules.load_gen = LoadGen(max_size=4)
+        load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
         m.d.comb += [
             load_gen.typ.eq(uop.mem_size),
             load_gen.signed.eq(uop.mem_signed),
@@ -180,7 +196,7 @@ class DataCache(Elaboratable):
             load_gen.data_in.eq(self.dbus.dat_r),
         ]
 
-        store_gen = m.submodules.store_gen = StoreGen(max_size=4)
+        store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
         m.d.comb += [
             store_gen.typ.eq(req_chosen.uop.mem_size),
             store_gen.addr.eq(req_chosen.addr),
@@ -195,7 +211,7 @@ class DataCache(Elaboratable):
                           & ~self.br_update.uop_killed(req_chosen.uop)
                           & ~(self.exception & req_chosen.uop.uses_ldq)):
                     m.d.comb += [
-                        self.dbus.adr.eq(req_chosen.addr[2:]),
+                        self.dbus.adr.eq(req_chosen.addr[granularity_bits:]),
                         self.dbus.stb.eq(1),
                         self.dbus.dat_w.eq(store_gen.data_out),
                         self.dbus.cyc.eq(1),
@@ -223,7 +239,7 @@ class DataCache(Elaboratable):
             with m.State('WAIT_ACK'):
                 m.d.comb += [
                     chosen.eq(last_grant),
-                    self.dbus.adr.eq(req_addr[2:]),
+                    self.dbus.adr.eq(req_addr[granularity_bits:]),
                     self.dbus.stb.eq(self.dbus.cyc),
                     self.dbus.dat_w.eq(dat_w),
                     self.dbus.cyc.eq(~req_chosen.kill),
@@ -330,6 +346,7 @@ def gen_byte_mask(addr, size):
 class LoadStoreUnit(Elaboratable):
 
     def __init__(self, dbus, params):
+        self.xlen = params['xlen']
         self.core_width = params['core_width']
         self.ldq_size = params['ldq_size']
         self.stq_size = params['stq_size']
@@ -899,8 +916,8 @@ class LoadStoreUnit(Elaboratable):
                 data_valid = stq_e.data_valid
                 live = ~self.br_update.uop_killed(ldq_e.uop)
 
-                load_gen = LoadGen(max_size=4)
-                store_gen = StoreGen(max_size=4)
+                load_gen = LoadGen(max_size=self.xlen // 8)
+                store_gen = StoreGen(max_size=self.xlen // 8)
                 m.submodules += [load_gen, store_gen]
 
                 m.d.comb += [

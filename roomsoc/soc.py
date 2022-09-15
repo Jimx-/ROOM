@@ -54,15 +54,24 @@ class BusHelper(Elaboratable):
             if interface.data_width == self.data_width:
                 return interface
             else:
-                adapted_interface = wishbone.Interface(
-                    data_width=self.data_width,
-                    addr_width=self.get_addr_width(),
-                    granularity=8,
-                    name=f'{name}_dw_adapted')
+
                 if direction == 'm2s':
+                    adapted_interface = wishbone.Interface(
+                        data_width=self.data_width,
+                        addr_width=self.get_addr_width(),
+                        granularity=8,
+                        name=f'{name}_dw_adapted')
                     master, slave = interface, adapted_interface
                 else:
+                    adapted_interface = wishbone.Interface(
+                        data_width=self.data_width,
+                        addr_width=interface.addr_width +
+                        log2_int(interface.data_width // 8) -
+                        log2_int(self.data_width // 8),
+                        granularity=8,
+                        name=f'{name}_dw_adapted')
                     master, slave = adapted_interface, interface
+                    master.memory_map = slave.memory_map
 
                 self.converters[f'{name}_dw_converter'] = wishbone.Converter(
                     master=master, slave=slave)
