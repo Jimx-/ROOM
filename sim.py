@@ -7,6 +7,7 @@ from room import Core
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
 from roomsoc.peripheral.uart import UART
+from roomsoc.peripheral.sdc import MockSDController
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 
 import argparse
@@ -94,14 +95,14 @@ class Top(Elaboratable):
 
         soc.add_rom(name='rom',
                     origin=self.mem_map['rom'],
-                    size=0x2000,
+                    size=0x20000,
                     init=self.rom_image)
 
         soc.add_peripheral('dm', debug_module)
 
         soc.add_ram(name='sram',
                     origin=self.mem_map['sram'],
-                    size=0x1000,
+                    size=0x20000,
                     init=self.ram_image)
 
         soc.add_controller()
@@ -110,6 +111,9 @@ class Top(Elaboratable):
 
         uart = UART(divisor=int(self.clk_freq // 115200))
         soc.add_peripheral('uart', uart)
+
+        sdc = MockSDController()
+        soc.add_peripheral('sdc', sdc)
 
         dm_base = 0
 
@@ -168,23 +172,16 @@ if __name__ == "__main__":
         r = yield from dut.jtag.read_dmi(0x11)
         print(hex(r))
 
-        yield from dut.jtag.write_dmi(0x4, 0x20000ff0)
-        for _ in range(100):
-            yield
-        yield from dut.jtag.write_dmi(0x17, 0x00231002)
-        for _ in range(200):
-            yield
-
         # Write 0x4 to DCSR
-        yield from dut.jtag.write_dmi(0x4, 0x4)
-        for _ in range(100):
-            yield
-        yield from dut.jtag.write_dmi(0x17, 0x002307b0)
-        for _ in range(200):
-            yield
+        # yield from dut.jtag.write_dmi(0x4, 0x4)
+        # for _ in range(100):
+        #     yield
+        # yield from dut.jtag.write_dmi(0x17, 0x002307b0)
+        # for _ in range(200):
+        #     yield
 
         # Write 0x0 to DPC
-        yield from dut.jtag.write_dmi(0x4, 0x10)
+        yield from dut.jtag.write_dmi(0x4, 0x2d44)
         for _ in range(100):
             yield
         yield from dut.jtag.write_dmi(0x17, 0x002307b1)
@@ -209,6 +206,6 @@ if __name__ == "__main__":
         print(hex(r))
 
     sim.add_sync_process(process)
-    sim.add_sync_process(process_debug, domain='debug')
+    # sim.add_sync_process(process_debug, domain='debug')
     with sim.write_vcd('room.vcd'):
         sim.run()

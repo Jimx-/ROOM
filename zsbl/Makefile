@@ -2,9 +2,9 @@ CC	= $(RISCV)/bin/riscv64-unknown-elf-gcc
 LD	= $(RISCV)/bin/riscv64-unknown-elf-ld
 OBJCOPY	= $(RISCV)/bin/riscv64-unknown-elf-objcopy
 
-CFLAGS	= -march=rv32im -mabi=ilp32 -nostdlib -nostartfiles -g
+CFLAGS	= -march=rv64im -mabi=lp64 -nostdlib -nostartfiles -g
 CFLAGS	+= -I../include/ -Ifat/src/ -I$(RISCV)/riscv64-unknown-elf/include/
-LDFLAGS	= -melf32lriscv -Tlinker.ld
+LDFLAGS	= -melf64lriscv -Tlinker.ld
 
 SRCS	= start.S main.c serial.c memset.S memcpy.S string.c vsprintf.c sd.c
 SRCS	+= fat/src/fat_access.c fat/src/fat_filelib.c fat/src/fat_misc.c fat/src/fat_table.c \

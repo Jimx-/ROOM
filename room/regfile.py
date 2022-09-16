@@ -112,6 +112,8 @@ class RegReadDecoder(Elaboratable):
         IMM_B = self.rrd_uop.imm_sel.eq(ImmSel.B)
         IMM_U = self.rrd_uop.imm_sel.eq(ImmSel.U)
 
+        DW_32 = self.rrd_uop.alu_dw.eq(ALUWidth.DW_32)
+
         with m.Switch(self.iss_uop.opcode):
             with m.Case(UOpCode.LUI):
                 m.d.comb += [
@@ -141,6 +143,21 @@ class RegReadDecoder(Elaboratable):
                     ]
 
             for uopc, alu_op in (
+                (UOpCode.ADDIW, ALUOperator.ADD),
+                (UOpCode.SLLIW, ALUOperator.SL),
+                (UOpCode.SRAIW, ALUOperator.SRA),
+                (UOpCode.SRLIW, ALUOperator.SR),
+            ):
+                with m.Case(uopc):
+                    m.d.comb += [
+                        F(alu_op),
+                        OPA_RS1,
+                        OPB_IMM,
+                        IMM_I,
+                        DW_32,
+                    ]
+
+            for uopc, alu_op in (
                 (UOpCode.ADD, ALUOperator.ADD),
                 (UOpCode.SUB, ALUOperator.SUB),
                 (UOpCode.AND, ALUOperator.AND),
@@ -160,6 +177,21 @@ class RegReadDecoder(Elaboratable):
                     ]
 
             for uopc, alu_op in (
+                (UOpCode.ADDW, ALUOperator.ADD),
+                (UOpCode.SUBW, ALUOperator.SUB),
+                (UOpCode.SLLW, ALUOperator.SL),
+                (UOpCode.SRAW, ALUOperator.SRA),
+                (UOpCode.SRLW, ALUOperator.SR),
+            ):
+                with m.Case(uopc):
+                    m.d.comb += [
+                        F(alu_op),
+                        OPA_RS1,
+                        OPB_RS2,
+                        DW_32,
+                    ]
+
+            for uopc, alu_op in (
                 (UOpCode.MUL, ALUOperator.MUL),
                 (UOpCode.MULH, ALUOperator.MULH),
                 (UOpCode.MULHU, ALUOperator.MULHU),
@@ -172,6 +204,14 @@ class RegReadDecoder(Elaboratable):
                         OPB_RS2,
                     ]
 
+            with m.Case(UOpCode.MULW):
+                m.d.comb += [
+                    F(ALUOperator.MUL),
+                    OPA_RS1,
+                    OPB_RS2,
+                    DW_32,
+                ]
+
             for uopc, alu_op in (
                 (UOpCode.DIV, ALUOperator.DIV),
                 (UOpCode.DIVU, ALUOperator.DIVU),
@@ -183,6 +223,20 @@ class RegReadDecoder(Elaboratable):
                         F(alu_op),
                         OPA_RS1,
                         OPB_RS2,
+                    ]
+
+            for uopc, alu_op in (
+                (UOpCode.DIVW, ALUOperator.DIV),
+                (UOpCode.DIVUW, ALUOperator.DIVU),
+                (UOpCode.REMW, ALUOperator.REM),
+                (UOpCode.REMUW, ALUOperator.REMU),
+            ):
+                with m.Case(uopc):
+                    m.d.comb += [
+                        F(alu_op),
+                        OPA_RS1,
+                        OPB_RS2,
+                        DW_32,
                     ]
 
             with m.Case(UOpCode.JAL):

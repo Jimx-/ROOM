@@ -724,10 +724,10 @@ class SDDataPHY(Elaboratable):
         return m
 
 
-class SDController(Peripheral, Elaboratable):
+class SDControllerBase(Peripheral, Elaboratable):
 
-    def __init__(self, *, name=None):
-        super().__init__(name=name)
+    def __init__(self, *, name=None, src_loc_at=2):
+        super().__init__(name=name, src_loc_at=src_loc_at)
 
         bank = self.csr_bank()
         self._argument = bank.csr(32, 'rw', addr=SDControllerReg.ARGUMENT)
@@ -759,6 +759,17 @@ class SDController(Peripheral, Elaboratable):
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
 
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.bridge = self._bridge
+        return m
+
+
+class SDController(SDControllerBase):
+
+    def __init__(self, *, name=None, src_loc_at=1):
+        super().__init__(name=name, src_loc_at=src_loc_at + 1)
+
         self.sdio_clk = Signal()
         self.sdio_cmd_i = Signal()
         self.sdio_cmd_o = Signal()
@@ -771,8 +782,7 @@ class SDController(Peripheral, Elaboratable):
         self.finish = Signal()
 
     def elaborate(self, platform):
-        m = Module()
-        m.submodules.bridge = self._bridge
+        m = super().elaborate(platform)
 
         #
         # SDIO clock
@@ -1010,5 +1020,22 @@ class SDController(Peripheral, Elaboratable):
         m.d.comb += self._buffer.r_data.eq(data_fifo.r_data)
         with m.If(self._buffer.r_stb):
             m.d.comb += data_fifo.r_en.eq(1)
+
+        return m
+
+
+class MockSDController(SDControllerBase):
+
+    def __init__(self, *, name=None, src_loc_at=1):
+        super().__init__(name=name, src_loc_at=src_loc_at + 1)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        with m.If(self._argument.w_stb):
+            m.d.sync += self._cmd_isr.r_data.eq(1)
+
+        with m.If(self._cmd_isr.w_stb):
+            m.d.sync += self._cmd_isr.r_data.eq(0)
 
         return m

@@ -931,7 +931,7 @@ class LoadStoreUnit(Elaboratable):
 
                 m.d.comb += [
                     iresp.uop.eq(ldq_e.uop),
-                    iresp.valid.eq(ldq_e.uop.dst_rtype == RegisterType.FIX
+                    iresp.valid.eq((ldq_e.uop.dst_rtype == RegisterType.FIX)
                                    & data_valid & live),
                     iresp.data.eq(load_gen.data_out),
                 ]

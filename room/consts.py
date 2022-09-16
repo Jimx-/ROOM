@@ -202,6 +202,11 @@ class ALUOperator(IntEnum):
     REMU = AND
 
 
+class ALUWidth(IntEnum):
+    DW_XLEN = 0
+    DW_32 = 1
+
+
 class CFIType(IntEnum):
     X = 0
     JAL = 1

@@ -145,6 +145,7 @@ class ALU(Elaboratable):
         self.width = width
 
         self.fn = Signal(ALUOperator)
+        self.dw = Signal(ALUWidth)
         self.in1 = Signal(width)
         self.in2 = Signal(width)
         self.out = Signal(width)
@@ -171,21 +172,30 @@ class ALU(Elaboratable):
         #
 
         in1_xor_in2 = self.in1 ^ in2_inv
-        slt = Mux(self.in1[-1] == self.in2[-1], adder_out[-1],
-                  Mux(is_cmp_unsigned, self.in2[-1], self.in1[-1]))
+        slt = Mux(
+            self.in1[self.width - 1] == self.in2[self.width - 1],
+            adder_out[self.width - 1],
+            Mux(is_cmp_unsigned, self.in2[self.width - 1],
+                self.in1[self.width - 1]))
 
         #
         # SLL, SRL, SRA
         #
 
+        shin_r = Signal(self.width)
+
         if self.width == 32:
             shamt = self.in2[:5]
+            m.d.comb += shin_r.eq(self.in1)
         else:
-            shamt = self.in2[:6]
+            shin_hi_32 = Repl(is_sub & self.in1[31], 32)
+            shin_hi = Mux(self.dw == ALUWidth.DW_XLEN, self.in1[32:64],
+                          shin_hi_32)
+            shamt = Cat(self.in2[:5],
+                        self.in2[5] & (self.dw == ALUWidth.DW_XLEN))
+            m.d.comb += shin_r.eq(Cat(self.in1[:32], shin_hi))
 
-        shin_r = Signal(self.width)
         shin_l = Signal(self.width)
-        m.d.comb += shin_r.eq(self.in1)
         for a, b in zip(shin_l, reversed(shin_r)):
             m.d.comb += a.eq(b)
 
@@ -195,7 +205,7 @@ class ALU(Elaboratable):
         shout_r = Signal(self.width)
         shout_l = Signal(self.width)
         m.d.comb += shout_r.eq(
-            Cat(shin, is_sub & shin[-1]).as_signed() >> shamt)
+            Cat(shin, is_sub & shin[self.width - 1]).as_signed() >> shamt)
         for a, b in zip(shout_l, reversed(shout_r)):
             m.d.comb += a.eq(b)
         shout = Mux((self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA),
@@ -212,9 +222,15 @@ class ALU(Elaboratable):
 
         shift_logic = (is_cmp & slt) | logic | shout
 
-        m.d.comb += self.out.eq(
+        out = Signal.like(self.out)
+        m.d.comb += out.eq(
             Mux((self.fn == ALUOperator.ADD) | (self.fn == ALUOperator.SUB),
                 adder_out, shift_logic))
+
+        m.d.comb += self.out.eq(out)
+        if self.width > 32:
+            with m.If(self.dw == ALUWidth.DW_32):
+                m.d.comb += self.out.eq(Cat(out[:32], Repl(out[31], 32)))
 
         return m
 
@@ -236,6 +252,8 @@ class ALUUnit(PipelinedFunctionalUnit):
         #
 
         imm = generate_imm(uop.imm_packed, uop.imm_sel)
+        if self.xlen == 64:
+            imm = Cat(imm, Repl(imm[31], 32))
 
         opa_data = Signal(self.xlen)
         opb_data = Signal(self.xlen)
@@ -268,6 +286,7 @@ class ALUUnit(PipelinedFunctionalUnit):
             alu.in1.eq(opa_data),
             alu.in2.eq(opb_data),
             alu.fn.eq(uop.alu_fn),
+            alu.dw.eq(uop.alu_dw),
         ]
 
         #
@@ -282,7 +301,8 @@ class ALUUnit(PipelinedFunctionalUnit):
         rs2 = self.req.rs2_data
         br_eq = rs1 == rs2
         br_ltu = (rs1.as_unsigned() < rs2.as_unsigned())
-        br_lt = (~(rs1[-1] ^ rs2[-1]) & br_ltu) | (rs1[-1] & ~rs2[-1])
+        br_lt = (~(rs1[self.xlen - 1] ^ rs2[self.xlen - 1])
+                 & br_ltu) | (rs1[self.xlen - 1] & ~rs2[self.xlen - 1])
 
         pc_sel = Signal(PCSel)
 
@@ -389,6 +409,7 @@ class MulDivReq(Record):
     def __init__(self, width, name=None, src_loc_at=0):
         super().__init__([
             ('fn', Shape.cast(ALUOperator).width),
+            ('dw', Shape.cast(ALUWidth).width),
             ('in1', width),
             ('in2', width),
         ],
@@ -420,13 +441,17 @@ class Multiplier(Elaboratable):
         fn = in_req.fn
         h = (fn == ALUOperator.MULH) | (fn == ALUOperator.MULHU) | (
             fn == ALUOperator.MULHSU)
+        half = (self.width > 32) & (self.req.dw == ALUWidth.DW_32)
         lhs_signed = (fn == ALUOperator.MULH) | (fn == ALUOperator.MULHSU)
         rhs_signed = (fn == ALUOperator.MULH)
 
         lhs = Cat(in_req.in1, (lhs_signed & in_req.in1[-1])).as_signed()
         rhs = Cat(in_req.in2, (rhs_signed & in_req.in2[-1])).as_signed()
         prod = lhs * rhs
-        muxed = Mux(h, prod[self.width:self.width * 2], prod[:self.width])
+        half_sext = Cat(prod[:self.width // 2],
+                        Repl(prod[self.width // 2 - 1], self.width // 2))
+        muxed = Mux(h, prod[self.width:self.width * 2],
+                    Mux(half, half_sext, prod[:self.width]))
 
         valid = in_valid
         data = muxed
@@ -462,6 +487,7 @@ class MultiplierUnit(PipelinedFunctionalUnit):
         mul = m.submodules.mul = Multiplier(self.width, self.latency)
         m.d.comb += [
             mul.req.fn.eq(self.req.uop.alu_fn),
+            mul.req.dw.eq(self.req.uop.alu_dw),
             mul.req.in1.eq(self.req.rs1_data),
             mul.req.in2.eq(self.req.rs2_data),
             mul.req_valid.eq(self.req.valid),
@@ -532,11 +558,18 @@ class IntDiv(Elaboratable):
 
         fn = self.req.fn
         h = (fn == ALUOperator.REM) | (fn == ALUOperator.REMU)
+        half_width = (self.width > 32) & (self.req.dw == ALUWidth.DW_32)
         lhs_signed = (fn == ALUOperator.DIV) | (fn == ALUOperator.REM)
         rhs_signed = lhs_signed
 
-        lhs_sign = self.req.in1[-1] & lhs_signed
-        rhs_sign = self.req.in2[-1] & rhs_signed
+        def sext(x, signed):
+            sign = Mux(half_width, x[self.width // 2 - 1], x[-1]) & signed
+            hi = Mux(half_width, Repl(sign, self.width // 2),
+                     x[self.width // 2:])
+            return Cat(x[:self.width // 2], hi), sign
+
+        lhs_in, lhs_sign = sext(self.req.in1, lhs_signed)
+        rhs_in, rhs_sign = sext(self.req.in2, rhs_signed)
 
         is_hi = Signal()
         res_hi = Signal()
@@ -552,8 +585,8 @@ class IntDiv(Elaboratable):
                         req.eq(self.req),
                         neg_out.eq(Mux(h, lhs_sign, lhs_sign ^ rhs_sign)),
                         count.eq(0),
-                        divisor.eq(Cat(self.req.in2, rhs_sign)),
-                        remainder.eq(self.req.in1),
+                        divisor.eq(Cat(rhs_in, rhs_sign)),
+                        remainder.eq(lhs_in),
                         is_hi.eq(h),
                         res_hi.eq(0),
                     ]
@@ -618,7 +651,11 @@ class IntDiv(Elaboratable):
                 with m.If(self.kill | (self.resp_valid & self.resp_ready)):
                     m.next = 'IDLE'
 
-        m.d.comb += self.resp_data.eq(result)
+        result_lo = result[:self.width // 2]
+        result_hi = Mux(half_width,
+                        Repl(result[self.width // 2 - 1], self.width // 2),
+                        result[self.width // 2:])
+        m.d.comb += self.resp_data.eq(Cat(result_lo, result_hi))
 
         return m
 
@@ -637,6 +674,7 @@ class DivUnit(IterativeFunctionalUnit):
 
         m.d.comb += [
             div.req.fn.eq(self.req.uop.alu_fn),
+            div.req.dw.eq(self.req.uop.alu_dw),
             div.req.in1.eq(self.req.rs1_data),
             div.req.in2.eq(self.req.rs2_data),
             div.req_valid.eq(self.req.valid),

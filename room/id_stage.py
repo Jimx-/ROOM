@@ -56,6 +56,8 @@ class BranchDecoder(Elaboratable):
 class DecodeUnit(Elaboratable):
 
     def __init__(self, params):
+        self.xlen = params['xlen']
+
         self.in_uop = MicroOp(params)
         self.out_uop = MicroOp(params)
 
@@ -217,17 +219,51 @@ class DecodeUnit(Elaboratable):
 
                     with m.Case(F3('SLLI')):
                         m.d.comb += UOPC(UOpCode.SLLI)
-                        with m.If(inuop.inst[25:32] != 0):
+                        with m.If((inuop.inst[26:32] != 0) | (
+                            (self.xlen == 32) & (inuop.inst[25] != 0))):
                             m.d.comb += ILL_INSN
 
                     with m.Case(F3('SRLI')):
-                        with m.Switch(inuop.inst[25:32]):
-                            with m.Case(F7('SRLI')):
-                                m.d.comb += UOPC(UOpCode.SRLI)
-                            with m.Case(F7('SRAI')):
-                                m.d.comb += UOPC(UOpCode.SRAI)
-                            with m.Default():
+                        with m.If((inuop.inst[26:30] != 0) | (
+                            (self.xlen == 32) & (inuop.inst[25] != 0))):
+                            m.d.comb += ILL_INSN
+                        with m.Else():
+                            with m.Switch(inuop.inst[30:32]):
+                                with m.Case(0b00):
+                                    m.d.comb += UOPC(UOpCode.SRLI)
+                                with m.Case(0b01):
+                                    m.d.comb += UOPC(UOpCode.SRAI)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
+            if self.xlen == 64:
+                # OP-IMM-32
+                with m.Case(0b0011011):
+                    m.d.comb += [
+                        uop.iq_type.eq(IssueQueueType.INT),
+                        uop.fu_type.eq(FUType.ALU),
+                        uop.dst_rtype.eq(RegisterType.FIX),
+                        uop.lrs1_rtype.eq(RegisterType.FIX),
+                        IMM_SEL_I,
+                    ]
+
+                    with m.Switch(inuop.inst[12:15]):
+                        with m.Case(F3('ADDI')):
+                            m.d.comb += UOPC(UOpCode.ADDIW)
+
+                        with m.Case(F3('SLLI')):
+                            m.d.comb += UOPC(UOpCode.SLLIW)
+                            with m.If(inuop.inst[25:32] != 0):
                                 m.d.comb += ILL_INSN
+
+                        with m.Case(F3('SRLI')):
+                            with m.Switch(inuop.inst[25:32]):
+                                with m.Case(F7('SRLI')):
+                                    m.d.comb += UOPC(UOpCode.SRLIW)
+                                with m.Case(F7('SRAI')):
+                                    m.d.comb += UOPC(UOpCode.SRAIW)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
 
             # Register-register
             with m.Case(OPV('ADD')):
@@ -264,6 +300,39 @@ class DecodeUnit(Elaboratable):
                             UOPC(getattr(UOpCode, name)),
                             uop.fu_type.eq(FUType.DIV),
                         ]
+
+            if self.xlen == 64:
+                # OP-32
+                with m.Case(0b0111011):
+                    m.d.comb += [
+                        uop.iq_type.eq(IssueQueueType.INT),
+                        uop.dst_rtype.eq(RegisterType.FIX),
+                        uop.lrs1_rtype.eq(RegisterType.FIX),
+                        uop.lrs2_rtype.eq(RegisterType.FIX),
+                    ]
+
+                    for name in ['ADD', 'SUB', 'SLL', 'SRL', 'SRA']:
+                        with m.If((inuop.inst[25:31] == F7(name))
+                                  & (inuop.inst[12:15] == F3(name))):
+                            m.d.comb += [
+                                UOPC(getattr(UOpCode, name + 'W')),
+                                uop.fu_type.eq(FUType.ALU),
+                            ]
+
+                    with m.If((inuop.inst[25:31] == F7('MUL'))
+                              & (inuop.inst[12:15] == F3('MUL'))):
+                        m.d.comb += [
+                            UOPC(UOpCode.MULW),
+                            uop.fu_type.eq(FUType.MUL),
+                        ]
+
+                    for name in ['DIV', 'DIVU', 'REM', 'REMU']:
+                        with m.If((inuop.inst[25:31] == F7(name))
+                                  & (inuop.inst[12:15] == F3(name))):
+                            m.d.comb += [
+                                UOPC(getattr(UOpCode, name + 'W')),
+                                uop.fu_type.eq(FUType.DIV),
+                            ]
 
             # System
             with m.Case(OPV('EBREAK')):
