@@ -316,7 +316,7 @@ class IFStage(Elaboratable):
         self.redirect_ftq_idx = Signal(range(ftq_size))
 
         self.bp = [
-            Breakpoint(vaddr_bits=self.vaddr_bits, name=f'bp{i}')
+            Breakpoint(self.params, name=f'bp{i}')
             for i in range(self.num_breakpoints)
         ]
 

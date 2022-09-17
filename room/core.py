@@ -62,13 +62,13 @@ class Core(Elaboratable):
 
         mem_width = self.params['mem_width']
 
-        csr = m.submodules.csr = CSRFile(width=32)
+        csr = m.submodules.csr = CSRFile(width=self.xlen)
 
         #
         # Exception
         #
 
-        exc_unit = m.submodules.exc_unit = ExceptionUnit()
+        exc_unit = m.submodules.exc_unit = ExceptionUnit(self.params)
         csr.add_csrs(exc_unit.iter_csrs())
 
         m.d.comb += exc_unit.interrupts.eq(self.interrupts)

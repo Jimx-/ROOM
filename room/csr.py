@@ -3,7 +3,7 @@ from collections import OrderedDict
 import riscvmodel.csrnames as csrnames
 
 from amaranth import *
-from amaranth.utils import bits_for
+from amaranth.utils import bits_for, log2_int
 
 from room.consts import *
 
@@ -53,11 +53,12 @@ class AutoCSR:
                 yield from v.iter_csrs()
 
 
-misa_layout = [
-    ("extensions", 26, CSRAccess.RW),
-    ("zero", 4, CSRAccess.RO),
-    ("mxl", 2, CSRAccess.RW),
-]
+def misa_layout(xlen):
+    return [
+        ("extensions", 26, CSRAccess.RW),
+        ("zero", xlen - 28, CSRAccess.RO),
+        ("mxl", 2, CSRAccess.RW),
+    ]
 
 
 class CSRFile(Elaboratable):
@@ -68,15 +69,22 @@ class CSRFile(Elaboratable):
         self._csr_map = OrderedDict()
         self._ports = []
 
-        self.mhartid = CSR(csrnames.mhartid, [('value', 32, CSRAccess.RO)])
-        self.misa = CSR(csrnames.misa, misa_layout)
-        self.mscratch = CSR(csrnames.mscratch, [('value', 32, CSRAccess.RW)])
+        self.mhartid = CSR(csrnames.mhartid,
+                           [('value', self.width, CSRAccess.RO)])
+        self.misa = CSR(csrnames.misa, misa_layout(self.width))
+        self.mscratch = CSR(csrnames.mscratch,
+                            [('value', self.width, CSRAccess.RW)])
 
-        self.mcycle = CSR(csrnames.mcycle, [('value', 32, CSRAccess.RW)])
-        self.mcycleh = CSR(csrnames.mcycleh, [('value', 32, CSRAccess.RW)])
+        self.mcycle = CSR(csrnames.mcycle,
+                          [('value', self.width, CSRAccess.RW)])
 
         self.add_csrs([self.mhartid, self.misa, self.mscratch])
-        self.add_csrs([self.mcycle, self.mcycleh])
+        self.add_csrs([self.mcycle])
+
+        if self.width == 32:
+            self.mcycleh = CSR(csrnames.mcycleh,
+                               [('value', self.width, CSRAccess.RW)])
+            self.add_csrs([self.mcycleh])
 
     def add_csrs(self, csrs):
         for csr in csrs:
@@ -108,7 +116,7 @@ class CSRFile(Elaboratable):
             isa_ext |= 1 << (ord(c) - ord('A'))
         m.d.comb += [
             self.misa.r.extensions.eq(isa_ext),
-            self.misa.r.mxl.eq(1),
+            self.misa.r.mxl.eq(log2_int(self.width) - 4),
         ]
 
         with m.If(self.mscratch.we):
@@ -116,10 +124,9 @@ class CSRFile(Elaboratable):
 
         cycles = Signal(64)
         m.d.sync += cycles.eq(cycles + 1)
-        m.d.comb += [
-            self.mcycle.r.eq(cycles[:32]),
-            self.mcycleh.r.eq(cycles[32:]),
-        ]
+        m.d.comb += self.mcycle.r.eq(cycles[:self.width])
+        if self.width == 32:
+            m.d.comb += self.mcycleh.r.eq(cycles[32:])
 
         for p in self._ports:
             with m.Switch(p.addr):
@@ -134,7 +141,7 @@ class CSRFile(Elaboratable):
                         ]
 
                         m.d.comb += csr.we.eq(p.cmd[2])
-                        for i in range(self.width):
+                        for i in range(min(self.width, len(csr.w))):
                             rw = (1 << i) & csr.mask
                             m.d.comb += csr.w[i].eq(
                                 w_data[i] if rw else csr.r[i])

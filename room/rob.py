@@ -62,6 +62,8 @@ class CommitReq:
 class CommitExceptionReq(Record):
 
     def __init__(self, params, name=None):
+        self.xlen = params['xlen']
+
         _uop = MicroOp(params)
 
         super().__init__([
@@ -69,7 +71,7 @@ class CommitExceptionReq(Record):
             ('ftq_idx', _uop.ftq_idx.width),
             ('pc_lsb', _uop.pc_lsb.width),
             ('is_rvc', 1),
-            ('cause', 32),
+            ('cause', self.xlen),
             ('flush_type', Shape.cast(FlushType).width),
         ],
                          name=name)

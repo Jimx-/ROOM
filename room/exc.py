@@ -44,50 +44,73 @@ class Cause(IntEnum):
     DEBUG_INTERRUPT = 12
 
 
-mstatus_layout = [
-    ("uie", 1, CSRAccess.RO),  # User Interrupt Enable
-    ("sie", 1, CSRAccess.RO),  # Supervisor Interrupt Enable
-    ("zero0", 1, CSRAccess.RO),
-    ("mie", 1, CSRAccess.RW),  # Machine Interrupt Enable
-    ("upie", 1, CSRAccess.RO),  # User Previous Interrupt Enable
-    ("spie", 1, CSRAccess.RO),  # Supervisor Previous Interrupt Enable
-    ("zero1", 1, CSRAccess.RO),
-    ("mpie", 1, CSRAccess.RW),  # Machine Previous Interrupt Enable
-    ("spp", 1, CSRAccess.RO),  # Supervisor Previous Privilege
-    ("zero2", 2, CSRAccess.RO),
-    ("mpp", 2, CSRAccess.RW),  # Machine Previous Privilege
-    ("fs", 2, CSRAccess.RO),  # FPU Status
-    ("xs", 2, CSRAccess.RO),  # user-mode eXtensions Status
-    ("mprv", 1, CSRAccess.RO),  # Modify PRiVilege
-    ("sum", 1, CSRAccess.RO),  # Supervisor User Memory access
-    ("mxr", 1, CSRAccess.RO),  # Make eXecutable Readable
-    ("tvm", 1, CSRAccess.RO),  # Trap Virtual Memory
-    ("tw", 1, CSRAccess.RO),  # Timeout Wait
-    ("tsr", 1, CSRAccess.RO),  # Trap SRET
-    ("zero3", 8, CSRAccess.RO),
-    ("sd", 1, CSRAccess.RO),  # State Dirty (set if XS or FS are set to dirty)
-]
+def mstatus_layout(xlen):
+    layout = [
+        ("uie", 1, CSRAccess.RO),  # User Interrupt Enable
+        ("sie", 1, CSRAccess.RO),  # Supervisor Interrupt Enable
+        ("zero0", 1, CSRAccess.RO),
+        ("mie", 1, CSRAccess.RW),  # Machine Interrupt Enable
+        ("upie", 1, CSRAccess.RO),  # User Previous Interrupt Enable
+        ("spie", 1, CSRAccess.RO),  # Supervisor Previous Interrupt Enable
+        ("zero1", 1, CSRAccess.RO),
+        ("mpie", 1, CSRAccess.RW),  # Machine Previous Interrupt Enable
+        ("spp", 1, CSRAccess.RO),  # Supervisor Previous Privilege
+        ("zero2", 2, CSRAccess.RO),
+        ("mpp", 2, CSRAccess.RW),  # Machine Previous Privilege
+        ("fs", 2, CSRAccess.RO),  # FPU Status
+        ("xs", 2, CSRAccess.RO),  # user-mode eXtensions Status
+        ("mprv", 1, CSRAccess.RO),  # Modify PRiVilege
+        ("sum", 1, CSRAccess.RO),  # Supervisor User Memory access
+        ("mxr", 1, CSRAccess.RO),  # Make eXecutable Readable
+        ("tvm", 1, CSRAccess.RO),  # Trap Virtual Memory
+        ("tw", 1, CSRAccess.RO),  # Timeout Wait
+        ("tsr", 1, CSRAccess.RO),  # Trap SRET
+    ]
 
-mip_layout = [
-    ("usip", 1, CSRAccess.RO),
-    ("ssip", 1, CSRAccess.RO),
-    ("zero0", 1, CSRAccess.RO),
-    ("msip", 1, CSRAccess.RW),
-    ("utip", 1, CSRAccess.RO),
-    ("stip", 1, CSRAccess.RO),
-    ("zero1", 1, CSRAccess.RO),
-    ("mtip", 1, CSRAccess.RW),
-    ("ueip", 1, CSRAccess.RO),
-    ("seip", 1, CSRAccess.RO),
-    ("zero2", 1, CSRAccess.RO),
-    ("meip", 1, CSRAccess.RW),
-    ("zero3", 20, CSRAccess.RO),
-]
+    if xlen == 32:
+        layout = layout + [
+            ("zero3", 8, CSRAccess.RO),
+        ]
+    else:
+        layout = layout + [
+            ("zero3", 9, CSRAccess.RO),
+            ("uxl", 2, CSRAccess.RW),
+            ("sxl", 2, CSRAccess.RW),
+            ("zero4", xlen - 37, CSRAccess.RO),
+        ]
 
-mcause_layout = [
-    ("ecode", 31, CSRAccess.RW),
-    ("interrupt", 1, CSRAccess.RW),
-]
+    layout.append(
+        ("sd", 1,
+         CSRAccess.RO),  # State Dirty (set if XS or FS are set to dirty)
+    )
+
+    return layout
+
+
+def mip_layout(xlen):
+    return [
+        ("usip", 1, CSRAccess.RO),
+        ("ssip", 1, CSRAccess.RO),
+        ("zero0", 1, CSRAccess.RO),
+        ("msip", 1, CSRAccess.RW),
+        ("utip", 1, CSRAccess.RO),
+        ("stip", 1, CSRAccess.RO),
+        ("zero1", 1, CSRAccess.RO),
+        ("mtip", 1, CSRAccess.RW),
+        ("ueip", 1, CSRAccess.RO),
+        ("seip", 1, CSRAccess.RO),
+        ("zero2", 1, CSRAccess.RO),
+        ("meip", 1, CSRAccess.RW),
+        ("zero3", xlen - 12, CSRAccess.RO),
+    ]
+
+
+def mcause_layout(xlen):
+    return [
+        ("ecode", xlen - 1, CSRAccess.RW),
+        ("interrupt", 1, CSRAccess.RW),
+    ]
+
 
 dcsr_layout = [
     ("prv", 2, CSRAccess.RW),  # Privilege level before Debug Mode was entered
@@ -111,11 +134,13 @@ dcsr_layout = [
 
 class ExceptionUnit(Elaboratable, AutoCSR):
 
-    def __init__(self):
+    def __init__(self, params):
+        self.xlen = params['xlen']
+
         self.interrupts = CoreInterrupts()
 
         self.interrupt = Signal()
-        self.interrupt_cause = Signal(32)
+        self.interrupt_cause = Signal(self.xlen)
         self.exc_vector = Signal(32)
 
         self.debug_mode = Signal()
@@ -126,19 +151,21 @@ class ExceptionUnit(Elaboratable, AutoCSR):
 
         self.commit = Signal()
         self.exception = Signal()
-        self.cause = Signal(32)
+        self.cause = Signal(self.xlen)
         self.epc = Signal(32)
 
         self.single_step = Signal()
 
-        self.mstatus = CSR(csrnames.mstatus, mstatus_layout)
-        self.mip = CSR(csrnames.mip, mip_layout)
-        self.mcause = CSR(csrnames.mcause, mcause_layout)
+        self.mstatus = CSR(csrnames.mstatus, mstatus_layout(self.xlen))
+        self.mip = CSR(csrnames.mip, mip_layout(self.xlen))
+        self.mcause = CSR(csrnames.mcause, mcause_layout(self.xlen))
 
         self.dcsr = CSR(csrnames.dcsr, dcsr_layout)
-        self.dpc = CSR(csrnames.dpc, [('value', 32, CSRAccess.RW)])
-        self.dscratch0 = CSR(csrnames.dscratch0, [('value', 32, CSRAccess.RW)])
-        self.dscratch1 = CSR(csrnames.dscratch1, [('value', 32, CSRAccess.RW)])
+        self.dpc = CSR(csrnames.dpc, [('value', self.xlen, CSRAccess.RW)])
+        self.dscratch0 = CSR(csrnames.dscratch0,
+                             [('value', self.xlen, CSRAccess.RW)])
+        self.dscratch1 = CSR(csrnames.dscratch1,
+                             [('value', self.xlen, CSRAccess.RW)])
 
     def elaborate(self, platform):
         m = Module()
@@ -157,7 +184,7 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         interrupt_pe = m.submodules.interrupt_pe = PriorityEncoder(16)
         m.d.comb += interrupt_pe.i.eq(interrupts)
 
-        interrupt_cause = Record([l[:2] for l in mcause_layout])
+        interrupt_cause = Record([l[:2] for l in mcause_layout(self.xlen)])
         m.d.comb += [
             interrupt_cause.interrupt.eq(1),
             interrupt_cause.ecode.eq(interrupt_pe.o),
@@ -194,7 +221,7 @@ class ExceptionUnit(Elaboratable, AutoCSR):
                 with m.Case(0x7b2):  # DRET
                     m.d.comb += insn_dret.eq(1)
 
-        cause = Record([l[:2] for l in mcause_layout])
+        cause = Record([l[:2] for l in mcause_layout(self.xlen)])
         m.d.comb += cause.eq(self.cause)
 
         single_stepped = Signal()

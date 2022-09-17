@@ -62,7 +62,7 @@ class DecodeUnit(Elaboratable):
         self.out_uop = MicroOp(params)
 
         self.interrupt = Signal()
-        self.interrupt_cause = Signal(32)
+        self.interrupt_cause = Signal(self.xlen)
 
     def elaborate(self, platform):
         m = Module()
@@ -448,6 +448,7 @@ class DecodeUnit(Elaboratable):
 class DecodeStage(Elaboratable):
 
     def __init__(self, params):
+        self.xlen = params['xlen']
         self.core_width = params['core_width']
         self.params = params
 
@@ -470,7 +471,7 @@ class DecodeStage(Elaboratable):
         self.flush_pipeline = Signal()
 
         self.interrupt = Signal()
-        self.interrupt_cause = Signal(32)
+        self.interrupt_cause = Signal(self.xlen)
         self.single_step = Signal()
 
     def elaborate(self, platform):
