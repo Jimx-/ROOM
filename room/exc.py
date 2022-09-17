@@ -1,5 +1,6 @@
 from amaranth import *
 from amaranth.lib.coding import PriorityEncoder
+from amaranth.utils import log2_int
 import riscvmodel.insn as insn
 import riscvmodel.csrnames as csrnames
 from enum import IntEnum
@@ -112,6 +113,13 @@ def mcause_layout(xlen):
     ]
 
 
+def mtvec_layout(xlen):
+    return [
+        ("mode", 2, CSRAccess.RW),
+        ("base", xlen - 2, CSRAccess.RW),
+    ]
+
+
 dcsr_layout = [
     ("prv", 2, CSRAccess.RW),  # Privilege level before Debug Mode was entered
     ("step", 1,
@@ -159,6 +167,9 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         self.mstatus = CSR(csrnames.mstatus, mstatus_layout(self.xlen))
         self.mip = CSR(csrnames.mip, mip_layout(self.xlen))
         self.mcause = CSR(csrnames.mcause, mcause_layout(self.xlen))
+        self.mepc = CSR(csrnames.mepc, [('value', self.xlen, CSRAccess.RW)])
+        self.mtvec = CSR(csrnames.mtvec, mtvec_layout(self.xlen))
+        self.mtval = CSR(csrnames.mtval, [('value', self.xlen, CSRAccess.RW)])
 
         self.dcsr = CSR(csrnames.dcsr, dcsr_layout)
         self.dpc = CSR(csrnames.dpc, [('value', self.xlen, CSRAccess.RW)])
@@ -212,12 +223,18 @@ class ExceptionUnit(Elaboratable, AutoCSR):
             m.d.sync += self.dscratch1.r.eq(self.dscratch1.w)
 
         insn_break = Signal()
+        insn_mret = Signal()
+        insn_sret = Signal()
         insn_dret = Signal()
-        insn_ret = insn_dret
+        insn_ret = insn_mret | insn_sret | insn_dret
         with m.If(self.system_insn):
             with m.Switch(self.system_insn_imm):
                 with m.Case(insn.InstructionEBREAK.field_imm.value):
                     m.d.comb += insn_break.eq(1)
+                with m.Case(insn.InstructionMRET.field_imm.value):
+                    m.d.comb += insn_mret.eq(1)
+                with m.Case(insn.InstructionSRET.field_imm.value):
+                    m.d.comb += insn_sret.eq(1)
                 with m.Case(0x7b2):  # DRET
                     m.d.comb += insn_dret.eq(1)
 
@@ -232,8 +249,31 @@ class ExceptionUnit(Elaboratable, AutoCSR):
         is_debug_break = ~cause.interrupt & insn_break
         trap_to_debug = single_stepped | is_debug_int | is_debug_trigger | is_debug_break | self.debug_mode
 
+        with m.If(self.mtvec.we):
+            m.d.sync += [
+                self.mtvec.r.mode.eq(self.mtvec.w.mode & 1),
+                self.mtvec.r.base.eq(self.mtvec.w.base),
+            ]
+
+        with m.If(self.mepc.we):
+            m.d.sync += self.mepc.r.eq(self.mepc.w)
+
+        with m.If(self.mcause.we):
+            m.d.sync += [
+                self.mcause.r.interrupt.eq(self.mcause.w.interrupt),
+                self.mcause.r.ecode.eq(
+                    self.mcause.w.ecode[:log2_int(self.xlen)]),
+            ]
+
+        tvec_csr = self.mtvec.r
+        int_vector = Cat(0b00, cause.ecode, tvec_csr.base >>
+                         (log2_int(self.xlen) + 2))
+        vector_mode = tvec_csr.mode[0] & cause.interrupt
+        trap_vector = Mux(vector_mode, int_vector, tvec_csr.base << 2)
+
         m.d.comb += [
-            self.exc_vector.eq(Mux(trap_to_debug, self.debug_entry, 0)),
+            self.exc_vector.eq(
+                Mux(trap_to_debug, self.debug_entry, trap_vector)),
             self.single_step.eq(self.dcsr.r.step & ~self.debug_mode),
         ]
 
@@ -254,9 +294,24 @@ class ExceptionUnit(Elaboratable, AutoCSR):
                         self.dpc.r.eq(self.epc),
                     ]
 
+            with m.Else():
+                m.d.sync += [
+                    self.mepc.r.eq(self.epc),
+                    self.mcause.r.eq(self.cause),
+                    self.mstatus.r.mpie.eq(self.mstatus.r.mie),
+                    self.mstatus.r.mie.eq(0),
+                ]
+
         with m.If(insn_ret):
             with m.If(insn_dret):
                 m.d.sync += self.debug_mode.eq(0)
                 m.d.comb += self.exc_vector.eq(self.dpc.r)
+
+            with m.Elif(insn_mret):
+                m.d.sync += [
+                    self.mstatus.r.mie.eq(self.mstatus.r.mpie),
+                    self.mstatus.r.mpie.eq(1),
+                ]
+                m.d.comb += self.exc_vector.eq(self.mepc.r)
 
         return m

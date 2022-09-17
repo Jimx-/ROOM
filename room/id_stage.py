@@ -421,6 +421,9 @@ class DecodeUnit(Elaboratable):
                             uop.is_fencei.eq(1),
                         ]
 
+            with m.Default():
+                m.d.comb += ILL_INSN
+
         di20_25 = Mux((imm_sel == ImmSel.B) | (imm_sel == ImmSel.S),
                       inuop.inst[7:12], inuop.inst[20:25])
         m.d.comb += uop.imm_packed.eq(
@@ -440,6 +443,11 @@ class DecodeUnit(Elaboratable):
             m.d.comb += [
                 uop.exception.eq(1),
                 uop.exc_cause.eq(Cause.BREAKPOINT),
+            ]
+        with m.Elif(insn_illegal):
+            m.d.comb += [
+                uop.exception.eq(1),
+                uop.exc_cause.eq(Cause.ILLEGAL_INSTRUCTION),
             ]
 
         return m
