@@ -166,10 +166,11 @@ reg_map = dict([
     (DebugReg.SBCS, sbcs_layout),
     (DebugReg.SBADDRESS0, flat_layout),
     (DebugReg.SBDATA0, flat_layout),
-    (DebugReg.DATA0, flat_layout),
     (DebugReg.HALTSUM0, flat_layout),
     (DebugReg.HALTSUM1, flat_layout),
-] + [(DebugReg.PROGBUF0 + i, flat_layout) for i in range(16)])
+] + [(DebugReg.DATA0 + i, flat_layout)
+     for i in range(12)] + [(DebugReg.PROGBUF0 + i, flat_layout)
+                            for i in range(16)])
 
 
 class DmiError(IntEnum):
@@ -414,8 +415,12 @@ class DebugController(Elaboratable):
 
     class GenerateI(Elaboratable):
 
-        def __init__(self, insn):
+        def __init__(self, insn, funct3=None):
             self.insn = insn
+
+            if funct3 is None:
+                funct3 = insn.field_funct3.value
+            self.funct3 = funct3
 
             self.rd = Signal(5)
             self.rs1 = Signal(5)
@@ -428,7 +433,7 @@ class DebugController(Elaboratable):
             m.d.comb += [
                 self.inst[:7].eq(self.insn.field_opcode.value),
                 self.inst[7:12].eq(self.rd),
-                self.inst[12:15].eq(self.insn.field_funct3.value),
+                self.inst[12:15].eq(self.funct3),
                 self.inst[15:20].eq(self.rs1),
                 self.inst[20:].eq(self.imm),
             ]
@@ -437,8 +442,12 @@ class DebugController(Elaboratable):
 
     class GenerateS(Elaboratable):
 
-        def __init__(self, insn):
+        def __init__(self, insn, funct3=None):
             self.insn = insn
+
+            if funct3 is None:
+                funct3 = insn.field_funct3.value
+            self.funct3 = funct3
 
             self.rs1 = Signal(5)
             self.rs2 = Signal(5)
@@ -451,7 +460,7 @@ class DebugController(Elaboratable):
             m.d.comb += [
                 self.inst[:7].eq(self.insn.field_opcode.value),
                 self.inst[7:12].eq(self.imm[:5]),
-                self.inst[12:15].eq(self.insn.field_funct3.value),
+                self.inst[12:15].eq(self.funct3),
                 self.inst[15:20].eq(self.rs1),
                 self.inst[20:25].eq(self.rs2),
                 self.inst[25:].eq(self.imm[5:]),
@@ -470,7 +479,8 @@ class DebugController(Elaboratable):
 
             base = Mux(self.cmd.regno[0], 8, 9)
 
-            gen_ld = DebugController.GenerateI(insn.InstructionLW)
+            gen_ld = DebugController.GenerateI(insn.InstructionLW,
+                                               funct3=self.cmd.aarsize)
             m.submodules += gen_ld
             m.d.comb += [
                 gen_ld.rd.eq(self.cmd.regno),
@@ -479,7 +489,8 @@ class DebugController(Elaboratable):
                               & 0xfff),
             ]
 
-            gen_st = DebugController.GenerateS(insn.InstructionSW)
+            gen_st = DebugController.GenerateS(insn.InstructionSW,
+                                               funct3=self.cmd.aarsize)
             m.submodules += gen_st
             m.d.comb += [
                 gen_st.rs1.eq(base),
@@ -552,7 +563,8 @@ class DebugController(Elaboratable):
                 gen_csrw.imm.eq(self.cmd.regno),
             ]
 
-            gen_st = DebugController.GenerateS(insn.InstructionSW)
+            gen_st = DebugController.GenerateS(insn.InstructionSW,
+                                               funct3=self.cmd.aarsize)
             m.submodules += gen_st
             m.d.comb += [
                 gen_st.rs1.eq(9),
@@ -561,7 +573,8 @@ class DebugController(Elaboratable):
                               & 0xfff),
             ]
 
-            gen_ld = DebugController.GenerateI(insn.InstructionLW)
+            gen_ld = DebugController.GenerateI(insn.InstructionLW,
+                                               funct3=self.cmd.aarsize)
             m.submodules += gen_ld
             m.d.comb += [
                 gen_ld.rd.eq(8),
@@ -621,8 +634,9 @@ class DebugController(Elaboratable):
 
             return m
 
-    def __init__(self, debugrf, csr_bank, progbuf_size=16):
+    def __init__(self, debugrf, csr_bank, data_count=6, progbuf_size=16):
         self.progbuf_size = progbuf_size
+        self.data_count = data_count
 
         self.debug_int = Signal()
 
@@ -632,8 +646,11 @@ class DebugController(Elaboratable):
         self.abstractcs = debugrf.reg_port(DebugReg.ABSTRACTCS)
         self.command = debugrf.reg_port(DebugReg.COMMAND)
         self.abstractauto = debugrf.reg_port(DebugReg.ABSTRACTAUTO)
-        self.data0 = debugrf.reg_port(DebugReg.DATA0)
         self.haltsum0 = debugrf.reg_port(DebugReg.HALTSUM0)
+
+        self.data = [
+            debugrf.reg_port(DebugReg.DATA0 + i) for i in range(data_count)
+        ]
 
         self.progbuf = [
             debugrf.reg_port(DebugReg.PROGBUF0 + i)
@@ -654,7 +671,12 @@ class DebugController(Elaboratable):
         self._progbuf = csr_bank.csr(32 * self.progbuf_size,
                                      'r',
                                      addr=DebugModuleCSR.PROGBUF)
-        self._shadowed_data = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.DATA)
+        self._shadowed_data = [
+            csr_bank.csr(32,
+                         'rw',
+                         addr=DebugModuleCSR.DATA + i * 4,
+                         name=f'data{i}') for i in range(data_count)
+        ]
 
     def elaborate(self, platform):
         m = Module()
@@ -732,6 +754,7 @@ class DebugController(Elaboratable):
             self.haltsum0.w[0].eq(self.dmstatus.w.allhalted),
         ]
 
+        m.d.comb += self.abstractcs.w.datacount.eq(self.data_count)
         m.d.comb += self.abstractcs.w.progbufsize.eq(self.progbuf_size)
 
         cmd_idle = Signal()
@@ -758,16 +781,21 @@ class DebugController(Elaboratable):
             m.d.comb += self._progbuf.r_data[i * 32:(i + 1) * 32].eq(
                 self.progbuf[i].w)
 
-        abstract_data = Signal(32)
-        m.d.comb += [
-            self.data0.w.eq(abstract_data),
-            self._shadowed_data.r_data.eq(abstract_data),
-        ]
+        abstract_data = Signal(32 * self.data_count)
+        for i in range(self.data_count):
+            m.d.comb += [
+                self.data[i].w.eq(abstract_data[i * 32:(i + 1) * 32]),
+                self._shadowed_data[i].r_data.eq(abstract_data[i * 32:(i + 1) *
+                                                               32]),
+            ]
 
-        with m.If(self.data0.update & cmd_idle):
-            m.d.sync += abstract_data.eq(self.data0.r)
-        with m.Elif(self._shadowed_data.w_stb):
-            m.d.sync += abstract_data.eq(self._shadowed_data.w_data)
+            with m.If(self.data[i].update & cmd_idle):
+                m.d.sync += abstract_data[i * 32:(i + 1) * 32].eq(
+                    self.data[i].r)
+            with m.Elif(self._shadowed_data[i].w_stb):
+                m.d.sync += abstract_data[i * 32:(i + 1) * 32].eq(
+                    self._shadowed_data[i].w_data)
+
         with m.If(~self.dmcontrol.w.dmactive):
             m.d.sync += abstract_data.eq(0)
 
@@ -781,8 +809,12 @@ class DebugController(Elaboratable):
             m.d.comb += autoexec_progbuf[i].eq(
                 (self.progbuf[i].update | self.progbuf[i].capture)
                 & self.abstractauto.w.autoexecprogbuf[i])
-        autoexec_data = (self.data0.update | self.data0.capture
-                         ) & self.abstractauto.w.autoexecdata[0]
+
+        autoexec_data = Signal(self.data_count)
+        for i in range(self.data_count):
+            m.d.comb += autoexec_data[i].eq(
+                (self.data[i].update | self.data[i].capture)
+                & self.abstractauto.w.autoexecdata[i])
 
         go_req = Signal()
         go_abstract = Signal()
@@ -830,11 +862,13 @@ class DebugController(Elaboratable):
         # Abstract command FSM
         #
 
+        data_access = Cat(*Array((self.data[i].update | self.data[i].capture)
+                                 for i in range(self.data_count)))
+
         m.d.comb += cmderr_busy.eq((self.abstractcs.update
                                     | self.command.update
                                     | self.abstractauto.update
-                                    | self.data0.update
-                                    | self.data0.capture) & ~cmd_idle)
+                                    | (data_access != 0)) & ~cmd_idle)
 
         with m.FSM():
             with m.State('WAIT'):
@@ -855,7 +889,8 @@ class DebugController(Elaboratable):
             with m.State('CMD_START'):
                 with m.Switch(command.cmdtype):
                     with m.Case(Command.ACCESS_REG):
-                        with m.If((cmd_access_reg.aarsize != 2)
+                        with m.If(((cmd_access_reg.aarsize != 2)
+                                   & (cmd_access_reg.aarsize != 3))
                                   | cmd_access_reg.aarpostincrement):
                             m.d.comb += cmderr_exception.eq(1)
                             m.next = 'CMD_DONE'
