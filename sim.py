@@ -32,23 +32,32 @@ def read_mem_image(filename, word_len=32):
     return image
 
 
-core_params = dict(xlen=32,
-                   vaddr_bits=32,
-                   fetch_width=4,
-                   fetch_buffer_size=16,
-                   core_width=4,
-                   num_pregs=96,
-                   num_rob_rows=16,
-                   max_br_count=4,
-                   ldq_size=16,
-                   stq_size=16,
-                   num_breakpoints=1,
-                   issue_params={
-                       IssueQueueType.MEM:
-                       dict(dispatch_width=4, num_entries=16, issue_width=2),
-                       IssueQueueType.INT:
-                       dict(dispatch_width=4, num_entries=16, issue_width=4),
-                   })
+core_params = dict(
+    xlen=64,
+    vaddr_bits=32,
+    fetch_width=4,
+    fetch_buffer_size=16,
+    core_width=4,
+    num_pregs=96,
+    num_rob_rows=16,
+    max_br_count=4,
+    ldq_size=16,
+    stq_size=16,
+    num_breakpoints=1,
+    issue_params={
+        IssueQueueType.MEM: dict(dispatch_width=4,
+                                 num_entries=16,
+                                 issue_width=2),
+        IssueQueueType.INT: dict(dispatch_width=4,
+                                 num_entries=16,
+                                 issue_width=4),
+    },
+    icache_params=dict(
+        n_sets=64,
+        n_ways=4,
+        block_bytes=64,
+    ),
+)
 
 
 class Top(Elaboratable):
@@ -157,6 +166,7 @@ if __name__ == "__main__":
         yield dut.rst.eq(1)
         yield
         yield dut.rst.eq(0)
+
         for _ in range(100):
             yield
 

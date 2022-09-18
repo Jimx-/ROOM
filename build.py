@@ -28,23 +28,32 @@ def read_mem_image(filename):
     return image
 
 
-core_params = dict(xlen=64,
-                   vaddr_bits=32,
-                   fetch_width=4,
-                   fetch_buffer_size=16,
-                   core_width=2,
-                   num_pregs=96,
-                   num_rob_rows=16,
-                   max_br_count=4,
-                   ldq_size=16,
-                   stq_size=16,
-                   num_breakpoints=1,
-                   issue_params={
-                       IssueQueueType.MEM:
-                       dict(dispatch_width=2, num_entries=16, issue_width=2),
-                       IssueQueueType.INT:
-                       dict(dispatch_width=2, num_entries=16, issue_width=2),
-                   })
+core_params = dict(
+    xlen=64,
+    vaddr_bits=32,
+    fetch_width=4,
+    fetch_buffer_size=16,
+    core_width=2,
+    num_pregs=96,
+    num_rob_rows=16,
+    max_br_count=4,
+    ldq_size=16,
+    stq_size=16,
+    num_breakpoints=1,
+    issue_params={
+        IssueQueueType.MEM: dict(dispatch_width=2,
+                                 num_entries=16,
+                                 issue_width=2),
+        IssueQueueType.INT: dict(dispatch_width=2,
+                                 num_entries=16,
+                                 issue_width=2),
+    },
+    icache_params=dict(
+        n_sets=64,
+        n_ways=4,
+        block_bytes=64,
+    ),
+)
 
 
 class Top(Elaboratable):

@@ -7,6 +7,7 @@ from room.rvc import RVCDecoder
 from room.id_stage import BranchDecoder
 from room.types import MicroOp
 from room.breakpoint import Breakpoint, BreakpointMatcher
+from room.icache import ICache
 
 
 class GetPCResp(Record):
@@ -286,14 +287,19 @@ class IFStage(Elaboratable):
     def __init__(self, ibus, params):
         self.ibus = ibus
         self.params = params
+        self.enable_icache = params.get('icache_params') is not None
 
         self.vaddr_bits = params['vaddr_bits_extended']
         self.fetch_width = params['fetch_width']
+        self.fetch_bytes = params['fetch_bytes']
         self.core_width = params['core_width']
         self.fetch_buffer_size = params['fetch_buffer_size']
         self.fetch_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
         ftq_size = self.fetch_buffer_size
         self.num_breakpoints = params['num_breakpoints']
+
+        if not self.enable_icache:
+            assert self.fetch_bytes * 8 == self.ibus.data_width
 
         self.fetch_packet = [
             MicroOp(params, name=f'fetch_uop{i}')
@@ -315,6 +321,8 @@ class IFStage(Elaboratable):
         self.redirect_flush = Signal()
         self.redirect_ftq_idx = Signal(range(ftq_size))
 
+        self.flush_icache = Signal()
+
         self.bp = [
             Breakpoint(self.params, name=f'bp{i}')
             for i in range(self.num_breakpoints)
@@ -323,21 +331,23 @@ class IFStage(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        ibus = self.ibus
-
         def fetch_mask(addr):
             off = (addr >> 1)[0:Shape.cast(range(self.fetch_width)).width]
             return (((1 << self.fetch_width) - 1) << off)[0:self.fetch_width]
 
         def fetch_align(addr):
-            lsb_width = Shape.cast(range(ibus.dat_r.width >> 3)).width
+            lsb_width = Shape.cast(range(self.fetch_bytes)).width
             return Cat(Const(0, lsb_width), addr[lsb_width:])
 
         def next_fetch(addr):
             return fetch_align(addr) + self.fetch_width * 2
 
+        if self.enable_icache:
+            icache = m.submodules.icache = ICache(self.ibus, self.params)
+            m.d.comb += icache.invalidate.eq(self.flush_icache)
+
         #
-        # Next PC select
+        # F0 - Next PC select
         #
 
         s0_vpc = Signal(32)
@@ -356,82 +366,157 @@ class IFStage(Elaboratable):
                 s0_valid.eq(1),
             ]
 
+        if self.enable_icache:
+            m.d.comb += [
+                icache.req.addr.eq(s0_vpc),
+                icache.req.valid.eq(s0_valid),
+            ]
+
         #
-        # ICache Access
+        # F1 - ICache Access
         #
 
-        s1_vpc = Signal(32)
+        s1_vpc = Signal.like(s0_vpc)
         s1_valid = Signal()
         f1_clear = Signal()
-        f2_ready = Signal()
 
-        ibus_addr = Mux(s0_valid, s0_vpc, s1_vpc)
-        m.d.comb += [
-            ibus.adr.eq(ibus_addr[self.fetch_addr_shift:]),
-            ibus.cyc.eq((s0_valid | s1_valid) & ~f1_clear),
-            ibus.stb.eq(ibus.cyc),
-            ibus.sel.eq(~0),
+        m.d.sync += [
+            s1_vpc.eq(s0_vpc),
+            s1_valid.eq(s0_valid),
         ]
 
-        m.d.sync += s1_vpc.eq(Mux(s0_valid, s0_vpc, s1_vpc))
+        s1_ppc = s1_vpc
 
-        with m.If(s0_valid):
-            m.d.sync += s1_valid.eq(1)
-        with m.Elif((ibus.ack & f2_ready) | f1_clear):
-            m.d.sync += s1_valid.eq(0)
+        if self.enable_icache:
+            m.d.comb += [
+                icache.s1_paddr.eq(s1_ppc),
+                icache.s1_kill.eq(f1_clear),
+            ]
+
+            f1_predicted_target = Signal(32)
+            m.d.comb += f1_predicted_target.eq(next_fetch(s1_vpc))
+
+            with m.If(s1_valid):
+                m.d.comb += [
+                    s0_valid.eq(1),
+                    s0_vpc.eq(f1_predicted_target),
+                ]
 
         #
-        # ICache Response
+        # F2 - ICache Response
         #
 
+        s2_vpc = Signal.like(s1_vpc)
+        s2_valid = Signal()
+        s2_ppc = Signal.like(s1_ppc)
         f2_clear = Signal()
-        f2_fifo = m.submodules.f2_fifo = ResetInserter(f2_clear)(SyncFIFO(
-            width=ibus.dat_r.width + 32, depth=1))
-
         f3_ready = Signal()
 
+        if self.enable_icache:
+            m.d.sync += [
+                s2_vpc.eq(s1_vpc),
+                s2_valid.eq(s1_valid & ~f1_clear),
+                s2_ppc.eq(s1_ppc),
+            ]
+
+            f2_predicted_target = Signal(32)
+            m.d.comb += f2_predicted_target.eq(next_fetch(s2_vpc))
+
+            with m.If((s2_valid & ~icache.resp.valid)
+                      | (s2_valid & icache.resp.valid & ~f3_ready)):
+                m.d.comb += [
+                    s0_valid.eq(1),
+                    s0_vpc.eq(s2_vpc),
+                    f1_clear.eq(1),
+                ]
+
+            with m.Elif(s2_valid & f3_ready):
+                with m.If((s1_valid & (s1_vpc != f2_predicted_target))
+                          | ~s1_valid):
+                    m.d.comb += [
+                        f1_clear.eq(1),
+                        s0_valid.eq(1),
+                        s0_vpc.eq(f2_predicted_target),
+                    ]
+
+        else:
+            ibus_addr = Mux(s1_valid & ~f1_clear, s1_vpc, s2_vpc)
+            m.d.comb += [
+                self.ibus.adr.eq(ibus_addr[self.fetch_addr_shift:]),
+                self.ibus.cyc.eq((s1_valid & ~f1_clear)
+                                 | (s2_valid & ~f2_clear)),
+                self.ibus.stb.eq(self.ibus.cyc),
+                self.ibus.sel.eq(~0),
+            ]
+
+            m.d.sync += s2_vpc.eq(Mux(s1_valid & ~f1_clear, s1_vpc, s2_vpc))
+
+            with m.If(s1_valid & ~f1_clear):
+                m.d.sync += s2_valid.eq(1)
+            with m.Elif((self.ibus.ack & f3_ready) | f2_clear):
+                m.d.sync += s2_valid.eq(0)
+
+        #
+        # F3 - Pre-decoding
+        #
+
+        f3_clear = Signal()
+        f3_fifo = m.submodules.f3_fifo = ResetInserter(f3_clear)(SyncFIFO(
+            width=self.fetch_bytes * 8 + 32, depth=1))
+
+        f4_ready = Signal()
+
+        if self.enable_icache:
+            m.d.comb += [
+                f3_fifo.w_en.eq(s2_valid & ~f2_clear & icache.resp.valid),
+                f3_fifo.w_data.eq(Cat(s2_vpc, icache.resp.data)),
+            ]
+        else:
+            m.d.comb += [
+                f3_fifo.w_en.eq(s2_valid & ~f2_clear & self.ibus.ack),
+                f3_fifo.w_data.eq(Cat(s2_vpc, self.ibus.dat_r)),
+            ]
+
         m.d.comb += [
-            f2_fifo.w_en.eq(~f1_clear & ibus.ack),
-            f2_fifo.w_data.eq(Cat(s1_vpc, ibus.dat_r)),
-            f2_fifo.r_en.eq(f3_ready),
-            f2_ready.eq(f2_fifo.w_rdy),
+            f3_fifo.r_en.eq(f4_ready),
+            f3_ready.eq(f3_fifo.w_rdy),
         ]
 
-        s2_valid = f2_fifo.r_rdy
-        s2_pc = Signal(32)
-        s2_data = Signal(ibus.dat_r.width)
+        s3_valid = f3_fifo.r_rdy
+        s3_pc = Signal(32)
+        s3_data = Signal(self.fetch_bytes * 8)
         m.d.comb += [
-            s2_pc.eq(f2_fifo.r_data[:32]),
-            s2_data.eq(f2_fifo.r_data[32:]),
+            s3_pc.eq(f3_fifo.r_data[:32]),
+            s3_data.eq(f3_fifo.r_data[32:]),
         ]
 
-        f2_prev_half = Signal(16)
-        f2_prev_half_valid = Signal()
+        f3_prev_half = Signal(16)
+        f3_prev_half_valid = Signal()
 
-        f2_imemresp_mask = Signal(self.fetch_width)
-        f2_aligned_pc = fetch_align(s2_pc)
-        f2_insts = [Signal(32) for _ in range(self.fetch_width)]
-        f2_exp_insts = [Signal(32) for _ in range(self.fetch_width)]
-        f2_mask = Signal(self.fetch_width)
-        f2_is_rvc = Signal(self.fetch_width)
-        f2_redirects = Signal(self.fetch_width)
-        f2_targets = Array(
-            Signal(32, name=f'f2_target{i}') for i in range(self.fetch_width))
-        f2_plus4_mask = Signal(self.fetch_width)
-        f2_cfi_types = Array(
-            Signal(CFIType, name=f'f2_cfi_type{i}')
+        f3_imemresp_mask = Signal(self.fetch_width)
+        f3_aligned_pc = fetch_align(s3_pc)
+        f3_insts = [Signal(32) for _ in range(self.fetch_width)]
+        f3_exp_insts = [Signal(32) for _ in range(self.fetch_width)]
+        f3_mask = Signal(self.fetch_width)
+        f3_is_rvc = Signal(self.fetch_width)
+        f3_redirects = Signal(self.fetch_width)
+        f3_targets = Array(
+            Signal(32, name=f'f3_target{i}') for i in range(self.fetch_width))
+        f3_plus4_mask = Signal(self.fetch_width)
+        f3_cfi_types = Array(
+            Signal(CFIType, name=f'f3_cfi_type{i}')
             for i in range(self.fetch_width))
-        f2_fetch_bundle = FetchBundle(self.params, name='f2_fetch_bundle')
+        f3_fetch_bundle = FetchBundle(self.params, name='f3_fetch_bundle')
 
-        m.d.comb += f2_imemresp_mask.eq(fetch_mask(s2_pc))
+        m.d.comb += f3_imemresp_mask.eq(fetch_mask(s3_pc))
 
-        for binst, inst in zip(f2_fetch_bundle.insts, f2_insts):
+        for binst, inst in zip(f3_fetch_bundle.insts, f3_insts):
             m.d.comb += binst.eq(inst)
-        for binst, inst in zip(f2_fetch_bundle.exp_insts, f2_exp_insts):
+        for binst, inst in zip(f3_fetch_bundle.exp_insts, f3_exp_insts):
             m.d.comb += binst.eq(inst)
         m.d.comb += [
-            f2_fetch_bundle.mask.eq(f2_mask),
-            f2_fetch_bundle.pc.eq(f2_aligned_pc),
+            f3_fetch_bundle.mask.eq(f3_mask),
+            f3_fetch_bundle.pc.eq(f3_aligned_pc),
         ]
 
         redirects_found = 0
@@ -444,16 +529,16 @@ class IFStage(Elaboratable):
                 m.d.comb += m_bp.eq(bp)
 
             if w == 0:
-                inst0 = Cat(f2_prev_half, s2_data[0:16])
-                inst1 = s2_data[0:32]
+                inst0 = Cat(f3_prev_half, s3_data[0:16])
+                inst1 = s3_data[0:32]
                 dec0 = RVCDecoder()
                 dec1 = RVCDecoder()
                 br_dec0 = BranchDecoder(self.vaddr_bits)
                 br_dec1 = BranchDecoder(self.vaddr_bits)
                 m.submodules += [dec0, dec1, br_dec0, br_dec1]
 
-                pc0 = f2_aligned_pc - 2
-                pc1 = f2_aligned_pc
+                pc0 = f3_aligned_pc - 2
+                pc1 = f3_aligned_pc
 
                 m.d.comb += [
                     dec0.instr_i.eq(inst0),
@@ -464,12 +549,12 @@ class IFStage(Elaboratable):
                     br_dec1.pc.eq(pc1),
                 ]
 
-                with m.If(f2_prev_half_valid):
+                with m.If(f3_prev_half_valid):
                     pass
                 with m.Else():
                     m.d.comb += [
-                        f2_insts[w].eq(inst1),
-                        f2_exp_insts[w].eq(dec1.instr_o),
+                        f3_insts[w].eq(inst1),
+                        f3_exp_insts[w].eq(dec1.instr_o),
                         bp_matcher.pc.eq(pc1),
                     ]
                     br_sigs = br_dec1.out
@@ -478,17 +563,17 @@ class IFStage(Elaboratable):
 
             else:
                 inst = Signal(32)
-                pc = f2_aligned_pc + (w * 2)
+                pc = f3_aligned_pc + (w * 2)
                 dec = RVCDecoder()
                 br_dec = BranchDecoder(self.vaddr_bits)
                 m.submodules += [dec, br_dec]
 
                 m.d.comb += [
-                    f2_insts[w].eq(inst),
+                    f3_insts[w].eq(inst),
                     dec.instr_i.eq(inst),
                     br_dec.inst.eq(dec.instr_o),
                     br_dec.pc.eq(pc),
-                    f2_exp_insts[w].eq(dec.instr_o),
+                    f3_exp_insts[w].eq(dec.instr_o),
                     bp_matcher.pc.eq(pc),
                 ]
 
@@ -496,114 +581,117 @@ class IFStage(Elaboratable):
 
                 if w == 1:
                     m.d.comb += [
-                        inst.eq(s2_data[16:48]),
+                        inst.eq(s3_data[16:48]),
                         # insts[0] is not a 32-bit instruction
-                        valid.eq(f2_prev_half_valid
-                                 | ~(f2_mask[w - 1] &
-                                     (f2_insts[w - 1][0:2] == 3))),
+                        valid.eq(f3_prev_half_valid
+                                 | ~(f3_mask[w - 1] &
+                                     (f3_insts[w - 1][0:2] == 3))),
                     ]
                 elif w == self.fetch_width - 1:
                     m.d.comb += [
-                        inst.eq(Cat(s2_data[-16:], Const(0, 16))),
+                        inst.eq(Cat(s3_data[-16:], Const(0, 16))),
                         # Last instruction is not a 32-bit instruction and this is a RVC instruction
-                        valid.eq(~((f2_mask[w - 1]
-                                    & (f2_insts[w - 1][0:2] == 3))
-                                   | (f2_insts[w][0:2] == 3))),
+                        valid.eq(~((f3_mask[w - 1]
+                                    & (f3_insts[w - 1][0:2] == 3))
+                                   | (f3_insts[w][0:2] == 3))),
                     ]
                 else:
                     m.d.comb += [
-                        inst.eq(s2_data[w * 16:w * 16 + 32]),
+                        inst.eq(s3_data[w * 16:w * 16 + 32]),
                         # Last instruction is not a 32-bit instruction
-                        valid.eq(~(f2_mask[w - 1]
-                                   & (f2_insts[w - 1][0:2] == 3)))
+                        valid.eq(~(f3_mask[w - 1]
+                                   & (f3_insts[w - 1][0:2] == 3)))
                     ]
 
             m.d.comb += [
-                f2_is_rvc[w].eq(f2_insts[w][0:2] != 3),
-                f2_mask[w].eq(s2_valid & valid & f2_imemresp_mask[w]
+                f3_is_rvc[w].eq(f3_insts[w][0:2] != 3),
+                f3_mask[w].eq(s3_valid & valid & f3_imemresp_mask[w]
                               & ~redirects_found),
-                f2_targets[w].eq(br_sigs.target),
+                f3_targets[w].eq(br_sigs.target),
             ]
 
             if w == 0:
-                f2_plus4_mask[w].eq(
-                    ((f2_insts[w][0:2] == 3) & ~f2_prev_half_valid))
+                f3_plus4_mask[w].eq(
+                    ((f3_insts[w][0:2] == 3) & ~f3_prev_half_valid))
             else:
-                f2_plus4_mask[w].eq((f2_insts[w][0:2] == 3))
+                f3_plus4_mask[w].eq((f3_insts[w][0:2] == 3))
 
-            m.d.comb += f2_redirects[w].eq(f2_mask[w] & (
+            m.d.comb += f3_redirects[w].eq(f3_mask[w] & (
                 (br_sigs.cfi_type == CFIType.JAL)
                 | (br_sigs.cfi_type == CFIType.JALR)))
 
-            m.d.comb += f2_cfi_types[w].eq(br_sigs.cfi_type)
+            m.d.comb += f3_cfi_types[w].eq(br_sigs.cfi_type)
 
             m.d.comb += [
-                f2_fetch_bundle.bp_exc_if[w].eq(bp_matcher.exc_if),
-                f2_fetch_bundle.bp_debug_if[w].eq(bp_matcher.debug_if),
+                f3_fetch_bundle.bp_exc_if[w].eq(bp_matcher.exc_if),
+                f3_fetch_bundle.bp_debug_if[w].eq(bp_matcher.debug_if),
             ]
 
-            redirects_found |= f2_redirects[w]
+            redirects_found |= f3_redirects[w]
 
-        last_inst = f2_insts[self.fetch_width - 1][0:16]
-        with m.If(f2_fifo.r_en & f2_fifo.r_rdy):
+        last_inst = f3_insts[self.fetch_width - 1][0:16]
+        with m.If(f3_fifo.r_en & f3_fifo.r_rdy):
             m.d.sync += [
-                f2_prev_half.eq(last_inst),
-                f2_prev_half_valid.eq(~(f2_mask[self.fetch_width - 2]
-                                        & ~f2_is_rvc[self.fetch_width - 2])
+                f3_prev_half.eq(last_inst),
+                f3_prev_half_valid.eq(~(f3_mask[self.fetch_width - 2]
+                                        & ~f3_is_rvc[self.fetch_width - 2])
                                       & (last_inst[0:2] != 3)),
             ]
-        with m.Elif(f2_clear):
-            m.d.sync += f2_prev_half_valid.eq(0)
+        with m.Elif(f3_clear):
+            m.d.sync += f3_prev_half_valid.eq(0)
 
-        f2_prio_enc = m.submodules.f2_prio_enc = PriorityEncoder(
+        f3_prio_enc = m.submodules.f3_prio_enc = PriorityEncoder(
             self.fetch_width)
         m.d.comb += [
-            f2_prio_enc.i.eq(f2_redirects),
-            f2_fetch_bundle.cfi_type.eq(f2_cfi_types[f2_fetch_bundle.cfi_idx]),
-            f2_fetch_bundle.cfi_valid.eq(~f2_prio_enc.n),
-            f2_fetch_bundle.cfi_idx.eq(f2_prio_enc.o),
+            f3_prio_enc.i.eq(f3_redirects),
+            f3_fetch_bundle.cfi_type.eq(f3_cfi_types[f3_fetch_bundle.cfi_idx]),
+            f3_fetch_bundle.cfi_valid.eq(~f3_prio_enc.n),
+            f3_fetch_bundle.cfi_idx.eq(f3_prio_enc.o),
         ]
 
-        f2_predicted_target = Signal(32)
+        f3_predicted_target = Signal(32)
         m.d.comb += [
-            f2_predicted_target.eq(
+            f3_predicted_target.eq(
                 Mux(
-                    f2_fetch_bundle.cfi_valid &
-                    (f2_fetch_bundle.cfi_type != CFIType.JALR),
-                    f2_targets[f2_fetch_bundle.cfi_idx],
-                    next_fetch(f2_fetch_bundle.pc))),
-            f2_fetch_bundle.next_pc.eq(f2_predicted_target),
+                    f3_fetch_bundle.cfi_valid &
+                    (f3_fetch_bundle.cfi_type != CFIType.JALR),
+                    f3_targets[f3_fetch_bundle.cfi_idx],
+                    next_fetch(f3_fetch_bundle.pc))),
+            f3_fetch_bundle.next_pc.eq(f3_predicted_target),
         ]
 
-        with m.If(s2_valid & f3_ready):
-            with m.If(f2_fetch_bundle.cfi_valid):
-                m.d.sync += f2_prev_half_valid.eq(0)
+        with m.If(s3_valid & f4_ready):
+            with m.If(f3_fetch_bundle.cfi_valid):
+                m.d.sync += f3_prev_half_valid.eq(0)
 
-            with m.If((s1_valid & (s1_vpc != f2_predicted_target))
-                      | ~s1_valid):
+            with m.If((s2_valid & (s2_vpc != f3_predicted_target))
+                      | (~s2_valid & s1_valid
+                         & (s1_vpc != f3_predicted_target))
+                      | (~s2_valid & ~s1_valid)):
                 m.d.comb += [
                     f1_clear.eq(s1_valid),
+                    f2_clear.eq(s2_valid),
                     s0_valid.eq(1),
-                    s0_vpc.eq(f2_predicted_target),
+                    s0_vpc.eq(f3_predicted_target),
                 ]
 
         #
-        # Fetch Buffer
+        # F4 - Fetch Buffer
         #
 
-        f3_clear = Signal()
+        f4_clear = Signal()
         fb = m.submodules.fb = FetchBuffer(self.params)
         ftq = m.submodules.ftq = FetchTargetQueue(self.params)
 
         m.d.comb += [
-            f3_ready.eq(fb.w_rdy & ftq.w_rdy),
-            fb.w_data.eq(f2_fetch_bundle),
+            f4_ready.eq(fb.w_rdy & ftq.w_rdy),
+            fb.w_data.eq(f3_fetch_bundle),
             fb.w_data.ftq_idx.eq(ftq.w_idx),
-            fb.w_en.eq(f2_fifo.r_rdy & ftq.w_rdy & ~f2_clear),
+            fb.w_en.eq(f3_fifo.r_rdy & ftq.w_rdy & ~f3_clear),
             fb.r_en.eq(self.fetch_packet_ready),
             self.fetch_packet_valid.eq(fb.r_rdy),
-            ftq.w_data.eq(f2_fetch_bundle),
-            ftq.w_en.eq(f2_fifo.r_rdy & fb.w_rdy & ~f2_clear),
+            ftq.w_data.eq(f3_fetch_bundle),
+            ftq.w_en.eq(f3_fifo.r_rdy & fb.w_rdy & ~f3_clear),
         ]
 
         for fp, rd in zip(self.fetch_packet, fb.r_data):
@@ -628,6 +716,7 @@ class IFStage(Elaboratable):
                 f1_clear.eq(1),
                 f2_clear.eq(1),
                 f3_clear.eq(1),
+                f4_clear.eq(1),
                 fb.flush.eq(1),
                 s0_valid.eq(self.redirect_valid),
                 s0_vpc.eq(self.redirect_pc),

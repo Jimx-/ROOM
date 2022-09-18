@@ -234,6 +234,10 @@ class Core(Elaboratable):
         ]
 
         m.d.comb += [
+            if_stage.flush_icache.eq(
+                Cat(*Array((rob.commit_req.valids[i]
+                            & rob.commit_req.uops[i].is_fencei)
+                           for i in range(self.core_width))) != 0),
             dec_stage.rollback.eq(rob.commit_req.rollback),
             dec_stage.flush_pipeline.eq(rob_flush_d1.valid),
         ]
@@ -532,6 +536,7 @@ class Core(Elaboratable):
             lsu.commit.eq(rob.commit_req),
             lsu.br_update.eq(br_update),
             lsu.exception.eq(rob_flush_d1.valid),
+            rob.lsu_exc.eq(lsu.lsu_exc),
         ]
 
         #

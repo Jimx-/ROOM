@@ -32,6 +32,7 @@ class Cause(IntEnum):
     LOAD_PAGE_FAULT = 13
     STORE_PAGE_FAULT = 15
     DEBUG_TRIGGER = 16
+    MEM_ORDERING_FAULT = 17
     # interrupts
     U_SOFTWARE_INTERRUPT = 0
     S_SOFTWARE_INTERRUPT = 1

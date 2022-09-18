@@ -5,7 +5,8 @@ from room.consts import *
 from room.types import MicroOp
 from room.alu import ExecResp
 from room.branch import BranchUpdate
-from room.rob import CommitReq
+from room.rob import CommitReq, Exception
+from room.exc import Cause
 
 from roomsoc.interconnect import wishbone
 
@@ -273,6 +274,7 @@ class LDQEntry:
 
     def __init__(self, params, name=None):
         name = (name is not None) and f'{name}_' or ''
+        stq_size = params['stq_size']
 
         self.valid = Signal(name=f'{name}valid')
         self.uop = MicroOp(params, name=f'{name}uop')
@@ -282,9 +284,14 @@ class LDQEntry:
 
         self.executed = Signal(name=f'{name}executed')
         self.succeeded = Signal(name=f'{name}succeeded')
+        self.order_fail = Signal(name=f'{name}order_fail')
 
-        self.st_dep_mask = Signal(params['stq_size'],
-                                  name=f'{name}st_dep_mask')
+        self.st_dep_mask = Signal(stq_size, name=f'{name}st_dep_mask')
+        self.next_stq_idx = Signal(range(stq_size), name=f'{name}next_stq_idx')
+
+        self.forwarded = Signal(name=f'{name}forwarded')
+        self.forward_stq_idx = Signal(range(stq_size),
+                                      name=f'{name}forward_stq_idx')
 
     def eq(self, rhs):
         attrs = [
@@ -392,6 +399,8 @@ class LoadStoreUnit(Elaboratable):
 
         self.br_update = BranchUpdate(params)
 
+        self.lsu_exc = Exception(params, name='lsu_exc')
+
     def elaborate(self, platform):
         m = Module()
 
@@ -449,8 +458,11 @@ class LoadStoreUnit(Elaboratable):
                     ldq[self.dis_ldq_idx[w]].addr_valid.eq(0),
                     ldq[self.dis_ldq_idx[w]].executed.eq(0),
                     ldq[self.dis_ldq_idx[w]].succeeded.eq(0),
+                    ldq[self.dis_ldq_idx[w]].order_fail.eq(0),
+                    ldq[self.dis_ldq_idx[w]].forwarded.eq(0),
                     ldq[self.dis_ldq_idx[w]].st_dep_mask.eq(
                         next_live_store_mask),
+                    ldq[self.dis_ldq_idx[w]].next_stq_idx.eq(stq_w_idx),
                 ]
             with m.Elif(dis_w_stq):
                 m.d.sync += [
@@ -527,7 +539,8 @@ class LoadStoreUnit(Elaboratable):
                                           & ~ldq_retry_e.succeeded
                                           & ~s1_executing_loads[ldq_retry_idx]
                                           & (w == 0)
-                                          & (ldq_retry_e.st_dep_mask == 0)),
+                                          & (ldq_retry_e.st_dep_mask == 0)
+                                          & ~ldq_retry_e.order_fail),
                 can_fire_store_commit[w].eq(stq_commit_e.valid
                                             & stq_commit_e.committed
                                             & (w == self.mem_width - 1)),
@@ -673,8 +686,18 @@ class LoadStoreUnit(Elaboratable):
             for i in range(self.mem_width)
         ]
 
+        fired_stq_e = [
+            STQEntry(self.params, name=f'fired_stq_e{i}')
+            for i in range(self.mem_width)
+        ]
+
         fired_mem_addr = [
             Signal(32, name=f'fired_mem_addr{i}')
+            for i in range(self.mem_width)
+        ]
+
+        fired_req_addr = [
+            Signal(32, name=f'fired_req_addr{i}')
             for i in range(self.mem_width)
         ]
 
@@ -685,6 +708,9 @@ class LoadStoreUnit(Elaboratable):
                 m.d.comb += fired_ldq_e[w].eq(fired_ldq_incoming_e[w])
             with m.Elif(fired_load_retry[w]):
                 m.d.comb += fired_ldq_e[w].eq(fired_ldq_retry_e[w])
+
+            with m.If(fired_sta_incoming[w] | fired_stad_incoming[w]):
+                m.d.comb += fired_stq_e[w].eq(fired_stq_incoming_e[w])
 
             m.d.sync += [
                 dmem_req_fired[w].eq(dcache.reqs[w].valid
@@ -714,6 +740,7 @@ class LoadStoreUnit(Elaboratable):
                     self.br_update.get_new_br_mask(
                         stq[self.exec_reqs[w].uop.stq_idx].uop.br_mask)),
                 fired_mem_addr[w].eq(dcache.reqs[w].addr),
+                fired_req_addr[w].eq(self.exec_reqs[w].addr),
             ]
 
         #
@@ -784,6 +811,8 @@ class LoadStoreUnit(Elaboratable):
 
         do_ld_search = Cat((fired_load_incoming[w] | fired_load_retry[w])
                            for w in range(self.mem_width))
+        do_st_search = Cat((fired_sta_incoming[w] | fired_stad_incoming[w])
+                           for w in range(self.mem_width))
 
         cam_addr = [
             Signal(32, name=f'cam_addr{i}') for i in range(self.mem_width)
@@ -801,15 +830,27 @@ class LoadStoreUnit(Elaboratable):
             for i in range(self.mem_width)
         ]
 
+        cam_stq_idx = [
+            Signal(range(self.stq_size), name=f'cam_stq_idx{i}')
+            for i in range(self.mem_width)
+        ]
+
         for w in range(self.mem_width):
             m.d.comb += [
-                cam_addr[w].eq(fired_mem_addr[w]),
-                cam_uop[w].eq(Mux(do_ld_search[w], fired_ldq_e[w].uop, 0)),
+                cam_addr[w].eq(
+                    Mux(fired_sta_incoming[w] | fired_stad_incoming[w],
+                        fired_req_addr[w], fired_mem_addr[w])),
+                cam_uop[w].eq(
+                    Mux(do_st_search[w], fired_stq_e[w].uop,
+                        Mux(do_ld_search[w], fired_ldq_e[w].uop, 0))),
                 cam_mask[w].eq(gen_byte_mask(cam_addr[w],
                                              cam_uop[w].mem_size)),
                 cam_ldq_idx[w].eq(
                     Mux(fired_load_incoming[w], fired_incoming_uop[w].ldq_idx,
                         Mux(fired_load_retry[w], s1_ldq_retry_idx, 0))),
+                cam_stq_idx[w].eq(
+                    Mux(fired_sta_incoming[w] | fired_stad_incoming[w],
+                        fired_incoming_uop[w].stq_idx, 0)),
             ]
 
         ldst_addr_matches = [
@@ -820,6 +861,54 @@ class LoadStoreUnit(Elaboratable):
             Signal(self.stq_size, name=f'ldst_forward_matches{i}')
             for i in range(self.mem_width)
         ]
+
+        failed_loads = Signal(self.ldq_size)
+
+        mem_forward_valid = Signal(self.mem_width)
+        mem_forward_stq_idx = [
+            Signal(range(self.stq_size), name=f'mem_forward_stq_idx{i}')
+            for i in range(self.mem_width)
+        ]
+
+        wb_forward_valid = Signal(self.mem_width)
+        wb_forward_ldq_idx = [
+            Signal(range(self.ldq_size), name=f'wb_forward_ldq_idx{i}')
+            for i in range(self.mem_width)
+        ]
+        wb_forward_stq_idx = [
+            Signal(range(self.stq_size), name=f'wb_forward_stq_idx{i}')
+            for i in range(self.mem_width)
+        ]
+
+        for i in range(self.ldq_size):
+            addr_matches = Cat(ldq[i].addr[3:] == cam_addr[w][3:]
+                               for w in range(self.mem_width))
+
+            load_mask = gen_byte_mask(ldq[i].addr, ldq[i].uop.mem_size)
+
+            load_forwarders = Cat(wb_forward_valid[w]
+                                  & (wb_forward_ldq_idx[w] == i)
+                                  for w in range(self.mem_width))
+            load_forward_stq_idx = Signal(range(self.stq_size))
+
+            for w in range(self.mem_width):
+                with m.If(do_st_search[w] & ldq[i].valid & ldq[i].addr_valid
+                          & (ldq[i].executed | ldq[i].succeeded
+                             | (load_forwarders != 0))
+                          & ((ldq[i].st_dep_mask & (1 << cam_stq_idx[w])) != 0)
+                          & addr_matches[w]
+                          & ((load_mask & cam_mask[w]) != 0)):
+
+                    forwarder_is_older = (
+                        load_forward_stq_idx < cam_stq_idx[w]) ^ (
+                            load_forward_stq_idx < ldq[i].next_stq_idx) ^ (
+                                cam_stq_idx[w] < ldq[i].next_stq_idx)
+
+                    with m.If(~ldq[i].forwarded
+                              | ((load_forward_stq_idx != cam_stq_idx[w])
+                                 & forwarder_is_older)):
+                        m.d.comb += failed_loads[i].eq(1)
+                        m.d.sync += ldq[i].order_fail.eq(1)
 
         for i in range(self.stq_size):
             addr_matches = Cat(
@@ -847,22 +936,6 @@ class LoadStoreUnit(Elaboratable):
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
 
-        mem_forward_valid = Signal(self.mem_width)
-        mem_forward_stq_idx = [
-            Signal(range(self.stq_size), name=f'mem_forward_stq_idx{i}')
-            for i in range(self.mem_width)
-        ]
-
-        wb_forward_valid = Signal(self.mem_width)
-        wb_forward_ldq_idx = [
-            Signal(range(self.ldq_size), name=f'wb_forward_ldq_idx{i}')
-            for i in range(self.mem_width)
-        ]
-        wb_forward_stq_idx = [
-            Signal(range(self.stq_size), name=f'wb_forward_stq_idx{i}')
-            for i in range(self.mem_width)
-        ]
-
         for w in range(self.mem_width):
             enc = RRPriorityEncoder(self.stq_size, is_head=False)
             m.submodules += enc
@@ -881,6 +954,35 @@ class LoadStoreUnit(Elaboratable):
                 wb_forward_ldq_idx[w].eq(cam_ldq_idx[w]),
                 wb_forward_stq_idx[w].eq(mem_forward_stq_idx[w]),
             ]
+
+        ld_fail_enc = RRPriorityEncoder(self.ldq_size)
+        m.submodules += ld_fail_enc
+        m.d.comb += [
+            ld_fail_enc.i.eq(failed_loads),
+            ld_fail_enc.head_or_tail.eq(ldq_head),
+        ]
+
+        #
+        # Throw exception
+        #
+
+        exc_valid = Signal()
+
+        ld_exc_valid = ~ld_fail_enc.n
+        ld_exc_uop = ldq[ld_fail_enc.o].uop
+
+        m.d.sync += [
+            exc_valid.eq(ld_exc_valid & ~self.exception
+                         & ~self.br_update.uop_killed(ld_exc_uop)),
+            self.lsu_exc.uop.eq(ld_exc_uop),
+            self.lsu_exc.uop.br_mask.eq(
+                self.br_update.get_new_br_mask(ld_exc_uop.br_mask)),
+            self.lsu_exc.cause.eq(Cause.MEM_ORDERING_FAULT),
+        ]
+
+        m.d.comb += self.lsu_exc.valid.eq(
+            exc_valid & ~self.exception
+            & ~self.br_update.uop_killed(self.lsu_exc.uop))
 
         #
         # Writeback
@@ -937,7 +1039,11 @@ class LoadStoreUnit(Elaboratable):
                 ]
 
                 with m.If(data_valid & live):
-                    m.d.sync += ldq_e.succeeded.eq(1)
+                    m.d.sync += [
+                        ldq_e.succeeded.eq(1),
+                        ldq_e.forwarded.eq(1),
+                        ldq_e.forward_stq_idx.eq(wb_forward_stq_idx[w]),
+                    ]
 
         #
         # Branch mispredict
@@ -995,6 +1101,8 @@ class LoadStoreUnit(Elaboratable):
                     ldq[idx].addr_valid.eq(0),
                     ldq[idx].executed.eq(0),
                     ldq[idx].succeeded.eq(0),
+                    ldq[idx].order_fail.eq(0),
+                    ldq[idx].forwarded.eq(0),
                 ]
 
             next_stq_commit_head = Mux(

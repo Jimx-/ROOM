@@ -32,6 +32,8 @@ entry_loop:
 
     csrr s0, dscratch0
 
+    fence.i
+
     sw    zero, GOING(s1)
     csrrw s1, dscratch1, s1
     j     trampoline

@@ -33,23 +33,23 @@ class DownConverter(Elaboratable):
                         m.d.comb += self.slave.sel.eq(
                             self.master.sel[i * dw_to // 8:])
 
-                    with m.If(~self.master.cyc):
-                        m.d.comb += self.slave.cyc.eq(0)
-                        m.next = 'IDLE'
-                    with m.Elif(self.master.cyc & self.master.stb):
-                        m.d.comb += [
-                            skip.eq(self.slave.sel == 0),
-                            self.slave.we.eq(self.master.we),
-                            self.slave.cyc.eq(~skip),
-                            self.slave.stb.eq(~skip),
-                        ]
+                with m.If(~self.master.cyc):
+                    m.d.comb += self.slave.cyc.eq(0)
+                    m.next = 'IDLE'
+                with m.Elif(self.master.cyc & self.master.stb):
+                    m.d.comb += [
+                        skip.eq(self.slave.sel == 0),
+                        self.slave.we.eq(self.master.we),
+                        self.slave.cyc.eq(~skip),
+                        self.slave.stb.eq(~skip),
+                    ]
 
-                        with m.If(self.slave.ack | skip):
-                            m.d.sync += counter.eq(counter + 1)
+                    with m.If(self.slave.ack | skip):
+                        m.d.sync += counter.eq(counter + 1)
 
-                            with m.If(counter == (ratio - 1)):
-                                m.d.comb += self.master.ack.eq(1)
-                                m.next = 'IDLE'
+                        with m.If(counter == (ratio - 1)):
+                            m.d.comb += self.master.ack.eq(1)
+                            m.next = 'IDLE'
 
         for i in range(ratio):
             with m.If(counter == i):

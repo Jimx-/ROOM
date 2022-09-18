@@ -5,6 +5,7 @@ from room.consts import *
 from room.alu import ExecResp
 from room.types import MicroOp
 from room.branch import BranchUpdate
+from room.exc import Cause
 
 
 class FlushType(IntEnum):
@@ -77,6 +78,31 @@ class CommitExceptionReq(Record):
                          name=name)
 
 
+class Exception:
+
+    def __init__(self, params, name=None):
+        xlen = params['xlen']
+
+        self.valid = Signal(
+            name=(name is not None) and f'{name}_valid' or None)
+
+        self.uop = MicroOp(params,
+                           name=(name is not None) and f'{name}_uop' or None)
+
+        self.cause = Signal(xlen,
+                            name=(name is not None) and f'{name}_cause'
+                            or None)
+
+    def eq(self, rhs):
+        return [
+            getattr(self, name).eq(getattr(rhs, name)) for name in (
+                'valid',
+                'uop',
+                'cause',
+            )
+        ]
+
+
 class ReorderBuffer(Elaboratable):
 
     def __init__(self, num_wakeup_ports, params):
@@ -110,6 +136,8 @@ class ReorderBuffer(Elaboratable):
         self.tail_idx = Signal(range(self.core_width * self.num_rob_rows))
 
         self.br_update = BranchUpdate(params)
+
+        self.lsu_exc = Exception(params, name='lsu_exc')
 
         self.ready = Signal()
         self.empty = Signal()
@@ -195,6 +223,14 @@ class ReorderBuffer(Elaboratable):
                 with m.If(clr_val & (get_bank(clr_idx) == w)):
                     m.d.sync += rob_busy[get_row(clr_idx)].eq(0)
 
+            with m.If(self.lsu_exc.valid
+                      & (get_bank(self.lsu_exc.uop.rob_idx) == w)):
+                m.d.sync += [
+                    rob_exception[get_row(self.lsu_exc.uop.rob_idx)].eq(1),
+                    rob_uop[get_row(self.lsu_exc.uop.rob_idx)].exc_cause.eq(
+                        self.lsu_exc.cause),
+                ]
+
             m.d.comb += [
                 can_throw_exception[w].eq(rob_valid[rob_head]
                                           & rob_exception[rob_head]),
@@ -261,7 +297,8 @@ class ReorderBuffer(Elaboratable):
 
         m.d.comb += [
             self.commit_req.rollback.eq(state_is_rollback),
-            self.commit_exc.valid.eq(exception_thrown),
+            self.commit_exc.valid.eq(exception_thrown & (
+                self.commit_exc.cause != Cause.MEM_ORDERING_FAULT)),
         ]
 
         commit_exc_uop = MicroOp(self.params, name='commit_exc_uop')
@@ -297,10 +334,14 @@ class ReorderBuffer(Elaboratable):
         ]
 
         with m.If(self.flush.valid):
-            with m.If(exception_thrown):
+            with m.If(exception_thrown
+                      & (self.commit_exc.cause != Cause.MEM_ORDERING_FAULT)):
                 m.d.comb += self.flush.flush_type.eq(FlushType.EXCEPT)
             with m.Elif(flush_commit & (flush_uop.opcode == UOpCode.ERET)):
                 m.d.comb += self.flush.flush_type.eq(FlushType.ERET)
+            with m.Elif(exception_thrown):
+                # Must be a memory ordering failure, just replay the memory load
+                m.d.comb += self.flush.flush_type.eq(FlushType.REFETCH)
             with m.Else():
                 m.d.comb += self.flush.flush_type.eq(FlushType.NEXT)
 
