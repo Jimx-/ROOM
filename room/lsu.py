@@ -11,6 +11,25 @@ from room.exc import Cause
 from roomsoc.interconnect import wishbone
 
 
+class LSUDebug(Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        xlen = params['xlen']
+        num_pregs = params['num_pregs']
+
+        super().__init__([
+            ('valid', 1),
+            ('uop_id', MicroOp.ID_WIDTH),
+            ('opcode', Shape.cast(UOpCode).width),
+            ('addr', xlen),
+            ('data', xlen),
+            ('prs1', range(num_pregs)),
+            ('prs2', range(num_pregs)),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class RRPriorityEncoder(Elaboratable):
 
     def __init__(self, width, is_head=True):
@@ -352,12 +371,13 @@ def gen_byte_mask(addr, size):
 
 class LoadStoreUnit(Elaboratable):
 
-    def __init__(self, dbus, params):
+    def __init__(self, dbus, params, sim_debug=False):
         self.core_width = params['core_width']
         self.ldq_size = params['ldq_size']
         self.stq_size = params['stq_size']
         self.mem_width = params['mem_width']
         self.params = params
+        self.sim_debug = sim_debug
 
         self.dbus = dbus
 
@@ -400,6 +420,12 @@ class LoadStoreUnit(Elaboratable):
         self.br_update = BranchUpdate(params)
 
         self.lsu_exc = Exception(params, name='lsu_exc')
+
+        if self.sim_debug:
+            self.lsu_debug = [
+                LSUDebug(params, name=f'lsu_debug{i}')
+                for i in range(self.mem_width)
+            ]
 
     def elaborate(self, platform):
         m = Module()
@@ -487,6 +513,18 @@ class LoadStoreUnit(Elaboratable):
             ldq_tail.eq(ldq_w_idx),
             stq_tail.eq(stq_w_idx),
         ]
+
+        if self.sim_debug:
+            for lsu_debug, req in zip(self.lsu_debug, self.exec_reqs):
+                m.d.comb += [
+                    lsu_debug.valid.eq(req.valid),
+                    lsu_debug.uop_id.eq(req.uop.uop_id),
+                    lsu_debug.opcode.eq(req.uop.opcode),
+                    lsu_debug.addr.eq(req.addr),
+                    lsu_debug.data.eq(req.data),
+                    lsu_debug.prs1.eq(req.uop.prs1),
+                    lsu_debug.prs2.eq(req.uop.prs2),
+                ]
 
         ldq_retry_enc = RRPriorityEncoder(self.ldq_size)
         m.submodules += ldq_retry_enc

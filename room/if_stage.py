@@ -22,6 +22,19 @@ class GetPCResp(Record):
                          name=name)
 
 
+class IFDebug(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('valid', 1),
+            ('uop_id', MicroOp.ID_WIDTH),
+            ('pc', 32),
+            ('inst', 32),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class FetchBundle:
 
     def __init__(self, params, name=None):
@@ -69,7 +82,8 @@ class FetchBundle:
 
 class FetchBuffer(Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sim_debug=False):
+        self.sim_debug = sim_debug
         self.params = params
         self.fetch_width = params['fetch_width']
         self.core_width = params['core_width']
@@ -84,6 +98,11 @@ class FetchBuffer(Elaboratable):
         self.w_en = Signal()
         self.r_en = Signal()
         self.flush = Signal()
+
+        if self.sim_debug:
+            self.if_debug = [
+                IFDebug(name=f'if_debug{i}') for i in range(self.fetch_width)
+            ]
 
     def elaborate(self, platform):
         m = Module()
@@ -107,10 +126,13 @@ class FetchBuffer(Elaboratable):
         ]
         in_mask = Signal(self.fetch_width)
 
+        id_counter = Signal(MicroOp.ID_WIDTH)
+        next_id = id_counter
         for w in range(self.fetch_width):
             pc = self.w_data.pc + (w << 1)
             m.d.comb += [
                 in_mask[w].eq(self.w_data.mask[w] & self.w_en),
+                in_uops[w].uop_id.eq(next_id),
                 in_uops[w].ftq_idx.eq(self.w_data.ftq_idx),
                 in_uops[w].pc_lsb.eq(pc),
                 in_uops[w].inst.eq(self.w_data.exp_insts[w]),
@@ -120,6 +142,20 @@ class FetchBuffer(Elaboratable):
                 in_uops[w].bp_exc_if.eq(self.w_data.bp_exc_if[w]),
                 in_uops[w].bp_debug_if.eq(self.w_data.bp_debug_if[w]),
             ]
+
+            next_id = Mux(in_mask[w], next_id + 1, next_id)
+
+        m.d.sync += id_counter.eq(next_id)
+
+        if self.sim_debug:
+            for w in range(self.fetch_width):
+                pc = self.w_data.pc + (w << 1)
+                m.d.comb += [
+                    self.if_debug[w].valid.eq(in_mask[w]),
+                    self.if_debug[w].uop_id.eq(in_uops[w].uop_id),
+                    self.if_debug[w].inst.eq(in_uops[w].inst),
+                    self.if_debug[w].pc.eq(pc),
+                ]
 
         wr_slots = [
             Signal(num_entries, name=f'wr_slot{i}')
@@ -284,10 +320,11 @@ class FetchTargetQueue(Elaboratable):
 
 class IFStage(Elaboratable):
 
-    def __init__(self, ibus, params):
+    def __init__(self, ibus, params, sim_debug=False):
         self.ibus = ibus
         self.params = params
         self.enable_icache = params.get('icache_params') is not None
+        self.sim_debug = sim_debug
 
         self.vaddr_bits = params['vaddr_bits_extended']
         self.fetch_width = params['fetch_width']
@@ -327,6 +364,11 @@ class IFStage(Elaboratable):
             Breakpoint(self.params, name=f'bp{i}')
             for i in range(self.num_breakpoints)
         ]
+
+        if self.sim_debug:
+            self.if_debug = [
+                IFDebug(name=f'if_debug{i}') for i in range(self.fetch_width)
+            ]
 
     def elaborate(self, platform):
         m = Module()
@@ -680,7 +722,8 @@ class IFStage(Elaboratable):
         #
 
         f4_clear = Signal()
-        fb = m.submodules.fb = FetchBuffer(self.params)
+        fb = m.submodules.fb = FetchBuffer(self.params,
+                                           sim_debug=self.sim_debug)
         ftq = m.submodules.ftq = FetchTargetQueue(self.params)
 
         m.d.comb += [
@@ -723,5 +766,13 @@ class IFStage(Elaboratable):
                 ftq.redirect_valid.eq(self.redirect_valid),
                 ftq.redirect_idx.eq(self.redirect_ftq_idx),
             ]
+
+        #
+        # Debug signals
+        #
+
+        if self.sim_debug:
+            for l, r in zip(self.if_debug, fb.if_debug):
+                m.d.comb += l.eq(r)
 
         return m

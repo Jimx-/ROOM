@@ -5,6 +5,8 @@ from room.consts import *
 
 class MicroOp(Record):
 
+    ID_WIDTH = 10
+
     def __init__(self, params, name=None):
         W = lambda x: Shape.cast(x).width
         xlen = params['xlen']
@@ -15,7 +17,8 @@ class MicroOp(Record):
         ftq_size = params['fetch_buffer_size']
 
         super().__init__(
-            [('valid', 1), ('opcode', W(UOpCode)), ('inst', 32), ('is_rvc', 1),
+            [('valid', 1), ('uop_id', MicroOp.ID_WIDTH),
+             ('opcode', W(UOpCode)), ('inst', 32), ('is_rvc', 1),
              ('iq_type', W(IssueQueueType)), ('fu_type', W(FUType)),
              ('br_type', W(BranchType)), ('opa_sel', W(OpA)),
              ('opb_sel', W(OpB)), ('imm_sel', W(ImmSel)),

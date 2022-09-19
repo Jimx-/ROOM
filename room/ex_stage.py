@@ -7,6 +7,25 @@ from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
 
 
+class ExecDebug(Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        xlen = params['xlen']
+        num_pregs = params['num_pregs']
+
+        super().__init__([
+            ('valid', 1),
+            ('uop_id', MicroOp.ID_WIDTH),
+            ('opcode', Shape.cast(UOpCode).width),
+            ('prs1', range(num_pregs)),
+            ('rs1_data', xlen),
+            ('prs2', range(num_pregs)),
+            ('rs2_data', xlen),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class ExecUnit(Elaboratable):
 
     def __init__(self,
@@ -19,7 +38,8 @@ class ExecUnit(Elaboratable):
                  has_mul=False,
                  has_div=False,
                  has_mem=False,
-                 has_csr=False):
+                 has_csr=False,
+                 sim_debug=False):
         self.params = params
         self.data_width = data_width
         self.irf_read = irf_read
@@ -30,6 +50,7 @@ class ExecUnit(Elaboratable):
         self.has_div = has_div
         self.has_mem = has_mem
         self.has_csr = has_csr
+        self.sim_debug = sim_debug
 
         self.fu_types = Signal(FUType)
 
@@ -49,8 +70,22 @@ class ExecUnit(Elaboratable):
         if has_mem:
             self.lsu_req = ExecResp(params, name='lsu_req')
 
+        if sim_debug:
+            self.exec_debug = ExecDebug(params, name='ex_debug')
+
     def elaborate(self, platform):
         m = Module()
+
+        if self.sim_debug:
+            m.d.comb += [
+                self.exec_debug.valid.eq(self.req.valid),
+                self.exec_debug.uop_id.eq(self.req.uop.uop_id),
+                self.exec_debug.opcode.eq(self.req.uop.opcode),
+                self.exec_debug.prs1.eq(self.req.uop.prs1),
+                self.exec_debug.rs1_data.eq(self.req.rs1_data),
+                self.exec_debug.prs2.eq(self.req.uop.prs2),
+                self.exec_debug.rs2_data.eq(self.req.rs2_data),
+            ]
 
         return m
 
@@ -65,6 +100,7 @@ class ALUExecUnit(ExecUnit):
                  has_div=False,
                  has_mem=False,
                  has_csr=False,
+                 sim_debug=False,
                  name=None):
         super().__init__(params['xlen'],
                          params,
@@ -75,7 +111,8 @@ class ALUExecUnit(ExecUnit):
                          has_mul=has_mul,
                          has_div=has_div,
                          has_mem=has_mem,
-                         has_csr=has_csr)
+                         has_csr=has_csr,
+                         sim_debug=sim_debug)
         self.name = name
 
     def elaborate(self, platform):
@@ -173,12 +210,15 @@ class ALUExecUnit(ExecUnit):
 
 class ExecUnits(Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sim_debug=False):
         self.exec_units = []
         self.issue_params = params['issue_params']
 
         self.irf_readers = 0
         self.irf_writers = 0
+
+        if sim_debug:
+            self.exec_debug = []
 
         mem_width = self.issue_params[IssueQueueType.MEM]['issue_width']
         for i in range(mem_width):
@@ -197,10 +237,14 @@ class ExecUnits(Elaboratable):
                              has_csr=(i == (1 % int_width)),
                              has_mul=(i == (2 % int_width)),
                              has_div=(i == (3 % int_width)),
+                             sim_debug=sim_debug,
                              name=f'alu_int{i}')
             self.exec_units.append(eu)
             self.irf_readers += eu.irf_read
             self.irf_writers += eu.irf_write
+
+            if sim_debug:
+                self.exec_debug.append(eu.exec_debug)
 
         self.irf_read_ports = self.irf_readers * 2
         self.irf_write_ports = self.irf_writers

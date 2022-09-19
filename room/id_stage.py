@@ -7,6 +7,20 @@ from room.branch import BranchMaskAllocator, BranchUpdate
 from room.exc import Cause
 
 
+class IDDebug(Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        max_br_count = params['max_br_count']
+
+        super().__init__([
+            ('valid', 1),
+            ('uop_id', MicroOp.ID_WIDTH),
+            ('br_mask', max_br_count),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class BranchSignals(Record):
 
     def __init__(self, vaddr_bits, name=None):
@@ -455,10 +469,11 @@ class DecodeUnit(Elaboratable):
 
 class DecodeStage(Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sim_debug=False):
         self.xlen = params['xlen']
         self.core_width = params['core_width']
         self.params = params
+        self.sim_debug = sim_debug
 
         self.fetch_packet = [MicroOp(params) for _ in range(self.core_width)]
         self.fetch_packet_valid = Signal()
@@ -481,6 +496,12 @@ class DecodeStage(Elaboratable):
         self.interrupt = Signal()
         self.interrupt_cause = Signal(self.xlen)
         self.single_step = Signal()
+
+        if sim_debug:
+            self.id_debug = [
+                IDDebug(params, name=f'id_debug{i}')
+                for i in range(self.core_width)
+            ]
 
     def elaborate(self, platform):
         m = Module()
@@ -554,5 +575,15 @@ class DecodeStage(Elaboratable):
             m.d.sync += dec_finished_mask.eq(0)
         with m.Else():
             m.d.sync += dec_finished_mask.eq(dec_finished_mask | self.fire)
+
+        if self.sim_debug:
+            for w in range(self.core_width):
+                id_debug = self.id_debug[w]
+
+                m.d.comb += [
+                    id_debug.valid.eq(self.fire[w]),
+                    id_debug.uop_id.eq(self.uops[w].uop_id),
+                    id_debug.br_mask.eq(self.uops[w].br_mask),
+                ]
 
         return m

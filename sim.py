@@ -2,7 +2,7 @@ from amaranth import *
 from amaranth.sim import Simulator
 
 from room.consts import *
-from room import Core
+from room.core import Core, CoreDebug
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
@@ -67,11 +67,19 @@ class Top(Elaboratable):
         'sram': 0x20000000,
     }
 
-    def __init__(self, clk_freq, rom_image, debug_rom_image, ram_image=[]):
+    def __init__(self,
+                 clk_freq,
+                 core_params,
+                 rom_image,
+                 debug_rom_image,
+                 ram_image=[],
+                 sim_debug=False):
         self.rom_image = rom_image
         self.debug_rom_image = debug_rom_image
         self.ram_image = ram_image
         self.clk_freq = clk_freq
+        self.core_params = Core.validate_params(core_params)
+        self.sim_debug = sim_debug
 
         self.axil_master = axi.AXILiteInterface(data_width=32,
                                                 addr_width=32,
@@ -80,6 +88,9 @@ class Top(Elaboratable):
         self.rst = Signal()
 
         self.jtag = JTAGInterface()
+
+        if sim_debug:
+            self.core_debug = CoreDebug(self.core_params)
 
     def elaborate(self, platform):
         m = Module()
@@ -91,7 +102,10 @@ class Top(Elaboratable):
 
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
-        core = Core(Core.validate_params(core_params))
+        core = Core(self.core_params, sim_debug=self.sim_debug)
+
+        if self.sim_debug:
+            m.d.comb += self.core_debug.eq(core.core_debug)
 
         debug_module = DebugModule(self.debug_rom_image)
         m.d.comb += [
@@ -156,7 +170,7 @@ if __name__ == "__main__":
     else:
         ram = []
 
-    dut = Top(args.freq, rom, debug_rom, ram)
+    dut = Top(args.freq, core_params, rom, debug_rom, ram, sim_debug=True)
 
     sim = Simulator(dut)
     sim.add_clock(1.0 / args.freq)
@@ -169,6 +183,90 @@ if __name__ == "__main__":
 
         for _ in range(100):
             yield
+
+    def process_sim_debug(cycles=100, log_file=None):
+
+        def proc():
+            yield dut.rst.eq(1)
+            yield
+            yield dut.rst.eq(0)
+
+            for _ in range(cycles):
+                for if_debug in dut.core_debug.if_debug:
+                    valid = yield if_debug.valid
+
+                    if valid:
+                        id = yield if_debug.uop_id
+                        pc = yield if_debug.pc
+                        inst = yield if_debug.inst
+                        print(f'I {id} {pc:x} {inst:x}', file=log_file)
+
+                for id_debug in dut.core_debug.id_debug:
+                    valid = yield id_debug.valid
+
+                    if valid:
+                        id = yield id_debug.uop_id
+                        br_mask = yield id_debug.br_mask
+                        print(f'ID {id} {br_mask:x}', file=log_file)
+
+                for ex_debug in dut.core_debug.ex_debug:
+                    valid = yield ex_debug.valid
+
+                    if valid:
+                        id = yield ex_debug.uop_id
+                        opcode = yield ex_debug.opcode
+                        prs1 = yield ex_debug.prs1
+                        rs1_data = yield ex_debug.rs1_data
+                        prs2 = yield ex_debug.prs2
+                        rs2_data = yield ex_debug.rs2_data
+
+                        print(
+                            f'EX {id} {opcode} {prs1} {rs1_data:x} {prs2} {rs2_data:x}',
+                            file=log_file)
+
+                for mem_debug in dut.core_debug.mem_debug:
+                    valid = yield mem_debug.valid
+
+                    if valid:
+                        id = yield mem_debug.uop_id
+                        opcode = yield mem_debug.opcode
+                        addr = yield mem_debug.addr
+                        data = yield mem_debug.data
+                        prs1 = yield mem_debug.prs1
+                        prs2 = yield mem_debug.prs2
+
+                        print(
+                            f'MEM {id} {opcode} {prs1} {prs2} {addr:x} {data:x}',
+                            file=log_file)
+
+                for wb_debug in dut.core_debug.wb_debug:
+                    valid = yield wb_debug.valid
+
+                    if valid:
+                        id = yield wb_debug.uop_id
+                        pdst = yield wb_debug.pdst
+                        data = yield wb_debug.data
+                        print(f'WB {id} {pdst} {data:x}', file=log_file)
+
+                for com_debug in dut.core_debug.commit_debug:
+                    valid = yield com_debug.valid
+
+                    if valid:
+                        id = yield com_debug.uop_id
+                        print(f'C {id}', file=log_file)
+
+                br_mask = yield dut.core_debug.branch_mispredict
+                if br_mask != 0:
+                    print(f'BRK {br_mask:x}', file=log_file)
+
+                if (yield dut.core_debug.flush_pipeline):
+                    print(f'X', file=log_file)
+
+                print('+', file=log_file)
+
+                yield
+
+        return proc
 
     def process_debug():
         for _ in range(10):
@@ -215,7 +313,11 @@ if __name__ == "__main__":
         r = yield from dut.jtag.read_dmi(0x16)
         print(hex(r))
 
-    sim.add_sync_process(process)
+    f = open('trace.log', 'w')
+
+    sim.add_sync_process(process_sim_debug(cycles=10000, log_file=f))
     # sim.add_sync_process(process_debug, domain='debug')
     with sim.write_vcd('room.vcd'):
         sim.run()
+
+    f.close()

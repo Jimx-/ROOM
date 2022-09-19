@@ -5,16 +5,16 @@ from room.consts import *
 from room.alu import ExecResp
 from room.types import MicroOp
 
-from room.if_stage import IFStage
-from room.id_stage import DecodeStage
+from room.if_stage import IFStage, IFDebug
+from room.id_stage import DecodeStage, IDDebug
 from room.rename import RenameStage
 from room.dispatch import Dispatcher
 from room.issue import IssueUnit
 from room.rob import ReorderBuffer, FlushType
 from room.regfile import RegisterFile, RegisterRead
-from room.ex_stage import ExecUnits
+from room.ex_stage import ExecUnits, ExecDebug
 from room.branch import BranchUpdate, BranchResolution
-from room.lsu import LoadStoreUnit
+from room.lsu import LoadStoreUnit, LSUDebug
 from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts
 from room.breakpoint import BreakpointUnit
@@ -22,12 +22,109 @@ from room.breakpoint import BreakpointUnit
 from roomsoc.interconnect import wishbone
 
 
-class Core(Elaboratable):
+class WritebackDebug(Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        xlen = params['xlen']
+        num_pregs = params['num_pregs']
+
+        super().__init__([
+            ('valid', 1),
+            ('uop_id', MicroOp.ID_WIDTH),
+            ('pdst', range(num_pregs)),
+            ('data', xlen),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
+class CommitDebug(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('valid', 1),
+            ('uop_id', MicroOp.ID_WIDTH),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
+class CoreDebug:
 
     def __init__(self, params):
+        xlen = params['xlen']
+        fetch_width = params['fetch_width']
+        core_width = params['fetch_width']
+        max_br_count = params['max_br_count']
+
+        issue_params = params['issue_params']
+        mem_width = params['mem_width']
+        int_width = issue_params[IssueQueueType.INT]['issue_width']
+
+        self.if_debug = [
+            IFDebug(name=f'if_debug{i}') for i in range(fetch_width)
+        ]
+
+        self.id_debug = [
+            IDDebug(params, name=f'id_debug{i}') for i in range(core_width)
+        ]
+
+        self.ex_debug = [
+            ExecDebug(params, name=f'ex_debug{i}') for i in range(int_width)
+        ]
+
+        self.mem_debug = [
+            LSUDebug(params, name=f'mem_debug{i}') for i in range(mem_width)
+        ]
+
+        self.wb_debug = [
+            WritebackDebug(params, name=f'wb_debug{i}')
+            for i in range(mem_width + int_width)
+        ]
+
+        self.commit_debug = [
+            CommitDebug(name=f'commit_debug{i}') for i in range(core_width)
+        ]
+
+        self.branch_mispredict = Signal(max_br_count)
+        self.flush_pipeline = Signal()
+
+    def eq(self, rhs):
+        ret = []
+
+        for l, r in zip(self.if_debug, rhs.if_debug):
+            ret.append(l.eq(r))
+
+        for l, r in zip(self.id_debug, rhs.id_debug):
+            ret.append(l.eq(r))
+
+        for l, r in zip(self.ex_debug, rhs.ex_debug):
+            ret.append(l.eq(r))
+
+        for l, r in zip(self.mem_debug, rhs.mem_debug):
+            ret.append(l.eq(r))
+
+        for l, r in zip(self.wb_debug, rhs.wb_debug):
+            ret.append(l.eq(r))
+
+        for l, r in zip(self.commit_debug, rhs.commit_debug):
+            ret.append(l.eq(r))
+
+        ret += [
+            self.branch_mispredict.eq(rhs.branch_mispredict),
+            self.flush_pipeline.eq(rhs.flush_pipeline),
+        ]
+
+        return ret
+
+
+class Core(Elaboratable):
+
+    def __init__(self, params, sim_debug=False):
         self.params = params
         self.xlen = params['xlen']
         self.core_width = params['core_width']
+        self.sim_debug = sim_debug
 
         self.interrupts = CoreInterrupts()
         self.debug_entry = Signal(32)
@@ -44,6 +141,9 @@ class Core(Elaboratable):
                                        name='dbus')
 
         self.periph_buses = [self.ibus, self.dbus]
+
+        if sim_debug:
+            self.core_debug = CoreDebug(params)
 
     @staticmethod
     def validate_params(params):
@@ -86,10 +186,16 @@ class Core(Elaboratable):
         # Instruction fetch
         #
 
-        if_stage = m.submodules.if_stage = IFStage(self.ibus, self.params)
+        if_stage = m.submodules.if_stage = IFStage(self.ibus,
+                                                   self.params,
+                                                   sim_debug=self.sim_debug)
 
         for if_bp, bp in zip(if_stage.bp, bp_unit.bp):
             m.d.comb += if_bp.eq(bp)
+
+        if self.sim_debug:
+            for l, r in zip(self.core_debug.if_debug, if_stage.if_debug):
+                m.d.comb += l.eq(r)
 
         dec_ready = Signal()
 
@@ -102,7 +208,8 @@ class Core(Elaboratable):
 
         br_update = BranchUpdate(self.params, name='br_update')
 
-        dec_stage = m.submodules.decode_stage = DecodeStage(self.params)
+        dec_stage = m.submodules.decode_stage = DecodeStage(
+            self.params, sim_debug=self.sim_debug)
         for a, b in zip(dec_stage.fetch_packet, if_stage.fetch_packet):
             m.d.comb += a.eq(b)
         m.d.comb += [
@@ -117,11 +224,16 @@ class Core(Elaboratable):
             dec_stage.single_step.eq(exc_unit.single_step),
         ]
 
+        if self.sim_debug:
+            for l, r in zip(self.core_debug.id_debug, dec_stage.id_debug):
+                m.d.comb += l.eq(r)
+
         #
         # Renaming
         #
 
-        exec_units = m.submodules.exec_units = ExecUnits(self.params)
+        exec_units = m.submodules.exec_units = ExecUnits(
+            self.params, sim_debug=self.sim_debug)
 
         num_int_iss_wakeup_ports = exec_units.irf_write_ports + mem_width
         num_int_ren_wakeup_ports = num_int_iss_wakeup_ports
@@ -142,7 +254,9 @@ class Core(Elaboratable):
         # Dispatcher
         #
 
-        lsu = m.submodules.lsu = LoadStoreUnit(self.dbus, self.params)
+        lsu = m.submodules.lsu = LoadStoreUnit(self.dbus,
+                                               self.params,
+                                               sim_debug=self.sim_debug)
 
         dispatcher = m.submodules.dispatcher = Dispatcher(self.params)
 
@@ -252,6 +366,15 @@ class Core(Elaboratable):
                 m.d.comb += dis_uop.rob_idx.eq(
                     Cat(Const(w, width), rob.tail_idx >> width))
 
+        if self.sim_debug:
+            for w in range(self.core_width):
+                commit_debug = self.core_debug.commit_debug[w]
+
+                m.d.comb += [
+                    commit_debug.valid.eq(rob.commit_req.valids[w]),
+                    commit_debug.uop_id.eq(rob.commit_req.uops[w].uop_id),
+                ]
+
         #
         # Frontend redirect
         #
@@ -334,6 +457,9 @@ class Core(Elaboratable):
                 if_stage.commit.eq(ecall_commit),
                 if_stage.commit_valid.eq(1),
             ]
+
+        if self.sim_debug:
+            m.d.comb += self.core_debug.flush_pipeline.eq(rob_flush_d1.valid)
 
         #
         # Issue queue
@@ -490,6 +616,10 @@ class Core(Elaboratable):
                 br_res.valid.eq(eu.br_res.valid & ~rob.flush.valid),
             ]
 
+        if self.sim_debug:
+            for l, r in zip(self.core_debug.ex_debug, exec_units.exec_debug):
+                m.d.comb += l.eq(r)
+
         #
         # Get PC for jump unit
         #
@@ -538,6 +668,10 @@ class Core(Elaboratable):
             lsu.exception.eq(rob_flush_d1.valid),
             rob.lsu_exc.eq(lsu.lsu_exc),
         ]
+
+        if self.sim_debug:
+            for l, r in zip(self.core_debug.mem_debug, lsu.lsu_debug):
+                m.d.comb += l.eq(r)
 
         #
         # Branch resolution
@@ -589,12 +723,16 @@ class Core(Elaboratable):
 
         m.d.comb += if_stage.get_pc_idx[1].eq(oldest_res.uop.ftq_idx)
 
+        if self.sim_debug:
+            m.d.comb += self.core_debug.branch_mispredict.eq(
+                br_update.mispredict_mask)
+
         #
         # Writeback
         #
 
-        for wp, iresp in zip(iregfile.write_ports[:mem_width],
-                             lsu.exec_iresps):
+        for i, (wp, iresp) in enumerate(
+                zip(iregfile.write_ports[:mem_width], lsu.exec_iresps)):
             m.d.comb += [
                 wp.valid.eq(iresp.valid & iresp.uop.rf_wen()
                             & iresp.uop.dst_rtype == RegisterType.FIX),
@@ -602,8 +740,19 @@ class Core(Elaboratable):
                 wp.data.eq(iresp.data),
             ]
 
-        for eu, wp in zip([eu for eu in exec_units if eu.irf_write],
-                          iregfile.write_ports[mem_width:]):
+            if self.sim_debug:
+                wb_debug = self.core_debug.wb_debug[i]
+
+                m.d.comb += [
+                    wb_debug.valid.eq(wp.valid),
+                    wb_debug.uop_id.eq(iresp.uop.uop_id),
+                    wb_debug.pdst.eq(iresp.uop.pdst),
+                    wb_debug.data.eq(wp.data),
+                ]
+
+        for i, (eu, wp) in enumerate(
+                zip([eu for eu in exec_units if eu.irf_write],
+                    iregfile.write_ports[mem_width:]), mem_width):
             m.d.comb += [
                 wp.valid.eq(eu.iresp.valid & eu.iresp.uop.rf_wen()
                             & eu.iresp.uop.dst_rtype == RegisterType.FIX),
@@ -616,6 +765,16 @@ class Core(Elaboratable):
                         eu.iresp.data))
             else:
                 m.d.comb += wp.data.eq(eu.iresp.data)
+
+            if self.sim_debug:
+                wb_debug = self.core_debug.wb_debug[i]
+
+                m.d.comb += [
+                    wb_debug.valid.eq(wp.valid),
+                    wb_debug.uop_id.eq(eu.iresp.uop.uop_id),
+                    wb_debug.pdst.eq(eu.iresp.uop.pdst),
+                    wb_debug.data.eq(wp.data),
+                ]
 
         #
         # Commit
