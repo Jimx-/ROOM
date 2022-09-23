@@ -86,6 +86,7 @@ class CoreDebug:
             CommitDebug(name=f'commit_debug{i}') for i in range(core_width)
         ]
 
+        self.branch_resolve = Signal(max_br_count)
         self.branch_mispredict = Signal(max_br_count)
         self.flush_pipeline = Signal()
 
@@ -111,6 +112,7 @@ class CoreDebug:
             ret.append(l.eq(r))
 
         ret += [
+            self.branch_resolve.eq(rhs.branch_resolve),
             self.branch_mispredict.eq(rhs.branch_mispredict),
             self.flush_pipeline.eq(rhs.flush_pipeline),
         ]
@@ -724,8 +726,11 @@ class Core(Elaboratable):
         m.d.comb += if_stage.get_pc_idx[1].eq(oldest_res.uop.ftq_idx)
 
         if self.sim_debug:
-            m.d.comb += self.core_debug.branch_mispredict.eq(
-                br_update.mispredict_mask)
+            m.d.comb += [
+                self.core_debug.branch_resolve.eq(br_update.resolve_mask),
+                self.core_debug.branch_mispredict.eq(
+                    br_update.mispredict_mask),
+            ]
 
         #
         # Writeback

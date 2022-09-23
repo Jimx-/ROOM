@@ -187,17 +187,20 @@ class Freelist(Elaboratable):
                 dec.i.eq(enc.o),
                 dec.n.eq(enc.n),
                 sels[i].eq(dec.o),
-                self.alloc_pregs[i].eq(enc.o),
             ]
 
             if i != self.core_width - 1:
                 m.d.comb += masks[i + 1].eq(masks[i] & ~sels[i])
 
             valid = Signal()
+            preg = Signal.like(self.alloc_pregs[i])
             m.d.sync += [valid.eq((valid & ~self.reqs[i]) | (sels[i] != 0))]
+            with m.If(sel_fire[i]):
+                m.d.sync += preg.eq(enc.o)
 
             m.d.comb += [
                 sel_fire[i].eq((~valid | self.reqs[i]) & (sels[i] != 0)),
+                self.alloc_pregs[i].eq(preg),
                 self.alloc_valids[i].eq(valid),
             ]
 

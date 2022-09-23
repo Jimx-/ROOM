@@ -255,9 +255,13 @@ if __name__ == "__main__":
                         id = yield com_debug.uop_id
                         print(f'C {id}', file=log_file)
 
-                br_mask = yield dut.core_debug.branch_mispredict
-                if br_mask != 0:
-                    print(f'BRK {br_mask:x}', file=log_file)
+                mispredict_mask = yield dut.core_debug.branch_mispredict
+                if mispredict_mask != 0:
+                    print(f'BRK {mispredict_mask:x}', file=log_file)
+
+                resolve_mask = yield dut.core_debug.branch_resolve
+                if resolve_mask != 0:
+                    print(f'BRR {resolve_mask:x}', file=log_file)
 
                 if (yield dut.core_debug.flush_pipeline):
                     print(f'X', file=log_file)
@@ -289,12 +293,12 @@ if __name__ == "__main__":
         #     yield
 
         # Write 0x0 to DPC
-        yield from dut.jtag.write_dmi(0x4, 0x2d44)
-        for _ in range(100):
-            yield
-        yield from dut.jtag.write_dmi(0x17, 0x002307b1)
-        for _ in range(200):
-            yield
+        # yield from dut.jtag.write_dmi(0x4, 0x2d44)
+        # for _ in range(100):
+        #     yield
+        # yield from dut.jtag.write_dmi(0x17, 0x002307b1)
+        # for _ in range(200):
+        #     yield
 
         yield from dut.jtag.write_dmi(0x10, 0x40000001)
         for _ in range(100):
@@ -307,16 +311,17 @@ if __name__ == "__main__":
         r = yield from dut.jtag.read_dmi(0x11)
         print(hex(r))
 
-        yield from dut.jtag.write_dmi(0x17, 0x00221001)
-        for _ in range(200):
-            yield
-        r = yield from dut.jtag.read_dmi(0x16)
-        print(hex(r))
+        # yield from dut.jtag.write_dmi(0x17, 0x00221001)
+        # for _ in range(200):
+        #     yield
+        # r = yield from dut.jtag.read_dmi(0x16)
+        # print(hex(r))
 
     f = open('trace.log', 'w')
 
     sim.add_sync_process(process_sim_debug(cycles=10000, log_file=f))
-    # sim.add_sync_process(process_debug, domain='debug')
+    # sim.add_sync_process(process)
+    sim.add_sync_process(process_debug, domain='debug')
     with sim.write_vcd('room.vcd'):
         sim.run()
 

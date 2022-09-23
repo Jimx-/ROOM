@@ -386,6 +386,12 @@ class TraceParser:
                 for k in killed:
                     self.insts.pop(k)
 
+            elif cmd == 'BRR':
+                br_mask = int(args[0], base=16)
+
+                for v in self.insts.values():
+                    v.br_mask &= ~br_mask
+
             elif cmd == 'C':
                 id = int(args[0])
 

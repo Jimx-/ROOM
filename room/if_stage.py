@@ -126,13 +126,10 @@ class FetchBuffer(Elaboratable):
         ]
         in_mask = Signal(self.fetch_width)
 
-        id_counter = Signal(MicroOp.ID_WIDTH)
-        next_id = id_counter
         for w in range(self.fetch_width):
             pc = self.w_data.pc + (w << 1)
             m.d.comb += [
                 in_mask[w].eq(self.w_data.mask[w] & self.w_en),
-                in_uops[w].uop_id.eq(next_id),
                 in_uops[w].ftq_idx.eq(self.w_data.ftq_idx),
                 in_uops[w].pc_lsb.eq(pc),
                 in_uops[w].inst.eq(self.w_data.exp_insts[w]),
@@ -143,19 +140,23 @@ class FetchBuffer(Elaboratable):
                 in_uops[w].bp_debug_if.eq(self.w_data.bp_debug_if[w]),
             ]
 
-            next_id = Mux(in_mask[w], next_id + 1, next_id)
-
-        m.d.sync += id_counter.eq(next_id)
-
         if self.sim_debug:
+            id_counter = Signal(MicroOp.ID_WIDTH)
+            next_id = id_counter
+
             for w in range(self.fetch_width):
                 pc = self.w_data.pc + (w << 1)
                 m.d.comb += [
+                    in_uops[w].uop_id.eq(next_id),
                     self.if_debug[w].valid.eq(in_mask[w]),
                     self.if_debug[w].uop_id.eq(in_uops[w].uop_id),
                     self.if_debug[w].inst.eq(in_uops[w].inst),
                     self.if_debug[w].pc.eq(pc),
                 ]
+
+                next_id = Mux(in_mask[w], next_id + 1, next_id)
+
+            m.d.sync += id_counter.eq(next_id)
 
         wr_slots = [
             Signal(num_entries, name=f'wr_slot{i}')
@@ -503,33 +504,41 @@ class IFStage(Elaboratable):
         #
 
         f3_clear = Signal()
-        f3_fifo = m.submodules.f3_fifo = ResetInserter(f3_clear)(SyncFIFO(
-            width=self.fetch_bytes * 8 + 32, depth=1))
+
+        f3_pipe_reg = Signal(self.fetch_bytes * 8 + 32)
+        f3_empty = Signal(reset=1)
 
         f4_ready = Signal()
 
         if self.enable_icache:
-            m.d.comb += [
-                f3_fifo.w_en.eq(s2_valid & ~f2_clear & icache.resp.valid),
-                f3_fifo.w_data.eq(Cat(s2_vpc, icache.resp.data)),
-            ]
+            f3_w_en = s2_valid & ~f2_clear & icache.resp.valid
+            f3_w_data = Cat(s2_vpc, icache.resp.data)
         else:
-            m.d.comb += [
-                f3_fifo.w_en.eq(s2_valid & ~f2_clear & self.ibus.ack),
-                f3_fifo.w_data.eq(Cat(s2_vpc, self.ibus.dat_r)),
+            f3_w_en = s2_valid & ~f2_clear & self.ibus.ack
+            f3_w_data = Cat(s2_vpc, self.ibus.dat_r)
+
+        m.d.comb += f3_ready.eq(f3_empty)
+
+        with m.If(f4_ready):
+            m.d.comb += f3_ready.eq(1)
+            m.d.sync += f3_empty.eq(1)
+
+        with m.If(f3_w_en & f3_ready):
+            m.d.sync += [
+                f3_empty.eq(0),
+                f3_pipe_reg.eq(f3_w_data),
             ]
 
-        m.d.comb += [
-            f3_fifo.r_en.eq(f4_ready),
-            f3_ready.eq(f3_fifo.w_rdy),
-        ]
+        with m.If(f3_clear):
+            m.d.sync += f3_empty.eq(1)
 
-        s3_valid = f3_fifo.r_rdy
+        s3_valid = Signal()
         s3_pc = Signal(32)
         s3_data = Signal(self.fetch_bytes * 8)
         m.d.comb += [
-            s3_pc.eq(f3_fifo.r_data[:32]),
-            s3_data.eq(f3_fifo.r_data[32:]),
+            s3_valid.eq(~f3_empty),
+            s3_pc.eq(f3_pipe_reg[:32]),
+            s3_data.eq(f3_pipe_reg[32:]),
         ]
 
         f3_prev_half = Signal(16)
@@ -672,7 +681,7 @@ class IFStage(Elaboratable):
             redirects_found |= f3_redirects[w]
 
         last_inst = f3_insts[self.fetch_width - 1][0:16]
-        with m.If(f3_fifo.r_en & f3_fifo.r_rdy):
+        with m.If(s3_valid & f4_ready):
             m.d.sync += [
                 f3_prev_half.eq(last_inst),
                 f3_prev_half_valid.eq(~(f3_mask[self.fetch_width - 2]
@@ -730,11 +739,11 @@ class IFStage(Elaboratable):
             f4_ready.eq(fb.w_rdy & ftq.w_rdy),
             fb.w_data.eq(f3_fetch_bundle),
             fb.w_data.ftq_idx.eq(ftq.w_idx),
-            fb.w_en.eq(f3_fifo.r_rdy & ftq.w_rdy & ~f3_clear),
+            fb.w_en.eq(s3_valid & ftq.w_rdy & ~f3_clear),
             fb.r_en.eq(self.fetch_packet_ready),
             self.fetch_packet_valid.eq(fb.r_rdy),
             ftq.w_data.eq(f3_fetch_bundle),
-            ftq.w_en.eq(f3_fifo.r_rdy & fb.w_rdy & ~f3_clear),
+            ftq.w_en.eq(s3_valid & fb.w_rdy & ~f3_clear),
         ]
 
         for fp, rd in zip(self.fetch_packet, fb.r_data):

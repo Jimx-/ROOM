@@ -1,7 +1,7 @@
 from amaranth.sim import Settle
 import pytest
 
-from room.alu import ALU, ALUOperator, Multiplier, IntDiv
+from room.alu import ALU, ALUOperator, ALUWidth, Multiplier, IntDiv
 from room.test import run_test
 
 
@@ -9,12 +9,14 @@ def mask_xlen(data, xlen):
     return data & ((1 << xlen) - 1)
 
 
-def alu_unittest(alu, a, b, fn, expected):
+def alu_unittest(alu, a, b, fn, expected, dw32=False):
 
     def proc():
         yield alu.in1.eq(a)
         yield alu.in2.eq(b)
         yield alu.fn.eq(fn)
+        if dw32:
+            yield alu.dw.eq(ALUWidth.DW_32)
         yield Settle()
         out = yield alu.out
         assert out == expected
@@ -50,6 +52,32 @@ def test_alu_add(xlen):
         expected = mask_xlen(expected, xlen)
 
         run_test(dut, alu_unittest(dut, a, b, ALUOperator.ADD, expected))
+
+
+def test_alu_addw():
+    dut = ALU(64)
+
+    cases = [
+        (0x00000000, 0x00000000, 0x00000000),
+        (0x00000001, 0x00000001, 0x00000002),
+        (0x00000003, 0x00000007, 0x0000000a),
+        (0x0000000000000000, 0xffffffffffff8000, 0xffffffffffff8000),
+        (0xffffffff80000000, 0x00000000, 0xffffffff80000000),
+        (0xffffffff80000000, 0xffffffffffff8000, 0x000000007fff8000),
+        (0x0000000000000000, 0x0000000000007fff, 0x0000000000007fff),
+        (0x000000007fffffff, 0x0000000000000000, 0x000000007fffffff),
+        (0x000000007fffffff, 0x0000000000007fff, 0xffffffff80007ffe),
+        (0xffffffff80000000, 0x0000000000007fff, 0xffffffff80007fff),
+        (0x000000007fffffff, 0xffffffffffff8000, 0x000000007fff7fff),
+        (0x0000000000000000, 0xffffffffffffffff, 0xffffffffffffffff),
+        (0xffffffffffffffff, 0x0000000000000001, 0x0000000000000000),
+        (0xffffffffffffffff, 0xffffffffffffffff, 0xfffffffffffffffe),
+        (0x0000000000000001, 0x000000007fffffff, 0xffffffff80000000),
+    ]
+
+    for a, b, expected in cases:
+        run_test(dut,
+                 alu_unittest(dut, a, b, ALUOperator.ADD, expected, dw32=True))
 
 
 @pytest.mark.parametrize("xlen", [32, 64])
@@ -132,6 +160,41 @@ def test_alu_sll(xlen):
         expected = mask_xlen(expected, xlen)
 
         run_test(dut, alu_unittest(dut, a, b, ALUOperator.SL, expected))
+
+
+def test_alu_sllw():
+    dut = ALU(64)
+
+    cases = [
+        (0x0000000000000001, 0, 0x0000000000000001),
+        (0x0000000000000001, 1, 0x0000000000000002),
+        (0x0000000000000001, 7, 0x0000000000000080),
+        (0x0000000000000001, 14, 0x0000000000004000),
+        (0x0000000000000001, 31, 0xffffffff80000000),
+        (0xffffffffffffffff, 0, 0xffffffffffffffff),
+        (0xffffffffffffffff, 1, 0xfffffffffffffffe),
+        (0xffffffffffffffff, 7, 0xffffffffffffff80),
+        (0xffffffffffffffff, 14, 0xffffffffffffc000),
+        (0xffffffffffffffff, 31, 0xffffffff80000000),
+        (0x0000000021212121, 0, 0x0000000021212121),
+        (0x0000000021212121, 1, 0x0000000042424242),
+        (0x0000000021212121, 7, 0xffffffff90909080),
+        (0x0000000021212121, 14, 0x0000000048484000),
+        (0x0000000021212121, 31, 0xffffffff80000000),
+        (0x0000000021212121, 0xffffffffffffffe0, 0x0000000021212121),
+        (0x0000000021212121, 0xffffffffffffffe1, 0x0000000042424242),
+        (0x0000000021212121, 0xffffffffffffffe7, 0xffffffff90909080),
+        (0x0000000021212121, 0xffffffffffffffee, 0x0000000048484000),
+        (0x0000000021212121, 0xffffffffffffffff, 0xffffffff80000000),
+        (0xffffffff12345678, 0, 0x0000000012345678),
+        (0xffffffff12345678, 4, 0x0000000023456780),
+        (0x0000000092345678, 0, 0xffffffff92345678),
+        (0x0000000099345678, 4, 0xffffffff93456780),
+    ]
+
+    for a, b, expected in cases:
+        run_test(dut,
+                 alu_unittest(dut, a, b, ALUOperator.SL, expected, dw32=True))
 
 
 @pytest.mark.parametrize("xlen", [32, 64])
@@ -229,6 +292,41 @@ def test_alu_sra(xlen):
         run_test(dut, alu_unittest(dut, a, b, ALUOperator.SRA, expected))
 
 
+def test_alu_sraw():
+    dut = ALU(64)
+
+    cases = [
+        (0xffffffff80000000, 0, 0xffffffff80000000),
+        (0xffffffff80000000, 1, 0xffffffffc0000000),
+        (0xffffffff80000000, 7, 0xffffffffff000000),
+        (0xffffffff80000000, 14, 0xfffffffffffe0000),
+        (0xffffffff80000001, 31, 0xffffffffffffffff),
+        (0x000000007fffffff, 0, 0x000000007fffffff),
+        (0x000000007fffffff, 1, 0x000000003fffffff),
+        (0x000000007fffffff, 7, 0x0000000000ffffff),
+        (0x000000007fffffff, 14, 0x000000000001ffff),
+        (0x000000007fffffff, 31, 0x0000000000000000),
+        (0xffffffff81818181, 0, 0xffffffff81818181),
+        (0xffffffff81818181, 1, 0xffffffffc0c0c0c0),
+        (0xffffffff81818181, 7, 0xffffffffff030303),
+        (0xffffffff81818181, 14, 0xfffffffffffe0606),
+        (0xffffffff81818181, 31, 0xffffffffffffffff),
+        (0xffffffff81818181, 0xffffffffffffffe0, 0xffffffff81818181),
+        (0xffffffff81818181, 0xffffffffffffffe1, 0xffffffffc0c0c0c0),
+        (0xffffffff81818181, 0xffffffffffffffe7, 0xffffffffff030303),
+        (0xffffffff81818181, 0xffffffffffffffee, 0xfffffffffffe0606),
+        (0xffffffff81818181, 0xffffffffffffffff, 0xffffffffffffffff),
+        (0xffffffff12345678, 0, 0x0000000012345678),
+        (0xffffffff12345678, 4, 0x0000000001234567),
+        (0x0000000092345678, 0, 0xffffffff92345678),
+        (0x0000000092345678, 4, 0xfffffffff9234567),
+    ]
+
+    for a, b, expected in cases:
+        run_test(dut,
+                 alu_unittest(dut, a, b, ALUOperator.SRA, expected, dw32=True))
+
+
 @pytest.mark.parametrize("xlen", [32, 64])
 def test_alu_srl(xlen):
     dut = ALU(xlen)
@@ -269,6 +367,41 @@ def test_alu_srl(xlen):
         run_test(dut, alu_unittest(dut, a, b, ALUOperator.SR, expected))
 
 
+def test_alu_srlw():
+    dut = ALU(64)
+
+    cases = [
+        (0xffffffff80000000, 0, 0xffffffff80000000),
+        (0xffffffff80000000, 1, 0x0000000040000000),
+        (0xffffffff80000000, 7, 0x0000000001000000),
+        (0xffffffff80000000, 14, 0x0000000000020000),
+        (0xffffffff80000001, 31, 0x0000000000000001),
+        (0xffffffffffffffff, 0, 0xffffffffffffffff),
+        (0xffffffffffffffff, 1, 0x000000007fffffff),
+        (0xffffffffffffffff, 7, 0x0000000001ffffff),
+        (0xffffffffffffffff, 14, 0x000000000003ffff),
+        (0xffffffffffffffff, 31, 0x0000000000000001),
+        (0x0000000021212121, 0, 0x0000000021212121),
+        (0x0000000021212121, 1, 0x0000000010909090),
+        (0x0000000021212121, 7, 0x0000000000424242),
+        (0x0000000021212121, 14, 0x0000000000008484),
+        (0x0000000021212121, 31, 0x0000000000000000),
+        (0x0000000021212121, 0xffffffffffffffe0, 0x0000000021212121),
+        (0x0000000021212121, 0xffffffffffffffe1, 0x0000000010909090),
+        (0x0000000021212121, 0xffffffffffffffe7, 0x0000000000424242),
+        (0x0000000021212121, 0xffffffffffffffee, 0x0000000000008484),
+        (0x0000000021212121, 0xffffffffffffffff, 0x0000000000000000),
+        (0xffffffff12345678, 0, 0x0000000012345678),
+        (0xffffffff12345678, 4, 0x0000000001234567),
+        (0x0000000092345678, 0, 0xffffffff92345678),
+        (0x0000000092345678, 4, 0x0000000009234567),
+    ]
+
+    for a, b, expected in cases:
+        run_test(dut,
+                 alu_unittest(dut, a, b, ALUOperator.SR, expected, dw32=True))
+
+
 @pytest.mark.parametrize("xlen", [32, 64])
 def test_alu_sub(xlen):
     dut = ALU(xlen)
@@ -298,9 +431,8 @@ def test_alu_sub(xlen):
         run_test(dut, alu_unittest(dut, a, b, ALUOperator.SUB, expected))
 
 
-@pytest.mark.parametrize("xlen", [32, 64])
-def test_alu_sub(xlen):
-    dut = ALU(xlen)
+def test_alu_subw():
+    dut = ALU(64)
 
     cases = [
         (0x0000000000000000, 0x0000000000000000, 0x0000000000000000),
@@ -312,19 +444,16 @@ def test_alu_sub(xlen):
         (0x0000000000000000, 0x0000000000007fff, 0xffffffffffff8001),
         (0x000000007fffffff, 0x0000000000000000, 0x000000007fffffff),
         (0x000000007fffffff, 0x0000000000007fff, 0x000000007fff8000),
-        (0xffffffff80000000, 0x0000000000007fff, 0xffffffff7fff8001),
-        (0x000000007fffffff, 0xffffffffffff8000, 0x0000000080007fff),
+        (0xffffffff80000000, 0x0000000000007fff, 0x000000007fff8001),
+        (0x000000007fffffff, 0xffffffffffff8000, 0xffffffff80007fff),
         (0x0000000000000000, 0xffffffffffffffff, 0x0000000000000001),
         (0xffffffffffffffff, 0x0000000000000001, 0xfffffffffffffffe),
         (0xffffffffffffffff, 0xffffffffffffffff, 0x0000000000000000),
     ]
 
     for a, b, expected in cases:
-        a = mask_xlen(a, xlen)
-        b = mask_xlen(b, xlen)
-        expected = mask_xlen(expected, xlen)
-
-        run_test(dut, alu_unittest(dut, a, b, ALUOperator.SUB, expected))
+        run_test(dut,
+                 alu_unittest(dut, a, b, ALUOperator.SUB, expected, dw32=True))
 
 
 @pytest.mark.parametrize("xlen", [32, 64])
@@ -346,12 +475,14 @@ def test_alu_xor(xlen):
         run_test(dut, alu_unittest(dut, a, b, ALUOperator.XOR, expected))
 
 
-def mul_unittest(mul, a, b, fn, expected):
+def mul_unittest(mul, a, b, fn, expected, dw32=False):
 
     def proc():
         yield mul.req.in1.eq(a)
         yield mul.req.in2.eq(b)
         yield mul.req.fn.eq(fn)
+        if dw32:
+            yield mul.req.dw.eq(ALUWidth.DW_32)
         yield mul.req_valid.eq(1)
         yield
 
@@ -396,6 +527,24 @@ def test_mul_mul(xlen):
 
         run_test(dut,
                  mul_unittest(dut, a, b, ALUOperator.MUL, expected),
+                 sync=True)
+
+
+def test_mul_mulw():
+    dut = Multiplier(64, 3)
+
+    cases = [
+        (0x00000000, 0x00000000, 0x00000000),
+        (0x00000001, 0x00000001, 0x00000001),
+        (0x00000003, 0x00000007, 0x00000015),
+        (0x0000000000000000, 0xffffffffffff8000, 0x0000000000000000),
+        (0xffffffff80000000, 0x00000000, 0x0000000000000000),
+        (0xffffffff80000000, 0xffffffffffff8000, 0x0000000000000000),
+    ]
+
+    for a, b, expected in cases:
+        run_test(dut,
+                 mul_unittest(dut, a, b, ALUOperator.MUL, expected, dw32=True),
                  sync=True)
 
 
@@ -501,12 +650,14 @@ def test_mul_mulhu(xlen):
                  sync=True)
 
 
-def div_unittest(div, a, b, fn, expected):
+def div_unittest(div, a, b, fn, expected, dw32=False):
 
     def proc():
         yield div.req.in1.eq(a)
         yield div.req.in2.eq(b)
         yield div.req.fn.eq(fn)
+        if dw32:
+            yield div.req.dw.eq(ALUWidth.DW_32)
         yield div.req_valid.eq(1)
         yield
 
@@ -547,6 +698,29 @@ def test_div_div(xlen):
                  sync=True)
 
 
+def test_div_divw():
+    dut = IntDiv(64)
+
+    cases = [
+        (20, 6, 3),
+        (-20, 6, -3),
+        (20, -6, -3),
+        (-20, -6, 3),
+        (-1 << 31, 1, -1 << 31),
+        (-1 << 31, -1, -1 << 31),
+        (-1 << 31, 0, -1),
+        (1, 0, -1),
+        (0, 0, -1),
+    ]
+
+    for a, b, expected in cases:
+        expected = mask_xlen(expected, 64)
+
+        run_test(dut,
+                 div_unittest(dut, a, b, ALUOperator.DIV, expected, dw32=True),
+                 sync=True)
+
+
 @pytest.mark.parametrize("xlen", [32, 64])
 def test_div_divu(xlen):
     dut = IntDiv(xlen)
@@ -570,6 +744,30 @@ def test_div_divu(xlen):
 
         run_test(dut,
                  div_unittest(dut, a, b, ALUOperator.DIVU, expected),
+                 sync=True)
+
+
+def test_div_divuw():
+    dut = IntDiv(64)
+
+    cases = [
+        (20, 6, 3),
+        (-20 << 32 >> 32, 6, 715827879),
+        (20, -6, 0),
+        (-20, -6, 0),
+        (-1 << 31, 1, -1 << 31),
+        (-1 << 31, -1, 0),
+        (-1 << 31, 0, -1),
+        (1, 0, -1),
+        (0, 0, -1),
+    ]
+
+    for a, b, expected in cases:
+        expected = mask_xlen(expected, 64)
+
+        run_test(dut,
+                 div_unittest(dut, a, b, ALUOperator.DIVU, expected,
+                              dw32=True),
                  sync=True)
 
 
@@ -599,6 +797,30 @@ def test_div_rem(xlen):
                  sync=True)
 
 
+def test_div_remw():
+    dut = IntDiv(64)
+
+    cases = [
+        (20, 6, 2),
+        (-20, 6, -2),
+        (20, -6, 2),
+        (-20, -6, -2),
+        (-1 << 31, 1, 0),
+        (-1 << 31, -1, 0),
+        (-1 << 31, 0, -1 << 31),
+        (1, 0, 1),
+        (0, 0, 0),
+        (0xfffffffffffff897, 0, 0xfffffffffffff897),
+    ]
+
+    for a, b, expected in cases:
+        expected = mask_xlen(expected, 64)
+
+        run_test(dut,
+                 div_unittest(dut, a, b, ALUOperator.REM, expected, dw32=True),
+                 sync=True)
+
+
 @pytest.mark.parametrize("xlen", [32, 64])
 def test_div_remu(xlen):
     dut = IntDiv(xlen)
@@ -622,4 +844,28 @@ def test_div_remu(xlen):
 
         run_test(dut,
                  div_unittest(dut, a, b, ALUOperator.REMU, expected),
+                 sync=True)
+
+
+def test_div_remwu():
+    dut = IntDiv(64)
+
+    cases = [
+        (20, 6, 2),
+        (-20, 6, 2),
+        (20, -6, 20),
+        (-20, -6, -20),
+        (-1 << 31, 1, 0),
+        (-1 << 31, -1, -1 << 31),
+        (-1 << 31, 0, -1 << 31),
+        (1, 0, 1),
+        (0, 0, 0),
+    ]
+
+    for a, b, expected in cases:
+        expected = mask_xlen(expected, 64)
+
+        run_test(dut,
+                 div_unittest(dut, a, b, ALUOperator.REMU, expected,
+                              dw32=True),
                  sync=True)

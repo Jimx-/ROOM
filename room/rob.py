@@ -280,7 +280,8 @@ class ReorderBuffer(Elaboratable):
                 will_commit[w].eq(can_commit[w] & ~can_throw_exception[w]
                                   & ~block_commit)
             ]
-            block_commit |= (rob_head_valids[w] & ~can_commit[w])
+            block_commit |= (rob_head_valids[w] &
+                             (~can_commit[w] | can_throw_exception[w]))
             block_exc = will_commit[w]
 
             will_throw_exception = next_throw_exception
