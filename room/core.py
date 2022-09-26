@@ -566,8 +566,18 @@ class Core(Elaboratable):
             m.d.comb += irr_uop.eq(iss_uop)
         m.d.comb += iregread.iss_valids.eq(iss_valids)
 
-        for iss_fu_typ, eu in zip(iss_fu_types, exec_units):
+        for iss_uop, iss_valid, iss_fu_typ, eu in zip(iss_uops, iss_valids,
+                                                      iss_fu_types,
+                                                      exec_units):
             m.d.comb += iss_fu_typ.eq(eu.fu_types)
+
+            # Disallow back-to-back integer division
+            if eu.has_div:
+                div_issued = Signal()
+                m.d.sync += div_issued.eq(iss_valid
+                                          & (iss_uop.fu_type == FUType.DIV))
+                m.d.comb += iss_fu_typ.eq(
+                    Mux(div_issued, eu.fu_types & ~FUType.DIV, eu.fu_types))
 
         for irr_rp, rp in zip(iregread.read_ports, iregfile.read_ports):
             m.d.comb += irr_rp.connect(rp)

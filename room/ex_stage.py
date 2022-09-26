@@ -179,7 +179,7 @@ class ALUExecUnit(ExecUnit):
                                  & (self.req.uop.fu_type == FUType.DIV)),
                 div.br_update.eq(self.br_update),
                 div.resp.ready.eq(~div_resp_busy),
-                div_busy.eq(~div.resp.ready | div.req.valid),
+                div_busy.eq(~div.req.ready | div.req.valid),
             ]
 
             iresp_units.append(div)

@@ -392,6 +392,8 @@ class RegisterRead(Elaboratable):
 
             m.d.sync += [
                 rrd_uop.eq(dec.rrd_uop),
+                rrd_uop.br_mask.eq(
+                    self.br_update.get_new_br_mask(dec.rrd_uop.br_mask)),
                 rrd_v.eq(dec.rrd_valid
                          & ~self.br_update.uop_killed(dec.rrd_uop)),
             ]

@@ -60,6 +60,8 @@ static int finish_cmd(unsigned int cmd, unsigned int response[4])
 
             if (status == SDC_ISR_CC) {
                 if (response) {
+                    __asm__ __volatile__ ("fence io,i" : : : "memory");
+
                     response[0] = mmio_read32((void*)SDC_RESP0_ADDRESS);
                     response[1] = mmio_read32((void*)SDC_RESP1_ADDRESS);
                     response[2] = mmio_read32((void*)SDC_RESP2_ADDRESS);
@@ -91,6 +93,8 @@ static int finish_data(void* buf, unsigned int blocks)
                 int i;
 
                 for (i = 0; i < (blocks << 7); i++) {
+                    __asm__ __volatile__ ("fence io,i" : : : "memory");
+
                     data = mmio_read32((void*)SDC_BUFFER_ADDRESS);
                     data = ((data >> 24) & 0xff) | ((data << 8) & 0xff0000) |
                            ((data >> 8) & 0xff00) | ((data << 24) & 0xff000000);

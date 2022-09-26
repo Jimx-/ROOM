@@ -293,12 +293,12 @@ if __name__ == "__main__":
         #     yield
 
         # Write 0x0 to DPC
-        # yield from dut.jtag.write_dmi(0x4, 0x2d44)
-        # for _ in range(100):
-        #     yield
-        # yield from dut.jtag.write_dmi(0x17, 0x002307b1)
-        # for _ in range(200):
-        #     yield
+        yield from dut.jtag.write_dmi(0x4, 0x39b8)
+        for _ in range(100):
+            yield
+        yield from dut.jtag.write_dmi(0x17, 0x002307b1)
+        for _ in range(200):
+            yield
 
         yield from dut.jtag.write_dmi(0x10, 0x40000001)
         for _ in range(100):

@@ -214,6 +214,7 @@ class IssueUnit(Elaboratable):
         for wen_oh, tmp in zip(entry_wen, entry_wen_array):
             for w in range(self.dispatch_width):
                 m.d.comb += wen_oh[w].eq(tmp[w] & self.dis_valids[w]
+                                         & ~self.dis_uops[w].exception
                                          & ~self.dis_uops[w].is_fence
                                          & ~self.dis_uops[w].is_fencei)
 

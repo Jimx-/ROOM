@@ -257,12 +257,15 @@ class DataCache(Elaboratable):
                     m.next = 'WAIT_ACK'
 
             with m.State('WAIT_ACK'):
+                req_killed = req_chosen.kill | self.br_update.uop_killed(
+                    uop) | (self.exception & uop.uses_ldq)
+
                 m.d.comb += [
                     chosen.eq(last_grant),
                     self.dbus.adr.eq(req_addr[granularity_bits:]),
                     self.dbus.stb.eq(self.dbus.cyc),
                     self.dbus.dat_w.eq(dat_w),
-                    self.dbus.cyc.eq(~req_chosen.kill),
+                    self.dbus.cyc.eq(~req_killed),
                     self.dbus.sel.eq(sel),
                     self.dbus.we.eq(we),
                 ]
@@ -272,8 +275,7 @@ class DataCache(Elaboratable):
                         uop.br_mask)),
                 ]
 
-                with m.If(req_chosen.kill | self.br_update.uop_killed(uop)
-                          | (self.exception & uop.uses_ldq)):
+                with m.If(req_killed):
                     m.next = 'IDLE'
                 with m.Elif(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
                     m.d.comb += [
@@ -580,8 +582,10 @@ class LoadStoreUnit(Elaboratable):
                                           & (ldq_retry_e.st_dep_mask == 0)
                                           & ~ldq_retry_e.order_fail),
                 can_fire_store_commit[w].eq(stq_commit_e.valid
-                                            & stq_commit_e.committed
-                                            & (w == self.mem_width - 1)),
+                                            & ~stq_commit_e.uop.exception
+                                            & ~stq_commit_e.uop.is_fence
+                                            & (w == self.mem_width - 1)
+                                            & stq_commit_e.committed),
             ]
 
         will_fire_load_incoming = Signal(self.mem_width)
@@ -959,7 +963,7 @@ class LoadStoreUnit(Elaboratable):
                 with m.If(do_ld_search[w] & stq[i].valid
                           & fired_ldq_e[w].st_dep_mask[i]):
                     with m.If(((cam_mask[w] & write_mask) == cam_mask[w])
-                              & addr_matches[w]):
+                              & addr_matches[w] & ~stq[i].uop.is_fence):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
                             ldst_forward_matches[w][i].eq(1),
@@ -968,6 +972,12 @@ class LoadStoreUnit(Elaboratable):
                         ]
                     with m.Elif(((cam_mask[w] & write_mask) != 0)
                                 & addr_matches[w]):
+                        m.d.comb += [
+                            ldst_addr_matches[w][i].eq(1),
+                            dcache.reqs[w].kill.eq(dmem_req_fired[w]),
+                            s1_set_executed[cam_ldq_idx[w]].eq(0),
+                        ]
+                    with m.Elif(stq[i].uop.is_fence):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
                             dcache.reqs[w].kill.eq(dmem_req_fired[w]),
@@ -1156,7 +1166,8 @@ class LoadStoreUnit(Elaboratable):
         ]
 
         with m.If(stq[stq_head].valid & stq[stq_head].committed):
-            m.d.comb += clear_store.eq(stq[stq_head].succeeded)
+            m.d.comb += clear_store.eq(stq[stq_head].uop.is_fence
+                                       | stq[stq_head].succeeded)
 
         with m.If(clear_store):
             m.d.sync += [
@@ -1167,6 +1178,10 @@ class LoadStoreUnit(Elaboratable):
                 stq[stq_head].succeeded.eq(0),
                 stq_head.eq(_incr(stq_head, self.stq_size)),
             ]
+
+            with m.If(stq[stq_head].uop.is_fence):
+                m.d.sync += stq_execute_head.eq(
+                    _incr(stq_execute_head, self.stq_size))
 
         #
         # Exception

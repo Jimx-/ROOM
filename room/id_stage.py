@@ -425,6 +425,8 @@ class DecodeUnit(Elaboratable):
                     with m.Case(F3('FENCE')):
                         m.d.comb += [
                             UOPC(UOpCode.FENCE),
+                            uop.fu_type.eq(FUType.MEM),
+                            uop.uses_stq.eq(1),
                             uop.is_fence.eq(1),
                         ]
 

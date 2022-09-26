@@ -1,9 +1,11 @@
 #include "generated/platform.h"
 #include "mmio.h"
 
+#include <stdio.h>
 #include <stdarg.h>
 
-#define UART_SR_TXEMPTY 1
+#define UART_SR_TXEMPTY (1 << 0)
+#define UART_SR_TXBUSY  (1 << 2)
 
 int vsprintf(char* buf, const char* fmt, va_list args);
 
@@ -15,10 +17,12 @@ void serial_putc(char c)
 
     mmio_write32((void*)UART_DATA_ADDRESS, (unsigned int)c);
 
+    __asm__ __volatile__ ("fence o,io" : : : "memory");
+
     for (;;) {
         status = mmio_read32((void*)UART_STATUS_ADDRESS);
 
-        if (status & UART_SR_TXEMPTY) break;
+        if (!(status & UART_SR_TXBUSY)) break;
     }
 }
 
@@ -37,7 +41,7 @@ int serial_printf(const char* fmt, ...)
     va_list arg;
 
     va_start(arg, fmt);
-    i = vsprintf(buf, fmt, arg);
+    i = vsnprintf(buf, sizeof(buf), fmt, arg);
     serial_puts(buf);
 
     va_end(arg);
