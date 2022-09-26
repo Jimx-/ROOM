@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth import tracer
 
 from room.consts import *
 from room.types import MicroOp
@@ -6,18 +7,19 @@ from room.types import MicroOp
 
 class BranchResolution:
 
-    def __init__(self, params, name=None):
-        name = (name is not None) and f'{name}_' or ''
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.valid = Signal(name=f'{name}valid')
-        self.uop = MicroOp(params, name=f'{name}uop')
-        self.mispredict = Signal(name=f'{name}mispredict')
-        self.cfi_type = Signal(CFIType, name=f'{name}cfi_type')
-        self.taken = Signal(name=f'{name}taken')
-        self.pc_sel = Signal(PCSel, name=f'{name}pc_sel')
-        self.target_offset = Signal(signed(32), name=f'{name}target_offset')
+        self.valid = Signal(name=f'{name}_valid')
+        self.uop = MicroOp(params, name=f'{name}_uop')
+        self.mispredict = Signal(name=f'{name}_mispredict')
+        self.cfi_type = Signal(CFIType, name=f'{name}_cfi_type')
+        self.taken = Signal(name=f'{name}_taken')
+        self.pc_sel = Signal(PCSel, name=f'{name}_pc_sel')
+        self.target_offset = Signal(signed(32), name=f'{name}_target_offset')
         self.jalr_target = Signal(params['vaddr_bits_extended'],
-                                  name=f'{name}jalr_target')
+                                  name=f'{name}_jalr_target')
 
     def eq(self, rhs):
         names = [
@@ -35,17 +37,19 @@ class BranchResolution:
 
 class BranchUpdate:
 
-    def __init__(self, params, name=None):
-        max_br_count = params['max_br_count']
-        name = (name is not None) and f'{name}_' or ''
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.resolve_mask = Signal(max_br_count, name=f'{name}resolve_mask')
+        max_br_count = params['max_br_count']
+
+        self.resolve_mask = Signal(max_br_count, name=f'{name}_resolve_mask')
         self.mispredict_mask = Signal(max_br_count,
-                                      name=f'{name}mispredict_mask')
+                                      name=f'{name}_mispredict_mask')
 
         ###
 
-        self.br_res = BranchResolution(params, name=f'{name}resolution')
+        self.br_res = BranchResolution(params, name=f'{name}_resolution')
 
     def eq(self, rhs):
         names = ['resolve_mask', 'mispredict_mask', 'br_res']

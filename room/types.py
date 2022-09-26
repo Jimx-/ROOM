@@ -7,7 +7,7 @@ class MicroOp(Record):
 
     ID_WIDTH = 10
 
-    def __init__(self, params, name=None):
+    def __init__(self, params, name=None, src_loc_at=0):
         W = lambda x: Shape.cast(x).width
         xlen = params['xlen']
         core_width = params['core_width']
@@ -43,7 +43,8 @@ class MicroOp(Record):
              ('exc_cause', xlen), ('ldst', 5), ('lrs1', 5), ('lrs2', 5),
              ('lrs3', 5), ('ldst_valid', 1), ('dst_rtype', W(RegisterType)),
              ('lrs1_rtype', W(RegisterType)), ('lrs2_rtype', W(RegisterType))],
-            name=name)
+            name=name,
+            src_loc_at=src_loc_at + 1)
 
     def allocate_brtag(self):
         return self.is_jalr | self.is_br

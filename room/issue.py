@@ -9,12 +9,13 @@ from room.branch import BranchUpdate
 
 class IssueQueueWakeup(Record):
 
-    def __init__(self, num_pregs, name=None):
+    def __init__(self, num_pregs, name=None, src_loc_at=0):
         self.num_pregs = num_pregs
 
         super().__init__([('valid', 1), ('pdst', range(num_pregs)),
                           ('poisoned', 1)],
-                         name=name)
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class IssueSlot(Elaboratable):

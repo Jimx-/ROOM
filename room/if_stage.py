@@ -1,6 +1,6 @@
 from amaranth import *
+from amaranth import tracer
 from amaranth.lib.coding import PriorityEncoder
-from amaranth.lib.fifo import SyncFIFO
 
 from room.consts import *
 from room.rvc import RVCDecoder
@@ -12,14 +12,15 @@ from room.icache import ICache
 
 class GetPCResp(Record):
 
-    def __init__(self, name=None):
+    def __init__(self, name=None, src_loc_at=0):
         super().__init__([
             ('pc', 32),
             ('commit_pc', 32),
             ('next_pc', 32),
             ('next_valid', 1),
         ],
-                         name=name)
+                         name=name,
+                         src_loc_at=src_loc_at + 1)
 
 
 class IFDebug(Record):
@@ -37,29 +38,31 @@ class IFDebug(Record):
 
 class FetchBundle:
 
-    def __init__(self, params, name=None):
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
         fetch_width = params['fetch_width']
         ftq_size = params['fetch_buffer_size']
-        name = (name is not None) and f'{name}_' or ''
 
-        self.pc = Signal(32, name=f'{name}pc')
-        self.next_pc = Signal(32, name=f'{name}next_pc')
+        self.pc = Signal(32, name=f'{name}_pc')
+        self.next_pc = Signal(32, name=f'{name}_next_pc')
         self.insts = [
-            Signal(32, name=f'{name}inst{i}') for i in range(fetch_width)
+            Signal(32, name=f'{name}_inst{i}') for i in range(fetch_width)
         ]
         self.exp_insts = [
-            Signal(32, name=f'{name}exp_inst{i}') for i in range(fetch_width)
+            Signal(32, name=f'{name}_exp_inst{i}') for i in range(fetch_width)
         ]
         self.mask = Signal(fetch_width)
 
-        self.cfi_valid = Signal(name=f'{name}cfi_valid')
-        self.cfi_idx = Signal(range(fetch_width), name=f'{name}cfi_idx')
-        self.cfi_type = Signal(CFIType, name=f'{name}cfi_type')
+        self.cfi_valid = Signal(name=f'{name}_cfi_valid')
+        self.cfi_idx = Signal(range(fetch_width), name=f'{name}_cfi_idx')
+        self.cfi_type = Signal(CFIType, name=f'{name}_cfi_type')
 
-        self.ftq_idx = Signal(range(ftq_size), name=f'{name}ftq_size')
+        self.ftq_idx = Signal(range(ftq_size), name=f'{name}_ftq_size')
 
-        self.bp_exc_if = Signal(fetch_width, name=f'{name}bp_exc_if')
-        self.bp_debug_if = Signal(fetch_width, name=f'{name}bp_debug_if')
+        self.bp_exc_if = Signal(fetch_width, name=f'{name}_bp_exc_if')
+        self.bp_debug_if = Signal(fetch_width, name=f'{name}_bp_debug_if')
 
     def eq(self, rhs):
         ret = [

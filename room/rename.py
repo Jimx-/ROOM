@@ -10,34 +10,37 @@ from room.issue import IssueQueueWakeup
 
 class MapReq(Record):
 
-    def __init__(self, num_lregs, name=None):
+    def __init__(self, num_lregs, name=None, src_loc_at=0):
         super().__init__([
             ('lrs1', range(num_lregs)),
             ('lrs2', range(num_lregs)),
             ('lrs3', range(num_lregs)),
             ('ldst', range(num_lregs)),
         ],
-                         name=name)
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class MapResp(Record):
 
-    def __init__(self, num_pregs, name=None):
+    def __init__(self, num_pregs, name=None, src_loc_at=0):
         super().__init__([
             ('prs1', range(num_pregs)),
             ('prs2', range(num_pregs)),
             ('prs3', range(num_pregs)),
             ('stale_pdst', range(num_pregs)),
         ],
-                         name=name)
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class RemapReq(Record):
 
-    def __init__(self, num_lregs, num_pregs, name=None):
+    def __init__(self, num_lregs, num_pregs, name=None, src_loc_at=0):
         super().__init__([('ldst', range(num_lregs)),
                           ('pdst', range(num_pregs)), ('valid', 1)],
-                         name=name)
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class MapTable(Elaboratable):
@@ -249,13 +252,14 @@ class Freelist(Elaboratable):
 
 class BusyResp(Record):
 
-    def __init__(self, name=None):
+    def __init__(self, name=None, src_loc_at=0):
         super().__init__([
             ('prs1_busy', 1),
             ('prs2_busy', 1),
             ('prs3_busy', 1),
         ],
-                         name=name)
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class BusyTable(Elaboratable):

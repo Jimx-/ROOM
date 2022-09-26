@@ -1,4 +1,6 @@
 from amaranth import *
+from amaranth import tracer
+
 from enum import IntEnum
 
 from room.consts import *
@@ -32,23 +34,20 @@ def _decr(signal, modulo):
 
 class CommitReq:
 
-    def __init__(self, params, name=None):
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
         core_width = params['core_width']
 
-        self.valids = Signal(core_width,
-                             name=(name is not None) and f'{name}_valids'
-                             or None)
+        self.valids = Signal(core_width, name=f'{name}_valids')
         self.uops = [
-            MicroOp(params,
-                    name=(name is not None) and f'{name}_uop{i}' or None)
-            for i in range(core_width)
+            MicroOp(params, name=f'{name}_uop{i}') for i in range(core_width)
         ]
 
-        self.rollback = Signal(
-            name=(name is not None) and f'{name}_rollback' or None)
-        self.rollback_valids = Signal(
-            core_width,
-            name=(name is not None) and f'{name}_rollback_valids' or None)
+        self.rollback = Signal(name=f'{name}_rollback')
+        self.rollback_valids = Signal(core_width,
+                                      name=f'{name}_rollback_valids')
 
     def eq(self, rhs):
         return [
@@ -62,7 +61,7 @@ class CommitReq:
 
 class CommitExceptionReq(Record):
 
-    def __init__(self, params, name=None):
+    def __init__(self, params, name=None, src_loc_at=0):
         self.xlen = params['xlen']
 
         _uop = MicroOp(params)
@@ -75,23 +74,23 @@ class CommitExceptionReq(Record):
             ('cause', self.xlen),
             ('flush_type', Shape.cast(FlushType).width),
         ],
-                         name=name)
+                         name=name,
+                         src_loc_at=src_loc_at + 1)
 
 
 class Exception:
 
-    def __init__(self, params, name=None):
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
         xlen = params['xlen']
 
-        self.valid = Signal(
-            name=(name is not None) and f'{name}_valid' or None)
+        self.valid = Signal(name=f'{name}_valid')
 
-        self.uop = MicroOp(params,
-                           name=(name is not None) and f'{name}_uop' or None)
+        self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.cause = Signal(xlen,
-                            name=(name is not None) and f'{name}_cause'
-                            or None)
+        self.cause = Signal(xlen, name=f'{name}_cause')
 
     def eq(self, rhs):
         return [

@@ -9,25 +9,27 @@ from room.branch import BranchUpdate
 
 class RFReadPort(Record):
 
-    def __init__(self, addr_width, data_width, name=None):
+    def __init__(self, addr_width, data_width, name=None, src_loc_at=0):
         self.addr_width = addr_width
         self.data_width = data_width
 
         super().__init__([('addr', addr_width, DIR_FANOUT),
                           ('data', data_width, DIR_FANIN)],
-                         name=name)
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class RFWritePort(Record):
 
-    def __init__(self, addr_width, data_width, name=None):
+    def __init__(self, addr_width, data_width, name=None, src_loc_at=0):
         self.addr_width = addr_width
         self.data_width = data_width
 
         super().__init__([('addr', addr_width, DIR_FANIN),
                           ('data', data_width, DIR_FANIN),
                           ('valid', 1, DIR_FANIN)],
-                         name=name)
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class RegisterFile(Elaboratable):

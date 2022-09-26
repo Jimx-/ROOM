@@ -23,12 +23,13 @@ class IDDebug(Record):
 
 class BranchSignals(Record):
 
-    def __init__(self, vaddr_bits, name=None):
+    def __init__(self, vaddr_bits, name=None, src_loc_at=0):
         super().__init__([
             ('cfi_type', Shape.cast(CFIType).width),
             ('target', vaddr_bits),
         ],
-                         name=name)
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class BranchDecoder(Elaboratable):

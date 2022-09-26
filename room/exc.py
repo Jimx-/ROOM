@@ -10,10 +10,11 @@ from room.csr import *
 
 class CoreInterrupts(Record):
 
-    def __init__(self, name=None):
+    def __init__(self, name=None, src_loc_at=0):
         super().__init__([('debug', 1), ('mtip', 1), ('msip', 1), ('meip', 1),
                           ('seip', 1)],
-                         name=name)
+                         name=name,
+                         src_loc_at=src_loc_at + 1)
 
 
 class Cause(IntEnum):

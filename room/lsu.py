@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth import tracer
 from amaranth.utils import log2_int
 
 from room.consts import *
@@ -67,27 +68,29 @@ class RRPriorityEncoder(Elaboratable):
 
 class DCacheReq:
 
-    def __init__(self, params, name=None):
-        name = (name is not None) and f'{name}_' or ''
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.valid = Signal(name=f'{name}valid')
-        self.uop = MicroOp(params, name=f'{name}uop')
-        self.kill = Signal(name=f'{name}kill')
+        self.valid = Signal(name=f'{name}_valid')
+        self.uop = MicroOp(params, name=f'{name}_uop')
+        self.kill = Signal(name=f'{name}_kill')
 
-        self.addr = Signal(32, name=f'{name}addr')
-        self.data = Signal(params['xlen'], name=f'{name}data')
+        self.addr = Signal(32, name=f'{name}_addr')
+        self.data = Signal(params['xlen'], name=f'{name}_data')
 
-        self.ready = Signal(name=f'{name}ready')
+        self.ready = Signal(name=f'{name}_ready')
 
 
 class DCacheResp:
 
-    def __init__(self, params, name=None):
-        name = (name is not None) and f'{name}_' or ''
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.valid = Signal(name=f'{name}valid')
-        self.uop = MicroOp(params, name=f'{name}uop')
-        self.data = Signal(params['xlen'], name=f'{name}data')
+        self.valid = Signal(name=f'{name}_valid')
+        self.uop = MicroOp(params, name=f'{name}_uop')
+        self.data = Signal(params['xlen'], name=f'{name}_data')
 
 
 class StoreGen(Elaboratable):
@@ -293,26 +296,29 @@ class DataCache(Elaboratable):
 
 class LDQEntry:
 
-    def __init__(self, params, name=None):
-        name = (name is not None) and f'{name}_' or ''
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
         stq_size = params['stq_size']
 
-        self.valid = Signal(name=f'{name}valid')
-        self.uop = MicroOp(params, name=f'{name}uop')
+        self.valid = Signal(name=f'{name}_valid')
+        self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.addr = Signal(params['vaddr_bits_extended'], name=f'{name}addr')
-        self.addr_valid = Signal(name=f'{name}addr_valid')
+        self.addr = Signal(params['vaddr_bits_extended'], name=f'{name}_addr')
+        self.addr_valid = Signal(name=f'{name}_addr_valid')
 
-        self.executed = Signal(name=f'{name}executed')
-        self.succeeded = Signal(name=f'{name}succeeded')
-        self.order_fail = Signal(name=f'{name}order_fail')
+        self.executed = Signal(name=f'{name}_executed')
+        self.succeeded = Signal(name=f'{name}_succeeded')
+        self.order_fail = Signal(name=f'{name}_order_fail')
 
-        self.st_dep_mask = Signal(stq_size, name=f'{name}st_dep_mask')
-        self.next_stq_idx = Signal(range(stq_size), name=f'{name}next_stq_idx')
+        self.st_dep_mask = Signal(stq_size, name=f'{name}_st_dep_mask')
+        self.next_stq_idx = Signal(range(stq_size),
+                                   name=f'{name}_next_stq_idx')
 
-        self.forwarded = Signal(name=f'{name}forwarded')
+        self.forwarded = Signal(name=f'{name}_forwarded')
         self.forward_stq_idx = Signal(range(stq_size),
-                                      name=f'{name}forward_stq_idx')
+                                      name=f'{name}_forward_stq_idx')
 
     def eq(self, rhs):
         attrs = [
@@ -329,19 +335,20 @@ class LDQEntry:
 
 class STQEntry:
 
-    def __init__(self, params, name=None):
-        name = (name is not None) and f'{name}_' or ''
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.valid = Signal(name=f'{name}valid')
-        self.uop = MicroOp(params, name=f'{name}uop')
+        self.valid = Signal(name=f'{name}_valid')
+        self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.addr = Signal(params['vaddr_bits_extended'], name=f'{name}addr')
-        self.addr_valid = Signal(name=f'{name}addr_valid')
-        self.data = Signal(params['xlen'], name=f'{name}data')
-        self.data_valid = Signal(name=f'{name}data_valid')
+        self.addr = Signal(params['vaddr_bits_extended'], name=f'{name}_addr')
+        self.addr_valid = Signal(name=f'{name}_addr_valid')
+        self.data = Signal(params['xlen'], name=f'{name}_data')
+        self.data_valid = Signal(name=f'{name}_data_valid')
 
-        self.committed = Signal(name=f'{name}committed')
-        self.succeeded = Signal(name=f'{name}succeeded')
+        self.committed = Signal(name=f'{name}_committed')
+        self.succeeded = Signal(name=f'{name}_succeeded')
 
     def eq(self, rhs):
         attrs = [

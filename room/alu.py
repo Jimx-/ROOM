@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth import tracer
 from enum import IntEnum
 
 from room.consts import *
@@ -9,19 +10,21 @@ from room.branch import BranchResolution, BranchUpdate
 
 class ExecReq:
 
-    def __init__(self, params, name=None):
-        name = (name is not None) and f'{name}_' or ''
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
         self.xlen = params['xlen']
 
-        self.uop = MicroOp(params, name=f'{name}uop')
-        self.valid = Signal(name=f'{name}valid')
+        self.uop = MicroOp(params, name=f'{name}_uop')
+        self.valid = Signal(name=f'{name}_valid')
 
-        self.rs1_data = Signal(self.xlen, name=f'{name}rs1_data')
-        self.rs2_data = Signal(self.xlen, name=f'{name}rs2_data')
+        self.rs1_data = Signal(self.xlen, name=f'{name}_rs1_data')
+        self.rs2_data = Signal(self.xlen, name=f'{name}_rs2_data')
 
-        self.kill = Signal(name=f'{name}kill')
+        self.kill = Signal(name=f'{name}_kill')
 
-        self.ready = Signal(name=f'{name}ready')
+        self.ready = Signal(name=f'{name}_ready')
 
     def eq(self, rhs):
         attrs = ['uop', 'valid', 'rs1_data', 'rs2_data', 'kill']
@@ -30,18 +33,20 @@ class ExecReq:
 
 class ExecResp:
 
-    def __init__(self, params, name=None):
-        name = (name is not None) and f'{name}_' or ''
+    def __init__(self, params, name=None, src_loc_at=0):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
         self.xlen = params['xlen']
         self.vaddr_bits = params['vaddr_bits']
 
-        self.uop = MicroOp(params, name=f'{name}uop')
-        self.valid = Signal(name=f'{name}valid')
+        self.uop = MicroOp(params, name=f'{name}_uop')
+        self.valid = Signal(name=f'{name}_valid')
 
-        self.data = Signal(self.xlen, name=f'{name}data')
-        self.addr = Signal(self.vaddr_bits + 1, name=f'{name}addr')
+        self.data = Signal(self.xlen, name=f'{name}_data')
+        self.addr = Signal(self.vaddr_bits + 1, name=f'{name}_addr')
 
-        self.ready = Signal(name=f'{name}ready')
+        self.ready = Signal(name=f'{name}_ready')
 
     def eq(self, rhs):
         attrs = ['uop', 'valid', 'addr', 'data']
