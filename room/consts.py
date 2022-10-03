@@ -243,3 +243,11 @@ class CSRCommand(IntEnum):
     W = 5
     S = 6
     C = 7
+
+
+class RoundingMode(IntEnum):
+    RNE = 0
+    RTZ = 1
+    RDN = 2
+    RUP = 3
+    RMM = 4
