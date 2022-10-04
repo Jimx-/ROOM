@@ -348,7 +348,6 @@ class RegisterRead(Elaboratable):
 
     def __init__(self, issue_width, num_rports, rports_array, reg_width,
                  params):
-        num_regs = params['num_pregs']
         self.issue_width = issue_width
         self.params = params
         self.rports_array = rports_array
@@ -360,7 +359,7 @@ class RegisterRead(Elaboratable):
         self.iss_valids = Signal(issue_width)
 
         self.read_ports = [
-            RFReadPort(Shape.cast(range(num_regs)).width,
+            RFReadPort(Shape.cast(range(params['num_pregs'])).width,
                        self.data_width,
                        name=f'read_port{i}') for i in range(num_rports)
         ]

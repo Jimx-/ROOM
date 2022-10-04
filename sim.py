@@ -38,7 +38,8 @@ core_params = dict(
     fetch_width=4,
     fetch_buffer_size=16,
     core_width=4,
-    num_pregs=96,
+    num_int_pregs=96,
+    num_fp_pregs=64,
     num_rob_rows=16,
     max_br_count=4,
     ldq_size=16,
@@ -57,6 +58,8 @@ core_params = dict(
         n_ways=4,
         block_bytes=64,
     ),
+    use_fpu=True,
+    flen=64,
 )
 
 
@@ -319,7 +322,7 @@ if __name__ == "__main__":
 
     f = open('trace.log', 'w')
 
-    sim.add_sync_process(process_sim_debug(cycles=10000, log_file=f))
+    sim.add_sync_process(process_sim_debug(cycles=100, log_file=f))
     # sim.add_sync_process(process)
     sim.add_sync_process(process_debug, domain='debug')
     with sim.write_vcd('room.vcd'):

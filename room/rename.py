@@ -5,7 +5,7 @@ from room.consts import *
 from room.types import MicroOp
 from room.branch import BranchUpdate
 from room.rob import CommitReq
-from room.issue import IssueQueueWakeup
+from room.alu import ExecResp
 
 
 class MapReq(Record):
@@ -45,11 +45,13 @@ class RemapReq(Record):
 
 class MapTable(Elaboratable):
 
-    def __init__(self, core_width, num_lregs, num_pregs, max_br_count, params):
+    def __init__(self, core_width, num_lregs, num_pregs, max_br_count,
+                 is_float, params):
         self.core_width = core_width
         self.num_lregs = num_lregs
         self.num_pregs = num_pregs
         self.max_br_count = max_br_count
+        self.is_float = is_float
 
         self.map_reqs = [
             MapReq(num_lregs, name=f'map_req{i}') for i in range(core_width)
@@ -90,7 +92,7 @@ class MapTable(Elaboratable):
         for ldst in range(self.num_lregs):
             m.d.comb += remap_table[0][ldst].eq(map_table[ldst])
 
-            if ldst == 0:
+            if ldst == 0 and not self.is_float:
                 for pl in range(self.core_width):
                     m.d.comb += remap_table[pl + 1][ldst].eq(0)
             else:
@@ -118,9 +120,11 @@ class MapTable(Elaboratable):
             m.d.comb += [
                 resp.prs1.eq(map_table[req.lrs1]),
                 resp.prs2.eq(map_table[req.lrs2]),
-                resp.prs3.eq(map_table[req.lrs3]),
                 resp.stale_pdst.eq(map_table[req.ldst]),
             ]
+
+            if self.is_float:
+                m.d.comb += resp.prs3.eq(map_table[req.lrs3])
 
         return m
 
@@ -264,9 +268,10 @@ class BusyResp(Record):
 
 class BusyTable(Elaboratable):
 
-    def __init__(self, num_wakeup_ports, params):
+    def __init__(self, num_pregs, num_wakeup_ports, is_float, params):
         self.core_width = params['core_width']
-        self.num_pregs = params['num_pregs']
+        self.num_pregs = num_pregs
+        self.is_float = is_float
 
         self.ren_uops = [
             MicroOp(params, name=f'busy_uop{i}')
@@ -317,20 +322,23 @@ class BusyTable(Elaboratable):
             m.d.comb += [
                 resp.prs1_busy.eq(busy_table[uop.prs1]),
                 resp.prs2_busy.eq(busy_table[uop.prs2]),
-                resp.prs3_busy.eq(busy_table[uop.prs3]),
             ]
+
+            if self.is_float:
+                m.d.comb += resp.prs3_busy.eq(busy_table[uop.prs3])
 
         return m
 
 
 class RenameStage(Elaboratable):
 
-    def __init__(self, num_wakeup_ports, params):
+    def __init__(self, num_pregs, num_wakeup_ports, is_float, params):
         self.params = params
         self.core_width = params['core_width']
         self.max_br_count = params['max_br_count']
-        self.num_pregs = params['num_pregs']
+        self.num_pregs = num_pregs
         self.num_wakeup_ports = num_wakeup_ports
+        self.is_float = is_float
 
         self.kill = Signal()
 
@@ -349,7 +357,7 @@ class RenameStage(Elaboratable):
         self.ren2_mask = Signal(self.core_width)
 
         self.wakeup_ports = [
-            IssueQueueWakeup(self.num_pregs, name=f'wakeup_port{i}')
+            ExecResp(self.params, name=f'wakeup_port{i}')
             for i in range(self.num_wakeup_ports)
         ]
 
@@ -366,10 +374,14 @@ class RenameStage(Elaboratable):
 
         bypass_rs1 = [Signal(range(self.num_pregs)) for _ in range(w + 1)]
         bypass_rs2 = [Signal(range(self.num_pregs)) for _ in range(w + 1)]
+        bypass_rs3 = [Signal(range(self.num_pregs)) for _ in range(w + 1)]
         bypass_dst = [Signal(range(self.num_pregs)) for _ in range(w + 1)]
 
         m.d.comb += [
-            bypass_rs1[0].eq(0), bypass_rs2[0].eq(0), bypass_dst[0].eq(0)
+            bypass_rs1[0].eq(0),
+            bypass_rs2[0].eq(0),
+            bypass_rs3[0].eq(0),
+            bypass_dst[0].eq(0),
         ]
 
         for i in range(w):
@@ -380,6 +392,9 @@ class RenameStage(Elaboratable):
                 bypass_rs2[i + 1].eq(
                     Mux((uop.lrs2 == older_uops[i].ldst) & alloc_reqs[i],
                         older_uops[i].pdst, bypass_rs2[i])),
+                bypass_rs3[i + 1].eq(
+                    Mux((uop.lrs3 == older_uops[i].ldst) & alloc_reqs[i],
+                        older_uops[i].pdst, bypass_rs3[i])),
                 bypass_dst[i + 1].eq(
                     Mux((uop.ldst == older_uops[i].ldst) & alloc_reqs[i],
                         older_uops[i].pdst, bypass_dst[i]))
@@ -390,16 +405,24 @@ class RenameStage(Elaboratable):
                                    uop.prs1)),
             bypass_uop.prs2.eq(Mux(bypass_rs2[w] != 0, bypass_rs2[w],
                                    uop.prs2)),
+            bypass_uop.prs3.eq(Mux(bypass_rs3[w] != 0, bypass_rs3[w],
+                                   uop.prs3)),
             bypass_uop.stale_pdst.eq(
                 Mux(bypass_dst[w] != 0, bypass_dst[w], uop.stale_pdst)),
             bypass_uop.prs1_busy.eq(Mux(bypass_rs1[w] != 0, 1, uop.prs1_busy)),
             bypass_uop.prs2_busy.eq(Mux(bypass_rs2[w] != 0, 1, uop.prs2_busy)),
         ]
 
+        if self.is_float:
+            m.d.comb += bypass_uop.prs3_busy.eq(
+                Mux(bypass_rs3[w] != 0, 1, uop.prs3_busy))
+
         return bypass_uop
 
     def elaborate(self, platform):
         m = Module()
+
+        rtype = RegisterType.FLT if self.is_float else RegisterType.FIX
 
         ren1_fire = Signal(self.core_width)
         ren1_uops = [
@@ -468,13 +491,14 @@ class RenameStage(Elaboratable):
         map_table = m.submodules.map_table = MapTable(self.core_width, 32,
                                                       self.num_pregs,
                                                       self.max_br_count,
+                                                      self.is_float,
                                                       self.params)
         freelist = m.submodules.freelist = Freelist(self.core_width,
                                                     self.num_pregs,
                                                     self.max_br_count,
                                                     self.params)
         busy_table = m.submodules.busy_table = BusyTable(
-            self.num_wakeup_ports, self.params)
+            self.num_pregs, self.num_wakeup_ports, self.is_float, self.params)
 
         commit_valids = Signal(self.core_width)
         rollback_valids = Signal(self.core_width)
@@ -484,9 +508,9 @@ class RenameStage(Elaboratable):
                                           self.commit.rollback_valids):
             m.d.comb += [
                 cv.eq(cuop.ldst_valid
-                      & (cuop.dst_rtype == RegisterType.FIX) & ccv),
+                      & (cuop.dst_rtype == rtype) & ccv),
                 rv.eq(cuop.ldst_valid
-                      & (cuop.dst_rtype == RegisterType.FIX) & crv),
+                      & (cuop.dst_rtype == rtype) & crv),
             ]
 
         #
@@ -532,7 +556,7 @@ class RenameStage(Elaboratable):
 
         for uop, fire, req in zip(ren2_uops, ren2_fire, ren2_alloc_reqs):
             m.d.comb += req.eq(uop.ldst_valid
-                               & (uop.dst_rtype == RegisterType.FIX) & fire)
+                               & (uop.dst_rtype == rtype) & fire)
 
         for uop, preg in zip(ren2_uops, freelist.alloc_pregs):
             m.d.comb += uop.pdst.eq(Mux(uop.ldst != 0, preg, 0))
@@ -563,17 +587,18 @@ class RenameStage(Elaboratable):
                                                 busy_table.busy_resps):
             m.d.comb += [
                 busy_uop.eq(ren_uop),
-                ren_uop.prs1_busy.eq((ren_uop.lrs1_rtype == RegisterType.FIX)
+                ren_uop.prs1_busy.eq((ren_uop.lrs1_rtype == rtype)
                                      & busy_resp.prs1_busy),
-                ren_uop.prs2_busy.eq((ren_uop.lrs2_rtype == RegisterType.FIX)
+                ren_uop.prs2_busy.eq((ren_uop.lrs2_rtype == rtype)
                                      & busy_resp.prs2_busy),
+                ren_uop.prs3_busy.eq(ren_uop.frs3_en & busy_resp.prs2_busy),
             ]
         for busy_req, fl_req in zip(busy_table.busy_reqs, ren2_alloc_reqs):
             m.d.comb += busy_req.eq(fl_req)
 
         for wb_v, wb_pdst, wu in zip(busy_table.wb_valids, busy_table.wb_pdst,
                                      self.wakeup_ports):
-            m.d.comb += [wb_v.eq(wu.valid), wb_pdst.eq(wu.pdst)]
+            m.d.comb += [wb_v.eq(wu.valid), wb_pdst.eq(wu.uop.pdst)]
 
         for i in range(self.core_width):
             if i == 0:
@@ -587,7 +612,7 @@ class RenameStage(Elaboratable):
                 self.ren2_uops[i].eq(bypass_uop),
                 self.ren2_uops[i].br_mask.eq(
                     self.br_update.get_new_br_mask(bypass_uop.br_mask)),
-                self.stalls.eq((ren2_uops[i].dst_rtype == RegisterType.FIX)
+                self.stalls.eq((ren2_uops[i].dst_rtype == rtype)
                                & ~freelist.alloc_valids[i]),
             ]
 

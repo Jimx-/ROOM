@@ -34,7 +34,8 @@ core_params = dict(
     fetch_width=4,
     fetch_buffer_size=16,
     core_width=2,
-    num_pregs=96,
+    num_int_pregs=96,
+    num_fp_pregs=64,
     num_rob_rows=16,
     max_br_count=4,
     ldq_size=16,
@@ -53,6 +54,8 @@ core_params = dict(
         n_ways=4,
         block_bytes=64,
     ),
+    use_fpu=True,
+    flen=64,
 )
 
 

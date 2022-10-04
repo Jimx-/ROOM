@@ -72,6 +72,7 @@ class DecodeUnit(Elaboratable):
 
     def __init__(self, params):
         self.xlen = params['xlen']
+        self.use_fpu = params['use_fpu']
 
         self.in_uop = MicroOp(params)
         self.out_uop = MicroOp(params)
@@ -117,6 +118,11 @@ class DecodeUnit(Elaboratable):
         IMM_SEL_U = imm_sel.eq(ImmSel.U)
 
         with m.Switch(inuop.inst[0:7]):
+
+            #
+            # Jump
+            #
+
             with m.Case(OPV('JAL')):
                 m.d.comb += [
                     UOPC(UOpCode.JAL),
@@ -162,6 +168,10 @@ class DecodeUnit(Elaboratable):
                     with m.Case(F3('BLTU')):
                         m.d.comb += UOPC(UOpCode.BLTU)
 
+            #
+            # Store
+            #
+
             with m.Case(OPV('SW')):
                 m.d.comb += [
                     UOPC(UOpCode.STA),
@@ -174,6 +184,10 @@ class DecodeUnit(Elaboratable):
                     uop.mem_cmd.eq(MemoryCommand.WRITE),
                     uop.mem_size.eq(inuop.inst[12:14]),
                 ]
+
+            #
+            # Load
+            #
 
             with m.Case(OPV('LW')):
                 m.d.comb += [
@@ -207,7 +221,10 @@ class DecodeUnit(Elaboratable):
                     IMM_SEL_U,
                 ]
 
+            #
             # Register-immediate
+            #
+
             with m.Case(OPV('ADDI')):
                 m.d.comb += [
                     uop.iq_type.eq(IssueQueueType.INT),
@@ -279,7 +296,10 @@ class DecodeUnit(Elaboratable):
                                 with m.Default():
                                     m.d.comb += ILL_INSN
 
+            #
             # Register-register
+            #
+
             with m.Case(OPV('ADD')):
                 m.d.comb += [
                     uop.iq_type.eq(IssueQueueType.INT),
@@ -348,7 +368,10 @@ class DecodeUnit(Elaboratable):
                                 uop.fu_type.eq(FUType.DIV),
                             ]
 
+            #
             # System
+            #
+
             with m.Case(OPV('EBREAK')):
                 m.d.comb += [
                     uop.clear_pipeline.eq(1),
@@ -416,7 +439,11 @@ class DecodeUnit(Elaboratable):
                                     UOPC(getattr(UOpCode, name)),
                                     uop.lrs1_rtype.eq(RegisterType.FIX),
                                 ]
+
+            #
             # Fence
+            #
+
             with m.Case(OPV('FENCE')):
                 m.d.comb += [
                     uop.iq_type.eq(IssueQueueType.INT),
@@ -436,6 +463,64 @@ class DecodeUnit(Elaboratable):
                             UOPC(UOpCode.FENCEI),
                             uop.is_fencei.eq(1),
                         ]
+
+            #
+            # Floating-point unit
+            #
+
+            if self.use_fpu:
+                #
+                # FSW/FSD
+                #
+
+                with m.Case(0b0100111):
+                    m.d.comb += [
+                        uop.fp_valid.eq(1),
+                        UOPC(UOpCode.STA),
+                        uop.iq_type.eq(IssueQueueType.MEM),
+                        uop.fu_type.eq(FUType.MEM),
+                        uop.lrs1_rtype.eq(RegisterType.FLT),
+                        uop.lrs2_rtype.eq(RegisterType.FIX),
+                        IMM_SEL_S,
+                        uop.uses_stq.eq(1),
+                        uop.mem_cmd.eq(MemoryCommand.WRITE),
+                        uop.mem_size.eq(inuop.inst[12:14]),
+                    ]
+
+                    with m.Switch(uop.mem_size):
+                        with m.Case(0b010):
+                            m.d.comb += uop.fp_single.eq(1)
+                        with m.Case(0b011):
+                            pass
+                        with m.Default():
+                            m.d.comb += ILL_INSN
+
+                #
+                # FLW/FLD
+                #
+
+                with m.Case(0b0000111):
+                    m.d.comb += [
+                        uop.fp_valid.eq(1),
+                        UOPC(UOpCode.LD),
+                        uop.iq_type.eq(IssueQueueType.MEM),
+                        uop.fu_type.eq(FUType.MEM),
+                        uop.dst_rtype.eq(RegisterType.FLT),
+                        uop.lrs1_rtype.eq(RegisterType.FIX),
+                        IMM_SEL_I,
+                        uop.uses_ldq.eq(1),
+                        uop.mem_cmd.eq(MemoryCommand.READ),
+                        uop.mem_size.eq(inuop.inst[12:14]),
+                        uop.mem_signed.eq(~inuop.inst[14]),
+                    ]
+
+                    with m.Switch(uop.mem_size):
+                        with m.Case(0b010):
+                            m.d.comb += uop.fp_single.eq(1)
+                        with m.Case(0b011):
+                            pass
+                        with m.Default():
+                            m.d.comb += ILL_INSN
 
             with m.Default():
                 m.d.comb += ILL_INSN

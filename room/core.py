@@ -157,12 +157,16 @@ class Core(Elaboratable):
         params['mem_width'] = params['issue_params'][
             IssueQueueType.MEM]['issue_width']
 
+        params['num_pregs'] = max(params['num_int_pregs'],
+                                  params['num_fp_pregs'])
+
         return params
 
     def elaborate(self, platform):
         m = Module()
 
         mem_width = self.params['mem_width']
+        use_fpu = self.params['use_fpu']
 
         csr = m.submodules.csr = CSRFile(width=self.xlen)
 
@@ -239,9 +243,22 @@ class Core(Elaboratable):
 
         num_int_iss_wakeup_ports = exec_units.irf_write_ports + mem_width
         num_int_ren_wakeup_ports = num_int_iss_wakeup_ports
+        num_fp_wakeup_ports = 4 if use_fpu else 0
 
         ren_stage = m.submodules.rename_stage = RenameStage(
-            num_int_ren_wakeup_ports, self.params)
+            num_pregs=self.params['num_int_pregs'],
+            num_wakeup_ports=num_int_ren_wakeup_ports,
+            is_float=False,
+            params=self.params)
+
+        fp_ren_stage = None
+        if use_fpu:
+            fp_ren_stage = m.submodules.fp_rename_stage = RenameStage(
+                num_pregs=self.params['num_fp_pregs'],
+                num_wakeup_ports=num_fp_wakeup_ports,
+                is_float=True,
+                params=self.params)
+
         for a, b in zip(ren_stage.dec_uops, dec_stage.uops):
             m.d.comb += a.eq(b)
         m.d.comb += [
@@ -270,14 +287,58 @@ class Core(Elaboratable):
             setattr(m.submodules, f'issue_unit_{str(typ).split(".")[-1]}', iq)
             issue_units[typ] = iq
 
-        dis_valids = ren_stage.ren2_mask
+        dis_valids = Signal.like(ren_stage.ren2_mask)
         dis_uops = [
             MicroOp(self.params, name=f'dis_uop{i}')
             for i in range(self.core_width)
         ]
+        ren_stalls = Signal.like(ren_stage.stalls)
 
+        m.d.comb += [
+            dis_valids.eq(ren_stage.ren2_mask),
+            ren_stalls.eq(ren_stage.stalls),
+        ]
         for dis_uop, ren2_uop in zip(dis_uops, ren_stage.ren2_uops):
             m.d.comb += dis_uop.eq(ren2_uop)
+
+        for w in range(self.core_width):
+            i_uop = ren_stage.ren2_uops[w]
+            f_uop = fp_ren_stage.ren2_uops[
+                w] if use_fpu else ren_stage.ren2_uops[w]
+
+            m.d.comb += [
+                dis_uops[w].prs1.eq(
+                    Mux(
+                        dis_uops[w].lrs1_rtype == RegisterType.FLT,
+                        f_uop.prs1,
+                        Mux(dis_uops[w].lrs1_rtype == RegisterType.FIX,
+                            i_uop.prs1, dis_uops[w].lrs1),
+                    )),
+                dis_uops[w].prs2.eq(
+                    Mux(dis_uops[w].lrs2_rtype == RegisterType.FLT, f_uop.prs2,
+                        i_uop.prs2)),
+                dis_uops[w].prs3.eq(f_uop.prs3),
+                dis_uops[w].pdst.eq(
+                    Mux(dis_uops[w].dst_rtype == RegisterType.FLT, f_uop.pdst,
+                        i_uop.pdst)),
+                dis_uops[w].stale_pdst.eq(
+                    Mux(dis_uops[w].dst_rtype == RegisterType.FLT,
+                        f_uop.stale_pdst, i_uop.stale_pdst)),
+                dis_uops[w].prs1_busy.eq((
+                    (dis_uops[w].lrs1_rtype == RegisterType.FIX)
+                    & i_uop.prs1_busy) | (
+                        (dis_uops[w].lrs1_rtype == RegisterType.FLT)
+                        & f_uop.prs1_busy)),
+                dis_uops[w].prs2_busy.eq((
+                    (dis_uops[w].lrs2_rtype == RegisterType.FIX)
+                    & i_uop.prs2_busy) | (
+                        (dis_uops[w].lrs2_rtype == RegisterType.FLT)
+                        & f_uop.prs2_busy)),
+                dis_uops[w].prs3_busy.eq(dis_uops[w].frs3_en
+                                         & f_uop.prs3_busy),
+                ren_stalls[w].eq(ren_stage.stalls[w]
+                                 | (fp_ren_stage.stalls[w] if use_fpu else 0)),
+            ]
 
         rob_ready = Signal()
         rob_empty = Signal()
@@ -299,7 +360,7 @@ class Core(Elaboratable):
                 dis_uops[w].clear_pipeline & (~rob_empty | dis_prior_valid[w]))
 
         dis_hazards = [(dis_valids[w] &
-                        (~rob_ready | ren_stage.stalls[w] |
+                        (~rob_ready | ren_stalls[w] |
                          (lsu.ldq_full[w] & dis_uops[w].uses_ldq) |
                          (lsu.stq_full[w] & dis_uops[w].uses_stq)
                          | ~dispatcher.ready[w] | wait_for_empty_pipeline[w]
@@ -314,11 +375,6 @@ class Core(Elaboratable):
             dis_fire.eq(dis_valids & ~dis_stalls),
             dis_ready.eq(~dis_stalls[-1]),
         ]
-
-        for w in range(self.core_width):
-            m.d.comb += dis_uops[w].prs1.eq(
-                Mux(ren_stage.ren2_uops[w].lrs1_rtype == RegisterType.FIX,
-                    ren_stage.ren2_uops[w].prs1, ren_stage.ren2_uops[w].lrs1))
 
         for w in range(self.core_width):
             m.d.comb += [
@@ -515,10 +571,7 @@ class Core(Elaboratable):
                 int_ren_wakeups.append(wakeup)
 
         for rwp, wu in zip(ren_stage.wakeup_ports, int_ren_wakeups):
-            m.d.comb += [
-                rwp.valid.eq(wu.valid),
-                rwp.pdst.eq(wu.uop.pdst),
-            ]
+            m.d.comb += rwp.eq(wu)
 
         for iu in issue_units.values():
             for iwp, wu in zip(iu.wakeup_ports, int_iss_wakeups):
@@ -550,7 +603,7 @@ class Core(Elaboratable):
         iregfile = m.submodules.iregfile = RegisterFile(
             rports=exec_units.irf_read_ports,
             wports=exec_units.irf_write_ports + mem_width,
-            num_regs=self.params['num_pregs'],
+            num_regs=self.params['num_int_pregs'],
             data_width=self.xlen)
 
         iregread = m.submodules.iregread = RegisterRead(
