@@ -52,6 +52,9 @@ core_params = dict(
         IssueQueueType.INT: dict(dispatch_width=4,
                                  num_entries=16,
                                  issue_width=4),
+        IssueQueueType.FP: dict(dispatch_width=4,
+                                num_entries=16,
+                                issue_width=2),
     },
     icache_params=dict(
         n_sets=64,
@@ -324,7 +327,7 @@ if __name__ == "__main__":
 
     sim.add_sync_process(process_sim_debug(cycles=100, log_file=f))
     # sim.add_sync_process(process)
-    sim.add_sync_process(process_debug, domain='debug')
+    # sim.add_sync_process(process_debug, domain='debug')
     with sim.write_vcd('room.vcd'):
         sim.run()
 

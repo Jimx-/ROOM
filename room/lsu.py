@@ -417,6 +417,11 @@ class LoadStoreUnit(Elaboratable):
             for i in range(self.mem_width)
         ]
 
+        self.exec_fresps = [
+            ExecResp(self.params, name=f'exec_fresp{i}')
+            for i in range(self.mem_width)
+        ]
+
         self.clear_busy_valids = Signal(self.mem_width)
         self.clear_busy_idx = [
             Signal(range(self.core_width * params['num_rob_rows']),
@@ -1050,16 +1055,22 @@ class LoadStoreUnit(Elaboratable):
                 with m.If(dcache.resps[w].uop.uses_ldq):
                     ldq_idx = dcache.resps[w].uop.ldq_idx
                     iresp = self.exec_iresps[w]
+                    fresp = self.exec_fresps[w]
 
                     m.d.comb += [
                         iresp.uop.eq(ldq[ldq_idx].uop),
+                        fresp.uop.eq(ldq[ldq_idx].uop),
                         iresp.valid.eq(
                             ldq[ldq_idx].uop.dst_rtype == RegisterType.FIX),
+                        fresp.valid.eq(
+                            ldq[ldq_idx].uop.dst_rtype == RegisterType.FLT),
                         iresp.data.eq(dcache.resps[w].data),
+                        fresp.data.eq(dcache.resps[w].data),
                         dmem_resp_fire[w].eq(1),
                     ]
 
-                    m.d.sync += ldq[ldq_idx].succeeded.eq(1)
+                    m.d.sync += ldq[ldq_idx].succeeded.eq(iresp.valid
+                                                          | fresp.valid)
                 with m.If(dcache.resps[w].uop.uses_stq):
                     stq_idx = dcache.resps[w].uop.stq_idx
                     m.d.comb += dmem_resp_fire[w].eq(1)

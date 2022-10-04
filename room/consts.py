@@ -138,6 +138,7 @@ class RegisterType(IntEnum):
 class IssueQueueType(IntEnum):
     INT = 1
     MEM = 2
+    FP = 3
 
 
 class BranchType(IntEnum):

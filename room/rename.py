@@ -559,7 +559,8 @@ class RenameStage(Elaboratable):
                                & (uop.dst_rtype == rtype) & fire)
 
         for uop, preg in zip(ren2_uops, freelist.alloc_pregs):
-            m.d.comb += uop.pdst.eq(Mux(uop.ldst != 0, preg, 0))
+            m.d.comb += uop.pdst.eq(
+                Mux((uop.ldst != 0) | self.is_float, preg, 0))
 
         for preg, uop, v, cv, rv in zip(freelist.dealloc_pregs,
                                         self.commit.uops,

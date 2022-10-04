@@ -18,6 +18,7 @@ from room.lsu import LoadStoreUnit, LSUDebug
 from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts
 from room.breakpoint import BreakpointUnit
+from room.fp_pipeline import FPPipeline
 
 from roomsoc.interconnect import wishbone
 
@@ -52,7 +53,6 @@ class CommitDebug(Record):
 class CoreDebug:
 
     def __init__(self, params):
-        xlen = params['xlen']
         fetch_width = params['fetch_width']
         core_width = params['fetch_width']
         max_br_count = params['max_br_count']
@@ -189,6 +189,13 @@ class Core(Elaboratable):
         m.d.comb += bp_unit.debug.eq(exc_unit.debug_mode)
 
         #
+        # Floating point pipeline
+        #
+
+        if use_fpu:
+            fp_pipeline = m.submodules.fp_pipeline = FPPipeline(self.params)
+
+        #
         # Instruction fetch
         #
 
@@ -243,7 +250,7 @@ class Core(Elaboratable):
 
         num_int_iss_wakeup_ports = exec_units.irf_write_ports + mem_width
         num_int_ren_wakeup_ports = num_int_iss_wakeup_ports
-        num_fp_wakeup_ports = 4 if use_fpu else 0
+        num_fp_wakeup_ports = len(fp_pipeline.wakeups) if use_fpu else 0
 
         ren_stage = m.submodules.rename_stage = RenameStage(
             num_pregs=self.params['num_int_pregs'],
@@ -269,6 +276,17 @@ class Core(Elaboratable):
             ren_stage.br_update.eq(br_update),
         ]
 
+        if use_fpu:
+            for a, b in zip(fp_ren_stage.dec_uops, dec_stage.uops):
+                m.d.comb += a.eq(b)
+            m.d.comb += [
+                fp_ren_stage.kill.eq(if_stage.redirect_flush),
+                fp_ren_stage.dec_fire.eq(dec_stage.fire),
+                fp_ren_stage.dis_fire.eq(dis_fire),
+                fp_ren_stage.dis_ready.eq(dis_ready),
+                fp_ren_stage.br_update.eq(br_update),
+            ]
+
         #
         # Dispatcher
         #
@@ -281,11 +299,13 @@ class Core(Elaboratable):
 
         issue_units = dict()
         for typ, qp in self.params['issue_params'].items():
-            iq = IssueUnit(qp['issue_width'], qp['num_entries'],
-                           qp['dispatch_width'], num_int_iss_wakeup_ports,
-                           self.params)
-            setattr(m.submodules, f'issue_unit_{str(typ).split(".")[-1]}', iq)
-            issue_units[typ] = iq
+            if typ != IssueQueueType.FP:
+                iq = IssueUnit(qp['issue_width'], qp['num_entries'],
+                               qp['dispatch_width'], num_int_iss_wakeup_ports,
+                               self.params)
+                setattr(m.submodules, f'issue_unit_{str(typ).split(".")[-1]}',
+                        iq)
+                issue_units[typ] = iq
 
         dis_valids = Signal.like(ren_stage.ren2_mask)
         dis_uops = [
@@ -391,7 +411,8 @@ class Core(Elaboratable):
         #
 
         rob = m.submodules.rob = ReorderBuffer(
-            exec_units.irf_write_ports + mem_width, self.params)
+            exec_units.irf_write_ports + mem_width + num_fp_wakeup_ports,
+            self.params)
         rob_flush_d1 = Record(rob.flush.layout)
         m.d.sync += rob_flush_d1.eq(rob.flush)
 
@@ -415,6 +436,8 @@ class Core(Elaboratable):
         ]
 
         m.d.comb += ren_stage.commit.eq(rob.commit_req)
+        if use_fpu:
+            m.d.comb += fp_ren_stage.commit.eq(rob.commit_req)
 
         for w, dis_uop in enumerate(dis_uops):
             if self.core_width == 1:
@@ -495,6 +518,12 @@ class Core(Elaboratable):
                                      | rob.commit_exc.valid),
         ]
 
+        if use_fpu:
+            m.d.comb += [
+                fp_pipeline.br_update.eq(br_update),
+                fp_pipeline.flush_pipeline.eq(rob_flush_d1.valid),
+            ]
+
         # ECALL needs to write PC into CSR before commit
         ecall_commit = Signal.like(if_stage.commit)
         ecall_commit_valid = Signal.like(if_stage.commit_valid)
@@ -526,15 +555,27 @@ class Core(Elaboratable):
         for (typ, qp), duops, dvalids, dready in zip(
                 self.params['issue_params'].items(), dispatcher.dis_uops,
                 dispatcher.dis_valids, dispatcher.iq_ready):
-            iq = issue_units[typ]
-            for quop, duop in zip(iq.dis_uops, duops):
-                m.d.comb += [quop.eq(duop)]
-            m.d.comb += [
-                iq.dis_valids.eq(dvalids),
-                dready.eq(iq.ready),
-                iq.br_update.eq(br_update),
-                iq.flush_pipeline.eq(rob_flush_d1.valid),
-            ]
+            if typ == IssueQueueType.FP:
+                if use_fpu:
+                    for quop, duop in zip(fp_pipeline.dis_uops, duops):
+                        m.d.comb += quop.eq(duop)
+
+                    m.d.comb += [
+                        fp_pipeline.dis_valids.eq(dvalids),
+                        dready.eq(fp_pipeline.iq_ready),
+                    ]
+            else:
+                iq = issue_units[typ]
+
+                for quop, duop in zip(iq.dis_uops, duops):
+                    m.d.comb += quop.eq(duop)
+
+                m.d.comb += [
+                    iq.dis_valids.eq(dvalids),
+                    dready.eq(iq.ready),
+                    iq.br_update.eq(br_update),
+                    iq.flush_pipeline.eq(rob_flush_d1.valid),
+                ]
 
         #
         # Wakeup (issue & rename)
@@ -579,6 +620,10 @@ class Core(Elaboratable):
                     iwp.valid.eq(wu.valid),
                     iwp.pdst.eq(wu.uop.pdst),
                 ]
+
+        if use_fpu:
+            for rwp, wu in zip(fp_ren_stage.wakeup_ports, fp_pipeline.wakeups):
+                m.d.comb += rwp.eq(wu)
 
         #
         # Register read
@@ -803,7 +848,7 @@ class Core(Elaboratable):
                 zip(iregfile.write_ports[:mem_width], lsu.exec_iresps)):
             m.d.comb += [
                 wp.valid.eq(iresp.valid & iresp.uop.rf_wen()
-                            & iresp.uop.dst_rtype == RegisterType.FIX),
+                            & (iresp.uop.dst_rtype == RegisterType.FIX)),
                 wp.addr.eq(iresp.uop.pdst),
                 wp.data.eq(iresp.data),
             ]
@@ -823,7 +868,7 @@ class Core(Elaboratable):
                     iregfile.write_ports[mem_width:]), mem_width):
             m.d.comb += [
                 wp.valid.eq(eu.iresp.valid & eu.iresp.uop.rf_wen()
-                            & eu.iresp.uop.dst_rtype == RegisterType.FIX),
+                            & (eu.iresp.uop.dst_rtype == RegisterType.FIX)),
                 wp.addr.eq(eu.iresp.uop.pdst),
             ]
 
@@ -844,6 +889,10 @@ class Core(Elaboratable):
                     wb_debug.data.eq(wp.data),
                 ]
 
+        if use_fpu:
+            for wp, fresp in zip(fp_pipeline.mem_wb_ports, lsu.exec_fresps):
+                m.d.comb += wp.eq(fresp)
+
         #
         # Commit
         #
@@ -854,6 +903,11 @@ class Core(Elaboratable):
         for rob_wb, eu in zip(rob.wb_resps[mem_width:],
                               [eu for eu in exec_units if eu.irf_write]):
             m.d.comb += rob_wb.eq(eu.iresp)
+
+        for rob_wb, fresp in zip(
+                rob.wb_resps[mem_width + exec_units.irf_write_ports:],
+                fp_pipeline.wakeups):
+            m.d.comb += rob_wb.eq(fresp)
 
         for a, b in zip(rob.lsu_clear_busy_idx, lsu.clear_busy_idx):
             m.d.comb += a.eq(b)
