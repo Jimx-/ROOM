@@ -12,6 +12,7 @@ from room.ex_stage import ExecUnits
 class FPPipeline(Elaboratable):
 
     def __init__(self, params, sim_debug=False):
+        self.xlen = params['xlen']
         self.flen = params['flen']
         self.mem_width = params['mem_width']
         self.params = params
@@ -39,6 +40,8 @@ class FPPipeline(Elaboratable):
             for i in range(self.num_wakeup_ports)
         ]
 
+        self.to_lsu = ExecResp(self.xlen, params)
+
         self.br_update = BranchUpdate(params)
 
         self.flush_pipeline = Signal()
@@ -56,7 +59,7 @@ class FPPipeline(Elaboratable):
         issue_unit = m.submodules.issue_unit = IssueUnit(
             self.issue_params['issue_width'], self.issue_params['num_entries'],
             self.issue_params['dispatch_width'], self.num_wakeup_ports,
-            self.params)
+            IssueQueueType.FP, self.params)
 
         for quop, duop in zip(issue_unit.dis_uops, self.dis_uops):
             m.d.comb += quop.eq(duop)
@@ -150,6 +153,15 @@ class FPPipeline(Elaboratable):
                 wp.addr.eq(eu.fresp.uop.pdst),
                 wp.data.eq(eu.fresp.data),
             ]
+
+        fpiu_unit = [eu for eu in exec_units if eu.has_fpiu][0]
+        fpiu_is_stq = fpiu_unit.mem_iresp.uop.opcode == UOpCode.STA
+        m.d.comb += [
+            self.to_lsu.eq(fpiu_unit.mem_iresp),
+            self.to_lsu.valid.eq(fpiu_unit.mem_iresp.valid
+                                 & fpiu_unit.mem_iresp.ready & fpiu_is_stq),
+            fpiu_unit.mem_iresp.ready.eq(self.to_lsu.ready),
+        ]
 
         #
         # Commit

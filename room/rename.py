@@ -592,7 +592,7 @@ class RenameStage(Elaboratable):
                                      & busy_resp.prs1_busy),
                 ren_uop.prs2_busy.eq((ren_uop.lrs2_rtype == rtype)
                                      & busy_resp.prs2_busy),
-                ren_uop.prs3_busy.eq(ren_uop.frs3_en & busy_resp.prs2_busy),
+                ren_uop.prs3_busy.eq(ren_uop.frs3_en & busy_resp.prs3_busy),
             ]
         for busy_req, fl_req in zip(busy_table.busy_reqs, ren2_alloc_reqs):
             m.d.comb += busy_req.eq(fl_req)

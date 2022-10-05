@@ -71,12 +71,14 @@ class IssueSlot(Elaboratable):
 
         p1 = Signal()
         p2 = Signal()
+        p3 = Signal()
 
         with m.If(self.in_valid):
             m.d.sync += [
                 slot_uop.eq(self.in_uop),
                 p1.eq(~self.in_uop.prs1_busy),
                 p2.eq(~self.in_uop.prs2_busy),
+                p3.eq(~self.in_uop.prs3_busy),
             ]
 
         for wu in self.wakeup_ports:
@@ -84,6 +86,8 @@ class IssueSlot(Elaboratable):
                 m.d.sync += p1.eq(1)
             with m.If(wu.valid & (wu.pdst == next_uop.prs2)):
                 m.d.sync += p2.eq(1)
+            with m.If(wu.valid & (wu.pdst == next_uop.prs3)):
+                m.d.sync += p3.eq(1)
 
         with m.If(self.kill):
             m.d.comb += next_state.eq(IssueSlot.State.INVALID)
@@ -110,7 +114,7 @@ class IssueSlot(Elaboratable):
                 self.br_update.get_new_br_mask(slot_uop.br_mask))
 
         with m.If(state == IssueSlot.State.VALID_1):
-            m.d.comb += self.req.eq(p1 & p2 & ~self.kill)
+            m.d.comb += self.req.eq(p1 & p2 & p3 & ~self.kill)
         with m.Elif(state == IssueSlot.State.VALID_2):
             m.d.comb += self.req.eq((p1 | p2) & ~self.kill)
 
@@ -136,12 +140,13 @@ class IssueSlot(Elaboratable):
 class IssueUnit(Elaboratable):
 
     def __init__(self, issue_width, num_issue_slots, dispatch_width,
-                 num_wakeup_ports, params):
+                 num_wakeup_ports, iq_type, params):
         self.params = params
         self.issue_width = issue_width
         self.num_issue_slots = num_issue_slots
         self.dispatch_width = dispatch_width
         self.num_wakeup_ports = num_wakeup_ports
+        self.iq_type = iq_type
         num_pregs = params['num_pregs']
 
         self.dis_uops = [
@@ -227,9 +232,27 @@ class IssueUnit(Elaboratable):
                 mux_uop.issue_uops.eq(1),
             ]
 
-            with m.If((uop.opcode == UOpCode.STA)
-                      & (uop.lrs2_rtype == RegisterType.FIX)):
-                m.d.comb += mux_uop.issue_uops.eq(2)
+            if self.iq_type == IssueQueueType.INT or self.iq_type == IssueQueueType.MEM:
+                # For integer stores, issue two micro-ops (STA + STD)
+                with m.If((uop.opcode == UOpCode.STA)
+                          & (uop.lrs2_rtype == RegisterType.FIX)):
+                    m.d.comb += mux_uop.issue_uops.eq(2)
+                with m.Elif((uop.opcode == UOpCode.STA)
+                            & (uop.lrs2_rtype != RegisterType.FIX)):
+                    m.d.comb += [
+                        mux_uop.lrs2_rtype.eq(RegisterType.X),
+                        mux_uop.prs2_busy.eq(0),
+                    ]
+
+                m.d.comb += mux_uop.prs3_busy.eq(0)
+
+            elif self.iq_type == IssueQueueType.FP:
+                # For floating-point stores, address is from the integer unit
+                with m.If(uop.opcode == UOpCode.STA):
+                    m.d.comb += [
+                        mux_uop.lrs1_rtype.eq(RegisterType.X),
+                        mux_uop.prs1_busy.eq(0),
+                    ]
 
         for slot, wen_oh in zip(slots, entry_wen):
             enc = Encoder(self.dispatch_width)

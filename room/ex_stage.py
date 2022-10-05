@@ -1,10 +1,11 @@
 from amaranth import *
 
 from room.consts import *
-from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, FPUUnit, generate_imm
+from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, FPUUnit
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
+from room.utils import BranchKillableFIFO, generate_imm
 
 
 class ExecDebug(Record):
@@ -35,6 +36,8 @@ class ExecUnit(Elaboratable):
                  irf_write=False,
                  frf_read=False,
                  frf_write=False,
+                 mem_irf_write=False,
+                 mem_frf_write=False,
                  has_jmp_unit=False,
                  has_alu=False,
                  has_mul=False,
@@ -42,6 +45,8 @@ class ExecUnit(Elaboratable):
                  has_mem=False,
                  has_csr=False,
                  has_fpu=False,
+                 has_fdiv=False,
+                 has_fpiu=False,
                  sim_debug=False):
         self.params = params
         self.data_width = data_width
@@ -49,6 +54,8 @@ class ExecUnit(Elaboratable):
         self.irf_write = irf_write
         self.frf_read = frf_read
         self.frf_write = frf_write
+        self.mem_irf_write = mem_irf_write
+        self.mem_frf_write = mem_frf_write
         self.has_jmp_unit = has_jmp_unit
         self.has_alu = has_alu
         self.has_mul = has_mul
@@ -56,6 +63,8 @@ class ExecUnit(Elaboratable):
         self.has_mem = has_mem
         self.has_csr = has_csr
         self.has_fpu = has_fpu
+        self.has_fdiv = has_fdiv
+        self.has_fpiu = has_fpiu
         self.sim_debug = sim_debug
 
         self.fu_types = Signal(FUType)
@@ -66,6 +75,12 @@ class ExecUnit(Elaboratable):
                               name='iresp') if self.irf_write else None
         self.fresp = ExecResp(self.data_width, params,
                               name='fresp') if self.frf_write else None
+        self.mem_iresp = ExecResp(
+            self.data_width, params,
+            name='mem_iresp') if self.mem_irf_write else None
+        self.mem_fresp = ExecResp(
+            self.data_width, params,
+            name='mem_fresp') if self.mem_frf_write else None
 
         self.br_update = BranchUpdate(params)
 
@@ -220,12 +235,21 @@ class ALUExecUnit(ExecUnit):
 
 class FPUExecUnit(ExecUnit):
 
-    def __init__(self, params, has_fpu=True, sim_debug=False, name=None):
+    def __init__(self,
+                 params,
+                 has_fpu=True,
+                 has_fdiv=False,
+                 has_fpiu=False,
+                 sim_debug=False,
+                 name=None):
         super().__init__(params['flen'],
                          params,
                          frf_read=True,
                          frf_write=True,
+                         mem_irf_write=has_fpiu,
                          has_fpu=has_fpu,
+                         has_fdiv=has_fdiv,
+                         has_fpiu=has_fpiu,
                          sim_debug=sim_debug)
         self.name = name
 
@@ -234,7 +258,22 @@ class FPUExecUnit(ExecUnit):
 
         fu_units = []
 
-        m.d.comb += self.fu_types.eq((FUType.FPU if self.has_fpu else 0))
+        fdiv_busy = Signal()
+        fpiu_busy = Signal()
+
+        fu_type_fdiv = Signal(FUType)
+        fu_type_fpiu = Signal(FUType)
+
+        if self.has_fdiv:
+            with m.If(~fdiv_busy):
+                m.d.comb += fu_type_fdiv.eq(FUType.FDIV)
+
+        if self.has_fpiu:
+            with m.If(~fpiu_busy):
+                m.d.comb += fu_type_fpiu.eq(FUType.F2I)
+
+        m.d.comb += self.fu_types.eq((FUType.FPU if self.has_fpu else 0)
+                                     | fu_type_fdiv | fu_type_fpiu)
 
         if self.has_fpu:
             fpu = m.submodules.fpu = FPUUnit(self.data_width, self.params)
@@ -247,6 +286,35 @@ class FPUExecUnit(ExecUnit):
             ]
 
             fu_units.append(fpu)
+
+        if self.has_fpiu:
+            stq_rdata = ExecResp(self.data_width, self.params)
+
+            fp_stq = m.submodules.fp_stq = BranchKillableFIFO(
+                3,
+                len(stq_rdata.uop) + len(stq_rdata.data),
+                self.params,
+                flow=True)
+
+            m.d.comb += [
+                fp_stq.w_data.eq(Cat(self.req.uop, self.req.rs2_data)),
+                fp_stq.w_br_mask.eq(self.req.uop.br_mask),
+                fp_stq.w_en.eq(self.req.valid
+                               & (self.req.uop.opcode == UOpCode.STA
+                                  & ~self.br_update.uop_killed(self.req.uop))),
+                Cat(stq_rdata.uop, stq_rdata.data).eq(fp_stq.r_data),
+                stq_rdata.uop.br_mask.eq(fp_stq.r_br_mask),
+                fp_stq.br_update.eq(self.br_update),
+                fp_stq.flush.eq(self.req.kill),
+            ]
+
+            m.d.comb += [
+                self.mem_iresp.eq(stq_rdata),
+                self.mem_iresp.valid.eq(fp_stq.r_rdy),
+                fp_stq.r_en.eq(self.mem_iresp.ready),
+            ]
+
+            m.d.comb += fpiu_busy.eq(fp_stq.r_rdy)
 
         fresp_valid = 0
         for fu in reversed(fu_units):
@@ -310,6 +378,8 @@ class ExecUnits(Elaboratable):
             for i in range(fp_width):
                 eu = FPUExecUnit(params,
                                  has_fpu=True,
+                                 has_fdiv=(i == (1 % fp_width)),
+                                 has_fpiu=(i == (1 % fp_width)),
                                  sim_debug=sim_debug,
                                  name=f'fpu{i}')
                 self.exec_units.append(eu)

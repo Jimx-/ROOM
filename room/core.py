@@ -303,7 +303,7 @@ class Core(Elaboratable):
             if typ != IssueQueueType.FP:
                 iq = IssueUnit(qp['issue_width'], qp['num_entries'],
                                qp['dispatch_width'], num_int_iss_wakeup_ports,
-                               self.params)
+                               typ, self.params)
                 setattr(m.submodules, f'issue_unit_{str(typ).split(".")[-1]}',
                         iq)
                 issue_units[typ] = iq
@@ -784,6 +784,9 @@ class Core(Elaboratable):
             rob.lsu_exc.eq(lsu.lsu_exc),
         ]
 
+        if use_fpu:
+            m.d.comb += fp_pipeline.to_lsu.connect(lsu.fp_std)
+
         if self.sim_debug:
             for l, r in zip(self.core_debug.mem_debug, lsu.lsu_debug):
                 m.d.comb += l.eq(r)
@@ -909,10 +912,11 @@ class Core(Elaboratable):
                               [eu for eu in exec_units if eu.irf_write]):
             m.d.comb += rob_wb.eq(eu.iresp)
 
-        for rob_wb, fresp in zip(
-                rob.wb_resps[mem_width + exec_units.irf_write_ports:],
-                fp_pipeline.wakeups):
-            m.d.comb += rob_wb.eq(fresp)
+        if use_fpu:
+            for rob_wb, fresp in zip(
+                    rob.wb_resps[mem_width + exec_units.irf_write_ports:],
+                    fp_pipeline.wakeups):
+                m.d.comb += rob_wb.eq(fresp)
 
         for a, b in zip(rob.lsu_clear_busy_idx, lsu.clear_busy_idx):
             m.d.comb += a.eq(b)

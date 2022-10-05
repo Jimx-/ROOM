@@ -413,6 +413,8 @@ class LoadStoreUnit(Elaboratable):
             for i in range(self.mem_width)
         ]
 
+        self.fp_std = ExecResp(self.xlen, self.params)
+
         self.exec_iresps = [
             ExecResp(self.xlen, self.params, name=f'exec_iresp{i}')
             for i in range(self.mem_width)
@@ -423,10 +425,11 @@ class LoadStoreUnit(Elaboratable):
             for i in range(self.mem_width)
         ]
 
-        self.clear_busy_valids = Signal(self.mem_width)
+        self.clear_busy_valids = Signal(self.mem_width + 1)
         self.clear_busy_idx = [
             Signal(range(self.core_width * params['num_rob_rows']),
-                   name=f'clear_busy_idx{i}') for i in range(self.mem_width)
+                   name=f'clear_busy_idx{i}')
+            for i in range(self.mem_width + 1)
         ]
 
         self.commit = CommitReq(params)
@@ -444,6 +447,13 @@ class LoadStoreUnit(Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
+
+        exception_d1 = Signal()
+        exception_d2 = Signal()
+        m.d.sync += [
+            exception_d1.eq(self.exception),
+            exception_d2.eq(exception_d1),
+        ]
 
         dcache = m.submodules.dcache = DataCache(self.params)
         m.d.comb += [
@@ -658,12 +668,27 @@ class LoadStoreUnit(Elaboratable):
                     stq[stq_idx].uop.pdst.eq(self.exec_reqs[w].uop.pdst),
                 ]
 
-            with m.If(will_fire_std_incoming[w] | will_fire_stad_incoming[w]):
-                stq_idx = self.exec_reqs[w].uop.stq_idx
+            if w == 0:
+                m.d.comb += self.fp_std.ready.eq(~will_fire_std_incoming[w]
+                                                 & ~will_fire_stad_incoming[w])
+            fp_std_fire = self.fp_std.valid & self.fp_std.ready & (w == 0)
+
+            with m.If(will_fire_std_incoming[w] | will_fire_stad_incoming[w]
+                      | fp_std_fire):
+                stq_idx = Mux(
+                    will_fire_std_incoming[w] | will_fire_stad_incoming[w],
+                    self.exec_reqs[w].uop.stq_idx, self.fp_std.uop.stq_idx)
+
                 m.d.sync += [
-                    stq[stq_idx].data.eq(self.exec_reqs[w].data),
+                    stq[stq_idx].data.eq(
+                        Mux(
+                            will_fire_std_incoming[w]
+                            | will_fire_stad_incoming[w],
+                            self.exec_reqs[w].data, self.fp_std.data)),
                     stq[stq_idx].data_valid.eq(1),
                 ]
+
+        will_fire_stdf_incoming = self.fp_std.valid & self.fp_std.ready
 
         #
         # Memory access
@@ -715,6 +740,7 @@ class LoadStoreUnit(Elaboratable):
         fired_load_retry = Signal(self.mem_width)
         fired_sta_incoming = Signal(self.mem_width)
         fired_std_incoming = Signal(self.mem_width)
+        fired_stdf_incoming = Signal()
         fired_stad_incoming = Signal(self.mem_width)
 
         fired_incoming_uop = [
@@ -798,6 +824,16 @@ class LoadStoreUnit(Elaboratable):
                 fired_req_addr[w].eq(self.exec_reqs[w].addr),
             ]
 
+        stdf_killed = self.br_update.uop_killed(self.fp_std.uop)
+        fired_stdf_uop = MicroOp(self.params)
+
+        m.d.sync += [
+            fired_stdf_incoming.eq(will_fire_stdf_incoming & ~stdf_killed),
+            fired_stdf_uop.eq(self.fp_std.uop),
+            fired_stdf_uop.br_mask.eq(
+                self.br_update.get_new_br_mask(self.fp_std.uop.br_mask)),
+        ]
+
         #
         # Clear ROB busy
         #
@@ -856,9 +892,35 @@ class LoadStoreUnit(Elaboratable):
             m.d.comb += [
                 self.clear_busy_valids[w].eq(
                     clr_bsy_valids[w]
-                    & ~self.br_update.br_mask_killed(clr_bsy_br_mask[w])),
+                    & ~self.br_update.br_mask_killed(clr_bsy_br_mask[w])
+                    & ~self.exception & ~exception_d1 & ~exception_d2),
                 self.clear_busy_idx[w].eq(clr_bsy_rob_idx[w]),
             ]
+
+        stdf_clr_bsy_valid = Signal()
+        stdf_clr_bsy_rob_idx = Signal.like(self.clear_busy_idx[0])
+        stdf_clr_bsy_br_mask = Signal.like(self.br_update.resolve_mask)
+
+        with m.If(fired_stdf_incoming):
+            stq_idx = fired_stdf_uop.stq_idx
+
+            m.d.sync += [
+                stdf_clr_bsy_valid.eq(
+                    stq[stq_idx].valid
+                    & stq[stq_idx].addr_valid
+                    & ~self.br_update.uop_killed(fired_stdf_uop)),
+                stdf_clr_bsy_rob_idx.eq(fired_stdf_uop.rob_idx),
+                stdf_clr_bsy_br_mask.eq(
+                    self.br_update.get_new_br_mask(fired_stdf_uop.br_mask)),
+            ]
+
+        m.d.comb += [
+            self.clear_busy_valids[self.mem_width].eq(
+                stdf_clr_bsy_valid
+                & ~self.br_update.br_mask_killed(stdf_clr_bsy_br_mask)
+                & ~self.exception & ~exception_d1 & ~exception_d2),
+            self.clear_busy_idx[self.mem_width].eq(stdf_clr_bsy_rob_idx),
+        ]
 
         #
         # Memory ordering
@@ -1007,7 +1069,8 @@ class LoadStoreUnit(Elaboratable):
                 mem_forward_valid[w].eq(
                     ((ldst_forward_matches[w] &
                       (1 << mem_forward_stq_idx[w])) != 0)
-                    & ~self.br_update.uop_killed(cam_uop[w])),
+                    & ~self.br_update.uop_killed(cam_uop[w])
+                    & ~self.exception & ~exception_d1),
             ]
 
             m.d.sync += [
@@ -1142,7 +1205,7 @@ class LoadStoreUnit(Elaboratable):
                         ldq[i].addr_valid.eq(0),
                     ]
 
-        with m.If(self.br_update.br_res.mispredict):
+        with m.If(self.br_update.br_res.mispredict & ~self.exception):
             m.d.sync += [
                 stq_tail.eq(self.br_update.br_res.uop.stq_idx),
                 ldq_tail.eq(self.br_update.br_res.uop.ldq_idx),

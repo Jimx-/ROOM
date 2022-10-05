@@ -7,6 +7,7 @@ from room.types import MicroOp
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.fpu import FPUOperator, FType, FPUFMA
+from room.utils import generate_imm
 
 
 class ExecReq:
@@ -50,6 +51,12 @@ class ExecResp:
     def eq(self, rhs):
         attrs = ['uop', 'valid', 'addr', 'data']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
+
+    def connect(self, subord):
+        return subord.eq(self) + [
+            subord.valid.eq(self.valid),
+            self.ready.eq(subord.ready),
+        ]
 
 
 class FunctionalUnit(Elaboratable):
@@ -134,18 +141,6 @@ class PipelinedFunctionalUnit(FunctionalUnit):
             ]
 
         return m
-
-
-def generate_imm(ip, sel):
-    sign = ip[-1]
-    i20_30 = Mux(sel == ImmSel.U, ip[8:19], Repl(sign, 11))
-    i12_19 = Mux((sel == ImmSel.U) | (sel == ImmSel.J), ip[0:8], Repl(sign, 8))
-    i11 = Mux(sel == ImmSel.U, 0,
-              Mux((sel == ImmSel.J) | (sel == ImmSel.B), ip[8], sign))
-    i5_10 = Mux(sel == ImmSel.U, 0, ip[14:19])
-    i1_4 = Mux(sel == ImmSel.U, 0, ip[9:14])
-    i0 = Mux((sel == ImmSel.S) | (sel == ImmSel.I), ip[8], 0)
-    return Cat(i0, i1_4, i5_10, i11, i12_19, i20_30, sign)
 
 
 class ALU(Elaboratable):

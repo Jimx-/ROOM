@@ -122,10 +122,10 @@ class ReorderBuffer(Elaboratable):
                      name=f'wb_resp{i}') for i in range(num_wakeup_ports)
         ]
 
-        self.lsu_clear_busy_valids = Signal(mem_width)
+        self.lsu_clear_busy_valids = Signal(mem_width + 1)
         self.lsu_clear_busy_idx = [
             Signal(range(self.core_width * self.num_rob_rows),
-                   name=f'lsu_clear_busy_idx{i}') for i in range(mem_width)
+                   name=f'lsu_clear_busy_idx{i}') for i in range(mem_width + 1)
         ]
 
         self.commit_req = CommitReq(params, name='commit_req')

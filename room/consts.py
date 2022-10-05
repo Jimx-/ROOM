@@ -140,6 +140,8 @@ class IssueQueueType(IntEnum):
     MEM = 2
     FP = 4
 
+    FMEM = FP | MEM
+
 
 class BranchType(IntEnum):
     X = 0
@@ -225,6 +227,10 @@ class FUType(IntEnum):
     CSR = 32
     FPU = 64
     FDIV = 128
+    I2F = 256
+    F2I = 512
+
+    F2IMEM = F2I | MEM
 
 
 class PCSel(IntEnum):
