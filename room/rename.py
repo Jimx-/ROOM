@@ -357,7 +357,7 @@ class RenameStage(Elaboratable):
         self.ren2_mask = Signal(self.core_width)
 
         self.wakeup_ports = [
-            ExecResp(self.params, name=f'wakeup_port{i}')
+            ExecResp(params['xlen'], self.params, name=f'wakeup_port{i}')
             for i in range(self.num_wakeup_ports)
         ]
 

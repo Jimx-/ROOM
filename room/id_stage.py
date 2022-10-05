@@ -522,6 +522,46 @@ class DecodeUnit(Elaboratable):
                         with m.Default():
                             m.d.comb += ILL_INSN
 
+                #
+                # Floating point arithmetic
+                #
+
+                with m.Case(0b1010011):
+                    m.d.comb += [
+                        uop.iq_type.eq(IssueQueueType.FP),
+                        uop.fu_type.eq(FUType.FPU),
+                        uop.dst_rtype.eq(RegisterType.FLT),
+                        uop.lrs1_rtype.eq(RegisterType.FLT),
+                        uop.lrs2_rtype.eq(RegisterType.FLT),
+                    ]
+
+                    with m.Switch(inuop.inst[25:27]):
+                        with m.Case(0b00):
+                            m.d.comb += uop.fp_single.eq(1)
+                        with m.Case(0b01):
+                            pass
+                        with m.Default():
+                            m.d.comb += ILL_INSN
+
+                    with m.Switch(inuop.inst[27:32]):
+                        with m.Case(0b00000):  # fadd.fmt
+                            m.d.comb += UOPC(
+                                Mux(uop.fp_single, UOpCode.FADD_S,
+                                    UOpCode.FADD_D))
+
+                        with m.Case(0b00001):  # fsub.fmt
+                            m.d.comb += UOPC(
+                                Mux(uop.fp_single, UOpCode.FSUB_S,
+                                    UOpCode.FSUB_D))
+
+                        with m.Case(0b00010):  # fmul.fmt
+                            m.d.comb += UOPC(
+                                Mux(uop.fp_single, UOpCode.FMUL_S,
+                                    UOpCode.FMUL_D))
+
+                        with m.Default():
+                            m.d.comb += ILL_INSN
+
             with m.Default():
                 m.d.comb += ILL_INSN
 

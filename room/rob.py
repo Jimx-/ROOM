@@ -117,8 +117,9 @@ class ReorderBuffer(Elaboratable):
         self.enq_partial_stalls = Signal()
 
         self.wb_resps = [
-            ExecResp(params, name=f'wb_resp{i}')
-            for i in range(num_wakeup_ports)
+            ExecResp(max(params['xlen'], params['flen']),
+                     params,
+                     name=f'wb_resp{i}') for i in range(num_wakeup_ports)
         ]
 
         self.lsu_clear_busy_valids = Signal(mem_width)

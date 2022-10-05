@@ -6,44 +6,43 @@ from room.consts import *
 from room.types import MicroOp
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
+from room.fpu import FPUOperator, FType, FPUFMA
 
 
 class ExecReq:
 
-    def __init__(self, params, name=None, src_loc_at=0):
+    def __init__(self, data_width, params, name=None, src_loc_at=0):
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
-
-        self.xlen = params['xlen']
 
         self.uop = MicroOp(params, name=f'{name}_uop')
         self.valid = Signal(name=f'{name}_valid')
 
-        self.rs1_data = Signal(self.xlen, name=f'{name}_rs1_data')
-        self.rs2_data = Signal(self.xlen, name=f'{name}_rs2_data')
+        self.rs1_data = Signal(data_width, name=f'{name}_rs1_data')
+        self.rs2_data = Signal(data_width, name=f'{name}_rs2_data')
+        self.rs3_data = Signal(data_width, name=f'{name}_rs3_data')
 
         self.kill = Signal(name=f'{name}_kill')
 
         self.ready = Signal(name=f'{name}_ready')
 
     def eq(self, rhs):
-        attrs = ['uop', 'valid', 'rs1_data', 'rs2_data', 'kill']
+        attrs = ['uop', 'valid', 'rs1_data', 'rs2_data', 'rs3_data', 'kill']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
 class ExecResp:
 
-    def __init__(self, params, name=None, src_loc_at=0):
+    def __init__(self, data_width, params, name=None, src_loc_at=0):
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.xlen = params['xlen']
         self.vaddr_bits = params['vaddr_bits']
 
         self.uop = MicroOp(params, name=f'{name}_uop')
         self.valid = Signal(name=f'{name}_valid')
 
-        self.data = Signal(self.xlen, name=f'{name}_data')
+        self.data = Signal(data_width, name=f'{name}_data')
         self.addr = Signal(self.vaddr_bits + 1, name=f'{name}_addr')
 
         self.ready = Signal(name=f'{name}_ready')
@@ -55,11 +54,11 @@ class ExecResp:
 
 class FunctionalUnit(Elaboratable):
 
-    def __init__(self, params, is_jmp=False, is_alu=False):
+    def __init__(self, data_width, params, is_jmp=False, is_alu=False):
         self.is_jmp = is_jmp
 
-        self.req = ExecReq(params, name='req')
-        self.resp = ExecResp(params, name='resp')
+        self.req = ExecReq(data_width, params, name='req')
+        self.resp = ExecResp(data_width, params, name='resp')
 
         self.br_update = BranchUpdate(params)
 
@@ -72,11 +71,16 @@ class FunctionalUnit(Elaboratable):
 
 class PipelinedFunctionalUnit(FunctionalUnit):
 
-    def __init__(self, num_stages, params, is_jmp=False, is_alu=False):
+    def __init__(self,
+                 num_stages,
+                 data_width,
+                 params,
+                 is_jmp=False,
+                 is_alu=False):
         self.params = params
         self.num_stages = num_stages
 
-        super().__init__(params, is_jmp=is_jmp, is_alu=is_alu)
+        super().__init__(data_width, params, is_jmp=is_jmp, is_alu=is_alu)
 
     def elaborate(self, platform):
         m = Module()
@@ -242,10 +246,14 @@ class ALU(Elaboratable):
 
 class ALUUnit(PipelinedFunctionalUnit):
 
-    def __init__(self, params, is_jmp=False, num_stages=1):
+    def __init__(self, data_width, params, is_jmp=False, num_stages=1):
         self.xlen = params['xlen']
 
-        super().__init__(num_stages, params, is_jmp=is_jmp, is_alu=True)
+        super().__init__(num_stages,
+                         data_width,
+                         params,
+                         is_jmp=is_jmp,
+                         is_alu=True)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -395,7 +403,7 @@ class ALUUnit(PipelinedFunctionalUnit):
 class AddrGenUnit(PipelinedFunctionalUnit):
 
     def __init__(self, params):
-        super().__init__(0, params)
+        super().__init__(0, params['xlen'], params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -484,7 +492,7 @@ class MultiplierUnit(PipelinedFunctionalUnit):
         self.width = width
         self.latency = latency
 
-        super().__init__(latency, params)
+        super().__init__(latency, width, params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -505,12 +513,12 @@ class MultiplierUnit(PipelinedFunctionalUnit):
 
 class IterativeFunctionalUnit(FunctionalUnit):
 
-    def __init__(self, params):
+    def __init__(self, data_width, params):
         self.params = params
 
         self.do_kill = Signal()
 
-        super().__init__(params)
+        super().__init__(data_width, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -670,7 +678,7 @@ class DivUnit(IterativeFunctionalUnit):
     def __init__(self, width, params):
         self.width = width
 
-        super().__init__(params)
+        super().__init__(width, params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -689,5 +697,86 @@ class DivUnit(IterativeFunctionalUnit):
             div.resp_ready.eq(self.resp.ready),
             div.kill.eq(self.do_kill),
         ]
+
+        return m
+
+
+class FPUUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, width, params):
+        self.width = width
+        self.fma_latency = params['fma_latency']
+
+        super().__init__(self.fma_latency, width, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        fma_en = Signal()
+        fma_op = Signal(FPUOperator)
+        fma_op_mod = Signal()
+
+        type_in_single = Signal()
+        type_out_single = Signal()
+
+        swap32 = Signal()
+
+        with m.Switch(self.req.uop.opcode):
+            with m.Case(UOpCode.FADD_S, UOpCode.FADD_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.ADD),
+                    type_in_single.eq(self.req.uop.fp_single),
+                    type_out_single.eq(self.req.uop.fp_single),
+                    swap32.eq(1),
+                ]
+
+            with m.Case(UOpCode.FSUB_S, UOpCode.FSUB_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.ADD),
+                    fma_op_mod.eq(1),
+                    type_in_single.eq(self.req.uop.fp_single),
+                    type_out_single.eq(self.req.uop.fp_single),
+                    swap32.eq(1),
+                ]
+
+            with m.Case(UOpCode.FMUL_S, UOpCode.FMUL_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.MUL),
+                    type_in_single.eq(self.req.uop.fp_single),
+                    type_out_single.eq(self.req.uop.fp_single),
+                ]
+
+        def set_fu_input(inp):
+            m.d.comb += [
+                inp.in1.eq(self.req.rs1_data),
+                inp.in2.eq(self.req.rs2_data),
+                inp.in3.eq(self.req.rs3_data),
+                inp.fn.eq(fma_op),
+                inp.fn_mod.eq(fma_op_mod),
+            ]
+
+            with m.If(swap32):
+                m.d.comb += inp.in3.eq(self.req.rs2_data)
+
+        dfma = m.submodules.dfma = FPUFMA(self.width,
+                                          FType.FP64,
+                                          latency=self.fma_latency)
+        set_fu_input(dfma.inp)
+        m.d.comb += dfma.inp_valid.eq(self.req.valid & fma_en
+                                      & ~type_out_single)
+
+        sfma = m.submodules.sfma = FPUFMA(32,
+                                          FType.FP32,
+                                          latency=self.fma_latency)
+        set_fu_input(sfma.inp)
+        m.d.comb += sfma.inp_valid.eq(self.req.valid & fma_en
+                                      & type_out_single)
+
+        m.d.comb += self.resp.data.eq(
+            Mux(dfma.out_valid, dfma.out.data,
+                Mux(sfma.out_valid, sfma.out.data, 0)))
 
         return m

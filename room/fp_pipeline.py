@@ -3,17 +3,19 @@ from amaranth import *
 from room.consts import *
 from room.types import MicroOp
 from room.alu import ExecResp
-from room.regfile import RegisterFile
+from room.regfile import RegisterFile, RegisterRead
 from room.branch import BranchUpdate
 from room.issue import IssueUnit
+from room.ex_stage import ExecUnits
 
 
 class FPPipeline(Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sim_debug=False):
         self.flen = params['flen']
         self.mem_width = params['mem_width']
         self.params = params
+        self.sim_debug = sim_debug
 
         self.issue_params = params['issue_params'][IssueQueueType.FP]
         self.num_wakeup_ports = self.issue_params[
@@ -28,12 +30,12 @@ class FPPipeline(Elaboratable):
         self.iq_ready = Signal(self.dispatch_width)
 
         self.mem_wb_ports = [
-            ExecResp(params, name=f'mem_wb_ports{i}')
+            ExecResp(self.flen, params, name=f'mem_wb_ports{i}')
             for i in range(self.mem_width)
         ]
 
         self.wakeups = [
-            ExecResp(params, name=f'wakeup{i}')
+            ExecResp(self.flen, params, name=f'wakeup{i}')
             for i in range(self.num_wakeup_ports)
         ]
 
@@ -43,6 +45,9 @@ class FPPipeline(Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
+
+        exec_units = m.submodules.exec_units = ExecUnits(
+            True, self.params, sim_debug=self.sim_debug)
 
         #
         # Dispatch
@@ -63,14 +68,67 @@ class FPPipeline(Elaboratable):
         ]
 
         #
+        # Issue
+        #
+
+        for iss_uop, iss_valid, iss_fu_typ, eu in zip(issue_unit.iss_uops,
+                                                      issue_unit.iss_valids,
+                                                      issue_unit.fu_types,
+                                                      exec_units):
+            m.d.comb += iss_fu_typ.eq(eu.fu_types)
+
+        #
+        # Wakeup
+        #
+
+        for wu, wb in zip(issue_unit.wakeup_ports, self.wakeups):
+            m.d.comb += [
+                wu.valid.eq(wb.valid),
+                wu.pdst.eq(wb.uop.pdst),
+            ]
+
+        #
         # Register read
         #
 
         fregfile = m.submodules.fregfile = RegisterFile(
-            rports=4,
-            wports=4,
+            rports=exec_units.frf_read_ports,
+            wports=exec_units.frf_write_ports + self.mem_width,
             num_regs=self.params['num_fp_pregs'],
             data_width=self.flen)
+
+        fregread = m.submodules.fregread = RegisterRead(
+            issue_width=issue_unit.issue_width,
+            num_rports=exec_units.frf_read_ports,
+            rports_array=[3] * exec_units.frf_readers,
+            reg_width=self.flen,
+            params=self.params)
+
+        for frr_uop, iss_uop in zip(fregread.iss_uops, issue_unit.iss_uops):
+            m.d.comb += frr_uop.eq(iss_uop)
+        m.d.comb += fregread.iss_valids.eq(issue_unit.iss_valids)
+
+        for frr_rp, rp in zip(fregread.read_ports, fregfile.read_ports):
+            m.d.comb += frr_rp.connect(rp)
+
+        m.d.comb += [
+            fregread.br_update.eq(self.br_update),
+            fregread.kill.eq(self.flush_pipeline),
+        ]
+
+        #
+        # Execute
+        #
+
+        for eu, req in zip([eu for eu in exec_units if eu.frf_read],
+                           fregread.exec_reqs):
+            m.d.comb += [
+                eu.req.eq(req),
+                eu.req.kill.eq(self.flush_pipeline),
+            ]
+
+        for eu in exec_units:
+            m.d.comb += eu.br_update.eq(self.br_update)
 
         #
         # Writeback
@@ -85,11 +143,27 @@ class FPPipeline(Elaboratable):
                 wp.data.eq(fresp.data),
             ]
 
+        for eu, wp in zip([eu for eu in exec_units if eu.frf_write],
+                          fregfile.write_ports[self.mem_width:]):
+            m.d.comb += [
+                wp.valid.eq(eu.fresp.valid & eu.fresp.uop.rf_wen()),
+                wp.addr.eq(eu.fresp.uop.pdst),
+                wp.data.eq(eu.fresp.data),
+            ]
+
         #
         # Commit
         #
 
         for wb, fresp in zip(self.wakeups[:self.mem_width], self.mem_wb_ports):
             m.d.comb += wb.eq(fresp)
+
+        for wb, eu in zip(self.wakeups[self.mem_width:],
+                          [eu for eu in exec_units if eu.frf_write]):
+            m.d.comb += [
+                wb.eq(eu.fresp),
+                wb.valid.eq(eu.fresp.valid
+                            & (eu.fresp.uop.dst_rtype == RegisterType.FLT)),
+            ]
 
         return m

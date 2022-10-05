@@ -138,7 +138,7 @@ class RegisterType(IntEnum):
 class IssueQueueType(IntEnum):
     INT = 1
     MEM = 2
-    FP = 3
+    FP = 4
 
 
 class BranchType(IntEnum):
@@ -223,6 +223,8 @@ class FUType(IntEnum):
     MUL = 8
     DIV = 16
     CSR = 32
+    FPU = 64
+    FDIV = 128
 
 
 class PCSel(IntEnum):

@@ -381,6 +381,7 @@ def gen_byte_mask(addr, size):
 class LoadStoreUnit(Elaboratable):
 
     def __init__(self, dbus, params, sim_debug=False):
+        self.xlen = params['xlen']
         self.core_width = params['core_width']
         self.ldq_size = params['ldq_size']
         self.stq_size = params['stq_size']
@@ -408,17 +409,17 @@ class LoadStoreUnit(Elaboratable):
         ]
 
         self.exec_reqs = [
-            ExecResp(self.params, name=f'exec_req{i}')
+            ExecResp(self.xlen, self.params, name=f'exec_req{i}')
             for i in range(self.mem_width)
         ]
 
         self.exec_iresps = [
-            ExecResp(self.params, name=f'exec_iresp{i}')
+            ExecResp(self.xlen, self.params, name=f'exec_iresp{i}')
             for i in range(self.mem_width)
         ]
 
         self.exec_fresps = [
-            ExecResp(self.params, name=f'exec_fresp{i}')
+            ExecResp(self.xlen, self.params, name=f'exec_fresp{i}')
             for i in range(self.mem_width)
         ]
 

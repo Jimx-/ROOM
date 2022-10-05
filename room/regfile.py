@@ -365,7 +365,7 @@ class RegisterRead(Elaboratable):
         ]
 
         self.exec_reqs = [
-            ExecReq(self.params, name=f'exec_req{i}')
+            ExecReq(reg_width, self.params, name=f'exec_req{i}')
             for i in range(self.issue_width)
         ]
 
@@ -407,15 +407,21 @@ class RegisterRead(Elaboratable):
             Signal(self.data_width, name=f'rrd{i}_rs2_data')
             for i in range(self.issue_width)
         ]
+        rrd_rs3_data = [
+            Signal(self.data_width, name=f'rrd{i}_rs3_data')
+            for i in range(self.issue_width)
+        ]
 
         idx = 0
-        for iss_uop, rrd_uop, nrps, rs1_data, rs2_data in zip(
+        for iss_uop, rrd_uop, nrps, rs1_data, rs2_data, rs3_data in zip(
                 self.iss_uops, rrd_uops, self.rports_array, rrd_rs1_data,
-                rrd_rs2_data):
+                rrd_rs2_data, rrd_rs3_data):
             if nrps > 0:
                 m.d.comb += [self.read_ports[idx].addr.eq(iss_uop.prs1)]
             if nrps > 1:
                 m.d.comb += [self.read_ports[idx + 1].addr.eq(iss_uop.prs2)]
+            if nrps > 2:
+                m.d.comb += [self.read_ports[idx + 2].addr.eq(iss_uop.prs3)]
 
             if nrps > 0:
                 m.d.comb += rs1_data.eq(
@@ -423,16 +429,21 @@ class RegisterRead(Elaboratable):
             if nrps > 1:
                 m.d.comb += rs2_data.eq(
                     Mux(rrd_uop.prs2 == 0, 0, self.read_ports[idx + 1].data))
+            if nrps > 2:
+                m.d.comb += rs3_data.eq(
+                    Mux(rrd_uop.prs3 == 0, 0, self.read_ports[idx + 2].data))
 
             idx += nrps
 
-        for nrps, req, rs1_data, rs2_data in zip(self.rports_array,
-                                                 self.exec_reqs, rrd_rs1_data,
-                                                 rrd_rs2_data):
+        for nrps, req, rs1_data, rs2_data, rs3_data in zip(
+                self.rports_array, self.exec_reqs, rrd_rs1_data, rrd_rs2_data,
+                rrd_rs3_data):
             if nrps > 0:
                 m.d.sync += req.rs1_data.eq(rs1_data)
             if nrps > 1:
                 m.d.sync += req.rs2_data.eq(rs2_data)
+            if nrps > 2:
+                m.d.sync += req.rs3_data.eq(rs3_data)
 
         for req, rrd_uop, rrd_v in zip(self.exec_reqs, rrd_uops, rrd_valids):
             rrd_killed = self.kill | self.br_update.uop_killed(rrd_uop)

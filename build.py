@@ -48,6 +48,9 @@ core_params = dict(
         IssueQueueType.INT: dict(dispatch_width=2,
                                  num_entries=16,
                                  issue_width=2),
+        IssueQueueType.FP: dict(dispatch_width=2,
+                                num_entries=16,
+                                issue_width=2),
     },
     icache_params=dict(
         n_sets=64,
@@ -56,6 +59,7 @@ core_params = dict(
     ),
     use_fpu=True,
     flen=64,
+    fma_latency=4,
 )
 
 

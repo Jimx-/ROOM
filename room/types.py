@@ -91,3 +91,6 @@ class MicroOp(Record):
 
     def rf_wen(self):
         return self.dst_rtype != RegisterType.X
+
+    def fu_type_has(self, typ):
+        return (self.fu_type & typ) != 0

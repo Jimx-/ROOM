@@ -173,10 +173,10 @@ class FPUFMA(Elaboratable):
 
             with m.Case(FPUOperator.ADD):
                 m.d.comb += [
-                    in1.sign.eq(0),
-                    in1.exp.eq(self.ftyp.bias()),
-                    in1.man.eq(0),
-                    info1.is_normal.eq(1),
+                    in2.sign.eq(0),
+                    in2.exp.eq(self.ftyp.bias()),
+                    in2.man.eq(0),
+                    info2.is_normal.eq(1),
                 ]
 
             with m.Case(FPUOperator.MUL):
@@ -388,24 +388,36 @@ class FPUFMA(Elaboratable):
 
         result = regular_result
 
-        result_q = Signal.like(result)
-        valid_q2 = Signal()
-
         if self.latency > 2:
-            m.d.sync += [
-                result_q.eq(result),
-                valid_q2.eq(valid_q1),
+            result_q = [
+                Signal.like(result, name=f's{2+i}_result')
+                for i in range(self.latency - 2)
             ]
+            valid_q2 = [
+                Signal(name=f's{2+i}_valid') for i in range(self.latency - 2)
+            ]
+
+            m.d.sync += [
+                result_q[0].eq(result),
+                valid_q2[0].eq(valid_q1),
+            ]
+
+            for i in range(1, self.latency - 2):
+                m.d.sync += [
+                    result_q[i].eq(result_q[i - 1]),
+                    valid_q2[i].eq(valid_q2[i - 1]),
+                ]
+
+            m.d.comb += [
+                self.out.data.eq(result_q[-1]),
+                self.out_valid.eq(valid_q2[-1]),
+            ]
+
         else:
             m.d.comb += [
-                result_q.eq(result),
-                valid_q2.eq(valid_q1),
+                self.out.data.eq(result),
+                self.out_valid.eq(valid_q1),
             ]
-
-        m.d.comb += [
-            self.out.data.eq(result_q),
-            self.out_valid.eq(valid_q2),
-        ]
 
         return m
 

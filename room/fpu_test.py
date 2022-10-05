@@ -35,13 +35,13 @@ def test_fma_add_d():
 
     cases = [
         # fadd
-        (0.0, 2.5, 1.0, 3.5, FPUOperator.ADD, 0),
-        (0.0, -1235.1, 1.1, -1234, FPUOperator.ADD, 0),
-        (0.0, 3.14159265, 0.00000001, 3.14159266, FPUOperator.ADD, 0),
+        (2.5, 0.0, 1.0, 3.5, FPUOperator.ADD, 0),
+        (-1235.1, 0.0, 1.1, -1234, FPUOperator.ADD, 0),
+        (3.14159265, 0.0, 0.00000001, 3.14159266, FPUOperator.ADD, 0),
         # fsub
-        (0.0, 2.5, 1.0, 1.5, FPUOperator.ADD, 1),
-        (0.0, -1235.1, -1.1, -1234, FPUOperator.ADD, 1),
-        (0.0, 3.14159265, 0.00000001, 3.1415926400000001, FPUOperator.ADD, 1),
+        (2.5, 0.0, 1.0, 1.5, FPUOperator.ADD, 1),
+        (-1235.1, 0.0, -1.1, -1234, FPUOperator.ADD, 1),
+        (3.14159265, 0.0, 0.00000001, 3.1415926400000001, FPUOperator.ADD, 1),
         # fmul
         (2.5, 1.0, 0.0, 2.5, FPUOperator.MUL, 0),
         (-1235.1, -1.1, 0.0, 1358.61, FPUOperator.MUL, 0),

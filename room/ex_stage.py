@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import *
-from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, generate_imm
+from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, FPUUnit, generate_imm
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
@@ -33,30 +33,39 @@ class ExecUnit(Elaboratable):
                  params,
                  irf_read=False,
                  irf_write=False,
+                 frf_read=False,
+                 frf_write=False,
                  has_jmp_unit=False,
                  has_alu=False,
                  has_mul=False,
                  has_div=False,
                  has_mem=False,
                  has_csr=False,
+                 has_fpu=False,
                  sim_debug=False):
         self.params = params
         self.data_width = data_width
         self.irf_read = irf_read
         self.irf_write = irf_write
+        self.frf_read = frf_read
+        self.frf_write = frf_write
         self.has_jmp_unit = has_jmp_unit
         self.has_alu = has_alu
         self.has_mul = has_mul
         self.has_div = has_div
         self.has_mem = has_mem
         self.has_csr = has_csr
+        self.has_fpu = has_fpu
         self.sim_debug = sim_debug
 
         self.fu_types = Signal(FUType)
 
-        self.req = ExecReq(params, name='req')
+        self.req = ExecReq(data_width, params, name='req')
 
-        self.iresp = ExecResp(params, name='iresp')
+        self.iresp = ExecResp(self.data_width, params,
+                              name='iresp') if self.irf_write else None
+        self.fresp = ExecResp(self.data_width, params,
+                              name='fresp') if self.frf_write else None
 
         self.br_update = BranchUpdate(params)
 
@@ -68,7 +77,7 @@ class ExecUnit(Elaboratable):
 
         self.lsu_req = None
         if has_mem:
-            self.lsu_req = ExecResp(params, name='lsu_req')
+            self.lsu_req = ExecResp(self.data_width, params, name='lsu_req')
 
         if sim_debug:
             self.exec_debug = ExecDebug(params, name='ex_debug')
@@ -136,6 +145,7 @@ class ALUExecUnit(ExecUnit):
 
         if self.has_alu:
             alu = m.submodules.alu = ALUUnit(
+                self.data_width,
                 self.params,
                 is_jmp=self.has_jmp_unit,
                 num_stages=3 if self.has_mul else 1)
@@ -208,46 +218,112 @@ class ALUExecUnit(ExecUnit):
         return m
 
 
+class FPUExecUnit(ExecUnit):
+
+    def __init__(self, params, has_fpu=True, sim_debug=False, name=None):
+        super().__init__(params['flen'],
+                         params,
+                         frf_read=True,
+                         frf_write=True,
+                         has_fpu=has_fpu,
+                         sim_debug=sim_debug)
+        self.name = name
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        fu_units = []
+
+        m.d.comb += self.fu_types.eq((FUType.FPU if self.has_fpu else 0))
+
+        if self.has_fpu:
+            fpu = m.submodules.fpu = FPUUnit(self.data_width, self.params)
+
+            m.d.comb += [
+                fpu.req.eq(self.req),
+                fpu.req.valid.eq(self.req.valid
+                                 & (self.req.uop.fu_type == FUType.FPU)),
+                fpu.br_update.eq(self.br_update),
+            ]
+
+            fu_units.append(fpu)
+
+        fresp_valid = 0
+        for fu in reversed(fu_units):
+            fresp_valid |= fu.resp.valid
+
+            with m.If(fu.resp.valid):
+                m.d.comb += [
+                    self.fresp.data.eq(fu.resp.data),
+                    self.fresp.uop.eq(fu.resp.uop),
+                ]
+
+        m.d.comb += self.fresp.valid.eq(fresp_valid)
+
+        return m
+
+
 class ExecUnits(Elaboratable):
 
-    def __init__(self, params, sim_debug=False):
+    def __init__(self, is_fpu, params, sim_debug=False):
         self.exec_units = []
         self.issue_params = params['issue_params']
+        self.is_fpu = is_fpu
 
         self.irf_readers = 0
         self.irf_writers = 0
+        self.frf_readers = 0
+        self.frf_writers = 0
 
         if sim_debug:
             self.exec_debug = []
 
-        mem_width = self.issue_params[IssueQueueType.MEM]['issue_width']
-        for i in range(mem_width):
-            eu = ALUExecUnit(params,
-                             has_alu=False,
-                             has_mem=True,
-                             name=f'mem{i}')
-            self.exec_units.append(eu)
-            self.irf_readers += eu.irf_read
-            self.irf_writers += eu.irf_write
+        if not is_fpu:
+            mem_width = self.issue_params[IssueQueueType.MEM]['issue_width']
+            for i in range(mem_width):
+                eu = ALUExecUnit(params,
+                                 has_alu=False,
+                                 has_mem=True,
+                                 name=f'mem{i}')
+                self.exec_units.append(eu)
+                self.irf_readers += eu.irf_read
+                self.irf_writers += eu.irf_write
 
-        int_width = self.issue_params[IssueQueueType.INT]['issue_width']
-        for i in range(int_width):
-            eu = ALUExecUnit(params,
-                             has_jmp_unit=(i == 0),
-                             has_csr=(i == (1 % int_width)),
-                             has_mul=(i == (2 % int_width)),
-                             has_div=(i == (3 % int_width)),
-                             sim_debug=sim_debug,
-                             name=f'alu_int{i}')
-            self.exec_units.append(eu)
-            self.irf_readers += eu.irf_read
-            self.irf_writers += eu.irf_write
+            int_width = self.issue_params[IssueQueueType.INT]['issue_width']
+            for i in range(int_width):
+                eu = ALUExecUnit(params,
+                                 has_jmp_unit=(i == 0),
+                                 has_csr=(i == (1 % int_width)),
+                                 has_mul=(i == (2 % int_width)),
+                                 has_div=(i == (3 % int_width)),
+                                 sim_debug=sim_debug,
+                                 name=f'alu_int{i}')
+                self.exec_units.append(eu)
+                self.irf_readers += eu.irf_read
+                self.irf_writers += eu.irf_write
 
-            if sim_debug:
-                self.exec_debug.append(eu.exec_debug)
+                if sim_debug:
+                    self.exec_debug.append(eu.exec_debug)
+
+        else:
+            fp_width = self.issue_params[IssueQueueType.FP]['issue_width']
+            for i in range(fp_width):
+                eu = FPUExecUnit(params,
+                                 has_fpu=True,
+                                 sim_debug=sim_debug,
+                                 name=f'fpu{i}')
+                self.exec_units.append(eu)
+                self.frf_readers += eu.frf_read
+                self.frf_writers += eu.frf_write
+
+                if sim_debug:
+                    self.exec_debug.append(eu.exec_debug)
 
         self.irf_read_ports = self.irf_readers * 2
         self.irf_write_ports = self.irf_writers
+
+        self.frf_read_ports = self.frf_readers * 3
+        self.frf_write_ports = self.frf_writers
 
     def __getitem__(self, key):
         return self.exec_units[key]

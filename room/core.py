@@ -193,7 +193,8 @@ class Core(Elaboratable):
         #
 
         if use_fpu:
-            fp_pipeline = m.submodules.fp_pipeline = FPPipeline(self.params)
+            fp_pipeline = m.submodules.fp_pipeline = FPPipeline(
+                self.params, sim_debug=self.sim_debug)
 
         #
         # Instruction fetch
@@ -246,7 +247,7 @@ class Core(Elaboratable):
         #
 
         exec_units = m.submodules.exec_units = ExecUnits(
-            self.params, sim_debug=self.sim_debug)
+            False, self.params, sim_debug=self.sim_debug)
 
         num_int_iss_wakeup_ports = exec_units.irf_write_ports + mem_width
         num_int_ren_wakeup_ports = num_int_iss_wakeup_ports
@@ -587,7 +588,9 @@ class Core(Elaboratable):
         for w in range(mem_width):
             resp = lsu.exec_iresps[w]
 
-            wakeup = ExecResp(self.params, name=f'iss_ren_wakeup{w}')
+            wakeup = ExecResp(self.xlen,
+                              self.params,
+                              name=f'iss_ren_wakeup{w}')
             m.d.comb += [
                 wakeup.uop.eq(resp.uop),
                 wakeup.valid.eq(resp.valid & resp.uop.rf_wen()
@@ -601,7 +604,9 @@ class Core(Elaboratable):
             if eu.irf_write:
                 resp = eu.iresp
 
-                wakeup = ExecResp(self.params, name=f'iss_ren_wakeup{i}')
+                wakeup = ExecResp(self.xlen,
+                                  self.params,
+                                  name=f'iss_ren_wakeup{i}')
                 m.d.comb += [
                     wakeup.uop.eq(resp.uop),
                     wakeup.valid.eq(resp.valid & resp.uop.rf_wen()

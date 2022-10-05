@@ -63,6 +63,7 @@ core_params = dict(
     ),
     use_fpu=True,
     flen=64,
+    fma_latency=4,
 )
 
 
