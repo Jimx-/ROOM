@@ -744,6 +744,40 @@ class FPUUnit(PipelinedFunctionalUnit):
                     type_out_single.eq(self.req.uop.fp_single),
                 ]
 
+            with m.Case(UOpCode.FMADD_S, UOpCode.FMADD_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FMADD),
+                    type_in_single.eq(self.req.uop.fp_single),
+                    type_out_single.eq(self.req.uop.fp_single),
+                ]
+
+            with m.Case(UOpCode.FMSUB_S, UOpCode.FMSUB_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FMADD),
+                    fma_op.eq(1),
+                    type_in_single.eq(self.req.uop.fp_single),
+                    type_out_single.eq(self.req.uop.fp_single),
+                ]
+
+            with m.Case(UOpCode.FNMSUB_S, UOpCode.FNMSUB_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FNMSUB),
+                    type_in_single.eq(self.req.uop.fp_single),
+                    type_out_single.eq(self.req.uop.fp_single),
+                ]
+
+            with m.Case(UOpCode.FNMADD_S, UOpCode.FNMADD_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FNMSUB),
+                    fma_op.eq(1),
+                    type_in_single.eq(self.req.uop.fp_single),
+                    type_out_single.eq(self.req.uop.fp_single),
+                ]
+
         def set_fu_input(inp):
             m.d.comb += [
                 inp.in1.eq(self.req.rs1_data),
