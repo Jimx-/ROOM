@@ -80,6 +80,14 @@ class FPPipeline(Elaboratable):
                                                       exec_units):
             m.d.comb += iss_fu_typ.eq(eu.fu_types)
 
+            # Disallow back-to-back floating point division
+            if eu.has_fdiv:
+                fdiv_issued = Signal()
+                m.d.sync += fdiv_issued.eq(iss_valid
+                                           & (iss_uop.fu_type == FUType.FDIV))
+                m.d.comb += iss_fu_typ.eq(
+                    Mux(fdiv_issued, eu.fu_types & ~FUType.FDIV, eu.fu_types))
+
         #
         # Wakeup
         #

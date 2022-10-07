@@ -561,6 +561,23 @@ class DecodeUnit(Elaboratable):
                                 Mux(uop.fp_single, UOpCode.FMUL_S,
                                     UOpCode.FMUL_D))
 
+                        with m.Case(0b00011):  # fdiv.fmt
+                            m.d.comb += [
+                                UOPC(
+                                    Mux(uop.fp_single, UOpCode.FDIV_S,
+                                        UOpCode.FDIV_D)),
+                                uop.fu_type.eq(FUType.FDIV),
+                            ]
+
+                        with m.Case(0b01011):  # fsqrt.fmt
+                            m.d.comb += [
+                                UOPC(
+                                    Mux(uop.fp_single, UOpCode.FSQRT_S,
+                                        UOpCode.FSQRT_D)),
+                                uop.fu_type.eq(FUType.FDIV),
+                                uop.lrs2_rtype.eq(RegisterType.FLT),
+                            ]
+
                         with m.Default():
                             m.d.comb += ILL_INSN
 

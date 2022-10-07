@@ -6,7 +6,7 @@ from room.consts import *
 from room.types import MicroOp
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
-from room.fpu import FPUOperator, FPFormat, FPUFMA
+from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti
 from room.utils import generate_imm
 
 
@@ -821,5 +821,34 @@ class FPUUnit(PipelinedFunctionalUnit):
         m.d.comb += self.resp.data.eq(
             Mux(dfma.out_valid, dfma.out.data,
                 Mux(sfma.out_valid, sfma.out.data, 0)))
+
+        return m
+
+
+class FDivUnit(IterativeFunctionalUnit):
+
+    def __init__(self, width, params):
+        self.width = width
+
+        super().__init__(width, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        fdiv = m.submodules.fdiv = FPUDivSqrtMulti()
+
+        m.d.comb += [
+            fdiv.a.eq(self.req.rs1_data),
+            fdiv.b.eq(self.req.rs2_data),
+            fdiv.is_sqrt.eq((self.req.uop.opcode == UOpCode.FSQRT_S)
+                            | (self.req.uop.opcode == UOpCode.FSQRT_D)),
+            fdiv.fmt.eq(Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+            fdiv.in_valid.eq(self.req.valid),
+            self.req.ready.eq(fdiv.in_ready),
+            self.resp.data.eq(fdiv.out),
+            self.resp.valid.eq(fdiv.out_valid),
+            fdiv.out_ready.eq(self.resp.ready),
+            fdiv.kill.eq(self.do_kill),
+        ]
 
         return m

@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import *
-from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, FPUUnit
+from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, FPUUnit, FDivUnit
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
@@ -286,6 +286,24 @@ class FPUExecUnit(ExecUnit):
             ]
 
             fu_units.append(fpu)
+
+        if self.has_fdiv:
+            fdiv = m.submodules.fdiv = FDivUnit(self.data_width, self.params)
+
+            fdiv_resp_busy = 0
+            for fu in fu_units:
+                fdiv_resp_busy |= fu.resp.valid
+
+            m.d.comb += [
+                fdiv.req.eq(self.req),
+                fdiv.req.valid.eq(self.req.valid
+                                  & (self.req.uop.fu_type_has(FUType.FDIV))),
+                fdiv.br_update.eq(self.br_update),
+                fdiv.resp.ready.eq(~fdiv_resp_busy),
+                fdiv_busy.eq(~fdiv.req.ready | fdiv.req.valid),
+            ]
+
+            fu_units.append(fdiv)
 
         if self.has_fpiu:
             stq_rdata = ExecResp(self.data_width, self.params)

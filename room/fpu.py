@@ -449,6 +449,7 @@ class FPUDivSqrtMulti(Elaboratable):
 
         self.out = Signal(64)
         self.out_valid = Signal()
+        self.out_ready = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -571,9 +572,14 @@ class FPUDivSqrtMulti(Elaboratable):
         with m.Else():
             m.d.sync += count.eq(0)
 
-        m.d.comb += self.in_ready.eq(~start & (count == 0))
+        m.d.comb += self.in_ready.eq(~start & (count == 0) & ~self.out_valid)
 
-        m.d.sync += self.out_valid.eq(count == max_iters)
+        with m.If(self.kill):
+            m.d.sync += self.out_valid.eq(0)
+        with m.Elif(count == max_iters):
+            m.d.sync += self.out_valid.eq(1)
+        with m.Elif(self.out_valid & self.out_ready):
+            m.d.sync += self.out_valid.eq(0)
 
         quotient = Signal(PREC_BITS + 1)  # 59 bits
         remainder = Signal(PREC_BITS + 2)  # 60 bits
