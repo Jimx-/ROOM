@@ -5,6 +5,7 @@ from room.consts import *
 from room.types import MicroOp
 from room.branch import BranchMaskAllocator, BranchUpdate
 from room.exc import Cause
+from room.fpu import FPFormat
 
 
 class IDDebug(Record):
@@ -537,9 +538,9 @@ class DecodeUnit(Elaboratable):
                     ]
 
                     with m.Switch(inuop.inst[25:27]):
-                        with m.Case(0b00):
+                        with m.Case(FPFormat.S):
                             m.d.comb += uop.fp_single.eq(1)
-                        with m.Case(0b01):
+                        with m.Case(FPFormat.D):
                             pass
                         with m.Default():
                             m.d.comb += ILL_INSN
@@ -575,9 +576,9 @@ class DecodeUnit(Elaboratable):
                     ]
 
                     with m.Switch(inuop.inst[25:27]):
-                        with m.Case(0b00):
+                        with m.Case(FPFormat.S):
                             m.d.comb += uop.fp_single.eq(1)
-                        with m.Case(0b01):
+                        with m.Case(FPFormat.D):
                             pass
                         with m.Default():
                             m.d.comb += ILL_INSN

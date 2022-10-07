@@ -11,6 +11,11 @@ class FPUOperator(IntEnum):
     MUL = 3
 
 
+class FPFormat(IntEnum):
+    S = 0
+    D = 1
+
+
 class FType:
 
     INFO_LAYOUT = [('is_normal', 1), ('is_subnormal', 1), ('is_zero', 1),
@@ -48,6 +53,11 @@ class FType:
 
 FType.FP32 = FType(8, 23)
 FType.FP64 = FType(11, 52)
+
+_fmt_ftypes = {
+    FPFormat.S: FType.FP32,
+    FPFormat.D: FType.FP64,
+}
 
 
 class FPUInput(Record):
@@ -124,9 +134,9 @@ class FPURounding(Elaboratable):
 
 class FPUFMA(Elaboratable):
 
-    def __init__(self, width, ftyp, latency=3):
+    def __init__(self, width, format, latency=3):
         self.width = width
-        self.ftyp = ftyp
+        self.ftyp = _fmt_ftypes[format]
         self.latency = latency
 
         self.inp = FPUInput(self.width)
@@ -422,7 +432,7 @@ class FPUFMA(Elaboratable):
         return m
 
 
-class FPUDivSqrt64(Elaboratable):
+class FPUDivSqrtMulti(Elaboratable):
 
     def __init__(self):
         self.ftyp = FType.FP64
@@ -430,6 +440,7 @@ class FPUDivSqrt64(Elaboratable):
         self.a = Signal(64)
         self.b = Signal(64)
         self.is_sqrt = Signal()
+        self.fmt = Signal(FPFormat)
         self.rm = Signal(RoundingMode)
         self.in_valid = Signal()
         self.in_ready = Signal()
@@ -442,7 +453,13 @@ class FPUDivSqrt64(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        max_iters = 0x1c
+        ROUND_BITS = 6
+        PREC_BITS = self.ftyp.man + ROUND_BITS
+
+        N_ITERS = {
+            FPFormat.S: PREC_BITS // 4,
+            FPFormat.D: PREC_BITS // 2 - 1,
+        }
 
         in_a = Record(self.ftyp.record_layout())
         in_b = Record(self.ftyp.record_layout())
@@ -457,6 +474,16 @@ class FPUDivSqrt64(Elaboratable):
             in_info_b.eq(self.ftyp.classify(self.b)),
         ]
 
+        with m.Switch(self.fmt):
+            for fmt in [FPFormat.S, FPFormat.D]:
+                with m.Case(fmt):
+                    ftyp = _fmt_ftypes[fmt]
+
+                    m.d.comb += [
+                        in_info_a.eq(ftyp.classify(self.a)),
+                        in_info_b.eq(ftyp.classify(self.b)),
+                    ]
+
         #
         # Preprocessing
         #
@@ -466,6 +493,7 @@ class FPUDivSqrt64(Elaboratable):
 
         man_a = Signal(self.ftyp.man + 2)  # With implied bit & sign bit
         man_b = Signal(self.ftyp.man + 2)
+        man_b_inv = Signal(self.ftyp.man + 2)
         man_sqrt = Signal(self.ftyp.man + 2)
 
         info_a = Record(self.ftyp.INFO_LAYOUT)
@@ -473,6 +501,7 @@ class FPUDivSqrt64(Elaboratable):
 
         start = Signal()
         do_sqrt = Signal()
+        fmt_sel = Signal()
         round_mode = Signal.like(self.rm)
         final_sign = Signal()
 
@@ -482,27 +511,59 @@ class FPUDivSqrt64(Elaboratable):
             m.d.sync += [
                 info_a.eq(in_info_a),
                 info_b.eq(in_info_b),
-                exp_a.eq(in_a.exp),
-                exp_b.eq(in_b.exp),
-                man_a.eq(Cat(in_a.man, in_info_a.is_normal, 0)),
-                man_b.eq(Cat(in_b.man, in_info_b.is_normal, 0)),
-                man_sqrt.eq(
-                    Mux(in_a.exp[0], Cat(in_a.man, in_info_a.is_normal, 0),
-                        Cat(0, in_a.man, in_info_a.is_normal))),
                 do_sqrt.eq(self.is_sqrt),
+                fmt_sel.eq(self.fmt),
                 round_mode.eq(self.rm),
             ]
 
-            with m.If(self.is_sqrt):
-                m.d.sync += final_sign.eq(in_a.sign)
-            with m.Else():
-                m.d.sync += final_sign.eq(in_a.sign ^ in_b.sign)
+            with m.Switch(self.fmt):
+                for fmt in [FPFormat.S, FPFormat.D]:
+                    with m.Case(fmt):
+                        ftyp = _fmt_ftypes[fmt]
+
+                        sign_a = in_a[ftyp.man + ftyp.exp]
+                        sign_b = in_b[ftyp.man + ftyp.exp]
+
+                        m.d.sync += [
+                            exp_a.eq(in_a[ftyp.man:ftyp.man + ftyp.exp]),
+                            exp_b.eq(in_b[ftyp.man:ftyp.man + ftyp.exp]),
+                            man_a.eq(
+                                Cat(Repl(0, self.ftyp.man - ftyp.man),
+                                    in_a[:ftyp.man], in_info_a.is_normal, 0)),
+                            man_b.eq(
+                                Cat(Repl(0, self.ftyp.man - ftyp.man),
+                                    in_b[:ftyp.man], in_info_b.is_normal, 0)),
+                        ]
+
+                        with m.If(self.is_sqrt):
+                            m.d.sync += final_sign.eq(sign_a)
+                        with m.Else():
+                            m.d.sync += final_sign.eq(sign_a ^ sign_b)
+
+        m.d.comb += man_sqrt.eq(
+            Mux(exp_a[0], Cat(man_a[:-1], 0), Cat(0, man_a[:-1])))
+
+        with m.Switch(self.fmt):
+            for fmt in [FPFormat.S, FPFormat.D]:
+                with m.Case(fmt):
+                    ftyp = _fmt_ftypes[fmt]
+
+                    m.d.comb += man_b_inv.eq(
+                        Cat(Repl(0, self.ftyp.man - ftyp.man),
+                            ~man_b[self.ftyp.man - ftyp.man:]))
 
         #
         # FSM control
         #
 
         count = Signal(range(64))
+        max_iters = Signal.like(count)
+
+        with m.Switch(fmt_sel):
+            for fmt in [FPFormat.S, FPFormat.D]:
+                with m.Case(fmt):
+                    m.d.comb += max_iters.eq(N_ITERS[fmt])
+
         with m.If(self.kill | (count == max_iters)):
             m.d.sync += count.eq(0)
         with m.Elif(start | (count > 0)):
@@ -514,16 +575,18 @@ class FPUDivSqrt64(Elaboratable):
 
         m.d.sync += self.out_valid.eq(count == max_iters)
 
-        quotient = Signal(self.ftyp.man + 7)  # 59 bits
-        remainder = Signal(self.ftyp.man + 8)  # 60 bits
-
-        man_b_inv = Cat(Const(0, 5), 1, ~man_b)
+        quotient = Signal(PREC_BITS + 1)  # 59 bits
+        remainder = Signal(PREC_BITS + 2)  # 60 bits
 
         adder_in_div_a = [Signal.like(remainder) for _ in range(2)]
         adder_in_div_b = [Signal.like(remainder) for _ in range(2)]
 
-        adder_in_a = [Signal.like(remainder) for _ in range(2)]
-        adder_in_b = [Signal.like(remainder) for _ in range(2)]
+        adder_in_a = [
+            Signal.like(remainder, name=f'adder_in_a{i}') for i in range(2)
+        ]
+        adder_in_b = [
+            Signal.like(remainder, name=f'adder_in_b{i}') for i in range(2)
+        ]
 
         adder_out = [
             Signal.like(remainder, name=f'adder_out{i}') for i in range(2)
@@ -537,7 +600,7 @@ class FPUDivSqrt64(Elaboratable):
         sqrt_Do = [Signal(2, name=f'sqrt_Do{i}') for i in range(2)]
 
         with m.Switch(count):
-            for s in range(max_iters + 1):
+            for s in range(N_ITERS[FPFormat.D] + 1):
                 with m.Case(s):
                     if 4 * s <= self.ftyp.man:
                         m.d.comb += sqrt_Di[0].eq(
@@ -561,20 +624,32 @@ class FPUDivSqrt64(Elaboratable):
         m.d.comb += [
             sqrt_R[0].eq(Mux(start, 0, remainder)),
             sqrt_R[1].eq(
-                Cat(sqrt_Do[0], adder_out[0][:self.ftyp.man + 5],
+                Cat(sqrt_Do[0], adder_out[0][:self.ftyp.man + ROUND_BITS - 1],
                     adder_out[0][-1])),
         ]
 
+        def recode_vec(x, carry):
+            return Cat(
+                Const(0, ROUND_BITS - 1),
+                (fmt_sel == FPFormat.D) & carry,
+                x[:self.ftyp.man - FType.FP32.man - 1],
+                Mux(fmt_sel == FPFormat.S, carry,
+                    x[self.ftyp.man - FType.FP32.man - 1]),
+                x[self.ftyp.man - FType.FP32.man:],
+            )
+
         m.d.comb += [
             adder_in_div_a[0].eq(
-                Mux(start, Cat(Const(0, 5), 1, man_a),
-                    Cat(Const(0, 5), quotient[0], remainder[5:]))),
+                Mux(start, recode_vec(man_a, 1),
+                    recode_vec(remainder[ROUND_BITS - 1:], quotient[0]))),
             adder_in_div_b[0].eq(
-                Mux(start | quotient[0], man_b_inv, Cat(Const(0, 6), man_b))),
+                Mux(start | quotient[0], recode_vec(man_b_inv, 1),
+                    Cat(Const(0, ROUND_BITS), man_b))),
             adder_in_div_a[1].eq(
-                Cat(Const(0, 5), ~adder_out[0][-1], adder_out[0][5:])),
+                recode_vec(adder_out[0][ROUND_BITS - 1:], ~adder_out[0][-1])),
             adder_in_div_b[1].eq(
-                Mux(~adder_out[0][-1], man_b_inv, Cat(Const(0, 6), man_b))),
+                Mux(~adder_out[0][-1], recode_vec(man_b_inv, 1),
+                    Cat(Const(0, ROUND_BITS), man_b))),
         ]
 
         m.d.comb += [
@@ -595,7 +670,8 @@ class FPUDivSqrt64(Elaboratable):
             ]
 
         with m.If(start | (count > 0)):
-            sqrt_R = Cat(sqrt_Do[1], adder_out[1][:self.ftyp.man + 5],
+            sqrt_R = Cat(sqrt_Do[1],
+                         adder_out[1][:self.ftyp.man + ROUND_BITS - 1],
                          adder_out[1][-1])
 
             m.d.sync += [
@@ -610,9 +686,22 @@ class FPUDivSqrt64(Elaboratable):
                         Cat(exp_a, Repl(exp_a[-1], 2)))
         exp_add_b = Mux(do_sqrt, Cat(exp_a[0], Repl(0, self.ftyp.exp + 1)),
                         ~Cat(exp_b, Repl(exp_b[-1], 2)))
-        exp_add_c = Mux(do_sqrt, self.ftyp.half_bias(), self.ftyp.bias() + 1)
 
-        m.d.comb += final_mantissa.eq(Cat(Const(0, 1), quotient[:-1])),
+        exp_add_c = Signal.like(final_exponent)
+        with m.Switch(fmt_sel):
+            for fmt in [FPFormat.S, FPFormat.D]:
+                with m.Case(fmt):
+                    ftyp = _fmt_ftypes[fmt]
+
+                    m.d.comb += exp_add_c.eq(
+                        Mux(do_sqrt, ftyp.half_bias(),
+                            ftyp.bias() + 1))
+
+        with m.If(fmt_sel == FPFormat.S):
+            m.d.comb += final_mantissa.eq(quotient)
+        with m.Else():
+            m.d.comb += final_mantissa.eq(Cat(Const(0, 1), quotient[:-1]))
+
         with m.If(start):
             m.d.sync += final_exponent.eq(exp_add_a + exp_add_b + exp_add_c)
 
@@ -623,25 +712,41 @@ class FPUDivSqrt64(Elaboratable):
         pre_round_sign = Signal()
         pre_round_exponent = Signal(self.ftyp.exp)
         pre_round_mantissa = Signal(self.ftyp.man)
+        pre_round_abs = Signal(64)
         round_sticky_bits = Signal(2)
 
-        with m.If(final_mantissa[-1]):
-            m.d.comb += [
-                pre_round_sign.eq(final_sign),
-                pre_round_exponent.eq(final_exponent),
-                pre_round_mantissa.eq(final_mantissa[6:-1]),
-                round_sticky_bits.eq(
-                    Cat(final_mantissa[:5] != 0, final_mantissa[5])),
-            ]
+        with m.Switch(fmt_sel):
+            for fmt in [FPFormat.S, FPFormat.D]:
+                with m.Case(fmt):
+                    ftyp = _fmt_ftypes[fmt]
 
-        with m.Else():
-            m.d.comb += [
-                pre_round_sign.eq(final_sign),
-                pre_round_exponent.eq(final_exponent - 1),
-                pre_round_mantissa.eq(final_mantissa[5:-2]),
-                round_sticky_bits.eq(
-                    Cat(final_mantissa[:4] != 0, final_mantissa[4])),
-            ]
+                    with m.If(final_mantissa[ftyp.man + ROUND_BITS]):
+                        m.d.comb += [
+                            pre_round_sign.eq(final_sign),
+                            pre_round_exponent.eq(final_exponent),
+                            pre_round_mantissa.eq(
+                                final_mantissa[ROUND_BITS:ftyp.man +
+                                               ROUND_BITS]),
+                            round_sticky_bits.eq(
+                                Cat(final_mantissa[:ROUND_BITS - 1] != 0,
+                                    final_mantissa[ROUND_BITS - 1])),
+                        ]
+
+                    with m.Else():
+                        m.d.comb += [
+                            pre_round_sign.eq(final_sign),
+                            pre_round_exponent.eq(final_exponent - 1),
+                            pre_round_mantissa.eq(
+                                final_mantissa[ROUND_BITS - 1:ftyp.man +
+                                               ROUND_BITS - 1]),
+                            round_sticky_bits.eq(
+                                Cat(final_mantissa[:ROUND_BITS - 2] != 0,
+                                    final_mantissa[ROUND_BITS - 2])),
+                        ]
+
+                    m.d.comb += pre_round_abs.eq(
+                        Cat(pre_round_mantissa[:ftyp.man],
+                            pre_round_exponent[:ftyp.exp]))
 
         #
         # Rounding
@@ -652,11 +757,22 @@ class FPUDivSqrt64(Elaboratable):
 
         m.d.comb += [
             rounding.in_sign.eq(pre_round_sign),
-            rounding.in_abs.eq(Cat(pre_round_mantissa, pre_round_exponent)),
+            rounding.in_abs.eq(pre_round_abs),
             rounding.round_mode.eq(round_mode),
             rounding.round_sticky_bits.eq(round_sticky_bits),
         ]
 
-        m.d.comb += self.out.eq(Cat(rounding.rounded_abs, rounding.out_sign))
+        result = Signal(64)
+
+        with m.Switch(fmt_sel):
+            for fmt in [FPFormat.S, FPFormat.D]:
+                with m.Case(fmt):
+                    ftyp = _fmt_ftypes[fmt]
+
+                    m.d.comb += result.eq(
+                        Cat(rounding.rounded_abs[:ftyp.man + ftyp.exp],
+                            rounding.out_sign))
+
+        m.d.comb += self.out.eq(result)
 
         return m

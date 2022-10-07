@@ -6,7 +6,7 @@ from room.consts import *
 from room.types import MicroOp
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
-from room.fpu import FPUOperator, FType, FPUFMA
+from room.fpu import FPUOperator, FPFormat, FPUFMA
 from room.utils import generate_imm
 
 
@@ -711,8 +711,8 @@ class FPUUnit(PipelinedFunctionalUnit):
         fma_op = Signal(FPUOperator)
         fma_op_mod = Signal()
 
-        type_in_single = Signal()
-        type_out_single = Signal()
+        fmt_in = Signal(FPFormat)
+        fmt_out = Signal(FPFormat)
 
         swap32 = Signal()
 
@@ -721,8 +721,10 @@ class FPUUnit(PipelinedFunctionalUnit):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
-                    type_in_single.eq(self.req.uop.fp_single),
-                    type_out_single.eq(self.req.uop.fp_single),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
                     swap32.eq(1),
                 ]
 
@@ -731,8 +733,10 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
                     fma_op_mod.eq(1),
-                    type_in_single.eq(self.req.uop.fp_single),
-                    type_out_single.eq(self.req.uop.fp_single),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
                     swap32.eq(1),
                 ]
 
@@ -740,16 +744,20 @@ class FPUUnit(PipelinedFunctionalUnit):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.MUL),
-                    type_in_single.eq(self.req.uop.fp_single),
-                    type_out_single.eq(self.req.uop.fp_single),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FMADD_S, UOpCode.FMADD_D):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
-                    type_in_single.eq(self.req.uop.fp_single),
-                    type_out_single.eq(self.req.uop.fp_single),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FMSUB_S, UOpCode.FMSUB_D):
@@ -757,16 +765,20 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
                     fma_op.eq(1),
-                    type_in_single.eq(self.req.uop.fp_single),
-                    type_out_single.eq(self.req.uop.fp_single),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FNMSUB_S, UOpCode.FNMSUB_D):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
-                    type_in_single.eq(self.req.uop.fp_single),
-                    type_out_single.eq(self.req.uop.fp_single),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FNMADD_S, UOpCode.FNMADD_D):
@@ -774,8 +786,10 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
                     fma_op.eq(1),
-                    type_in_single.eq(self.req.uop.fp_single),
-                    type_out_single.eq(self.req.uop.fp_single),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
         def set_fu_input(inp):
@@ -791,18 +805,18 @@ class FPUUnit(PipelinedFunctionalUnit):
                 m.d.comb += inp.in3.eq(self.req.rs2_data)
 
         dfma = m.submodules.dfma = FPUFMA(self.width,
-                                          FType.FP64,
+                                          FPFormat.D,
                                           latency=self.fma_latency)
         set_fu_input(dfma.inp)
         m.d.comb += dfma.inp_valid.eq(self.req.valid & fma_en
-                                      & ~type_out_single)
+                                      & (fmt_out == FPFormat.D))
 
         sfma = m.submodules.sfma = FPUFMA(32,
-                                          FType.FP32,
+                                          FPFormat.S,
                                           latency=self.fma_latency)
         set_fu_input(sfma.inp)
         m.d.comb += sfma.inp_valid.eq(self.req.valid & fma_en
-                                      & type_out_single)
+                                      & (fmt_out == FPFormat.S))
 
         m.d.comb += self.resp.data.eq(
             Mux(dfma.out_valid, dfma.out.data,
