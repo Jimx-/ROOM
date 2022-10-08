@@ -122,3 +122,48 @@ class BranchKillableFIFO(Elaboratable):
                     m.d.comb += do_enq.eq(0)
 
         return m
+
+
+class Pipe(Elaboratable):
+
+    def __init__(self, width, depth=1):
+        self.width = width
+        self.depth = depth
+
+        self.in_valid = Signal()
+        self.in_data = Signal(width)
+
+        self.out_valid = Signal()
+        self.out_data = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        if self.depth == 0:
+            m.d.comb += [
+                self.out_valid.eq(self.in_valid),
+                self.out_data.eq(self.in_data),
+            ]
+
+        else:
+            valids = [Signal(name=f's{i}_valid') for i in range(self.depth)]
+            data = [
+                Signal.like(self.in_data, name=f's{i}_data')
+                for i in range(self.depth)
+            ]
+
+            m.d.sync += valids[0].eq(self.in_valid)
+            with m.If(self.in_valid):
+                m.d.sync += data[0].eq(self.in_data)
+
+            for i in range(1, self.depth):
+                m.d.sync += valids[i].eq(valids[i - 1])
+                with m.If(valids[i - 1]):
+                    m.d.sync += data[i].eq(data[i - 1])
+
+            m.d.comb += [
+                self.out_valid.eq(valids[-1]),
+                self.out_data.eq(data[-1]),
+            ]
+
+        return m

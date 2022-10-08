@@ -2,6 +2,7 @@ from amaranth import *
 from enum import IntEnum
 
 from room.consts import *
+from room.utils import Pipe
 
 
 class FPUOperator(IntEnum):
@@ -152,12 +153,20 @@ class FPUFMA(Elaboratable):
         exp_width = max(self.ftyp.exp + 2,
                         Shape.cast(range(2 * prec_bits + 3)).width)
 
-        valid = Signal()
-        inp = FPUInput(self.width)
+        #
+        # S1 - Input
+        #
 
-        m.d.sync += valid.eq(self.inp_valid)
-        with m.If(self.inp_valid):
-            m.d.sync += inp.eq(self.inp)
+        s1_valid = Signal()
+        s1_inp = FPUInput(self.width)
+
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp))
+        m.d.comb += [
+            inp_pipe.in_valid.eq(self.inp_valid),
+            inp_pipe.in_data.eq(self.inp),
+            s1_valid.eq(inp_pipe.out_valid),
+            s1_inp.eq(inp_pipe.out_data),
+        ]
 
         in1 = Record(self.ftyp.record_layout())
         in2 = Record(self.ftyp.record_layout())
@@ -168,18 +177,18 @@ class FPUFMA(Elaboratable):
         info3 = Record(self.ftyp.INFO_LAYOUT)
 
         m.d.comb += [
-            in1.eq(inp.in1),
-            in2.eq(inp.in2),
-            in3.eq(inp.in3),
-            in3.sign.eq(inp.in3[-1] ^ inp.fn_mod),
+            in1.eq(s1_inp.in1),
+            in2.eq(s1_inp.in2),
+            in3.eq(s1_inp.in3),
+            in3.sign.eq(s1_inp.in3[-1] ^ s1_inp.fn_mod),
             info1.eq(self.ftyp.classify(in1)),
             info2.eq(self.ftyp.classify(in2)),
             info3.eq(self.ftyp.classify(in3)),
         ]
 
-        with m.Switch(inp.fn):
+        with m.Switch(s1_inp.fn):
             with m.Case(FPUOperator.FNMSUB):
-                m.d.comb += in1.sign.eq(~inp.in1[-1])
+                m.d.comb += in1.sign.eq(~s1_inp.in1[-1])
 
             with m.Case(FPUOperator.ADD):
                 m.d.comb += [
@@ -197,21 +206,21 @@ class FPUFMA(Elaboratable):
                     info3.is_zero.eq(1),
                 ]
 
-        eff_subtraction = in1.sign ^ in2.sign ^ in3.sign
+        s1_eff_subtraction = in1.sign ^ in2.sign ^ in3.sign
         tentative_sign = in1.sign ^ in2.sign
 
         exp_addend = Signal(signed(exp_width))
-        exp_product = Signal(signed(exp_width))
-        exp_diff = Signal(signed(exp_width))
-        tentative_exp = Signal(signed(exp_width))
+        s1_exp_product = Signal(signed(exp_width))
+        s1_exp_diff = Signal(signed(exp_width))
+        s1_tentative_exp = Signal(signed(exp_width))
 
-        addend_shamt = Signal(range(3 * prec_bits + 5))
-        with m.If(exp_diff <= -2 * prec_bits - 1):
-            m.d.comb += addend_shamt.eq(3 * prec_bits + 4)
-        with m.Elif(exp_diff <= prec_bits + 2):
-            m.d.comb += addend_shamt.eq(prec_bits + 3 - exp_diff)
+        s1_addend_shamt = Signal(range(3 * prec_bits + 5))
+        with m.If(s1_exp_diff <= -2 * prec_bits - 1):
+            m.d.comb += s1_addend_shamt.eq(3 * prec_bits + 4)
+        with m.Elif(s1_exp_diff <= prec_bits + 2):
+            m.d.comb += s1_addend_shamt.eq(prec_bits + 3 - s1_exp_diff)
         with m.Else():
-            m.d.comb += addend_shamt.eq(0)
+            m.d.comb += s1_addend_shamt.eq(0)
 
         exp1 = Signal(signed(exp_width))
         exp2 = Signal(signed(exp_width))
@@ -222,13 +231,14 @@ class FPUFMA(Elaboratable):
             exp2.eq(Cat(in2.exp, 0)),
             exp3.eq(Cat(in3.exp, 0)),
             exp_addend.eq(exp3 + Cat(~info3.is_normal, 0).as_signed()),
-            exp_product.eq(
+            s1_exp_product.eq(
                 Mux(
                     info1.is_zero | info2.is_zero, 2 - self.ftyp.bias(),
                     exp1 + info1.is_subnormal + exp2 + info2.is_subnormal -
                     self.ftyp.bias())),
-            exp_diff.eq(exp_addend - exp_product),
-            tentative_exp.eq(Mux(exp_diff > 0, exp_addend, exp_product)),
+            s1_exp_diff.eq(exp_addend - s1_exp_product),
+            s1_tentative_exp.eq(
+                Mux(s1_exp_diff > 0, exp_addend, s1_exp_product)),
         ]
 
         man1 = Signal(prec_bits)
@@ -245,62 +255,60 @@ class FPUFMA(Elaboratable):
 
         addend_shifted = Signal(3 * prec_bits + 4)
         addend_sticky_bits = Signal(prec_bits)
-        sticky_before_add = (addend_sticky_bits != 0)
+        s1_sticky_before_add = (addend_sticky_bits != 0)
 
-        m.d.comb += Cat(
-            addend_sticky_bits,
-            addend_shifted).eq((man3 << (3 * prec_bits + 4)) >> addend_shamt)
+        m.d.comb += Cat(addend_sticky_bits, addend_shifted).eq(
+            (man3 << (3 * prec_bits + 4)) >> s1_addend_shamt)
 
         sum_raw = Signal(3 * prec_bits + 5)
-        sum = Signal(3 * prec_bits + 4)
+        s1_sum = Signal(3 * prec_bits + 4)
 
         m.d.comb += [
-            sum_raw.eq((product << 2) +
-                       Mux(eff_subtraction, ~addend_shifted, addend_shifted) +
-                       (eff_subtraction & (addend_sticky_bits != 0))),
-            sum.eq(Mux(eff_subtraction & ~sum_raw[-1], -sum_raw, sum_raw)),
+            sum_raw.eq(
+                (product << 2) +
+                Mux(s1_eff_subtraction, ~addend_shifted, addend_shifted) +
+                (s1_eff_subtraction & (addend_sticky_bits != 0))),
+            s1_sum.eq(Mux(s1_eff_subtraction & ~sum_raw[-1], -sum_raw,
+                          sum_raw)),
         ]
 
-        final_sign = Mux(eff_subtraction & (sum_raw[-1] == tentative_sign), 1,
-                         Mux(eff_subtraction, 0, tentative_sign))
+        s1_final_sign = Mux(
+            s1_eff_subtraction & (sum_raw[-1] == tentative_sign), 1,
+            Mux(s1_eff_subtraction, 0, tentative_sign))
 
-        eff_subtraction_q = Signal.like(eff_subtraction)
-        exp_product_q = Signal.like(exp_product)
-        exp_diff_q = Signal.like(exp_diff)
-        tentative_exp_q = Signal.like(tentative_exp)
-        addend_shamt_q = Signal.like(addend_shamt)
-        sticky_before_add_q = Signal.like(sticky_before_add)
-        sum_q = Signal.like(sum)
-        final_sign_q = Signal.like(final_sign)
-        round_mode_q = Signal.like(inp.rm)
-        valid_q1 = Signal()
+        #
+        # S2 - Normalization & Rounding
+        #
 
-        if self.latency > 1:
-            m.d.sync += [
-                eff_subtraction_q.eq(eff_subtraction),
-                exp_product_q.eq(exp_product),
-                exp_diff_q.eq(exp_diff),
-                tentative_exp_q.eq(tentative_exp),
-                addend_shamt_q.eq(addend_shamt),
-                sticky_before_add_q.eq(sticky_before_add),
-                sum_q.eq(sum),
-                final_sign_q.eq(final_sign),
-                round_mode_q.eq(inp.rm),
-                valid_q1.eq(valid),
-            ]
-        else:
-            m.d.comb += [
-                eff_subtraction_q.eq(eff_subtraction),
-                exp_product_q.eq(exp_product),
-                exp_diff_q.eq(exp_diff),
-                tentative_exp_q.eq(tentative_exp),
-                addend_shamt_q.eq(addend_shamt),
-                sticky_before_add_q.eq(sticky_before_add),
-                sum_q.eq(sum),
-                final_sign_q.eq(final_sign),
-                round_mode_q.eq(inp.rm),
-                valid_q1.eq(valid),
-            ]
+        s2_eff_subtraction = Signal.like(s1_eff_subtraction)
+        s2_exp_product = Signal.like(s1_exp_product)
+        s2_exp_diff = Signal.like(s1_exp_diff)
+        s2_tentative_exp = Signal.like(s1_tentative_exp)
+        s2_addend_shamt = Signal.like(s1_addend_shamt)
+        s2_sticky_before_add = Signal.like(s1_sticky_before_add)
+        s2_sum = Signal.like(s1_sum)
+        s2_final_sign = Signal.like(s1_final_sign)
+        s2_round_mode = Signal.like(s1_inp.rm)
+        s2_valid = Signal()
+
+        s2_pipe_in = Cat(s1_eff_subtraction, s1_exp_product, s1_exp_diff,
+                         s1_tentative_exp, s1_addend_shamt,
+                         s1_sticky_before_add, s1_sum, s1_final_sign,
+                         s1_inp.rm)
+        s2_pipe_out = Cat(s2_eff_subtraction, s2_exp_product, s2_exp_diff,
+                          s2_tentative_exp, s2_addend_shamt,
+                          s2_sticky_before_add, s2_sum, s2_final_sign,
+                          s2_round_mode)
+
+        s2_pipe = m.submodules.s2_pipe = Pipe(
+            width=len(s2_pipe_in), depth=1 if self.latency > 1 else 0)
+
+        m.d.comb += [
+            s2_pipe.in_valid.eq(s1_valid),
+            s2_pipe.in_data.eq(s2_pipe_in),
+            s2_valid.eq(s2_pipe.out_valid),
+            s2_pipe_out.eq(s2_pipe.out_data),
+        ]
 
         clz = Signal(range(2 * prec_bits + 4))
         clz_empty = Signal()
@@ -311,36 +319,37 @@ class FPUFMA(Elaboratable):
         ]
 
         for i in range(2 * prec_bits + 3):
-            with m.If(sum_q[i]):
+            with m.If(s2_sum[i]):
                 m.d.comb += [
                     clz.eq(2 * prec_bits + 2 - i),
                     clz_empty.eq(0),
                 ]
 
-        norm_shamt = Signal.like(addend_shamt)
+        norm_shamt = Signal.like(s2_addend_shamt)
         exp_normalized = Signal(self.ftyp.exp)
 
-        with m.If((exp_diff_q <= 0) | (eff_subtraction_q & (exp_diff_q <= 2))):
-            with m.If((exp_product_q - Cat(clz, 0).as_signed() + 1 >= 0)
+        with m.If((s2_exp_diff <= 0)
+                  | (s2_eff_subtraction & (s2_exp_diff <= 2))):
+            with m.If((s2_exp_product - Cat(clz, 0).as_signed() + 1 >= 0)
                       & ~clz_empty):
                 m.d.comb += [
                     norm_shamt.eq(prec_bits + 2 + clz),
-                    exp_normalized.eq(exp_product_q - Cat(clz, 0).as_signed() +
-                                      1),
+                    exp_normalized.eq(s2_exp_product -
+                                      Cat(clz, 0).as_signed() + 1),
                 ]
             with m.Else():
                 m.d.comb += [
-                    norm_shamt.eq(prec_bits + 2 + exp_product_q),
+                    norm_shamt.eq(prec_bits + 2 + s2_exp_product),
                     exp_normalized.eq(0),
                 ]
         with m.Else():
             m.d.comb += [
-                norm_shamt.eq(addend_shamt_q),
-                exp_normalized.eq(tentative_exp_q),
+                norm_shamt.eq(s2_addend_shamt),
+                exp_normalized.eq(s2_tentative_exp),
             ]
 
         sum_shifted = Signal.like(sum_raw)
-        m.d.comb += sum_shifted.eq(sum_q << norm_shamt)
+        m.d.comb += sum_shifted.eq(s2_sum << norm_shamt)
 
         final_mantissa = Signal(prec_bits + 1)
         final_exponent = Signal(self.ftyp.exp)
@@ -364,12 +373,12 @@ class FPUFMA(Elaboratable):
                 final_exponent.eq(exp_normalized - 1),
             ]
 
-        sticky_after_norm = (sum_sticky_bits != 0) | sticky_before_add_q
+        sticky_after_norm = (sum_sticky_bits != 0) | s2_sticky_before_add
 
         of_before_round = final_exponent >= (2**self.ftyp.exp - 1)
         uf_before_round = final_exponent == 0
 
-        pre_round_sign = final_sign
+        pre_round_sign = s2_final_sign
         pre_round_exponent = Mux(of_before_round, 2**self.ftyp.exp - 2,
                                  final_exponent[:self.ftyp.exp])
         pre_round_mantissa = Mux(of_before_round, Repl(1, self.ftyp.man),
@@ -383,9 +392,9 @@ class FPUFMA(Elaboratable):
         m.d.comb += [
             rounding.in_sign.eq(pre_round_sign),
             rounding.in_abs.eq(Cat(pre_round_mantissa, pre_round_exponent)),
-            rounding.round_mode.eq(round_mode_q),
+            rounding.round_mode.eq(s2_round_mode),
             rounding.round_sticky_bits.eq(round_sticky_bits),
-            rounding.eff_subtraction.eq(eff_subtraction_q),
+            rounding.eff_subtraction.eq(s2_eff_subtraction),
         ]
 
         uf_after_round = rounding.rounded_abs[self.ftyp.man:self.ftyp.man +
@@ -398,36 +407,18 @@ class FPUFMA(Elaboratable):
 
         result = regular_result
 
-        if self.latency > 2:
-            result_q = [
-                Signal.like(result, name=f's{2+i}_result')
-                for i in range(self.latency - 2)
-            ]
-            valid_q2 = [
-                Signal(name=f's{2+i}_valid') for i in range(self.latency - 2)
-            ]
+        #
+        # S3 - Output
+        #
 
-            m.d.sync += [
-                result_q[0].eq(result),
-                valid_q2[0].eq(valid_q1),
-            ]
-
-            for i in range(1, self.latency - 2):
-                m.d.sync += [
-                    result_q[i].eq(result_q[i - 1]),
-                    valid_q2[i].eq(valid_q2[i - 1]),
-                ]
-
-            m.d.comb += [
-                self.out.data.eq(result_q[-1]),
-                self.out_valid.eq(valid_q2[-1]),
-            ]
-
-        else:
-            m.d.comb += [
-                self.out.data.eq(result),
-                self.out_valid.eq(valid_q1),
-            ]
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(result),
+                                                depth=self.latency - 2)
+        m.d.comb += [
+            out_pipe.in_valid.eq(s2_valid),
+            out_pipe.in_data.eq(result),
+            self.out_valid.eq(out_pipe.out_valid),
+            self.out.data.eq(out_pipe.out_data),
+        ]
 
         return m
 
