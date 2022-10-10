@@ -10,11 +10,25 @@ class FPUOperator(IntEnum):
     FNMSUB = 1
     ADD = 2
     MUL = 3
+    SGNJ = 4
+    MINMAX = 5
+    CMP = 6
+    CLASSIFY = 7
+    F2F = 8
+    F2I = 9
+    I2F = 10
 
 
 class FPFormat(IntEnum):
     S = 0
     D = 1
+
+
+class IntFormat(IntEnum):
+    INT8 = 0
+    INT16 = 1
+    INT32 = 2
+    INT64 = 3
 
 
 class FType:
@@ -71,6 +85,9 @@ class FPUInput(Record):
             ('in1', width),
             ('in2', width),
             ('in3', width),
+            ('src_fmt', Shape.cast(FPFormat).width),
+            ('dst_fmt', Shape.cast(FPFormat).width),
+            ('int_fmt', Shape.cast(IntFormat).width),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -467,9 +484,9 @@ class FPUDivSqrtMulti(Elaboratable):
         ]
 
         with m.Switch(self.fmt):
-            for fmt in [FPFormat.S, FPFormat.D]:
-                with m.Case(fmt):
-                    ftyp = _fmt_ftypes[fmt]
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
 
                     m.d.comb += [
                         in_info_a.eq(ftyp.classify(self.a)),
@@ -509,9 +526,9 @@ class FPUDivSqrtMulti(Elaboratable):
             ]
 
             with m.Switch(self.fmt):
-                for fmt in [FPFormat.S, FPFormat.D]:
-                    with m.Case(fmt):
-                        ftyp = _fmt_ftypes[fmt]
+                for fmt in FPFormat:
+                    with m.Case(fmt.value):
+                        ftyp = _fmt_ftypes[fmt.value]
 
                         sign_a = in_a[ftyp.man + ftyp.exp]
                         sign_b = in_b[ftyp.man + ftyp.exp]
@@ -536,9 +553,9 @@ class FPUDivSqrtMulti(Elaboratable):
             Mux(exp_a[0], Cat(man_a[:-1], 0), Cat(0, man_a[:-1])))
 
         with m.Switch(self.fmt):
-            for fmt in [FPFormat.S, FPFormat.D]:
-                with m.Case(fmt):
-                    ftyp = _fmt_ftypes[fmt]
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
 
                     m.d.comb += man_b_inv.eq(
                         Cat(Repl(0, self.ftyp.man - ftyp.man),
@@ -686,9 +703,9 @@ class FPUDivSqrtMulti(Elaboratable):
 
         exp_add_c = Signal.like(final_exponent)
         with m.Switch(fmt_sel):
-            for fmt in [FPFormat.S, FPFormat.D]:
-                with m.Case(fmt):
-                    ftyp = _fmt_ftypes[fmt]
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
 
                     m.d.comb += exp_add_c.eq(
                         Mux(do_sqrt, ftyp.half_bias(),
@@ -713,9 +730,9 @@ class FPUDivSqrtMulti(Elaboratable):
         round_sticky_bits = Signal(2)
 
         with m.Switch(fmt_sel):
-            for fmt in [FPFormat.S, FPFormat.D]:
-                with m.Case(fmt):
-                    ftyp = _fmt_ftypes[fmt]
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
 
                     with m.If(final_mantissa[ftyp.man + ROUND_BITS]):
                         m.d.comb += [
@@ -762,14 +779,334 @@ class FPUDivSqrtMulti(Elaboratable):
         result = Signal(64)
 
         with m.Switch(fmt_sel):
-            for fmt in [FPFormat.S, FPFormat.D]:
-                with m.Case(fmt):
-                    ftyp = _fmt_ftypes[fmt]
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
 
                     m.d.comb += result.eq(
                         Cat(rounding.rounded_abs[:ftyp.man + ftyp.exp],
                             rounding.out_sign))
 
         m.d.comb += self.out.eq(result)
+
+        return m
+
+
+class FPUCastMulti(Elaboratable):
+
+    def __init__(self, latency=3):
+        self.width = 64
+        self.ftyp = FType.FP64
+        self.latency = latency
+
+        self.inp = FPUInput(self.width)
+        self.inp_valid = Signal()
+
+        self.out = FPUResult(self.width)
+        self.out_valid = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        MAN_WIDTH = max(self.ftyp.man + 1, self.width)
+        EXP_WIDTH = max(
+            Shape.cast(range(self.width)).width,
+            max(self.ftyp.exp,
+                Shape.cast(range(self.ftyp.bias() + self.ftyp.man)).width)) + 1
+
+        #
+        # S1 - Input
+        #
+
+        s1_valid = Signal()
+        s1_inp = FPUInput(self.width)
+
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp))
+        m.d.comb += [
+            inp_pipe.in_valid.eq(self.inp_valid),
+            inp_pipe.in_data.eq(self.inp),
+            s1_valid.eq(inp_pipe.out_valid),
+            s1_inp.eq(inp_pipe.out_data),
+        ]
+
+        src_is_int = s1_inp.fn == FPUOperator.I2F
+        dst_is_int = s1_inp.fn == FPUOperator.F2I
+
+        fmt_sign = Signal()
+        fmt_exponent = Signal(signed(EXP_WIDTH))
+        fmt_mantissa = Signal(MAN_WIDTH)
+        fmt_offset = Signal(signed(EXP_WIDTH))
+        fmt_bias = Signal(signed(EXP_WIDTH))
+        fmt_subnormal = Signal(signed(EXP_WIDTH))
+        fmt_info = Record(self.ftyp.INFO_LAYOUT)
+
+        with m.Switch(s1_inp.src_fmt):
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
+
+                    m.d.comb += [
+                        fmt_info.eq(ftyp.classify(s1_inp.in1)),
+                        fmt_sign.eq(s1_inp.in1[ftyp.exp +
+                                               ftyp.man].as_signed()),
+                        fmt_exponent.eq(
+                            Cat(s1_inp.in1[ftyp.man:ftyp.man + ftyp.exp], 0)),
+                        fmt_mantissa.eq(
+                            Cat(s1_inp.in1[:ftyp.man], fmt_info.is_normal)),
+                        fmt_offset.eq(MAN_WIDTH - 1 - ftyp.man),
+                        fmt_bias.eq(ftyp.bias()),
+                        fmt_subnormal.eq(Cat(fmt_info.is_subnormal, 0)),
+                    ]
+
+        int_sign = Signal()
+        int_value = Signal(MAN_WIDTH)
+        int_mantissa = Signal(MAN_WIDTH)
+
+        with m.Switch(s1_inp.int_fmt):
+            for fmt in IntFormat:
+                with m.Case(fmt.value):
+                    int_width = 1 << (fmt.value + 3)
+
+                    m.d.comb += [
+                        int_value.eq(
+                            Repl(s1_inp.in1[int_width - 1] & ~s1_inp.fn_mod,
+                                 len(int_value))),
+                        int_value[:int_width].eq(s1_inp.in1[:int_width]),
+                    ]
+
+        m.d.comb += [
+            int_sign.eq(int_value[-1] & ~s1_inp.fn_mod),
+            int_mantissa.eq(
+                Mux(int_sign, (-int_value).as_unsigned(), int_value)),
+        ]
+
+        encoded_mant = Mux(src_is_int, int_mantissa, fmt_mantissa)
+
+        renorm_shamt = Signal(range(MAN_WIDTH + 1))
+        mant_is_zero = Signal()
+
+        m.d.comb += [
+            renorm_shamt.eq(MAN_WIDTH),
+            mant_is_zero.eq(1),
+        ]
+
+        for i in range(MAN_WIDTH):
+            with m.If(encoded_mant[i]):
+                m.d.comb += [
+                    renorm_shamt.eq(MAN_WIDTH - 1 - i),
+                    mant_is_zero.eq(0),
+                ]
+
+        renorm_shamt_se = Signal(signed(len(renorm_shamt) + 1))
+        m.d.comb += renorm_shamt_se.eq(Cat(renorm_shamt, 0))
+
+        input_sign = Mux(src_is_int, int_sign, fmt_sign)
+        input_mant = (encoded_mant << renorm_shamt)[:MAN_WIDTH]
+
+        fp_input_exp = Signal(signed(EXP_WIDTH))
+        int_input_exp = Signal(signed(EXP_WIDTH))
+        m.d.comb += [
+            fp_input_exp.eq(fmt_exponent + fmt_subnormal - fmt_bias -
+                            renorm_shamt_se + fmt_offset),
+            int_input_exp.eq(MAN_WIDTH - 1 - renorm_shamt_se),
+        ]
+
+        input_exp = Signal(signed(EXP_WIDTH))
+        m.d.comb += input_exp.eq(Mux(src_is_int, int_input_exp, fp_input_exp))
+
+        dst_exp = Signal(signed(EXP_WIDTH))
+        with m.Switch(s1_inp.dst_fmt):
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
+                    m.d.comb += dst_exp.eq(input_exp + ftyp.bias())
+
+        s2_input_sign = Signal.like(input_sign)
+        s2_input_exp = Signal.like(input_exp)
+        s2_input_mant = Signal.like(input_mant)
+        s2_src_info = Record(self.ftyp.INFO_LAYOUT)
+        s2_dst_exp = Signal.like(dst_exp)
+        s2_inp = FPUInput(self.width)
+        s2_src_is_int = Signal()
+        s2_dst_is_int = Signal()
+        s2_mant_is_zero = Signal()
+        s2_valid = Signal()
+
+        s2_pipe_in = Cat(input_sign, input_exp, input_mant, fmt_info, dst_exp,
+                         s1_inp, src_is_int, dst_is_int, mant_is_zero)
+        s2_pipe_out = Cat(s2_input_sign, s2_input_exp, s2_input_mant,
+                          s2_src_info, s2_dst_exp, s2_inp, s2_src_is_int,
+                          s2_dst_is_int, s2_mant_is_zero)
+
+        s2_pipe = m.submodules.s2_pipe = Pipe(
+            width=len(s2_pipe_in), depth=1 if self.latency > 1 else 0)
+
+        m.d.comb += [
+            s2_pipe.in_valid.eq(s1_valid),
+            s2_pipe.in_data.eq(s2_pipe_in),
+            s2_valid.eq(s2_pipe.out_valid),
+            s2_pipe_out.eq(s2_pipe.out_data),
+        ]
+
+        dst_exp_bits = Signal(range(self.width))
+        dst_man_bits = Signal(range(self.width))
+
+        with m.Switch(s2_inp.dst_fmt):
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
+
+                    m.d.comb += [
+                        dst_exp_bits.eq(ftyp.exp),
+                        dst_man_bits.eq(ftyp.man),
+                    ]
+
+        final_exp = Signal(EXP_WIDTH)
+        preshift_mant = Signal(2 * MAN_WIDTH + 1)
+        dst_mant = Signal(2 * MAN_WIDTH + 1)
+        final_mant = Signal(self.ftyp.man)
+        final_int = Signal(self.width)
+
+        fp_round_sticky_bits = Signal(2)
+        int_round_sticky_bits = Signal(2)
+
+        of_before_round = Signal()
+        uf_before_round = Signal()
+
+        denorm_shamt = Signal(range(MAN_WIDTH + 1))
+
+        m.d.comb += [
+            final_exp.eq(s2_dst_exp),
+            denorm_shamt.eq(self.ftyp.man - dst_man_bits),
+            preshift_mant.eq(s2_input_mant << (MAN_WIDTH + 1)),
+        ]
+
+        with m.If(s2_dst_is_int):
+            m.d.comb += denorm_shamt.eq(self.width - 1 - s2_input_exp)
+
+            with m.If(s2_input_exp >= (1 << (s2_inp.int_fmt + 3)) - 1 +
+                      s2_inp.fn_mod):
+                m.d.comb += [
+                    denorm_shamt.eq(0),
+                    of_before_round.eq(1),
+                ]
+            with m.Elif(s2_input_exp < -1):
+                m.d.comb += [
+                    denorm_shamt.eq(self.width + 1),
+                    uf_before_round.eq(1),
+                ]
+
+        m.d.comb += [
+            dst_mant.eq(preshift_mant >> denorm_shamt),
+            Cat(fp_round_sticky_bits[1],
+                final_mant).eq(dst_mant[-self.ftyp.man - 2:-1]),
+            Cat(int_round_sticky_bits[1],
+                final_int).eq(dst_mant[-self.width - 1:]),
+            fp_round_sticky_bits[0].eq(dst_mant[:-self.ftyp.man - 2] != 0),
+            int_round_sticky_bits[0].eq(dst_mant[:-self.width - 1] != 0),
+        ]
+
+        round_sticky_bits = Mux(s2_dst_is_int, int_round_sticky_bits,
+                                fp_round_sticky_bits)
+
+        fmt_pre_round_abs = Signal(self.width)
+        ifmt_pre_round_abs = Signal(self.width)
+
+        with m.Switch(s2_inp.dst_fmt):
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
+
+                    m.d.comb += fmt_pre_round_abs.eq(
+                        Cat(final_mant[:ftyp.man], final_exp[:ftyp.exp]))
+
+        with m.Switch(s2_inp.int_fmt):
+            for fmt in IntFormat:
+                with m.Case(fmt.value):
+                    width = 1 << (fmt.value + 3)
+
+                    m.d.comb += [
+                        ifmt_pre_round_abs.eq(
+                            Repl(final_int[width - 1],
+                                 len(ifmt_pre_round_abs))),
+                        ifmt_pre_round_abs[:width].eq(final_int[:width]),
+                    ]
+
+        pre_round_abs = Mux(s2_dst_is_int, ifmt_pre_round_abs,
+                            fmt_pre_round_abs)
+
+        #
+        # Rounding
+        #
+
+        rounding = m.submodules.rounding = FPURounding(self.ftyp.exp +
+                                                       self.ftyp.man + 1)
+
+        m.d.comb += [
+            rounding.in_sign.eq(s2_input_sign),
+            rounding.in_abs.eq(pre_round_abs),
+            rounding.round_mode.eq(s2_inp.rm),
+            rounding.round_sticky_bits.eq(round_sticky_bits),
+        ]
+
+        fmt_result = Signal(self.width)
+        m.d.comb += fmt_result.eq(Repl(1, len(fmt_result)))
+
+        with m.Switch(s2_inp.dst_fmt):
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
+
+                    m.d.comb += fmt_result[:ftyp.man + ftyp.exp + 1].eq(
+                        Mux(
+                            s2_src_is_int & s2_mant_is_zero, 0,
+                            Cat(rounding.rounded_abs[:ftyp.man + ftyp.exp],
+                                rounding.out_sign)))
+
+        rounded_int_res = Mux(rounding.out_sign,
+                              (-rounding.rounded_abs).as_unsigned(),
+                              rounding.rounded_abs)
+
+        ifmt_special_result = Signal(self.width)
+        with m.Switch(s2_inp.int_fmt):
+            for fmt in IntFormat:
+                with m.Case(fmt.value):
+                    width = 1 << (fmt.value + 3)
+
+                    special_result = Signal(width)
+
+                    m.d.comb += [
+                        special_result[:width - 1].eq(Repl(1, width - 1)),
+                        special_result[width - 1].eq(s2_inp.fn_mod),
+                    ]
+
+                    neg_result = s2_input_sign & ~s2_src_info.is_nan
+
+                    m.d.comb += [
+                        ifmt_special_result.eq(
+                            Repl(neg_result ^ special_result[-1],
+                                 len(ifmt_special_result))),
+                        ifmt_special_result[:width].eq(
+                            Mux(neg_result, ~special_result, special_result)),
+                    ]
+
+        int_result_is_special = of_before_round | (s2_input_sign
+                                                   & s2_inp.fn_mod &
+                                                   (rounded_int_res != 0))
+
+        fp_result = fmt_result
+        int_result = Mux(int_result_is_special, ifmt_special_result,
+                         rounded_int_res)
+
+        result = Mux(s2_dst_is_int, int_result, fp_result)
+
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(result),
+                                                depth=self.latency - 2)
+        m.d.comb += [
+            out_pipe.in_valid.eq(s2_valid),
+            out_pipe.in_data.eq(result),
+            self.out_valid.eq(out_pipe.out_valid),
+            self.out.data.eq(out_pipe.out_data),
+        ]
 
         return m
