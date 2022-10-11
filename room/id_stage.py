@@ -578,6 +578,26 @@ class DecodeUnit(Elaboratable):
                                 uop.lrs2_rtype.eq(RegisterType.FLT),
                             ]
 
+                        with m.Case(0b01000):  # fcvt.fmt.fmt
+                            m.d.comb += [
+                                UOPC(
+                                    Mux(uop.fp_single, UOpCode.FCVT_S_D,
+                                        UOpCode.FCVT_D_S)),
+                                uop.lrs2_rtype.eq(RegisterType.X),
+                                IMM_SEL_I,
+                            ]
+
+                        with m.Case(0b11000):  # fcvt.int.fmt
+                            m.d.comb += [
+                                UOPC(
+                                    Mux(uop.fp_single, UOpCode.FCVT_X_S,
+                                        UOpCode.FCVT_X_D)),
+                                uop.fu_type.eq(FUType.F2I),
+                                uop.dst_rtype.eq(RegisterType.FIX),
+                                uop.lrs2_rtype.eq(RegisterType.X),
+                                IMM_SEL_I,
+                            ]
+
                         with m.Case(0b11010):  # fcvt.fmt.int
                             m.d.comb += [
                                 UOPC(

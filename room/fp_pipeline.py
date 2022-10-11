@@ -42,6 +42,7 @@ class FPPipeline(Elaboratable):
         ]
 
         self.from_int = ExecResp(self.flen, params)
+        self.to_int = ExecResp(self.xlen, params)
         self.to_lsu = ExecResp(self.xlen, params)
 
         self.br_update = BranchUpdate(params)
@@ -147,9 +148,9 @@ class FPPipeline(Elaboratable):
         # Writeback
         #
 
-        mem_wbarb = m.submodules.mem_wbarb = Arbiter(
-            width=len(self.from_int.data) + len(self.from_int.uop), n=2)
         mem_wbarb_out = ExecResp(self.flen, self.params)
+        mem_wbarb = m.submodules.mem_wbarb = Arbiter(
+            width=len(mem_wbarb_out.data) + len(mem_wbarb_out.uop), n=2)
 
         m.d.comb += [
             mem_wbarb.in_data[0].eq(
@@ -192,10 +193,14 @@ class FPPipeline(Elaboratable):
         fpiu_unit = [eu for eu in exec_units if eu.has_fpiu][0]
         fpiu_is_stq = fpiu_unit.mem_iresp.uop.opcode == UOpCode.STA
         m.d.comb += [
+            self.to_int.eq(fpiu_unit.mem_iresp),
+            self.to_int.valid.eq(fpiu_unit.mem_iresp.valid
+                                 & fpiu_unit.mem_iresp.ready & ~fpiu_is_stq),
             self.to_lsu.eq(fpiu_unit.mem_iresp),
             self.to_lsu.valid.eq(fpiu_unit.mem_iresp.valid
                                  & fpiu_unit.mem_iresp.ready & fpiu_is_stq),
-            fpiu_unit.mem_iresp.ready.eq(self.to_lsu.ready),
+            fpiu_unit.mem_iresp.ready.eq(self.to_int.ready
+                                         & self.to_lsu.ready),
         ]
 
         #

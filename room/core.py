@@ -19,6 +19,7 @@ from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts
 from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
+from room.utils import Arbiter
 
 from roomsoc.interconnect import wishbone
 
@@ -582,10 +583,40 @@ class Core(Elaboratable):
         # Wakeup (issue & rename)
         #
 
+        mem_wbarb_out = ExecResp(self.xlen, self.params)
+        mem_wbarb = m.submodules.mem_wbarb = Arbiter(
+            width=len(mem_wbarb_out.data) + len(mem_wbarb_out.uop),
+            n=1 + use_fpu)
+
+        m.d.comb += [
+            mem_wbarb.in_data[0].eq(
+                Cat(lsu.exec_iresps[0].uop, lsu.exec_iresps[0].data)),
+            mem_wbarb.in_valid[0].eq(lsu.exec_iresps[0].valid),
+            lsu.exec_iresps[0].ready.eq(mem_wbarb.in_ready[0]),
+        ]
+
+        m.d.comb += [
+            Cat(mem_wbarb_out.uop, mem_wbarb_out.data).eq(mem_wbarb.out_data),
+            mem_wbarb_out.valid.eq(mem_wbarb.out_valid),
+            mem_wbarb.out_ready.eq(mem_wbarb_out.ready),
+        ]
+
         int_iss_wakeups = []
         int_ren_wakeups = []
 
-        for w in range(mem_width):
+        arb_wakeup = ExecResp(self.xlen, self.params, name=f'iss_ren_wakeup0')
+        m.d.comb += [
+            arb_wakeup.uop.eq(mem_wbarb_out.uop),
+            arb_wakeup.valid.eq(
+                mem_wbarb_out.valid & mem_wbarb_out.ready
+                & mem_wbarb_out.uop.rf_wen()
+                & mem_wbarb_out.uop.dst_rtype == RegisterType.FIX),
+        ]
+
+        int_iss_wakeups.append(arb_wakeup)
+        int_ren_wakeups.append(arb_wakeup)
+
+        for w in range(1, mem_width):
             resp = lsu.exec_iresps[w]
 
             wakeup = ExecResp(self.xlen,
@@ -852,8 +883,28 @@ class Core(Elaboratable):
         # Writeback
         #
 
+        m.d.comb += [
+            iregfile.write_ports[0].valid.eq(
+                mem_wbarb_out.valid & mem_wbarb_out.uop.rf_wen()
+                & (mem_wbarb_out.uop.dst_rtype == RegisterType.FIX)),
+            iregfile.write_ports[0].addr.eq(mem_wbarb_out.uop.pdst),
+            iregfile.write_ports[0].data.eq(mem_wbarb_out.data),
+            mem_wbarb_out.ready.eq(1),
+        ]
+
+        if self.sim_debug:
+            wb_debug = self.core_debug.wb_debug[0]
+
+            m.d.comb += [
+                wb_debug.valid.eq(iregfile.write_ports[0].valid),
+                wb_debug.uop_id.eq(mem_wbarb_out.uop.uop_id),
+                wb_debug.pdst.eq(mem_wbarb_out.uop.pdst),
+                wb_debug.data.eq(iregfile.write_ports[0].data),
+            ]
+
         for i, (wp, iresp) in enumerate(
-                zip(iregfile.write_ports[:mem_width], lsu.exec_iresps)):
+                zip(iregfile.write_ports[1:mem_width], lsu.exec_iresps[1:]),
+                1):
             m.d.comb += [
                 wp.valid.eq(iresp.valid & iresp.uop.rf_wen()
                             & (iresp.uop.dst_rtype == RegisterType.FIX)),
@@ -901,6 +952,13 @@ class Core(Elaboratable):
             for wp, fresp in zip(fp_pipeline.mem_wb_ports, lsu.exec_fresps):
                 m.d.comb += wp.eq(fresp)
 
+            m.d.comb += [
+                mem_wbarb.in_data[1].eq(
+                    Cat(fp_pipeline.to_int.uop, fp_pipeline.to_int.data)),
+                mem_wbarb.in_valid[1].eq(fp_pipeline.to_int.valid),
+                fp_pipeline.to_int.ready.eq(mem_wbarb.in_ready[1]),
+            ]
+
             ifpu_unit = [eu for eu in exec_units if eu.has_ifpu][0]
             m.d.comb += ifpu_unit.mem_fresp.connect(fp_pipeline.from_int)
 
@@ -908,7 +966,10 @@ class Core(Elaboratable):
         # Commit
         #
 
-        for rob_wb, iresp in zip(rob.wb_resps[:mem_width], lsu.exec_iresps):
+        m.d.comb += rob.wb_resps[0].eq(mem_wbarb_out)
+
+        for rob_wb, iresp in zip(rob.wb_resps[1:mem_width],
+                                 lsu.exec_iresps[1:]):
             m.d.comb += rob_wb.eq(iresp)
 
         for rob_wb, eu in zip(rob.wb_resps[mem_width:],

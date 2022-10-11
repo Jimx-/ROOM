@@ -752,11 +752,14 @@ class FPUUnit(PipelinedFunctionalUnit):
         m = super().elaborate(platform)
 
         fma_en = Signal()
+        cast_en = Signal()
+
         fma_op = Signal(FPUOperator)
         fma_op_mod = Signal()
 
         fmt_in = Signal(FPFormat)
         fmt_out = Signal(FPFormat)
+        fmt_int = Signal(2)
 
         swap32 = Signal()
 
@@ -836,6 +839,28 @@ class FPUUnit(PipelinedFunctionalUnit):
                         Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
+            with m.Case(UOpCode.FCVT_X_S, UOpCode.FCVT_X_D):
+                typ = generate_imm_type(self.req.uop.imm_packed)
+
+                m.d.comb += [
+                    cast_en.eq(1),
+                    fma_op.eq(FPUOperator.F2I),
+                    fma_op_mod.eq(typ[0]),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_int.eq(Cat(typ[1], 1)),
+                ]
+
+            with m.Case(UOpCode.FCVT_D_S, UOpCode.FCVT_S_D):
+                m.d.comb += [
+                    cast_en.eq(1),
+                    fma_op.eq(FPUOperator.F2F),
+                    fmt_in.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.D, FPFormat.S)),
+                    fmt_out.eq(
+                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                ]
+
         def set_fu_input(inp):
             m.d.comb += [
                 inp.in1.eq(self.req.rs1_data),
@@ -862,9 +887,23 @@ class FPUUnit(PipelinedFunctionalUnit):
         m.d.comb += sfma.inp_valid.eq(self.req.valid & fma_en
                                       & (fmt_out == FPFormat.S))
 
+        fpiu = m.submodules.fpiu = FPUCastMulti(latency=self.fma_latency)
+
+        m.d.comb += [
+            fpiu.inp_valid.eq(self.req.valid & cast_en),
+            fpiu.inp.fn.eq(fma_op),
+            fpiu.inp.fn_mod.eq(fma_op_mod),
+            fpiu.inp.in1.eq(self.req.rs1_data),
+            fpiu.inp.src_fmt.eq(fmt_in),
+            fpiu.inp.dst_fmt.eq(fmt_out),
+            fpiu.inp.int_fmt.eq(fmt_int),
+        ]
+
         m.d.comb += self.resp.data.eq(
-            Mux(dfma.out_valid, dfma.out.data,
-                Mux(sfma.out_valid, sfma.out.data, 0)))
+            Mux(
+                dfma.out_valid, dfma.out.data,
+                Mux(sfma.out_valid, sfma.out.data,
+                    Mux(fpiu.out_valid, fpiu.out.data, 0))))
 
         return m
 
