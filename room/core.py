@@ -901,6 +901,9 @@ class Core(Elaboratable):
             for wp, fresp in zip(fp_pipeline.mem_wb_ports, lsu.exec_fresps):
                 m.d.comb += wp.eq(fresp)
 
+            ifpu_unit = [eu for eu in exec_units if eu.has_ifpu][0]
+            m.d.comb += ifpu_unit.mem_fresp.connect(fp_pipeline.from_int)
+
         #
         # Commit
         #

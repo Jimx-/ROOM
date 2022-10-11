@@ -16,6 +16,10 @@ def generate_imm(ip, sel):
     return Cat(i0, i1_4, i5_10, i11, i12_19, i20_30, sign)
 
 
+def generate_imm_type(ip):
+    return ip[8:10]
+
+
 def _incr(signal, modulo):
     if modulo == 2**len(signal):
         return (signal + 1)[:len(signal)]
@@ -165,5 +169,39 @@ class Pipe(Elaboratable):
                 self.out_valid.eq(valids[-1]),
                 self.out_data.eq(data[-1]),
             ]
+
+        return m
+
+
+class Arbiter(Elaboratable):
+
+    def __init__(self, width, n):
+        self.n = n
+
+        self.in_data = [Signal(width, name=f'in{i}') for i in range(n)]
+        self.in_valid = Signal(n)
+        self.in_ready = Signal(n)
+
+        self.out_data = Signal(width)
+        self.out_valid = Signal()
+        self.out_ready = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += self.out_valid.eq(0)
+
+        for i in reversed(range(self.n)):
+            with m.If(self.in_valid[i]):
+                m.d.comb += [
+                    self.out_valid.eq(1),
+                    self.out_data.eq(self.in_data[i]),
+                ]
+
+        ready = 1
+        for i in range(self.n):
+            m.d.comb += self.in_ready[i].eq(self.out_ready & ready)
+
+            ready &= ~(self.in_valid[i] & self.in_ready[i])
 
         return m

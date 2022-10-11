@@ -578,10 +578,22 @@ class DecodeUnit(Elaboratable):
                                 uop.lrs2_rtype.eq(RegisterType.FLT),
                             ]
 
+                        with m.Case(0b11010):  # fcvt.fmt.int
+                            m.d.comb += [
+                                UOPC(
+                                    Mux(uop.fp_single, UOpCode.FCVT_S_X,
+                                        UOpCode.FCVT_D_X)),
+                                uop.iq_type.eq(IssueQueueType.INT),
+                                uop.fu_type.eq(FUType.I2F),
+                                uop.lrs1_rtype.eq(RegisterType.FIX),
+                                uop.lrs2_rtype.eq(RegisterType.X),
+                                IMM_SEL_I,
+                            ]
+
                         with m.Default():
                             m.d.comb += ILL_INSN
 
-                # Floating point fused arithmetic (fmadd.fmt, fmsub.fmt, fnmadd.fmt, fnmsub.fmt)
+                # Floating point fused arithmetic
                 with m.Case(0b1000011, 0b1000111, 0b1001011, 0b1001111):
                     m.d.comb += [
                         uop.iq_type.eq(IssueQueueType.FP),
@@ -600,23 +612,23 @@ class DecodeUnit(Elaboratable):
                         with m.Default():
                             m.d.comb += ILL_INSN
 
-                    with m.Switch(inuop.inst[0:7]):
+                    with m.Switch(inuop.inst[0:7]):  # fmadd.fmt
                         with m.Case(0b1000011):
                             m.d.comb += UOPC(
                                 Mux(uop.fp_single, UOpCode.FMADD_S,
                                     UOpCode.FMADD_D))
 
-                        with m.Case(0b1000111):
+                        with m.Case(0b1000111):  # fmsub.fmt
                             m.d.comb += UOPC(
                                 Mux(uop.fp_single, UOpCode.FMSUB_S,
                                     UOpCode.FMSUB_D))
 
-                        with m.Case(0b1001011):
+                        with m.Case(0b1001011):  # fnmadd.fmt
                             m.d.comb += UOPC(
                                 Mux(uop.fp_single, UOpCode.FNMADD_S,
                                     UOpCode.FNMADD_D))
 
-                        with m.Case(0b1001111):
+                        with m.Case(0b1001111):  # fnmsub.fmt
                             m.d.comb += UOPC(
                                 Mux(uop.fp_single, UOpCode.FNMSUB_S,
                                     UOpCode.FNMSUB_D))

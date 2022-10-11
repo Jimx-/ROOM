@@ -6,8 +6,8 @@ from room.consts import *
 from room.types import MicroOp
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
-from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti
-from room.utils import generate_imm
+from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti
+from room.utils import generate_imm, generate_imm_type, Pipe
 
 
 class ExecReq:
@@ -692,6 +692,50 @@ class DivUnit(IterativeFunctionalUnit):
             div.resp_ready.eq(self.resp.ready),
             div.kill.eq(self.do_kill),
         ]
+
+        return m
+
+
+class IntToFPUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, width, latency, params):
+        self.width = width
+        self.latency = latency
+
+        super().__init__(latency, width, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        cast_en = Signal()
+
+        with m.Switch(self.req.uop.opcode):
+            with m.Case(UOpCode.FCVT_S_X, UOpCode.FCVT_D_X):
+                m.d.comb += cast_en.eq(1)
+
+        in_pipe = m.submodules.in_pipe = Pipe(width=len(self.req.rs1_data),
+                                              depth=self.latency)
+        m.d.comb += [
+            in_pipe.in_valid.eq(self.req.valid),
+            in_pipe.in_data.eq(self.req.rs1_data),
+        ]
+
+        ifpu = m.submodules.ifpu = FPUCastMulti(latency=self.latency)
+
+        typ = generate_imm_type(self.req.uop.imm_packed)
+
+        m.d.comb += [
+            ifpu.inp_valid.eq(self.req.valid & cast_en),
+            ifpu.inp.fn.eq(FPUOperator.I2F),
+            ifpu.inp.fn_mod.eq(typ[0]),
+            ifpu.inp.in1.eq(self.req.rs1_data),
+            ifpu.inp.dst_fmt.eq(
+                Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+            ifpu.inp.int_fmt.eq(Cat(typ[1], 1)),
+        ]
+
+        m.d.comb += self.resp.data.eq(
+            Mux(ifpu.out_valid, ifpu.out.data, in_pipe.out_data))
 
         return m
 

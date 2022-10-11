@@ -7,6 +7,7 @@ from room.regfile import RegisterFile, RegisterRead
 from room.branch import BranchUpdate
 from room.issue import IssueUnit
 from room.ex_stage import ExecUnits
+from room.utils import Arbiter
 
 
 class FPPipeline(Elaboratable):
@@ -40,6 +41,7 @@ class FPPipeline(Elaboratable):
             for i in range(self.num_wakeup_ports)
         ]
 
+        self.from_int = ExecResp(self.flen, params)
         self.to_lsu = ExecResp(self.xlen, params)
 
         self.br_update = BranchUpdate(params)
@@ -145,8 +147,33 @@ class FPPipeline(Elaboratable):
         # Writeback
         #
 
-        for wp, fresp in zip(fregfile.write_ports[:self.mem_width],
-                             self.mem_wb_ports):
+        mem_wbarb = m.submodules.mem_wbarb = Arbiter(
+            width=len(self.from_int.data) + len(self.from_int.uop), n=2)
+        mem_wbarb_out = ExecResp(self.flen, self.params)
+
+        m.d.comb += [
+            mem_wbarb.in_data[0].eq(
+                Cat(self.mem_wb_ports[0].uop, self.mem_wb_ports[0].data)),
+            mem_wbarb.in_valid[0].eq(self.mem_wb_ports[0].valid),
+            self.mem_wb_ports[0].ready.eq(mem_wbarb.in_ready[0]),
+            mem_wbarb.in_data[1].eq(Cat(self.from_int.uop,
+                                        self.from_int.data)),
+            mem_wbarb.in_valid[1].eq(self.from_int.valid),
+            self.from_int.ready.eq(mem_wbarb.in_ready[1]),
+            Cat(mem_wbarb_out.uop, mem_wbarb_out.data).eq(mem_wbarb.out_data),
+            mem_wbarb_out.valid.eq(mem_wbarb.out_valid),
+        ]
+
+        m.d.sync += [
+            fregfile.write_ports[0].valid.eq(
+                mem_wbarb_out.valid & mem_wbarb_out.uop.rf_wen()
+                & (mem_wbarb_out.uop.dst_rtype == RegisterType.FLT)),
+            fregfile.write_ports[0].addr.eq(mem_wbarb_out.uop.pdst),
+            fregfile.write_ports[0].data.eq(mem_wbarb_out.data),
+        ]
+
+        for wp, fresp in zip(fregfile.write_ports[1:self.mem_width],
+                             self.mem_wb_ports[1:]):
             m.d.sync += [
                 wp.valid.eq(fresp.valid & fresp.uop.rf_wen()
                             & (fresp.uop.dst_rtype == RegisterType.FLT)),
@@ -175,7 +202,13 @@ class FPPipeline(Elaboratable):
         # Commit
         #
 
-        for wb, fresp in zip(self.wakeups[:self.mem_width], self.mem_wb_ports):
+        m.d.comb += [
+            mem_wbarb.out_ready.eq(1),
+            self.wakeups[0].eq(mem_wbarb_out),
+        ]
+
+        for wb, fresp in zip(self.wakeups[1:self.mem_width],
+                             self.mem_wb_ports[1:]):
             m.d.comb += wb.eq(fresp)
 
         for wb, eu in zip(self.wakeups[self.mem_width:],
