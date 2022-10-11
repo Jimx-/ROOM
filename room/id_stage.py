@@ -610,6 +610,40 @@ class DecodeUnit(Elaboratable):
                                 IMM_SEL_I,
                             ]
 
+                        with m.Case(0b11100):
+                            m.d.comb += [
+                                uop.fu_type.eq(FUType.F2I),
+                                uop.dst_rtype.eq(RegisterType.FIX),
+                                uop.lrs2_rtype.eq(RegisterType.X),
+                                IMM_SEL_I,
+                            ]
+
+                            with m.Switch(inuop.inst[12:15]):
+                                with m.Case(0b000):  # fmv.x.fmt
+                                    m.d.comb += UOPC(
+                                        Mux(uop.fp_single, UOpCode.FMV_X_S,
+                                            UOpCode.FMV_X_D))
+
+                                with m.Case(0b001):  # fclass.fmt
+                                    m.d.comb += UOPC(
+                                        Mux(uop.fp_single, UOpCode.FCLASS_S,
+                                            UOpCode.FCLASS_D)),
+
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
+                        with m.Case(0b11110):  # fmv.fmt.x
+                            m.d.comb += [
+                                UOPC(
+                                    Mux(uop.fp_single, UOpCode.FMV_S_X,
+                                        UOpCode.FMV_D_X)),
+                                uop.iq_type.eq(IssueQueueType.INT),
+                                uop.fu_type.eq(FUType.I2F),
+                                uop.lrs1_rtype.eq(RegisterType.FIX),
+                                uop.lrs2_rtype.eq(RegisterType.X),
+                                IMM_SEL_I,
+                            ]
+
                         with m.Default():
                             m.d.comb += ILL_INSN
 

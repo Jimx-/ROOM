@@ -751,6 +751,13 @@ class FPUUnit(PipelinedFunctionalUnit):
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
+        in_pipe = m.submodules.in_pipe = Pipe(width=len(self.req.rs1_data),
+                                              depth=self.fma_latency)
+        m.d.comb += [
+            in_pipe.in_valid.eq(self.req.valid),
+            in_pipe.in_data.eq(self.req.rs1_data),
+        ]
+
         fma_en = Signal()
         cast_en = Signal()
 
@@ -903,7 +910,7 @@ class FPUUnit(PipelinedFunctionalUnit):
             Mux(
                 dfma.out_valid, dfma.out.data,
                 Mux(sfma.out_valid, sfma.out.data,
-                    Mux(fpiu.out_valid, fpiu.out.data, 0))))
+                    Mux(fpiu.out_valid, fpiu.out.data, in_pipe.out_data))))
 
         return m
 
