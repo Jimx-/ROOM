@@ -63,9 +63,10 @@ def misa_layout(xlen):
 
 class CSRFile(Elaboratable):
 
-    def __init__(self, width=32, depth=2**12):
+    def __init__(self, width=32, depth=2**12, params):
         self.width = width
         self.depth = depth
+        self.params = params
         self._csr_map = OrderedDict()
         self._ports = []
 

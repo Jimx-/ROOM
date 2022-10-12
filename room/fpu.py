@@ -75,6 +75,19 @@ _fmt_ftypes = {
 }
 
 
+class ClassMask(IntEnum):
+    NEG_INF = (1 << 0)
+    NEG_NORM = (1 << 1)
+    NEG_SUBNORM = (1 << 2)
+    NEG_ZERO = (1 << 3)
+    POS_ZERO = (1 << 4)
+    POS_SUBNORM = (1 << 5)
+    POS_NORM = (1 << 6)
+    POS_INF = (1 << 7)
+    SNAN = (1 << 8)
+    QNAN = (1 << 9)
+
+
 class FPUInput(Record):
 
     def __init__(self, width, name=None, src_loc_at=0):
@@ -1104,6 +1117,171 @@ class FPUCastMulti(Elaboratable):
                                                 depth=self.latency - 2)
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
+            out_pipe.in_data.eq(result),
+            self.out_valid.eq(out_pipe.out_valid),
+            self.out.data.eq(out_pipe.out_data),
+        ]
+
+        return m
+
+
+class FPUComp(Elaboratable):
+
+    def __init__(self, width, format, latency=3):
+        self.width = width
+        self.ftyp = _fmt_ftypes[format]
+        self.latency = latency
+
+        self.inp = FPUInput(self.width)
+        self.inp_valid = Signal()
+
+        self.out = FPUResult(self.width)
+        self.out_valid = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        #
+        # S1 - Input
+        #
+
+        s1_valid = Signal()
+        s1_inp = FPUInput(self.width)
+
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp))
+        m.d.comb += [
+            inp_pipe.in_valid.eq(self.inp_valid),
+            inp_pipe.in_data.eq(self.inp),
+            s1_valid.eq(inp_pipe.out_valid),
+            s1_inp.eq(inp_pipe.out_data),
+        ]
+
+        in1 = Record(self.ftyp.record_layout())
+        in2 = Record(self.ftyp.record_layout())
+
+        info1 = Record(self.ftyp.INFO_LAYOUT)
+        info2 = Record(self.ftyp.INFO_LAYOUT)
+
+        m.d.comb += [
+            in1.eq(s1_inp.in1),
+            in2.eq(s1_inp.in2),
+            info1.eq(self.ftyp.classify(in1)),
+            info2.eq(self.ftyp.classify(in2)),
+        ]
+
+        in_equal = (in1 == in2) | (info1.is_zero & info2.is_zero)
+        in1_smaller = (in1 < in2) ^ (in1.sign | in2.sign)
+
+        #
+        # Sign injection
+        #
+
+        sgnj_result = Record(self.ftyp.record_layout())
+
+        m.d.comb += sgnj_result.eq(in1)
+        with m.Switch(s1_inp.rm):
+            with m.Case(RoundingMode.RNE):
+                m.d.comb += sgnj_result.sign.eq(in2.sign)
+
+            with m.Case(RoundingMode.RTZ):
+                m.d.comb += sgnj_result.sign.eq(~in2.sign)
+
+            with m.Case(RoundingMode.RDN):
+                m.d.comb += sgnj_result.sign.eq(in1.sign ^ in2.sign)
+
+            with m.Case(RoundingMode.RUP):
+                m.d.comb += sgnj_result.sign.eq(in1.sign)
+
+        #
+        # Min/Max
+        #
+
+        minmax_result = Record(self.ftyp.record_layout())
+
+        with m.If(info1.is_nan & info2.is_nan):
+            m.d.comb += [
+                minmax_result.sign.eq(0),
+                minmax_result.exp.eq(~0),
+                minmax_result.man.eq(2**(self.ftyp.man - 1)),
+            ]
+
+        with m.Elif(info1.is_nan):
+            m.d.comb += minmax_result.eq(in1)
+
+        with m.Elif(info2.is_nan):
+            m.d.comb += minmax_result.eq(in2)
+
+        with m.Else():
+            with m.Switch(s1_inp.rm):
+                with m.Case(RoundingMode.RNE):
+                    m.d.comb += minmax_result.eq(Mux(in1_smaller, in1, in2))
+
+                with m.Case(RoundingMode.RTZ):
+                    m.d.comb += minmax_result.eq(Mux(in1_smaller, in2, in1))
+
+        #
+        # Comparison
+        #
+
+        cmp_result = Record(self.ftyp.record_layout())
+
+        with m.Switch(s1_inp.rm):
+            with m.Case(RoundingMode.RNE):
+                m.d.comb += cmp_result.eq((in1_smaller | in_equal)
+                                          ^ s1_inp.fn_mod)
+
+            with m.Case(RoundingMode.RTZ):
+                m.d.comb += cmp_result.eq((in1_smaller & ~in_equal)
+                                          ^ s1_inp.fn_mod)
+
+            with m.Case(RoundingMode.RDN):
+                m.d.comb += cmp_result.eq(in_equal ^ s1_inp.fn_mod)
+
+        #
+        # Classification
+        #
+
+        class_result = Record(self.ftyp.record_layout())
+
+        with m.If(info1.is_normal):
+            m.d.comb += class_result.eq(
+                Mux(in1.sign, ClassMask.NEG_NORM, ClassMask.POS_NORM))
+
+        with m.Elif(info1.is_subnormal):
+            m.d.comb += class_result.eq(
+                Mux(in1.sign, ClassMask.NEG_SUBNORM, ClassMask.POS_SUBNORM))
+
+        with m.Elif(info1.is_zero):
+            m.d.comb += class_result.eq(
+                Mux(in1.sign, ClassMask.NEG_ZERO, ClassMask.POS_ZERO))
+
+        with m.Elif(info1.is_inf):
+            m.d.comb += class_result.eq(
+                Mux(in1.sign, ClassMask.NEG_INF, ClassMask.POS_INF))
+
+        with m.Elif(info1.is_nan):
+            m.d.comb += class_result.eq(
+                Mux(info1.is_snan, ClassMask.SNAN, ClassMask.QNAN))
+
+        result = Record(self.ftyp.record_layout())
+
+        with m.Switch(s1_inp.fn):
+            with m.Case(FPUOperator.SGNJ):
+                m.d.comb += result.eq(sgnj_result)
+
+            with m.Case(FPUOperator.MINMAX):
+                m.d.comb += result.eq(minmax_result)
+
+            with m.Case(FPUOperator.CMP):
+                m.d.comb += result.eq(cmp_result)
+
+            with m.Case(FPUOperator.CLASSIFY):
+                m.d.comb += result.eq(class_result)
+
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(result),
+                                                depth=self.latency - 1)
+        m.d.comb += [
+            out_pipe.in_valid.eq(s1_valid),
             out_pipe.in_data.eq(result),
             self.out_valid.eq(out_pipe.out_valid),
             self.out.data.eq(out_pipe.out_data),

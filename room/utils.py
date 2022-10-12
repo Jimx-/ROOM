@@ -20,6 +20,10 @@ def generate_imm_type(ip):
     return ip[8:10]
 
 
+def generate_imm_rm(ip):
+    return ip[:3]
+
+
 def _incr(signal, modulo):
     if modulo == 2**len(signal):
         return (signal + 1)[:len(signal)]
