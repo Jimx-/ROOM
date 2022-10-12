@@ -169,7 +169,7 @@ class Core(Elaboratable):
         mem_width = self.params['mem_width']
         use_fpu = self.params['use_fpu']
 
-        csr = m.submodules.csr = CSRFile(width=self.xlen, params=self.params)
+        csr = m.submodules.csr = CSRFile(self.params, width=self.xlen)
 
         #
         # Exception

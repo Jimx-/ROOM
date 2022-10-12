@@ -63,7 +63,7 @@ def misa_layout(xlen):
 
 class CSRFile(Elaboratable):
 
-    def __init__(self, width=32, depth=2**12, params):
+    def __init__(self, params, width=32, depth=2**12):
         self.width = width
         self.depth = depth
         self.params = params
@@ -111,13 +111,18 @@ class CSRFile(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        isa_string = 'IMC'
+        xlen = self.params['xlen']
+        use_fpu = self.params['use_fpu']
+        flen = self.params['flen']
+
+        isa_string = 'IMC' + ('F' if use_fpu and flen >= 32 else
+                              '') + ('D' if use_fpu and flen >= 64 else '')
         isa_ext = 0
         for c in isa_string:
             isa_ext |= 1 << (ord(c) - ord('A'))
         m.d.comb += [
             self.misa.r.extensions.eq(isa_ext),
-            self.misa.r.mxl.eq(log2_int(self.width) - 4),
+            self.misa.r.mxl.eq(log2_int(xlen) - 4),
         ]
 
         with m.If(self.mscratch.we):

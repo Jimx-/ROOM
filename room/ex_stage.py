@@ -388,8 +388,8 @@ class FPUExecUnit(ExecUnit):
                 fp_stq.w_data.eq(Cat(self.req.uop, self.req.rs2_data)),
                 fp_stq.w_br_mask.eq(self.req.uop.br_mask),
                 fp_stq.w_en.eq(self.req.valid
-                               & (self.req.uop.opcode == UOpCode.STA
-                                  & ~self.br_update.uop_killed(self.req.uop))),
+                               & (self.req.uop.opcode == UOpCode.STA)
+                               & ~self.br_update.uop_killed(self.req.uop)),
                 Cat(stq_rdata.uop, stq_rdata.data).eq(fp_stq.r_data),
                 stq_rdata.uop.br_mask.eq(fp_stq.r_br_mask),
                 fp_stq.br_update.eq(self.br_update),

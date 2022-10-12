@@ -901,6 +901,12 @@ class LoadStoreUnit(Elaboratable):
         stdf_clr_bsy_rob_idx = Signal.like(self.clear_busy_idx[0])
         stdf_clr_bsy_br_mask = Signal.like(self.br_update.resolve_mask)
 
+        m.d.sync += [
+            stdf_clr_bsy_valid.eq(0),
+            stdf_clr_bsy_rob_idx.eq(0),
+            stdf_clr_bsy_br_mask.eq(0),
+        ]
+
         with m.If(fired_stdf_incoming):
             stq_idx = fired_stdf_uop.stq_idx
 

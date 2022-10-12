@@ -416,10 +416,18 @@ class DebugController(Elaboratable):
     class GenerateI(Elaboratable):
 
         def __init__(self, insn, funct3=None):
-            self.insn = insn
+            if isinstance(insn, int):
+                if funct3 is None:
+                    raise ValueError('Funct3 not provided.')
 
-            if funct3 is None:
-                funct3 = insn.field_funct3.value
+                self.opcode = insn
+
+            else:
+                self.opcode = insn.field_opcode.value
+
+                if funct3 is None:
+                    funct3 = insn.field_funct3.value
+
             self.funct3 = funct3
 
             self.rd = Signal(5)
@@ -431,7 +439,7 @@ class DebugController(Elaboratable):
             m = Module()
 
             m.d.comb += [
-                self.inst[:7].eq(self.insn.field_opcode.value),
+                self.inst[:7].eq(self.opcode),
                 self.inst[7:12].eq(self.rd),
                 self.inst[12:15].eq(self.funct3),
                 self.inst[15:20].eq(self.rs1),
@@ -443,10 +451,18 @@ class DebugController(Elaboratable):
     class GenerateS(Elaboratable):
 
         def __init__(self, insn, funct3=None):
-            self.insn = insn
+            if isinstance(insn, int):
+                if funct3 is None:
+                    raise ValueError('Funct3 not provided.')
 
-            if funct3 is None:
-                funct3 = insn.field_funct3.value
+                self.opcode = insn
+
+            else:
+                self.opcode = insn.field_opcode.value
+
+                if funct3 is None:
+                    funct3 = insn.field_funct3.value
+
             self.funct3 = funct3
 
             self.rs1 = Signal(5)
@@ -458,7 +474,7 @@ class DebugController(Elaboratable):
             m = Module()
 
             m.d.comb += [
-                self.inst[:7].eq(self.insn.field_opcode.value),
+                self.inst[:7].eq(self.opcode),
                 self.inst[7:12].eq(self.imm[:5]),
                 self.inst[12:15].eq(self.funct3),
                 self.inst[15:20].eq(self.rs1),
@@ -478,6 +494,7 @@ class DebugController(Elaboratable):
             m = Module()
 
             base = Mux(self.cmd.regno[0], 8, 9)
+            fp_reg = self.cmd.regno[5]
 
             gen_ld = DebugController.GenerateI(insn.InstructionLW,
                                                funct3=self.cmd.aarsize)
@@ -499,6 +516,26 @@ class DebugController(Elaboratable):
                               & 0xfff),
             ]
 
+            gen_fld = DebugController.GenerateI(0b0000111,
+                                                funct3=self.cmd.aarsize)
+            m.submodules += gen_fld
+            m.d.comb += [
+                gen_fld.rd.eq(self.cmd.regno),
+                gen_fld.rs1.eq(base),
+                gen_fld.imm.eq((DebugModuleCSR.DATA - DebugModuleCSR.ROM_BASE)
+                               & 0xfff),
+            ]
+
+            gen_fst = DebugController.GenerateS(0b0100111,
+                                                funct3=self.cmd.aarsize)
+            m.submodules += gen_fst
+            m.d.comb += [
+                gen_fst.rs1.eq(base),
+                gen_fst.rs2.eq(self.cmd.regno),
+                gen_fst.imm.eq((DebugModuleCSR.DATA - DebugModuleCSR.ROM_BASE)
+                               & 0xfff),
+            ]
+
             gen_csr = DebugController.GenerateI(insn.InstructionCSRRW)
             m.submodules += gen_csr
             m.d.comb += [
@@ -517,10 +554,12 @@ class DebugController(Elaboratable):
             # Instruction 1: CSRRW s1,dscratch1,s1 or CSRRW s0,dscratch1,s0
             m.d.comb += self.insts[:32].eq(gen_csr.inst)
 
-            # Instruction 2: LW regno,DebugModuleCSR.DATA(s{0,1}) or SW regno,DebugModuleCSR.DATA(s{0,1})
+            # Instruction 2: [F]LW regno,DebugModuleCSR.DATA(s{0,1}) or [F]SW regno,DebugModuleCSR.DATA(s{0,1})
             m.d.comb += self.insts[32:64].eq(
-                Mux(self.cmd.transfer,
-                    Mux(self.cmd.write, gen_ld.inst, gen_st.inst), nop))
+                Mux(
+                    self.cmd.transfer,
+                    Mux(self.cmd.write, Mux(fp_reg, gen_fld.inst, gen_ld.inst),
+                        Mux(fp_reg, gen_fst.inst, gen_st.inst)), nop))
 
             # Instruction 3: CSRRW s1,dscratch1,s1 or CSRRW s0,dscratch1,s0
             m.d.comb += self.insts[64:96].eq(gen_csr.inst)
@@ -856,7 +895,7 @@ class DebugController(Elaboratable):
         with m.If(go_abstract):
             with m.If(cmd_access_reg.regno.matches("0000------------")):
                 m.d.sync += self._abstract_rom.r_data.eq(gen_csr_access.insts)
-            with m.Elif(cmd_access_reg.regno.matches("00010000000-----")):
+            with m.Elif(cmd_access_reg.regno.matches("0001000000------")):
                 m.d.sync += self._abstract_rom.r_data.eq(gen_gpr_access.insts)
 
         # Abstract command FSM
