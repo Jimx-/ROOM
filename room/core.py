@@ -2,7 +2,7 @@ from amaranth import *
 from amaranth.utils import log2_int
 
 from room.consts import *
-from room.alu import ExecResp
+from room.fu import ExecResp
 from room.types import MicroOp
 
 from room.if_stage import IFStage, IFDebug

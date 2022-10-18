@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import *
-from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit
+from room.fu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp

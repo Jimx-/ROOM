@@ -5,7 +5,7 @@ from room.consts import *
 from room.types import MicroOp
 from room.branch import BranchUpdate
 from room.rob import CommitReq
-from room.alu import ExecResp
+from room.fu import ExecResp
 from room.utils import Valid
 
 

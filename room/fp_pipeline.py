@@ -2,7 +2,7 @@ from amaranth import *
 
 from room.consts import *
 from room.types import MicroOp
-from room.alu import ExecResp
+from room.fu import ExecResp
 from room.regfile import RegisterFile, RegisterRead
 from room.branch import BranchUpdate
 from room.issue import IssueUnit

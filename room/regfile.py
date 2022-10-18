@@ -3,7 +3,7 @@ from amaranth.hdl.rec import DIR_FANIN, DIR_FANOUT
 
 from room.consts import *
 from room.types import MicroOp
-from room.alu import ExecReq
+from room.fu import ExecReq
 from room.branch import BranchUpdate
 from room.utils import Decoupled
 
