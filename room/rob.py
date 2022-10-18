@@ -124,10 +124,10 @@ class ReorderBuffer(Elaboratable):
                   name=f'wb_resp{i}') for i in range(num_wakeup_ports)
         ]
 
-        self.lsu_clear_busy_valids = Signal(mem_width + 1)
-        self.lsu_clear_busy_idx = [
-            Signal(range(self.core_width * self.num_rob_rows),
-                   name=f'lsu_clear_busy_idx{i}') for i in range(mem_width + 1)
+        self.lsu_clear_busy = [
+            Valid(Signal,
+                  range(self.core_width * self.num_rob_rows),
+                  name=f'lsu_clear_busy{i}') for i in range(mem_width + 1)
         ]
 
         self.commit_req = CommitReq(params, name='commit_req')
@@ -220,10 +220,9 @@ class ReorderBuffer(Elaboratable):
                 with m.If(wb.valid & (get_bank(uop.rob_idx) == w)):
                     m.d.sync += rob_busy[row_idx].eq(0)
 
-            for clr_val, clr_idx in zip(self.lsu_clear_busy_valids,
-                                        self.lsu_clear_busy_idx):
-                with m.If(clr_val & (get_bank(clr_idx) == w)):
-                    m.d.sync += rob_busy[get_row(clr_idx)].eq(0)
+            for clr in self.lsu_clear_busy:
+                with m.If(clr.valid & (get_bank(clr.bits) == w)):
+                    m.d.sync += rob_busy[get_row(clr.bits)].eq(0)
 
             with m.If(self.lsu_exc.valid
                       & (get_bank(self.lsu_exc.uop.rob_idx) == w)):

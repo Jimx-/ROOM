@@ -425,11 +425,10 @@ class LoadStoreUnit(Elaboratable):
             for i in range(self.mem_width)
         ]
 
-        self.clear_busy_valids = Signal(self.mem_width + 1)
-        self.clear_busy_idx = [
-            Signal(range(self.core_width * params['num_rob_rows']),
-                   name=f'clear_busy_idx{i}')
-            for i in range(self.mem_width + 1)
+        self.clear_busy = [
+            Valid(Signal,
+                  range(self.core_width * params['num_rob_rows']),
+                  name=f'clear_busy{i}') for i in range(self.mem_width + 1)
         ]
 
         self.commit = CommitReq(params)
@@ -848,7 +847,7 @@ class LoadStoreUnit(Elaboratable):
 
         clr_bsy_valids = Signal(self.mem_width)
         clr_bsy_rob_idx = [
-            Signal.like(self.clear_busy_idx[0], name=f'clr_bsy_rob_idx{i}')
+            Signal.like(self.clear_busy[0].bits, name=f'clr_bsy_rob_idx{i}')
             for i in range(self.mem_width)
         ]
         clr_bsy_br_mask = [
@@ -898,15 +897,15 @@ class LoadStoreUnit(Elaboratable):
                 ]
 
             m.d.comb += [
-                self.clear_busy_valids[w].eq(
+                self.clear_busy[w].valid.eq(
                     clr_bsy_valids[w]
                     & ~self.br_update.br_mask_killed(clr_bsy_br_mask[w])
                     & ~self.exception & ~exception_d1 & ~exception_d2),
-                self.clear_busy_idx[w].eq(clr_bsy_rob_idx[w]),
+                self.clear_busy[w].bits.eq(clr_bsy_rob_idx[w]),
             ]
 
         stdf_clr_bsy_valid = Signal()
-        stdf_clr_bsy_rob_idx = Signal.like(self.clear_busy_idx[0])
+        stdf_clr_bsy_rob_idx = Signal.like(self.clear_busy[0].bits)
         stdf_clr_bsy_br_mask = Signal.like(self.br_update.resolve_mask)
 
         m.d.sync += [
@@ -929,11 +928,11 @@ class LoadStoreUnit(Elaboratable):
             ]
 
         m.d.comb += [
-            self.clear_busy_valids[self.mem_width].eq(
+            self.clear_busy[self.mem_width].valid.eq(
                 stdf_clr_bsy_valid
                 & ~self.br_update.br_mask_killed(stdf_clr_bsy_br_mask)
                 & ~self.exception & ~exception_d1 & ~exception_d2),
-            self.clear_busy_idx[self.mem_width].eq(stdf_clr_bsy_rob_idx),
+            self.clear_busy[self.mem_width].bits.eq(stdf_clr_bsy_rob_idx),
         ]
 
         #

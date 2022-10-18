@@ -217,26 +217,24 @@ class ALUExecUnit(ExecUnit):
                 ifpu.br_update.eq(self.br_update),
             ]
 
-            ifpu_rdata = ExecResp(self.data_width, self.params)
-
-            ifpu_q = m.submodules.ifpu_q = BranchKillableFIFO(
-                5,
-                len(ifpu_rdata.uop) + len(ifpu_rdata.data),
-                self.params,
-                flow=True)
+            ifpu_q = m.submodules.ifpu_q = BranchKillableFIFO(5,
+                                                              self.params,
+                                                              ExecResp,
+                                                              self.data_width,
+                                                              self.params,
+                                                              flow=True)
 
             m.d.comb += [
-                ifpu_q.w_data.eq(Cat(ifpu.resp.bits.uop, ifpu.resp.bits.data)),
+                ifpu_q.w_data.eq(ifpu.resp.bits),
                 ifpu_q.w_br_mask.eq(ifpu.resp.bits.uop.br_mask),
                 ifpu_q.w_en.eq(ifpu.resp.valid),
-                Cat(ifpu_rdata.uop, ifpu_rdata.data).eq(ifpu_q.r_data),
-                ifpu_rdata.uop.br_mask.eq(ifpu_q.r_br_mask),
                 ifpu_q.br_update.eq(self.br_update),
                 ifpu_q.flush.eq(self.req.bits.kill),
             ]
 
             m.d.comb += [
-                self.mem_fresp.bits.eq(ifpu_rdata),
+                self.mem_fresp.bits.eq(ifpu_q.r_data),
+                self.mem_fresp.bits.uop.br_mask.eq(ifpu_q.r_br_mask),
                 self.mem_fresp.valid.eq(ifpu_q.r_rdy),
                 ifpu_q.r_en.eq(self.mem_fresp.ready),
             ]
@@ -364,62 +362,56 @@ class FPUExecUnit(ExecUnit):
             fu_units.append(fdiv)
 
         if self.has_fpiu:
-            fpiu_rdata = ExecResp(self.data_width, self.params)
-
-            fpiu_q = m.submodules.fpiu_q = BranchKillableFIFO(
-                6,
-                len(fpiu_rdata.uop) + len(fpiu_rdata.data),
-                self.params,
-                flow=True)
+            fpiu_q = m.submodules.fpiu_q = BranchKillableFIFO(6,
+                                                              self.params,
+                                                              ExecResp,
+                                                              self.data_width,
+                                                              self.params,
+                                                              flow=True)
 
             m.d.comb += [
-                fpiu_q.w_data.eq(Cat(fpu.resp.bits.uop, fpu.resp.bits.data)),
+                fpiu_q.w_data.eq(fpu.resp.bits),
                 fpiu_q.w_br_mask.eq(fpu.resp.bits.uop.br_mask),
                 fpiu_q.w_en.eq(fpu.resp.valid
                                & fpu.resp.bits.uop.fu_type_has(FUType.F2I)
                                & (fpu.resp.bits.uop.opcode != UOpCode.STA)),
-                Cat(fpiu_rdata.uop, fpiu_rdata.data).eq(fpiu_q.r_data),
-                fpiu_rdata.uop.br_mask.eq(fpiu_q.r_br_mask),
                 fpiu_q.br_update.eq(self.br_update),
                 fpiu_q.flush.eq(self.req.bits.kill),
             ]
 
-            stq_rdata = ExecResp(self.data_width, self.params)
-
-            fp_stq = m.submodules.fp_stq = BranchKillableFIFO(
-                3,
-                len(stq_rdata.uop) + len(stq_rdata.data),
-                self.params,
-                flow=True)
+            fp_stq = m.submodules.fp_stq = BranchKillableFIFO(3,
+                                                              self.params,
+                                                              ExecResp,
+                                                              self.data_width,
+                                                              self.params,
+                                                              flow=True)
 
             m.d.comb += [
-                fp_stq.w_data.eq(Cat(self.req.bits.uop,
-                                     self.req.bits.rs2_data)),
+                fp_stq.w_data.uop.eq(self.req.bits.uop),
+                fp_stq.w_data.data.eq(self.req.bits.rs2_data),
                 fp_stq.w_br_mask.eq(self.req.bits.uop.br_mask),
                 fp_stq.w_en.eq(
                     self.req.valid
                     & (self.req.bits.uop.opcode == UOpCode.STA)
                     & ~self.br_update.uop_killed(self.req.bits.uop)),
-                Cat(stq_rdata.uop, stq_rdata.data).eq(fp_stq.r_data),
-                stq_rdata.uop.br_mask.eq(fp_stq.r_br_mask),
                 fp_stq.br_update.eq(self.br_update),
                 fp_stq.flush.eq(self.req.bits.kill),
             ]
 
-            resp_arb = m.submodules.resp_arb = Arbiter(
-                width=len(fpiu_rdata.uop) + len(fpiu_rdata.data), n=2)
+            resp_arb = m.submodules.resp_arb = Arbiter(2, ExecResp,
+                                                       self.data_width,
+                                                       self.params)
 
             m.d.comb += [
-                resp_arb.inp[0].bits.eq(Cat(fpiu_rdata.uop, fpiu_rdata.data)),
+                resp_arb.inp[0].bits.eq(fpiu_q.r_data),
+                resp_arb.inp[0].bits.uop.br_mask.eq(fpiu_q.r_br_mask),
                 resp_arb.inp[0].valid.eq(fpiu_q.r_rdy),
                 fpiu_q.r_en.eq(resp_arb.inp[0].ready),
-                resp_arb.inp[1].bits.eq(Cat(stq_rdata.uop, stq_rdata.data)),
+                resp_arb.inp[1].bits.eq(fp_stq.r_data),
+                resp_arb.inp[1].bits.uop.br_mask.eq(fp_stq.r_br_mask),
                 resp_arb.inp[1].valid.eq(fp_stq.r_rdy),
                 fp_stq.r_en.eq(resp_arb.inp[1].ready),
-                Cat(self.mem_iresp.bits.uop,
-                    self.mem_iresp.bits.data).eq(resp_arb.out.bits),
-                self.mem_iresp.valid.eq(resp_arb.out.valid),
-                resp_arb.out.ready.eq(self.mem_iresp.ready),
+                resp_arb.out.connect(self.mem_iresp),
             ]
 
             m.d.comb += fpiu_busy.eq(fpiu_q.r_rdy | fp_stq.r_rdy)

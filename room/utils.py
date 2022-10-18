@@ -82,18 +82,21 @@ def _incr(signal, modulo):
 
 class BranchKillableFIFO(Elaboratable):
 
-    def __init__(self, entries, data_width, params, flow=True):
+    def __init__(self, entries, params, cls, *args, flow=True, **kwargs):
         self.entries = entries
-        self.data_width = data_width
         self.flow = flow
         max_br_count = params['max_br_count']
 
-        self.w_data = Signal(data_width)
+        self.cls = cls
+        self.args = args
+        self.kwargs = kwargs
+
+        self.w_data = cls(*args, **kwargs)
         self.w_br_mask = Signal(max_br_count)
         self.w_en = Signal()
         self.w_rdy = Signal()
 
-        self.r_data = Signal(data_width)
+        self.r_data = cls(*args, **kwargs)
         self.r_br_mask = Signal(max_br_count)
         self.r_en = Signal()
         self.r_rdy = Signal()
@@ -104,9 +107,10 @@ class BranchKillableFIFO(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        mem = Array(
-            Signal.like(self.w_data, name=f'mem{i}')
-            for i in range(self.entries))
+        mem = [
+            self.cls(*self.args, **self.kwargs, name=f'mem{i}')
+            for i in range(self.entries)
+        ]
         valids = Array(Signal(name=f'valid{i}') for i in range(self.entries))
         br_masks = Array(
             Signal.like(self.w_br_mask, name=f'br_mask{i}')
@@ -139,12 +143,15 @@ class BranchKillableFIFO(Elaboratable):
 
         with m.If(do_enq):
             m.d.sync += [
-                mem[w_ptr].eq(self.w_data),
                 br_masks[w_ptr].eq(
                     self.br_update.get_new_br_mask(self.w_br_mask)),
                 valids[w_ptr].eq(1),
                 w_ptr.eq(_incr(w_ptr, self.entries)),
             ]
+
+            for i in range(self.entries):
+                with m.If(w_ptr == i):
+                    m.d.sync += mem[i].eq(self.w_data)
 
         with m.If(do_deq):
             m.d.sync += [
@@ -161,9 +168,12 @@ class BranchKillableFIFO(Elaboratable):
             self.r_rdy.eq(~empty & valids[r_ptr]
                           & ~self.br_update.br_mask_killed(br_masks[r_ptr])
                           & ~self.flush),
-            self.r_data.eq(mem[r_ptr]),
             self.r_br_mask.eq(self.br_update.get_new_br_mask(br_masks[r_ptr])),
         ]
+
+        for i in range(self.entries):
+            with m.If(r_ptr == i):
+                m.d.comb += self.r_data.eq(mem[i])
 
         if self.flow:
             with m.If(empty):
@@ -227,12 +237,14 @@ class Pipe(Elaboratable):
 
 class Arbiter(Elaboratable):
 
-    def __init__(self, width, n):
+    def __init__(self, n, cls, *args, **kwargs):
         self.n = n
 
-        self.inp = [Decoupled(Signal, width, name=f'in{i}') for i in range(n)]
+        self.inp = [
+            Decoupled(cls, *args, **kwargs, name=f'in{i}') for i in range(n)
+        ]
 
-        self.out = Decoupled(Signal, width)
+        self.out = Decoupled(cls, *args, **kwargs)
 
     def elaborate(self, platform):
         m = Module()

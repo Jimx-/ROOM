@@ -148,29 +148,20 @@ class FPPipeline(Elaboratable):
         # Writeback
         #
 
-        mem_wbarb_out = ExecResp(self.flen, self.params)
-        mem_wbarb = m.submodules.mem_wbarb = Arbiter(
-            width=len(mem_wbarb_out.data) + len(mem_wbarb_out.uop), n=2)
+        mem_wbarb = m.submodules.mem_wbarb = Arbiter(2, ExecResp, self.flen,
+                                                     self.params)
 
         m.d.comb += [
-            mem_wbarb.inp[0].bits.eq(
-                Cat(self.mem_wb_ports[0].bits.uop,
-                    self.mem_wb_ports[0].bits.data)),
-            mem_wbarb.inp[0].valid.eq(self.mem_wb_ports[0].valid),
-            self.mem_wb_ports[0].ready.eq(mem_wbarb.inp[0].ready),
-            mem_wbarb.inp[1].bits.eq(
-                Cat(self.from_int.bits.uop, self.from_int.bits.data)),
-            mem_wbarb.inp[1].valid.eq(self.from_int.valid),
-            self.from_int.ready.eq(mem_wbarb.inp[1].ready),
-            Cat(mem_wbarb_out.uop, mem_wbarb_out.data).eq(mem_wbarb.out.bits),
+            self.mem_wb_ports[0].connect(mem_wbarb.inp[0]),
+            self.from_int.connect(mem_wbarb.inp[1]),
         ]
 
         m.d.sync += [
             fregfile.write_ports[0].valid.eq(
-                mem_wbarb.out.valid & mem_wbarb_out.uop.rf_wen()
-                & (mem_wbarb_out.uop.dst_rtype == RegisterType.FLT)),
-            fregfile.write_ports[0].bits.addr.eq(mem_wbarb_out.uop.pdst),
-            fregfile.write_ports[0].bits.data.eq(mem_wbarb_out.data),
+                mem_wbarb.out.valid & mem_wbarb.out.bits.uop.rf_wen()
+                & (mem_wbarb.out.bits.uop.dst_rtype == RegisterType.FLT)),
+            fregfile.write_ports[0].bits.addr.eq(mem_wbarb.out.bits.uop.pdst),
+            fregfile.write_ports[0].bits.data.eq(mem_wbarb.out.bits.data),
         ]
 
         for wp, fresp in zip(fregfile.write_ports[1:self.mem_width],
@@ -209,8 +200,7 @@ class FPPipeline(Elaboratable):
 
         m.d.comb += [
             mem_wbarb.out.ready.eq(1),
-            self.wakeups[0].bits.eq(mem_wbarb_out),
-            self.wakeups[0].valid.eq(mem_wbarb.out.valid),
+            self.wakeups[0].eq(mem_wbarb.out),
         ]
 
         for wb, fresp in zip(self.wakeups[1:self.mem_width],
