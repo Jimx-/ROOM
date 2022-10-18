@@ -5,6 +5,7 @@ from room.consts import *
 from room.types import MicroOp
 from room.alu import ExecReq
 from room.branch import BranchUpdate
+from room.utils import Decoupled
 
 
 class RFReadPort(Record):
@@ -25,9 +26,10 @@ class RFWritePort(Record):
         self.addr_width = addr_width
         self.data_width = data_width
 
-        super().__init__([('addr', addr_width, DIR_FANIN),
-                          ('data', data_width, DIR_FANIN),
-                          ('valid', 1, DIR_FANIN)],
+        super().__init__([
+            ('addr', addr_width, DIR_FANIN),
+            ('data', data_width, DIR_FANIN),
+        ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
 
@@ -45,8 +47,10 @@ class RegisterFile(Elaboratable):
         ]
 
         self.write_ports = [
-            RFWritePort(addr_width, self.data_width, name=f'write_port{i}')
-            for i in range(wports)
+            Decoupled(RFWritePort,
+                      addr_width,
+                      self.data_width,
+                      name=f'write_port{i}') for i in range(wports)
         ]
 
     def elaborate(self, platform):
@@ -70,9 +74,10 @@ class RegisterFile(Elaboratable):
 
         for wp, mwp in zip(self.write_ports, mem_wports):
             m.d.comb += [
-                mwp.addr.eq(wp.addr),
-                mwp.data.eq(wp.data),
+                mwp.addr.eq(wp.bits.addr),
+                mwp.data.eq(wp.bits.data),
                 mwp.en.eq(wp.valid),
+                wp.ready.eq(1),
             ]
 
         return m
@@ -365,7 +370,7 @@ class RegisterRead(Elaboratable):
         ]
 
         self.exec_reqs = [
-            ExecReq(reg_width, self.params, name=f'exec_req{i}')
+            Decoupled(ExecReq, reg_width, self.params, name=f'exec_req{i}')
             for i in range(self.issue_width)
         ]
 
@@ -439,18 +444,18 @@ class RegisterRead(Elaboratable):
                 self.rports_array, self.exec_reqs, rrd_rs1_data, rrd_rs2_data,
                 rrd_rs3_data):
             if nrps > 0:
-                m.d.sync += req.rs1_data.eq(rs1_data)
+                m.d.sync += req.bits.rs1_data.eq(rs1_data)
             if nrps > 1:
-                m.d.sync += req.rs2_data.eq(rs2_data)
+                m.d.sync += req.bits.rs2_data.eq(rs2_data)
             if nrps > 2:
-                m.d.sync += req.rs3_data.eq(rs3_data)
+                m.d.sync += req.bits.rs3_data.eq(rs3_data)
 
         for req, rrd_uop, rrd_v in zip(self.exec_reqs, rrd_uops, rrd_valids):
             rrd_killed = self.kill | self.br_update.uop_killed(rrd_uop)
 
             m.d.sync += [
-                req.uop.eq(rrd_uop),
-                req.uop.br_mask.eq(
+                req.bits.uop.eq(rrd_uop),
+                req.bits.uop.br_mask.eq(
                     self.br_update.get_new_br_mask(rrd_uop.br_mask)),
                 req.valid.eq(rrd_v & ~rrd_killed),
             ]

@@ -6,6 +6,7 @@ from room.types import MicroOp
 from room.branch import BranchUpdate
 from room.rob import CommitReq
 from room.alu import ExecResp
+from room.utils import Valid
 
 
 class MapReq(Record):
@@ -357,8 +358,10 @@ class RenameStage(Elaboratable):
         self.ren2_mask = Signal(self.core_width)
 
         self.wakeup_ports = [
-            ExecResp(params['xlen'], self.params, name=f'wakeup_port{i}')
-            for i in range(self.num_wakeup_ports)
+            Valid(ExecResp,
+                  params['xlen'],
+                  self.params,
+                  name=f'wakeup_port{i}') for i in range(self.num_wakeup_ports)
         ]
 
         self.br_update = BranchUpdate(params)
@@ -599,7 +602,7 @@ class RenameStage(Elaboratable):
 
         for wb_v, wb_pdst, wu in zip(busy_table.wb_valids, busy_table.wb_pdst,
                                      self.wakeup_ports):
-            m.d.comb += [wb_v.eq(wu.valid), wb_pdst.eq(wu.uop.pdst)]
+            m.d.comb += [wb_v.eq(wu.valid), wb_pdst.eq(wu.bits.uop.pdst)]
 
         for i in range(self.core_width):
             if i == 0:

@@ -19,7 +19,7 @@ from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts
 from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
-from room.utils import Arbiter
+from room.utils import Arbiter, Valid, Decoupled
 
 from roomsoc.interconnect import wishbone
 
@@ -589,26 +589,27 @@ class Core(Elaboratable):
             n=1 + use_fpu)
 
         m.d.comb += [
-            mem_wbarb.in_data[0].eq(
-                Cat(lsu.exec_iresps[0].uop, lsu.exec_iresps[0].data)),
-            mem_wbarb.in_valid[0].eq(lsu.exec_iresps[0].valid),
-            lsu.exec_iresps[0].ready.eq(mem_wbarb.in_ready[0]),
+            mem_wbarb.inp[0].bits.eq(
+                Cat(lsu.exec_iresps[0].bits.uop,
+                    lsu.exec_iresps[0].bits.data)),
+            mem_wbarb.inp[0].valid.eq(lsu.exec_iresps[0].valid),
+            lsu.exec_iresps[0].ready.eq(mem_wbarb.inp[0].ready),
         ]
 
-        m.d.comb += [
-            Cat(mem_wbarb_out.uop, mem_wbarb_out.data).eq(mem_wbarb.out_data),
-            mem_wbarb_out.valid.eq(mem_wbarb.out_valid),
-            mem_wbarb.out_ready.eq(mem_wbarb_out.ready),
-        ]
+        m.d.comb += Cat(mem_wbarb_out.uop,
+                        mem_wbarb_out.data).eq(mem_wbarb.out.bits)
 
         int_iss_wakeups = []
         int_ren_wakeups = []
 
-        arb_wakeup = ExecResp(self.xlen, self.params, name=f'iss_ren_wakeup0')
+        arb_wakeup = Valid(ExecResp,
+                           self.xlen,
+                           self.params,
+                           name=f'iss_ren_wakeup0')
         m.d.comb += [
-            arb_wakeup.uop.eq(mem_wbarb_out.uop),
+            arb_wakeup.bits.uop.eq(mem_wbarb_out.uop),
             arb_wakeup.valid.eq(
-                mem_wbarb_out.valid & mem_wbarb_out.ready
+                mem_wbarb.out.fire
                 & mem_wbarb_out.uop.rf_wen()
                 & mem_wbarb_out.uop.dst_rtype == RegisterType.FIX),
         ]
@@ -619,13 +620,14 @@ class Core(Elaboratable):
         for w in range(1, mem_width):
             resp = lsu.exec_iresps[w]
 
-            wakeup = ExecResp(self.xlen,
-                              self.params,
-                              name=f'iss_ren_wakeup{w}')
+            wakeup = Valid(ExecResp,
+                           self.xlen,
+                           self.params,
+                           name=f'iss_ren_wakeup{w}')
             m.d.comb += [
-                wakeup.uop.eq(resp.uop),
-                wakeup.valid.eq(resp.valid & resp.uop.rf_wen()
-                                & resp.uop.dst_rtype == RegisterType.FIX),
+                wakeup.bits.uop.eq(resp.bits.uop),
+                wakeup.valid.eq(resp.valid & resp.bits.uop.rf_wen()
+                                & resp.bits.uop.dst_rtype == RegisterType.FIX),
             ]
 
             int_iss_wakeups.append(wakeup)
@@ -635,13 +637,15 @@ class Core(Elaboratable):
             if eu.irf_write:
                 resp = eu.iresp
 
-                wakeup = ExecResp(self.xlen,
-                                  self.params,
-                                  name=f'iss_ren_wakeup{i}')
+                wakeup = Valid(ExecResp,
+                               self.xlen,
+                               self.params,
+                               name=f'iss_ren_wakeup{i}')
                 m.d.comb += [
-                    wakeup.uop.eq(resp.uop),
-                    wakeup.valid.eq(resp.valid & resp.uop.rf_wen()
-                                    & resp.uop.dst_rtype == RegisterType.FIX),
+                    wakeup.bits.uop.eq(resp.bits.uop),
+                    wakeup.valid.eq(
+                        resp.valid & resp.bits.uop.rf_wen()
+                        & resp.bits.uop.dst_rtype == RegisterType.FIX),
                 ]
 
                 int_iss_wakeups.append(wakeup)
@@ -654,7 +658,7 @@ class Core(Elaboratable):
             for iwp, wu in zip(iu.wakeup_ports, int_iss_wakeups):
                 m.d.comb += [
                     iwp.valid.eq(wu.valid),
-                    iwp.pdst.eq(wu.uop.pdst),
+                    iwp.bits.pdst.eq(wu.bits.uop.pdst),
                 ]
 
         if use_fpu:
@@ -729,11 +733,11 @@ class Core(Elaboratable):
         csr_exec_unit = [eu for eu in exec_units if eu.has_csr][0]
 
         m.d.comb += [
-            csr_port.addr.eq(csr_exec_unit.iresp.uop.csr_addr),
+            csr_port.addr.eq(csr_exec_unit.iresp.bits.uop.csr_addr),
             csr_port.cmd.eq(
-                csr_exec_unit.iresp.uop.csr_cmd
+                csr_exec_unit.iresp.bits.uop.csr_cmd
                 & ~Mux(csr_exec_unit.iresp.valid, 0, CSRCommand.I)),
-            csr_port.w_data.eq(csr_exec_unit.iresp.data),
+            csr_port.w_data.eq(csr_exec_unit.iresp.bits.data),
         ]
 
         #
@@ -743,8 +747,8 @@ class Core(Elaboratable):
         for eu, req in zip([eu for eu in exec_units if eu.irf_read],
                            iregread.exec_reqs):
             m.d.comb += [
-                eu.req.eq(req),
-                eu.req.kill.eq(rob_flush_d1.valid),
+                req.connect(eu.req),
+                eu.req.bits.kill.eq(rob_flush_d1.valid),
             ]
 
         br_infos = [
@@ -885,11 +889,11 @@ class Core(Elaboratable):
 
         m.d.comb += [
             iregfile.write_ports[0].valid.eq(
-                mem_wbarb_out.valid & mem_wbarb_out.uop.rf_wen()
+                mem_wbarb.out.valid & mem_wbarb_out.uop.rf_wen()
                 & (mem_wbarb_out.uop.dst_rtype == RegisterType.FIX)),
-            iregfile.write_ports[0].addr.eq(mem_wbarb_out.uop.pdst),
-            iregfile.write_ports[0].data.eq(mem_wbarb_out.data),
-            mem_wbarb_out.ready.eq(1),
+            iregfile.write_ports[0].bits.addr.eq(mem_wbarb_out.uop.pdst),
+            iregfile.write_ports[0].bits.data.eq(mem_wbarb_out.data),
+            mem_wbarb.out.ready.eq(iregfile.write_ports[0].ready),
         ]
 
         if self.sim_debug:
@@ -899,17 +903,17 @@ class Core(Elaboratable):
                 wb_debug.valid.eq(iregfile.write_ports[0].valid),
                 wb_debug.uop_id.eq(mem_wbarb_out.uop.uop_id),
                 wb_debug.pdst.eq(mem_wbarb_out.uop.pdst),
-                wb_debug.data.eq(iregfile.write_ports[0].data),
+                wb_debug.data.eq(iregfile.write_ports[0].bits.data),
             ]
 
         for i, (wp, iresp) in enumerate(
                 zip(iregfile.write_ports[1:mem_width], lsu.exec_iresps[1:]),
                 1):
             m.d.comb += [
-                wp.valid.eq(iresp.valid & iresp.uop.rf_wen()
-                            & (iresp.uop.dst_rtype == RegisterType.FIX)),
-                wp.addr.eq(iresp.uop.pdst),
-                wp.data.eq(iresp.data),
+                wp.valid.eq(iresp.valid & iresp.bits.uop.rf_wen()
+                            & (iresp.bits.uop.dst_rtype == RegisterType.FIX)),
+                wp.bits.addr.eq(iresp.bits.uop.pdst),
+                wp.bits.data.eq(iresp.bits.data),
             ]
 
             if self.sim_debug:
@@ -917,46 +921,48 @@ class Core(Elaboratable):
 
                 m.d.comb += [
                     wb_debug.valid.eq(wp.valid),
-                    wb_debug.uop_id.eq(iresp.uop.uop_id),
-                    wb_debug.pdst.eq(iresp.uop.pdst),
-                    wb_debug.data.eq(wp.data),
+                    wb_debug.uop_id.eq(iresp.bits.uop.uop_id),
+                    wb_debug.pdst.eq(iresp.bits.uop.pdst),
+                    wb_debug.data.eq(wp.bits.data),
                 ]
 
         for i, (eu, wp) in enumerate(
                 zip([eu for eu in exec_units if eu.irf_write],
                     iregfile.write_ports[mem_width:]), mem_width):
             m.d.comb += [
-                wp.valid.eq(eu.iresp.valid & eu.iresp.uop.rf_wen()
-                            & (eu.iresp.uop.dst_rtype == RegisterType.FIX)),
-                wp.addr.eq(eu.iresp.uop.pdst),
+                wp.valid.eq(eu.iresp.valid & eu.iresp.bits.uop.rf_wen()
+                            &
+                            (eu.iresp.bits.uop.dst_rtype == RegisterType.FIX)),
+                wp.bits.addr.eq(eu.iresp.bits.uop.pdst),
             ]
 
             if eu.has_csr:
-                m.d.comb += wp.data.eq(
-                    Mux(eu.iresp.uop.csr_cmd != CSRCommand.X, csr_port.r_data,
-                        eu.iresp.data))
+                m.d.comb += wp.bits.data.eq(
+                    Mux(eu.iresp.bits.uop.csr_cmd != CSRCommand.X,
+                        csr_port.r_data, eu.iresp.bits.data))
             else:
-                m.d.comb += wp.data.eq(eu.iresp.data)
+                m.d.comb += wp.bits.data.eq(eu.iresp.bits.data)
 
             if self.sim_debug:
                 wb_debug = self.core_debug.wb_debug[i]
 
                 m.d.comb += [
                     wb_debug.valid.eq(wp.valid),
-                    wb_debug.uop_id.eq(eu.iresp.uop.uop_id),
-                    wb_debug.pdst.eq(eu.iresp.uop.pdst),
-                    wb_debug.data.eq(wp.data),
+                    wb_debug.uop_id.eq(eu.iresp.bits.uop.uop_id),
+                    wb_debug.pdst.eq(eu.iresp.bits.uop.pdst),
+                    wb_debug.data.eq(wp.bits.data),
                 ]
 
         if use_fpu:
             for wp, fresp in zip(fp_pipeline.mem_wb_ports, lsu.exec_fresps):
-                m.d.comb += wp.eq(fresp)
+                m.d.comb += fresp.connect(wp)
 
             m.d.comb += [
-                mem_wbarb.in_data[1].eq(
-                    Cat(fp_pipeline.to_int.uop, fp_pipeline.to_int.data)),
-                mem_wbarb.in_valid[1].eq(fp_pipeline.to_int.valid),
-                fp_pipeline.to_int.ready.eq(mem_wbarb.in_ready[1]),
+                mem_wbarb.inp[1].bits.eq(
+                    Cat(fp_pipeline.to_int.bits.uop,
+                        fp_pipeline.to_int.bits.data)),
+                mem_wbarb.inp[1].valid.eq(fp_pipeline.to_int.valid),
+                fp_pipeline.to_int.ready.eq(mem_wbarb.inp[1].ready),
             ]
 
             ifpu_unit = [eu for eu in exec_units if eu.has_ifpu][0]
@@ -966,7 +972,10 @@ class Core(Elaboratable):
         # Commit
         #
 
-        m.d.comb += rob.wb_resps[0].eq(mem_wbarb_out)
+        m.d.comb += [
+            rob.wb_resps[0].valid.eq(mem_wbarb.out.valid),
+            rob.wb_resps[0].bits.eq(mem_wbarb_out),
+        ]
 
         for rob_wb, iresp in zip(rob.wb_resps[1:mem_width],
                                  lsu.exec_iresps[1:]):

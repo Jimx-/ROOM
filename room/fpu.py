@@ -194,8 +194,8 @@ class FPUFMA(Elaboratable):
         m.d.comb += [
             inp_pipe.in_valid.eq(self.inp_valid),
             inp_pipe.in_data.eq(self.inp),
-            s1_valid.eq(inp_pipe.out_valid),
-            s1_inp.eq(inp_pipe.out_data),
+            s1_valid.eq(inp_pipe.out.valid),
+            s1_inp.eq(inp_pipe.out.bits),
         ]
 
         in1 = Record(self.ftyp.record_layout())
@@ -336,8 +336,8 @@ class FPUFMA(Elaboratable):
         m.d.comb += [
             s2_pipe.in_valid.eq(s1_valid),
             s2_pipe.in_data.eq(s2_pipe_in),
-            s2_valid.eq(s2_pipe.out_valid),
-            s2_pipe_out.eq(s2_pipe.out_data),
+            s2_valid.eq(s2_pipe.out.valid),
+            s2_pipe_out.eq(s2_pipe.out.bits),
         ]
 
         clz = Signal(range(2 * prec_bits + 4))
@@ -446,8 +446,8 @@ class FPUFMA(Elaboratable):
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
             out_pipe.in_data.eq(result),
-            self.out_valid.eq(out_pipe.out_valid),
-            self.out.data.eq(out_pipe.out_data),
+            self.out_valid.eq(out_pipe.out.valid),
+            self.out.data.eq(out_pipe.out.bits),
         ]
 
         return m
@@ -838,8 +838,8 @@ class FPUCastMulti(Elaboratable):
         m.d.comb += [
             inp_pipe.in_valid.eq(self.inp_valid),
             inp_pipe.in_data.eq(self.inp),
-            s1_valid.eq(inp_pipe.out_valid),
-            s1_inp.eq(inp_pipe.out_data),
+            s1_valid.eq(inp_pipe.out.valid),
+            s1_inp.eq(inp_pipe.out.bits),
         ]
 
         src_is_int = s1_inp.fn == FPUOperator.I2F
@@ -957,8 +957,8 @@ class FPUCastMulti(Elaboratable):
         m.d.comb += [
             s2_pipe.in_valid.eq(s1_valid),
             s2_pipe.in_data.eq(s2_pipe_in),
-            s2_valid.eq(s2_pipe.out_valid),
-            s2_pipe_out.eq(s2_pipe.out_data),
+            s2_valid.eq(s2_pipe.out.valid),
+            s2_pipe_out.eq(s2_pipe.out.bits),
         ]
 
         dst_exp_bits = Signal(range(self.width))
@@ -1118,8 +1118,8 @@ class FPUCastMulti(Elaboratable):
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
             out_pipe.in_data.eq(result),
-            self.out_valid.eq(out_pipe.out_valid),
-            self.out.data.eq(out_pipe.out_data),
+            self.out_valid.eq(out_pipe.out.valid),
+            self.out.data.eq(out_pipe.out.bits),
         ]
 
         return m
@@ -1152,8 +1152,8 @@ class FPUComp(Elaboratable):
         m.d.comb += [
             inp_pipe.in_valid.eq(self.inp_valid),
             inp_pipe.in_data.eq(self.inp),
-            s1_valid.eq(inp_pipe.out_valid),
-            s1_inp.eq(inp_pipe.out_data),
+            s1_valid.eq(inp_pipe.out.valid),
+            s1_inp.eq(inp_pipe.out.bits),
         ]
 
         in1 = Record(self.ftyp.record_layout())
@@ -1283,8 +1283,8 @@ class FPUComp(Elaboratable):
         m.d.comb += [
             out_pipe.in_valid.eq(s1_valid),
             out_pipe.in_data.eq(result),
-            self.out_valid.eq(out_pipe.out_valid),
-            self.out.data.eq(out_pipe.out_data),
+            self.out_valid.eq(out_pipe.out.valid),
+            self.out.data.eq(out_pipe.out.bits),
         ]
 
         return m

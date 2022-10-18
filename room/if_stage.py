@@ -414,7 +414,7 @@ class IFStage(Elaboratable):
 
         if self.enable_icache:
             m.d.comb += [
-                icache.req.addr.eq(s0_vpc),
+                icache.req.bits.addr.eq(s0_vpc),
                 icache.req.valid.eq(s0_valid),
             ]
 
@@ -515,7 +515,7 @@ class IFStage(Elaboratable):
 
         if self.enable_icache:
             f3_w_en = s2_valid & ~f2_clear & icache.resp.valid
-            f3_w_data = Cat(s2_vpc, icache.resp.data)
+            f3_w_data = Cat(s2_vpc, icache.resp.bits.data)
         else:
             f3_w_en = s2_valid & ~f2_clear & self.ibus.ack
             f3_w_data = Cat(s2_vpc, self.ibus.dat_r)

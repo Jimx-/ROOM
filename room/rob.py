@@ -8,6 +8,7 @@ from room.alu import ExecResp
 from room.types import MicroOp
 from room.branch import BranchUpdate
 from room.exc import Cause
+from room.utils import Valid
 
 
 class FlushType(IntEnum):
@@ -117,9 +118,10 @@ class ReorderBuffer(Elaboratable):
         self.enq_partial_stalls = Signal()
 
         self.wb_resps = [
-            ExecResp(max(params['xlen'], params['flen']),
-                     params,
-                     name=f'wb_resp{i}') for i in range(num_wakeup_ports)
+            Valid(ExecResp,
+                  max(params['xlen'], params['flen']),
+                  params,
+                  name=f'wb_resp{i}') for i in range(num_wakeup_ports)
         ]
 
         self.lsu_clear_busy_valids = Signal(mem_width + 1)
@@ -213,7 +215,7 @@ class ReorderBuffer(Elaboratable):
                 ]
 
             for wb in self.wb_resps:
-                uop = wb.uop
+                uop = wb.bits.uop
                 row_idx = get_row(uop.rob_idx)
                 with m.If(wb.valid & (get_bank(uop.rob_idx) == w)):
                     m.d.sync += rob_busy[row_idx].eq(0)

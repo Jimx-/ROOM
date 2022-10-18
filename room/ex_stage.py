@@ -5,7 +5,7 @@ from room.alu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, Di
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.types import MicroOp
-from room.utils import BranchKillableFIFO, Arbiter, generate_imm
+from room.utils import Valid, Decoupled, BranchKillableFIFO, Arbiter, generate_imm
 
 
 class ExecDebug(Record):
@@ -71,18 +71,19 @@ class ExecUnit(Elaboratable):
 
         self.fu_types = Signal(FUType)
 
-        self.req = ExecReq(data_width, params, name='req')
+        self.req = Decoupled(ExecReq, data_width, params)
 
-        self.iresp = ExecResp(self.data_width, params,
-                              name='iresp') if self.irf_write else None
-        self.fresp = ExecResp(self.data_width, params,
-                              name='fresp') if self.frf_write else None
-        self.mem_iresp = ExecResp(
-            self.data_width, params,
-            name='mem_iresp') if self.mem_irf_write else None
-        self.mem_fresp = ExecResp(
-            self.data_width, params,
-            name='mem_fresp') if self.mem_frf_write else None
+        if self.irf_write:
+            self.iresp = Decoupled(ExecResp, self.data_width, params)
+
+        if self.frf_write:
+            self.fresp = Decoupled(ExecResp, self.data_width, params)
+
+        if self.mem_irf_write:
+            self.mem_iresp = Decoupled(ExecResp, self.data_width, params)
+
+        if self.mem_frf_write:
+            self.mem_fresp = Decoupled(ExecResp, self.data_width, params)
 
         self.br_update = BranchUpdate(params)
 
@@ -94,7 +95,7 @@ class ExecUnit(Elaboratable):
 
         self.lsu_req = None
         if has_mem:
-            self.lsu_req = ExecResp(self.data_width, params, name='lsu_req')
+            self.lsu_req = Valid(ExecResp, self.data_width, params)
 
         if sim_debug:
             self.exec_debug = ExecDebug(params, name='ex_debug')
@@ -105,12 +106,12 @@ class ExecUnit(Elaboratable):
         if self.sim_debug:
             m.d.comb += [
                 self.exec_debug.valid.eq(self.req.valid),
-                self.exec_debug.uop_id.eq(self.req.uop.uop_id),
-                self.exec_debug.opcode.eq(self.req.uop.opcode),
-                self.exec_debug.prs1.eq(self.req.uop.prs1),
-                self.exec_debug.rs1_data.eq(self.req.rs1_data),
-                self.exec_debug.prs2.eq(self.req.uop.prs2),
-                self.exec_debug.rs2_data.eq(self.req.rs2_data),
+                self.exec_debug.uop_id.eq(self.req.bits.uop.uop_id),
+                self.exec_debug.opcode.eq(self.req.bits.uop.opcode),
+                self.exec_debug.prs1.eq(self.req.bits.uop.prs1),
+                self.exec_debug.rs1_data.eq(self.req.bits.rs1_data),
+                self.exec_debug.prs2.eq(self.req.bits.uop.prs2),
+                self.exec_debug.rs2_data.eq(self.req.bits.rs2_data),
             ]
 
         return m
@@ -180,11 +181,12 @@ class ALUExecUnit(ExecUnit):
             iresp_units.append(alu)
 
             m.d.comb += [
-                alu.req.eq(self.req),
-                alu.req.valid.eq(self.req.valid
-                                 & ((self.req.uop.fu_type == FUType.ALU)
-                                    | (self.req.uop.fu_type == FUType.JMP)
-                                    | (self.req.uop.fu_type == FUType.CSR))),
+                self.req.connect(alu.req),
+                alu.req.valid.eq(
+                    self.req.valid
+                    & ((self.req.bits.uop.fu_type == FUType.ALU)
+                       | (self.req.bits.uop.fu_type == FUType.JMP)
+                       | (self.req.bits.uop.fu_type == FUType.CSR))),
                 alu.br_update.eq(self.br_update),
                 self.br_res.eq(alu.br_res),
             ]
@@ -198,9 +200,9 @@ class ALUExecUnit(ExecUnit):
             iresp_units.append(imul)
 
             m.d.comb += [
-                imul.req.eq(self.req),
+                self.req.connect(imul.req),
                 imul.req.valid.eq(self.req.valid
-                                  & (self.req.uop.fu_type == FUType.MUL)),
+                                  & (self.req.bits.uop.fu_type == FUType.MUL)),
                 imul.br_update.eq(self.br_update),
             ]
 
@@ -208,9 +210,10 @@ class ALUExecUnit(ExecUnit):
             ifpu = m.submodules.ifpu = IntToFPUnit(self.data_width, 2,
                                                    self.params)
             m.d.comb += [
-                ifpu.req.eq(self.req),
+                self.req.connect(ifpu.req),
                 ifpu.req.valid.eq(self.req.valid
-                                  & (self.req.uop.fu_type_has(FUType.I2F))),
+                                  &
+                                  (self.req.bits.uop.fu_type_has(FUType.I2F))),
                 ifpu.br_update.eq(self.br_update),
             ]
 
@@ -223,17 +226,17 @@ class ALUExecUnit(ExecUnit):
                 flow=True)
 
             m.d.comb += [
-                ifpu_q.w_data.eq(Cat(ifpu.resp.uop, ifpu.resp.data)),
-                ifpu_q.w_br_mask.eq(ifpu.resp.uop.br_mask),
+                ifpu_q.w_data.eq(Cat(ifpu.resp.bits.uop, ifpu.resp.bits.data)),
+                ifpu_q.w_br_mask.eq(ifpu.resp.bits.uop.br_mask),
                 ifpu_q.w_en.eq(ifpu.resp.valid),
                 Cat(ifpu_rdata.uop, ifpu_rdata.data).eq(ifpu_q.r_data),
                 ifpu_rdata.uop.br_mask.eq(ifpu_q.r_br_mask),
                 ifpu_q.br_update.eq(self.br_update),
-                ifpu_q.flush.eq(self.req.kill),
+                ifpu_q.flush.eq(self.req.bits.kill),
             ]
 
             m.d.comb += [
-                self.mem_fresp.eq(ifpu_rdata),
+                self.mem_fresp.bits.eq(ifpu_rdata),
                 self.mem_fresp.valid.eq(ifpu_q.r_rdy),
                 ifpu_q.r_en.eq(self.mem_fresp.ready),
             ]
@@ -248,9 +251,9 @@ class ALUExecUnit(ExecUnit):
                 div_resp_busy |= iu.resp.valid
 
             m.d.comb += [
-                div.req.eq(self.req),
+                self.req.connect(div.req),
                 div.req.valid.eq(self.req.valid
-                                 & (self.req.uop.fu_type == FUType.DIV)),
+                                 & (self.req.bits.uop.fu_type == FUType.DIV)),
                 div.br_update.eq(self.br_update),
                 div.resp.ready.eq(~div_resp_busy),
                 div_busy.eq(~div.req.ready | div.req.valid),
@@ -262,7 +265,7 @@ class ALUExecUnit(ExecUnit):
             agu = m.submodules.agu = AddrGenUnit(self.params)
 
             m.d.comb += [
-                agu.req.eq(self.req),
+                self.req.connect(agu.req),
                 agu.br_update.eq(self.br_update),
                 self.lsu_req.eq(agu.resp),
             ]
@@ -270,13 +273,16 @@ class ALUExecUnit(ExecUnit):
         if self.irf_write:
             for iu in reversed(iresp_units):
                 with m.If(iu.resp.valid):
-                    m.d.comb += self.iresp.eq(iu.resp)
+                    m.d.comb += [
+                        self.iresp.valid.eq(1),
+                        self.iresp.bits.eq(iu.resp.bits),
+                    ]
 
             if self.has_alu:
                 m.d.comb += [
-                    self.iresp.uop.csr_addr.eq(
-                        generate_imm(alu.resp.uop.imm_packed, ImmSel.I)),
-                    self.iresp.uop.csr_cmd.eq(alu.resp.uop.csr_cmd),
+                    self.iresp.bits.uop.csr_addr.eq(
+                        generate_imm(alu.resp.bits.uop.imm_packed, ImmSel.I)),
+                    self.iresp.bits.uop.csr_cmd.eq(alu.resp.bits.uop.csr_cmd),
                 ]
 
         return m
@@ -328,10 +334,11 @@ class FPUExecUnit(ExecUnit):
             fpu = m.submodules.fpu = FPUUnit(self.data_width, self.params)
 
             m.d.comb += [
-                fpu.req.eq(self.req),
-                fpu.req.valid.eq(self.req.valid
-                                 & (self.req.uop.fu_type_has(FUType.FPU)
-                                    | self.req.uop.fu_type_has(FUType.F2I))),
+                self.req.connect(fpu.req),
+                fpu.req.valid.eq(
+                    self.req.valid
+                    & (self.req.bits.uop.fu_type_has(FUType.FPU)
+                       | self.req.bits.uop.fu_type_has(FUType.F2I))),
                 fpu.br_update.eq(self.br_update),
             ]
 
@@ -345,9 +352,10 @@ class FPUExecUnit(ExecUnit):
                 fdiv_resp_busy |= fu.resp.valid
 
             m.d.comb += [
-                fdiv.req.eq(self.req),
-                fdiv.req.valid.eq(self.req.valid
-                                  & (self.req.uop.fu_type_has(FUType.FDIV))),
+                self.req.connect(fdiv.req),
+                fdiv.req.valid.eq(
+                    self.req.valid
+                    & (self.req.bits.uop.fu_type_has(FUType.FDIV))),
                 fdiv.br_update.eq(self.br_update),
                 fdiv.resp.ready.eq(~fdiv_resp_busy),
                 fdiv_busy.eq(~fdiv.req.ready | fdiv.req.valid),
@@ -365,15 +373,15 @@ class FPUExecUnit(ExecUnit):
                 flow=True)
 
             m.d.comb += [
-                fpiu_q.w_data.eq(Cat(fpu.resp.uop, fpu.resp.data)),
-                fpiu_q.w_br_mask.eq(fpu.resp.uop.br_mask),
+                fpiu_q.w_data.eq(Cat(fpu.resp.bits.uop, fpu.resp.bits.data)),
+                fpiu_q.w_br_mask.eq(fpu.resp.bits.uop.br_mask),
                 fpiu_q.w_en.eq(fpu.resp.valid
-                               & fpu.resp.uop.fu_type_has(FUType.F2I)
-                               & (fpu.resp.uop.opcode != UOpCode.STA)),
+                               & fpu.resp.bits.uop.fu_type_has(FUType.F2I)
+                               & (fpu.resp.bits.uop.opcode != UOpCode.STA)),
                 Cat(fpiu_rdata.uop, fpiu_rdata.data).eq(fpiu_q.r_data),
                 fpiu_rdata.uop.br_mask.eq(fpiu_q.r_br_mask),
                 fpiu_q.br_update.eq(self.br_update),
-                fpiu_q.flush.eq(self.req.kill),
+                fpiu_q.flush.eq(self.req.bits.kill),
             ]
 
             stq_rdata = ExecResp(self.data_width, self.params)
@@ -385,31 +393,33 @@ class FPUExecUnit(ExecUnit):
                 flow=True)
 
             m.d.comb += [
-                fp_stq.w_data.eq(Cat(self.req.uop, self.req.rs2_data)),
-                fp_stq.w_br_mask.eq(self.req.uop.br_mask),
-                fp_stq.w_en.eq(self.req.valid
-                               & (self.req.uop.opcode == UOpCode.STA)
-                               & ~self.br_update.uop_killed(self.req.uop)),
+                fp_stq.w_data.eq(Cat(self.req.bits.uop,
+                                     self.req.bits.rs2_data)),
+                fp_stq.w_br_mask.eq(self.req.bits.uop.br_mask),
+                fp_stq.w_en.eq(
+                    self.req.valid
+                    & (self.req.bits.uop.opcode == UOpCode.STA)
+                    & ~self.br_update.uop_killed(self.req.bits.uop)),
                 Cat(stq_rdata.uop, stq_rdata.data).eq(fp_stq.r_data),
                 stq_rdata.uop.br_mask.eq(fp_stq.r_br_mask),
                 fp_stq.br_update.eq(self.br_update),
-                fp_stq.flush.eq(self.req.kill),
+                fp_stq.flush.eq(self.req.bits.kill),
             ]
 
             resp_arb = m.submodules.resp_arb = Arbiter(
                 width=len(fpiu_rdata.uop) + len(fpiu_rdata.data), n=2)
 
             m.d.comb += [
-                resp_arb.in_data[0].eq(Cat(fpiu_rdata.uop, fpiu_rdata.data)),
-                resp_arb.in_valid[0].eq(fpiu_q.r_rdy),
-                fpiu_q.r_en.eq(resp_arb.in_ready[0]),
-                resp_arb.in_data[1].eq(Cat(stq_rdata.uop, stq_rdata.data)),
-                resp_arb.in_valid[1].eq(fp_stq.r_rdy),
-                fp_stq.r_en.eq(resp_arb.in_ready[1]),
-                Cat(self.mem_iresp.uop,
-                    self.mem_iresp.data).eq(resp_arb.out_data),
-                self.mem_iresp.valid.eq(resp_arb.out_valid),
-                resp_arb.out_ready.eq(self.mem_iresp.ready),
+                resp_arb.inp[0].bits.eq(Cat(fpiu_rdata.uop, fpiu_rdata.data)),
+                resp_arb.inp[0].valid.eq(fpiu_q.r_rdy),
+                fpiu_q.r_en.eq(resp_arb.inp[0].ready),
+                resp_arb.inp[1].bits.eq(Cat(stq_rdata.uop, stq_rdata.data)),
+                resp_arb.inp[1].valid.eq(fp_stq.r_rdy),
+                fp_stq.r_en.eq(resp_arb.inp[1].ready),
+                Cat(self.mem_iresp.bits.uop,
+                    self.mem_iresp.bits.data).eq(resp_arb.out.bits),
+                self.mem_iresp.valid.eq(resp_arb.out.valid),
+                resp_arb.out.ready.eq(self.mem_iresp.ready),
             ]
 
             m.d.comb += fpiu_busy.eq(fpiu_q.r_rdy | fp_stq.r_rdy)
@@ -420,13 +430,13 @@ class FPUExecUnit(ExecUnit):
 
             with m.If(fu.resp.valid):
                 m.d.comb += [
-                    self.fresp.data.eq(fu.resp.data),
-                    self.fresp.uop.eq(fu.resp.uop),
+                    self.fresp.bits.data.eq(fu.resp.bits.data),
+                    self.fresp.bits.uop.eq(fu.resp.bits.uop),
                 ]
 
         m.d.comb += self.fresp.valid.eq(
             fresp_valid
-            & ~(fpu.resp.valid & fpu.resp.uop.fu_type_has(FUType.F2I)))
+            & ~(fpu.resp.valid & fpu.resp.bits.uop.fu_type_has(FUType.F2I)))
 
         return m
 

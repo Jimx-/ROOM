@@ -1,6 +1,8 @@
 from amaranth import *
 from amaranth.utils import log2_int
 
+from room.utils import Valid, Decoupled
+
 
 class ICacheReq(Record):
 
@@ -9,8 +11,6 @@ class ICacheReq(Record):
 
         super().__init__([
             ('addr', vaddr_bits),
-            ('valid', 1),
-            ('ready', 1),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -23,7 +23,6 @@ class ICacheResp(Record):
 
         super().__init__([
             ('data', fetch_bytes * 8),
-            ('valid', 1),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -41,12 +40,12 @@ class ICache(Elaboratable):
 
         self.ibus = ibus
 
-        self.req = ICacheReq(params)
+        self.req = Decoupled(ICacheReq, params)
         self.s1_paddr = Signal(32)
         self.s1_kill = Signal()
         self.s2_kill = Signal()
 
-        self.resp = ICacheResp(params)
+        self.resp = Valid(ICacheResp, params)
 
         self.invalidate = Signal()
 
@@ -62,8 +61,8 @@ class ICache(Elaboratable):
 
         word_bits = self.fetch_bytes * 8
 
-        s0_valid = self.req.valid & self.req.ready
-        s0_vaddr = self.req.addr
+        s0_valid = self.req.fire
+        s0_vaddr = self.req.bits.addr
 
         s1_valid = Signal()
         s1_tag_hit = Signal(self.n_ways)
@@ -180,14 +179,14 @@ class ICache(Elaboratable):
         s2_tag_hit = Signal.like(s1_tag_hit)
         m.d.sync += s2_tag_hit.eq(s1_tag_hit)
 
-        s2_data = Signal.like(self.resp.data)
+        s2_data = Signal.like(self.resp.bits.data)
 
         for i in range(self.n_ways):
             with m.If(s2_tag_hit[i]):
                 m.d.comb += s2_data.eq(s2_dout[i])
 
         m.d.comb += [
-            self.resp.data.eq(s2_data),
+            self.resp.bits.data.eq(s2_data),
             self.resp.valid.eq(s2_valid & s2_hit),
         ]
 

@@ -7,7 +7,7 @@ from room.types import MicroOp
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
-from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe
+from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe, Decoupled
 
 
 class ExecReq:
@@ -17,7 +17,6 @@ class ExecReq:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
         self.uop = MicroOp(params, name=f'{name}_uop')
-        self.valid = Signal(name=f'{name}_valid')
 
         self.rs1_data = Signal(data_width, name=f'{name}_rs1_data')
         self.rs2_data = Signal(data_width, name=f'{name}_rs2_data')
@@ -25,10 +24,8 @@ class ExecReq:
 
         self.kill = Signal(name=f'{name}_kill')
 
-        self.ready = Signal(name=f'{name}_ready')
-
     def eq(self, rhs):
-        attrs = ['uop', 'valid', 'rs1_data', 'rs2_data', 'rs3_data', 'kill']
+        attrs = ['uop', 'rs1_data', 'rs2_data', 'rs3_data', 'kill']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
@@ -41,22 +38,13 @@ class ExecResp:
         self.vaddr_bits = params['vaddr_bits']
 
         self.uop = MicroOp(params, name=f'{name}_uop')
-        self.valid = Signal(name=f'{name}_valid')
 
         self.data = Signal(data_width, name=f'{name}_data')
         self.addr = Signal(self.vaddr_bits + 1, name=f'{name}_addr')
 
-        self.ready = Signal(name=f'{name}_ready')
-
     def eq(self, rhs):
-        attrs = ['uop', 'valid', 'addr', 'data']
+        attrs = ['uop', 'addr', 'data']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
-
-    def connect(self, subord):
-        return subord.eq(self) + [
-            subord.valid.eq(self.valid),
-            self.ready.eq(subord.ready),
-        ]
 
 
 class FunctionalUnit(Elaboratable):
@@ -64,8 +52,8 @@ class FunctionalUnit(Elaboratable):
     def __init__(self, data_width, params, is_jmp=False, is_alu=False):
         self.is_jmp = is_jmp
 
-        self.req = ExecReq(data_width, params, name='req')
-        self.resp = ExecResp(data_width, params, name='resp')
+        self.req = Decoupled(ExecReq, data_width, params)
+        self.resp = Decoupled(ExecResp, data_width, params)
 
         self.br_update = BranchUpdate(params)
 
@@ -102,12 +90,13 @@ class PipelinedFunctionalUnit(FunctionalUnit):
             ]
 
             m.d.sync += [
-                self.valids[0].eq(self.req.valid
-                                  & ~self.br_update.uop_killed(self.req.uop)
-                                  & ~self.req.kill),
-                self.uops[0].eq(self.req.uop),
+                self.valids[0].eq(
+                    self.req.valid
+                    & ~self.br_update.uop_killed(self.req.bits.uop)
+                    & ~self.req.bits.kill),
+                self.uops[0].eq(self.req.bits.uop),
                 self.uops[0].br_mask.eq(
-                    self.br_update.get_new_br_mask(self.req.uop.br_mask)),
+                    self.br_update.get_new_br_mask(self.req.bits.uop.br_mask)),
             ]
 
             for i in range(1, self.num_stages):
@@ -115,7 +104,7 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                     self.valids[i].eq(
                         self.valids[i - 1]
                         & ~self.br_update.uop_killed(self.uops[i - 1])
-                        & ~self.req.kill),
+                        & ~self.req.bits.kill),
                     self.uops[i].eq(self.uops[i - 1]),
                     self.uops[i].br_mask.eq(
                         self.br_update.get_new_br_mask(self.uops[i -
@@ -126,18 +115,19 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                 self.resp.valid.eq(self.valids[self.num_stages - 1]
                                    & ~self.br_update.uop_killed(self.uops[
                                        self.num_stages - 1])),
-                self.resp.uop.eq(self.uops[self.num_stages - 1]),
-                self.resp.uop.br_mask.eq(
+                self.resp.bits.uop.eq(self.uops[self.num_stages - 1]),
+                self.resp.bits.uop.br_mask.eq(
                     self.br_update.get_new_br_mask(self.uops[self.num_stages -
                                                              1].br_mask)),
             ]
         else:
             m.d.comb += [
-                self.resp.valid.eq(self.req.valid
-                                   & ~self.br_update.uop_killed(self.req.uop)),
-                self.resp.uop.eq(self.req.uop),
-                self.resp.uop.br_mask.eq(
-                    self.br_update.get_new_br_mask(self.req.uop.br_mask)),
+                self.resp.valid.eq(
+                    self.req.valid
+                    & ~self.br_update.uop_killed(self.req.bits.uop)),
+                self.resp.bits.uop.eq(self.req.bits.uop),
+                self.resp.bits.uop.br_mask.eq(
+                    self.br_update.get_new_br_mask(self.req.bits.uop.br_mask)),
             ]
 
         return m
@@ -253,7 +243,7 @@ class ALUUnit(PipelinedFunctionalUnit):
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
-        uop = self.req.uop
+        uop = self.req.bits.uop
 
         #
         # Operands
@@ -270,18 +260,18 @@ class ALUUnit(PipelinedFunctionalUnit):
             uop_pc = self.get_pc.pc | uop.pc_lsb
 
             m.d.comb += opa_data.eq(
-                Mux(uop.opa_sel == OpA.RS1, self.req.rs1_data,
+                Mux(uop.opa_sel == OpA.RS1, self.req.bits.rs1_data,
                     Mux(uop.opa_sel == OpA.PC, uop_pc, 0)))
         else:
             m.d.comb += opa_data.eq(
-                Mux(uop.opa_sel == OpA.RS1, self.req.rs1_data, 0))
+                Mux(uop.opa_sel == OpA.RS1, self.req.bits.rs1_data, 0))
 
         m.d.comb += opb_data.eq(
             Mux(
                 uop.opb_sel == OpB.IMM, imm,
                 Mux(
-                    uop.opb_sel == OpB.IMMC, self.req.uop.prs1[:5],
-                    Mux(uop.opb_sel == OpB.RS2, self.req.rs2_data,
+                    uop.opb_sel == OpB.IMMC, self.req.bits.uop.prs1[:5],
+                    Mux(uop.opb_sel == OpB.RS2, self.req.bits.rs2_data,
                         Mux(uop.opb_sel == OpB.NEXT, Mux(uop.is_rvc, 2, 4),
                             0)))))
 
@@ -302,11 +292,11 @@ class ALUUnit(PipelinedFunctionalUnit):
         #
 
         killed = Signal()
-        with m.If(self.req.kill | self.br_update.uop_killed(uop)):
+        with m.If(self.req.bits.kill | self.br_update.uop_killed(uop)):
             m.d.comb += killed.eq(1)
 
-        rs1 = self.req.rs1_data
-        rs2 = self.req.rs2_data
+        rs1 = self.req.bits.rs1_data
+        rs2 = self.req.bits.rs2_data
         br_eq = rs1 == rs2
         br_ltu = (rs1.as_unsigned() < rs2.as_unsigned())
         br_lt = (~(rs1[self.xlen - 1] ^ rs2[self.xlen - 1])
@@ -363,7 +353,7 @@ class ALUUnit(PipelinedFunctionalUnit):
         ]
 
         if self.is_jmp:
-            m.d.comb += self.br_res.jalr_target.eq(self.req.rs1_data +
+            m.d.comb += self.br_res.jalr_target.eq(self.req.bits.rs1_data +
                                                    target_offset)
 
             with m.If(pc_sel == PCSel.JALR):
@@ -389,7 +379,7 @@ class ALUUnit(PipelinedFunctionalUnit):
             ]
 
         m.d.comb += [
-            self.resp.data.eq(data[self.num_stages - 1]),
+            self.resp.bits.data.eq(data[self.num_stages - 1]),
         ]
 
         return m
@@ -404,9 +394,10 @@ class AddrGenUnit(PipelinedFunctionalUnit):
         m = super().elaborate(platform)
 
         m.d.comb += [
-            self.resp.addr.eq(self.req.rs1_data +
-                              self.req.uop.imm_packed[8:20].as_signed()),
-            self.resp.data.eq(self.req.rs2_data),
+            self.resp.bits.addr.eq(
+                self.req.bits.rs1_data +
+                self.req.bits.uop.imm_packed[8:20].as_signed()),
+            self.resp.bits.data.eq(self.req.bits.rs2_data),
         ]
 
         return m
@@ -494,14 +485,14 @@ class MultiplierUnit(PipelinedFunctionalUnit):
 
         mul = m.submodules.mul = Multiplier(self.width, self.latency)
         m.d.comb += [
-            mul.req.fn.eq(self.req.uop.alu_fn),
-            mul.req.dw.eq(self.req.uop.alu_dw),
-            mul.req.in1.eq(self.req.rs1_data),
-            mul.req.in2.eq(self.req.rs2_data),
+            mul.req.fn.eq(self.req.bits.uop.alu_fn),
+            mul.req.dw.eq(self.req.bits.uop.alu_dw),
+            mul.req.in1.eq(self.req.bits.rs1_data),
+            mul.req.in2.eq(self.req.bits.rs2_data),
             mul.req_valid.eq(self.req.valid),
         ]
 
-        m.d.comb += self.resp.data.eq(mul.resp_data)
+        m.d.comb += self.resp.bits.data.eq(mul.resp_data)
 
         return m
 
@@ -522,20 +513,21 @@ class IterativeFunctionalUnit(FunctionalUnit):
 
         with m.If(self.req.valid & self.req.ready):
             m.d.comb += self.do_kill.eq(
-                self.req.kill | self.br_update.uop_killed(self.req.uop))
+                self.req.bits.kill
+                | self.br_update.uop_killed(self.req.bits.uop))
             m.d.sync += [
-                uop.eq(self.req.uop),
+                uop.eq(self.req.bits.uop),
                 uop.br_mask.eq(
-                    self.br_update.get_new_br_mask(self.req.uop.br_mask))
+                    self.br_update.get_new_br_mask(self.req.bits.uop.br_mask))
             ]
         with m.Else():
-            m.d.comb += self.do_kill.eq(self.req.kill
+            m.d.comb += self.do_kill.eq(self.req.bits.kill
                                         | self.br_update.uop_killed(uop))
             m.d.sync += [
                 uop.br_mask.eq(self.br_update.get_new_br_mask(uop.br_mask))
             ]
 
-        m.d.comb += self.resp.uop.eq(uop)
+        m.d.comb += self.resp.bits.uop.eq(uop)
 
         return m
 
@@ -681,13 +673,13 @@ class DivUnit(IterativeFunctionalUnit):
         div = m.submodules.div = IntDiv(self.width)
 
         m.d.comb += [
-            div.req.fn.eq(self.req.uop.alu_fn),
-            div.req.dw.eq(self.req.uop.alu_dw),
-            div.req.in1.eq(self.req.rs1_data),
-            div.req.in2.eq(self.req.rs2_data),
+            div.req.fn.eq(self.req.bits.uop.alu_fn),
+            div.req.dw.eq(self.req.bits.uop.alu_dw),
+            div.req.in1.eq(self.req.bits.rs1_data),
+            div.req.in2.eq(self.req.bits.rs2_data),
             div.req_valid.eq(self.req.valid),
             self.req.ready.eq(div.req_ready),
-            self.resp.data.eq(div.resp_data),
+            self.resp.bits.data.eq(div.resp_data),
             self.resp.valid.eq(div.resp_valid),
             div.resp_ready.eq(self.resp.ready),
             div.kill.eq(self.do_kill),
@@ -709,33 +701,34 @@ class IntToFPUnit(PipelinedFunctionalUnit):
 
         cast_en = Signal()
 
-        with m.Switch(self.req.uop.opcode):
+        with m.Switch(self.req.bits.uop.opcode):
             with m.Case(UOpCode.FCVT_S_X, UOpCode.FCVT_D_X):
                 m.d.comb += cast_en.eq(1)
 
-        in_pipe = m.submodules.in_pipe = Pipe(width=len(self.req.rs1_data),
+        in_pipe = m.submodules.in_pipe = Pipe(width=len(
+            self.req.bits.rs1_data),
                                               depth=self.latency)
         m.d.comb += [
             in_pipe.in_valid.eq(self.req.valid),
-            in_pipe.in_data.eq(self.req.rs1_data),
+            in_pipe.in_data.eq(self.req.bits.rs1_data),
         ]
 
         ifpu = m.submodules.ifpu = FPUCastMulti(latency=self.latency)
 
-        typ = generate_imm_type(self.req.uop.imm_packed)
+        typ = generate_imm_type(self.req.bits.uop.imm_packed)
 
         m.d.comb += [
             ifpu.inp_valid.eq(self.req.valid & cast_en),
             ifpu.inp.fn.eq(FPUOperator.I2F),
             ifpu.inp.fn_mod.eq(typ[0]),
-            ifpu.inp.in1.eq(self.req.rs1_data),
+            ifpu.inp.in1.eq(self.req.bits.rs1_data),
             ifpu.inp.dst_fmt.eq(
-                Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
             ifpu.inp.int_fmt.eq(Cat(typ[1], 1)),
         ]
 
-        m.d.comb += self.resp.data.eq(
-            Mux(ifpu.out_valid, ifpu.out.data, in_pipe.out_data))
+        m.d.comb += self.resp.bits.data.eq(
+            Mux(ifpu.out_valid, ifpu.out.data, in_pipe.out.bits))
 
         return m
 
@@ -751,11 +744,12 @@ class FPUUnit(PipelinedFunctionalUnit):
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
-        in_pipe = m.submodules.in_pipe = Pipe(width=len(self.req.rs1_data),
+        in_pipe = m.submodules.in_pipe = Pipe(width=len(
+            self.req.bits.rs1_data),
                                               depth=self.fma_latency)
         m.d.comb += [
             in_pipe.in_valid.eq(self.req.valid),
-            in_pipe.in_data.eq(self.req.rs1_data),
+            in_pipe.in_data.eq(self.req.bits.rs1_data),
         ]
 
         fma_en = Signal()
@@ -772,18 +766,20 @@ class FPUUnit(PipelinedFunctionalUnit):
         swap32 = Signal()
 
         fp_rm = Mux(
-            generate_imm_rm(self.req.uop.imm_packed) == 7, 0,
-            generate_imm_rm(self.req.uop.imm_packed))
+            generate_imm_rm(self.req.bits.uop.imm_packed) == 7, 0,
+            generate_imm_rm(self.req.bits.uop.imm_packed))
 
-        with m.Switch(self.req.uop.opcode):
+        with m.Switch(self.req.bits.uop.opcode):
             with m.Case(UOpCode.FADD_S, UOpCode.FADD_D):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     swap32.eq(1),
                 ]
 
@@ -793,9 +789,11 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_op.eq(FPUOperator.ADD),
                     fma_op_mod.eq(1),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     swap32.eq(1),
                 ]
 
@@ -804,9 +802,11 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.MUL),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FMADD_S, UOpCode.FMADD_D):
@@ -814,9 +814,11 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FMSUB_S, UOpCode.FMSUB_D):
@@ -825,9 +827,11 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_op.eq(FPUOperator.FMADD),
                     fma_op.eq(1),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FNMSUB_S, UOpCode.FNMSUB_D):
@@ -835,9 +839,11 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FNMADD_S, UOpCode.FNMADD_D):
@@ -846,20 +852,23 @@ class FPUUnit(PipelinedFunctionalUnit):
                     fma_op.eq(FPUOperator.FNMSUB),
                     fma_op.eq(1),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FCVT_X_S, UOpCode.FCVT_X_D):
-                typ = generate_imm_type(self.req.uop.imm_packed)
+                typ = generate_imm_type(self.req.bits.uop.imm_packed)
 
                 m.d.comb += [
                     cast_en.eq(1),
                     fma_op.eq(FPUOperator.F2I),
                     fma_op_mod.eq(typ[0]),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_int.eq(Cat(typ[1], 1)),
                 ]
 
@@ -868,9 +877,11 @@ class FPUUnit(PipelinedFunctionalUnit):
                     cast_en.eq(1),
                     fma_op.eq(FPUOperator.F2F),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.D, FPFormat.S)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.D,
+                            FPFormat.S)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FSGNJ_S, UOpCode.FSGNJ_D):
@@ -878,9 +889,11 @@ class FPUUnit(PipelinedFunctionalUnit):
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.SGNJ),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FMINMAX_S, UOpCode.FMINMAX_D):
@@ -888,9 +901,11 @@ class FPUUnit(PipelinedFunctionalUnit):
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.MINMAX),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                     fmt_out.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.CMPR_S, UOpCode.CMPR_D):
@@ -898,7 +913,8 @@ class FPUUnit(PipelinedFunctionalUnit):
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.CMP),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FCLASS_S, UOpCode.FCLASS_D):
@@ -906,14 +922,15 @@ class FPUUnit(PipelinedFunctionalUnit):
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.CLASSIFY),
                     fmt_in.eq(
-                        Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
                 ]
 
         def set_fu_input(inp):
             m.d.comb += [
-                inp.in1.eq(self.req.rs1_data),
-                inp.in2.eq(self.req.rs2_data),
-                inp.in3.eq(self.req.rs3_data),
+                inp.in1.eq(self.req.bits.rs1_data),
+                inp.in2.eq(self.req.bits.rs2_data),
+                inp.in3.eq(self.req.bits.rs3_data),
                 inp.fn.eq(fma_op),
                 inp.fn_mod.eq(fma_op_mod),
                 inp.rm.eq(fp_rm),
@@ -923,7 +940,7 @@ class FPUUnit(PipelinedFunctionalUnit):
             ]
 
             with m.If(swap32):
-                m.d.comb += inp.in3.eq(self.req.rs2_data)
+                m.d.comb += inp.in3.eq(self.req.bits.rs2_data)
 
         dfma = m.submodules.dfma = FPUFMA(self.width,
                                           FPFormat.D,
@@ -957,7 +974,7 @@ class FPUUnit(PipelinedFunctionalUnit):
         m.d.comb += scmp.inp_valid.eq(self.req.valid & cmp_en
                                       & (fmt_in == FPFormat.S))
 
-        m.d.comb += self.resp.data.eq(
+        m.d.comb += self.resp.bits.data.eq(
             Mux(
                 dfma.out_valid, dfma.out.data,
                 Mux(
@@ -967,7 +984,7 @@ class FPUUnit(PipelinedFunctionalUnit):
                         Mux(
                             dcmp.out_valid, dcmp.out.data,
                             Mux(scmp.out_valid, scmp.out.data,
-                                in_pipe.out_data))))))
+                                in_pipe.out.bits))))))
 
         return m
 
@@ -985,14 +1002,15 @@ class FDivUnit(IterativeFunctionalUnit):
         fdiv = m.submodules.fdiv = FPUDivSqrtMulti()
 
         m.d.comb += [
-            fdiv.a.eq(self.req.rs1_data),
-            fdiv.b.eq(self.req.rs2_data),
-            fdiv.is_sqrt.eq((self.req.uop.opcode == UOpCode.FSQRT_S)
-                            | (self.req.uop.opcode == UOpCode.FSQRT_D)),
-            fdiv.fmt.eq(Mux(self.req.uop.fp_single, FPFormat.S, FPFormat.D)),
+            fdiv.a.eq(self.req.bits.rs1_data),
+            fdiv.b.eq(self.req.bits.rs2_data),
+            fdiv.is_sqrt.eq((self.req.bits.uop.opcode == UOpCode.FSQRT_S)
+                            | (self.req.bits.uop.opcode == UOpCode.FSQRT_D)),
+            fdiv.fmt.eq(
+                Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
             fdiv.in_valid.eq(self.req.valid),
             self.req.ready.eq(fdiv.in_ready),
-            self.resp.data.eq(fdiv.out),
+            self.resp.bits.data.eq(fdiv.out),
             self.resp.valid.eq(fdiv.out_valid),
             fdiv.out_ready.eq(self.resp.ready),
             fdiv.kill.eq(self.do_kill),

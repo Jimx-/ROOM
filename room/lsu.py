@@ -8,6 +8,7 @@ from room.alu import ExecResp
 from room.branch import BranchUpdate
 from room.rob import CommitReq, Exception
 from room.exc import Cause
+from room.utils import Valid, Decoupled
 
 from roomsoc.interconnect import wishbone
 
@@ -72,14 +73,11 @@ class DCacheReq:
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.valid = Signal(name=f'{name}_valid')
         self.uop = MicroOp(params, name=f'{name}_uop')
         self.kill = Signal(name=f'{name}_kill')
 
         self.addr = Signal(32, name=f'{name}_addr')
         self.data = Signal(params['xlen'], name=f'{name}_data')
-
-        self.ready = Signal(name=f'{name}_ready')
 
 
 class DCacheResp:
@@ -88,7 +86,6 @@ class DCacheResp:
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.valid = Signal(name=f'{name}_valid')
         self.uop = MicroOp(params, name=f'{name}_uop')
         self.data = Signal(params['xlen'], name=f'{name}_data')
 
@@ -179,9 +176,11 @@ class DataCache(Elaboratable):
                                        granularity=8)
 
         self.reqs = Array(
-            DCacheReq(params, name=f'req{i}') for i in range(self.mem_width))
+            Decoupled(DCacheReq, params, name=f'req{i}')
+            for i in range(self.mem_width))
         self.resps = Array(
-            DCacheResp(params, name=f'resp{i}') for i in range(self.mem_width))
+            Valid(DCacheResp, params, name=f'resp{i}')
+            for i in range(self.mem_width))
 
         self.br_update = BranchUpdate(params)
         self.exception = Signal()
@@ -221,9 +220,9 @@ class DataCache(Elaboratable):
 
         store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
         m.d.comb += [
-            store_gen.typ.eq(req_chosen.uop.mem_size),
-            store_gen.addr.eq(req_chosen.addr),
-            store_gen.data_in.eq(req_chosen.data),
+            store_gen.typ.eq(req_chosen.bits.uop.mem_size),
+            store_gen.addr.eq(req_chosen.bits.addr),
+            store_gen.data_in.eq(req_chosen.bits.data),
         ]
 
         with m.FSM():
@@ -231,26 +230,27 @@ class DataCache(Elaboratable):
                 m.d.comb += chosen.eq(choice),
 
                 with m.If(req_chosen.valid
-                          & ~self.br_update.uop_killed(req_chosen.uop)
-                          & ~(self.exception & req_chosen.uop.uses_ldq)):
+                          & ~self.br_update.uop_killed(req_chosen.bits.uop)
+                          & ~(self.exception & req_chosen.bits.uop.uses_ldq)):
                     m.d.comb += [
-                        self.dbus.adr.eq(req_chosen.addr[granularity_bits:]),
+                        self.dbus.adr.eq(
+                            req_chosen.bits.addr[granularity_bits:]),
                         self.dbus.stb.eq(1),
                         self.dbus.dat_w.eq(store_gen.data_out),
                         self.dbus.cyc.eq(1),
                         self.dbus.sel.eq(Mux(self.dbus.we, store_gen.mask,
                                              ~0)),
-                        self.dbus.we.eq(
-                            req_chosen.uop.mem_cmd == MemoryCommand.WRITE),
+                        self.dbus.we.eq(req_chosen.bits.uop.mem_cmd ==
+                                        MemoryCommand.WRITE),
                         req_chosen.ready.eq(1),
                     ]
 
                     m.d.sync += [
-                        uop.eq(req_chosen.uop),
+                        uop.eq(req_chosen.bits.uop),
                         uop.br_mask.eq(
                             self.br_update.get_new_br_mask(
-                                req_chosen.uop.br_mask)),
-                        req_addr.eq(req_chosen.addr),
+                                req_chosen.bits.uop.br_mask)),
+                        req_addr.eq(req_chosen.bits.addr),
                         dat_w.eq(self.dbus.dat_w),
                         sel.eq(self.dbus.sel),
                         we.eq(self.dbus.we),
@@ -260,7 +260,7 @@ class DataCache(Elaboratable):
                     m.next = 'WAIT_ACK'
 
             with m.State('WAIT_ACK'):
-                req_killed = req_chosen.kill | self.br_update.uop_killed(
+                req_killed = req_chosen.bits.kill | self.br_update.uop_killed(
                     uop) | (self.exception & uop.uses_ldq)
 
                 m.d.comb += [
@@ -283,9 +283,9 @@ class DataCache(Elaboratable):
                 with m.Elif(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
                     m.d.comb += [
                         self.resps[chosen].valid.eq(1),
-                        self.resps[chosen].data.eq(load_gen.data_out),
-                        self.resps[chosen].uop.eq(uop),
-                        self.resps[chosen].uop.br_mask.eq(
+                        self.resps[chosen].bits.data.eq(load_gen.data_out),
+                        self.resps[chosen].bits.uop.eq(uop),
+                        self.resps[chosen].bits.uop.br_mask.eq(
                             self.br_update.get_new_br_mask(uop.br_mask)),
                     ]
 
@@ -409,19 +409,19 @@ class LoadStoreUnit(Elaboratable):
         ]
 
         self.exec_reqs = [
-            ExecResp(self.xlen, self.params, name=f'exec_req{i}')
+            Valid(ExecResp, self.xlen, self.params, name=f'exec_req{i}')
             for i in range(self.mem_width)
         ]
 
-        self.fp_std = ExecResp(self.xlen, self.params)
+        self.fp_std = Decoupled(ExecResp, self.xlen, self.params)
 
         self.exec_iresps = [
-            ExecResp(self.xlen, self.params, name=f'exec_iresp{i}')
+            Decoupled(ExecResp, self.xlen, self.params, name=f'exec_iresp{i}')
             for i in range(self.mem_width)
         ]
 
         self.exec_fresps = [
-            ExecResp(self.xlen, self.params, name=f'exec_fresp{i}')
+            Decoupled(ExecResp, self.xlen, self.params, name=f'exec_fresp{i}')
             for i in range(self.mem_width)
         ]
 
@@ -543,12 +543,12 @@ class LoadStoreUnit(Elaboratable):
             for lsu_debug, req in zip(self.lsu_debug, self.exec_reqs):
                 m.d.comb += [
                     lsu_debug.valid.eq(req.valid),
-                    lsu_debug.uop_id.eq(req.uop.uop_id),
-                    lsu_debug.opcode.eq(req.uop.opcode),
-                    lsu_debug.addr.eq(req.addr),
-                    lsu_debug.data.eq(req.data),
-                    lsu_debug.prs1.eq(req.uop.prs1),
-                    lsu_debug.prs2.eq(req.uop.prs2),
+                    lsu_debug.uop_id.eq(req.bits.uop.uop_id),
+                    lsu_debug.opcode.eq(req.bits.uop.opcode),
+                    lsu_debug.addr.eq(req.bits.addr),
+                    lsu_debug.data.eq(req.bits.data),
+                    lsu_debug.prs1.eq(req.bits.uop.prs1),
+                    lsu_debug.prs2.eq(req.bits.uop.prs2),
                 ]
 
         ldq_retry_enc = RRPriorityEncoder(self.ldq_size)
@@ -585,17 +585,21 @@ class LoadStoreUnit(Elaboratable):
 
         for w in range(self.mem_width):
             m.d.comb += [
-                can_fire_load_incoming[w].eq(self.exec_reqs[w].valid
-                                             & self.exec_reqs[w].uop.is_load),
-                can_fire_sta_incoming[w].eq(self.exec_reqs[w].valid
-                                            & self.exec_reqs[w].uop.is_sta
-                                            & ~self.exec_reqs[w].uop.is_std),
-                can_fire_std_incoming[w].eq(self.exec_reqs[w].valid
-                                            & self.exec_reqs[w].uop.is_std
-                                            & ~self.exec_reqs[w].uop.is_sta),
-                can_fire_stad_incoming[w].eq(self.exec_reqs[w].valid
-                                             & self.exec_reqs[w].uop.is_sta
-                                             & self.exec_reqs[w].uop.is_std),
+                can_fire_load_incoming[w].eq(
+                    self.exec_reqs[w].valid
+                    & self.exec_reqs[w].bits.uop.is_load),
+                can_fire_sta_incoming[w].eq(
+                    self.exec_reqs[w].valid
+                    & self.exec_reqs[w].bits.uop.is_sta
+                    & ~self.exec_reqs[w].bits.uop.is_std),
+                can_fire_std_incoming[w].eq(
+                    self.exec_reqs[w].valid
+                    & self.exec_reqs[w].bits.uop.is_std
+                    & ~self.exec_reqs[w].bits.uop.is_sta),
+                can_fire_stad_incoming[w].eq(
+                    self.exec_reqs[w].valid
+                    & self.exec_reqs[w].bits.uop.is_sta
+                    & self.exec_reqs[w].bits.uop.is_std),
                 can_fire_load_retry[w].eq(ldq_retry_e.valid
                                           & ldq_retry_e.addr_valid
                                           & ~ldq_retry_e.executed
@@ -653,19 +657,19 @@ class LoadStoreUnit(Elaboratable):
 
         for w in range(self.mem_width):
             with m.If(will_fire_load_incoming[w]):
-                ldq_idx = self.exec_reqs[w].uop.ldq_idx
+                ldq_idx = self.exec_reqs[w].bits.uop.ldq_idx
                 m.d.sync += [
-                    ldq[ldq_idx].addr.eq(self.exec_reqs[w].addr),
+                    ldq[ldq_idx].addr.eq(self.exec_reqs[w].bits.addr),
                     ldq[ldq_idx].addr_valid.eq(1),
-                    ldq[ldq_idx].uop.pdst.eq(self.exec_reqs[w].uop.pdst),
+                    ldq[ldq_idx].uop.pdst.eq(self.exec_reqs[w].bits.uop.pdst),
                 ]
 
             with m.If(will_fire_sta_incoming[w] | will_fire_stad_incoming[w]):
-                stq_idx = self.exec_reqs[w].uop.stq_idx
+                stq_idx = self.exec_reqs[w].bits.uop.stq_idx
                 m.d.sync += [
-                    stq[stq_idx].addr.eq(self.exec_reqs[w].addr),
+                    stq[stq_idx].addr.eq(self.exec_reqs[w].bits.addr),
                     stq[stq_idx].addr_valid.eq(1),
-                    stq[stq_idx].uop.pdst.eq(self.exec_reqs[w].uop.pdst),
+                    stq[stq_idx].uop.pdst.eq(self.exec_reqs[w].bits.uop.pdst),
                 ]
 
             if w == 0:
@@ -677,14 +681,16 @@ class LoadStoreUnit(Elaboratable):
                       | fp_std_fire):
                 stq_idx = Mux(
                     will_fire_std_incoming[w] | will_fire_stad_incoming[w],
-                    self.exec_reqs[w].uop.stq_idx, self.fp_std.uop.stq_idx)
+                    self.exec_reqs[w].bits.uop.stq_idx,
+                    self.fp_std.bits.uop.stq_idx)
 
                 m.d.sync += [
                     stq[stq_idx].data.eq(
                         Mux(
                             will_fire_std_incoming[w]
                             | will_fire_stad_incoming[w],
-                            self.exec_reqs[w].data, self.fp_std.data)),
+                            self.exec_reqs[w].bits.data,
+                            self.fp_std.bits.data)),
                     stq[stq_idx].data_valid.eq(1),
                 ]
 
@@ -702,24 +708,24 @@ class LoadStoreUnit(Elaboratable):
             with m.If(will_fire_load_incoming[w]):
                 m.d.comb += [
                     dmem_req.valid.eq(1),
-                    dmem_req.uop.eq(self.exec_reqs[w].uop),
-                    dmem_req.addr.eq(self.exec_reqs[w].addr),
-                    s0_executing_loads[self.exec_reqs[w].uop.ldq_idx].eq(
+                    dmem_req.bits.uop.eq(self.exec_reqs[w].bits.uop),
+                    dmem_req.bits.addr.eq(self.exec_reqs[w].bits.addr),
+                    s0_executing_loads[self.exec_reqs[w].bits.uop.ldq_idx].eq(
                         dmem_req.ready),
                 ]
             with m.Elif(will_fire_load_retry[w]):
                 m.d.comb += [
                     dmem_req.valid.eq(1),
-                    dmem_req.uop.eq(ldq_retry_e.uop),
-                    dmem_req.addr.eq(ldq_retry_e.addr),
+                    dmem_req.bits.uop.eq(ldq_retry_e.uop),
+                    dmem_req.bits.addr.eq(ldq_retry_e.addr),
                     s0_executing_loads[ldq_retry_idx].eq(dmem_req.ready),
                 ]
             with m.Elif(will_fire_store_commit[w]):
                 m.d.comb += [
                     dmem_req.valid.eq(1),
-                    dmem_req.uop.eq(stq_commit_e.uop),
-                    dmem_req.addr.eq(stq_commit_e.addr),
-                    dmem_req.data.eq(stq_commit_e.data),
+                    dmem_req.bits.uop.eq(stq_commit_e.uop),
+                    dmem_req.bits.addr.eq(stq_commit_e.addr),
+                    dmem_req.bits.data.eq(stq_commit_e.data),
                 ]
 
                 m.d.sync += [
@@ -783,7 +789,7 @@ class LoadStoreUnit(Elaboratable):
         ]
 
         for w in range(self.mem_width):
-            req_killed = self.br_update.uop_killed(self.exec_reqs[w].uop)
+            req_killed = self.br_update.uop_killed(self.exec_reqs[w].bits.uop)
 
             with m.If(fired_load_incoming[w]):
                 m.d.comb += fired_ldq_e[w].eq(fired_ldq_incoming_e[w])
@@ -796,10 +802,10 @@ class LoadStoreUnit(Elaboratable):
             m.d.sync += [
                 dmem_req_fired[w].eq(dcache.reqs[w].valid
                                      & dcache.reqs[w].ready),
-                fired_incoming_uop[w].eq(self.exec_reqs[w].uop),
+                fired_incoming_uop[w].eq(self.exec_reqs[w].bits.uop),
                 fired_incoming_uop[w].br_mask.eq(
                     self.br_update.get_new_br_mask(
-                        self.exec_reqs[w].uop.br_mask)),
+                        self.exec_reqs[w].bits.uop.br_mask)),
                 fired_load_incoming[w].eq(will_fire_load_incoming[w]
                                           & ~req_killed),
                 fired_load_retry[w].eq(will_fire_load_retry[w] & ~req_killed),
@@ -809,29 +815,31 @@ class LoadStoreUnit(Elaboratable):
                                          & ~req_killed),
                 fired_stad_incoming[w].eq(will_fire_stad_incoming[w]
                                           & ~req_killed),
-                fired_ldq_incoming_e[w].eq(ldq[self.exec_reqs[w].uop.ldq_idx]),
+                fired_ldq_incoming_e[w].eq(
+                    ldq[self.exec_reqs[w].bits.uop.ldq_idx]),
                 fired_ldq_incoming_e[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(
-                        ldq[self.exec_reqs[w].uop.ldq_idx].uop.br_mask)),
+                        ldq[self.exec_reqs[w].bits.uop.ldq_idx].uop.br_mask)),
                 fired_ldq_retry_e[w].eq(ldq_retry_e),
                 fired_ldq_retry_e[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(ldq_retry_e.uop.br_mask)),
-                fired_stq_incoming_e[w].eq(stq[self.exec_reqs[w].uop.stq_idx]),
+                fired_stq_incoming_e[w].eq(
+                    stq[self.exec_reqs[w].bits.uop.stq_idx]),
                 fired_stq_incoming_e[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(
-                        stq[self.exec_reqs[w].uop.stq_idx].uop.br_mask)),
-                fired_mem_addr[w].eq(dcache.reqs[w].addr),
-                fired_req_addr[w].eq(self.exec_reqs[w].addr),
+                        stq[self.exec_reqs[w].bits.uop.stq_idx].uop.br_mask)),
+                fired_mem_addr[w].eq(dcache.reqs[w].bits.addr),
+                fired_req_addr[w].eq(self.exec_reqs[w].bits.addr),
             ]
 
-        stdf_killed = self.br_update.uop_killed(self.fp_std.uop)
+        stdf_killed = self.br_update.uop_killed(self.fp_std.bits.uop)
         fired_stdf_uop = MicroOp(self.params)
 
         m.d.sync += [
             fired_stdf_incoming.eq(will_fire_stdf_incoming & ~stdf_killed),
-            fired_stdf_uop.eq(self.fp_std.uop),
+            fired_stdf_uop.eq(self.fp_std.bits.uop),
             fired_stdf_uop.br_mask.eq(
-                self.br_update.get_new_br_mask(self.fp_std.uop.br_mask)),
+                self.br_update.get_new_br_mask(self.fp_std.bits.uop.br_mask)),
         ]
 
         #
@@ -1048,20 +1056,20 @@ class LoadStoreUnit(Elaboratable):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
                             ldst_forward_matches[w][i].eq(1),
-                            dcache.reqs[w].kill.eq(dmem_req_fired[w]),
+                            dcache.reqs[w].bits.kill.eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
                     with m.Elif(((cam_mask[w] & write_mask) != 0)
                                 & addr_matches[w]):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
-                            dcache.reqs[w].kill.eq(dmem_req_fired[w]),
+                            dcache.reqs[w].bits.kill.eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
                     with m.Elif(stq[i].uop.is_fence):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
-                            dcache.reqs[w].kill.eq(dmem_req_fired[w]),
+                            dcache.reqs[w].bits.kill.eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
 
@@ -1122,27 +1130,27 @@ class LoadStoreUnit(Elaboratable):
 
         for w in range(self.mem_width):
             with m.If(dcache.resps[w].valid):
-                with m.If(dcache.resps[w].uop.uses_ldq):
-                    ldq_idx = dcache.resps[w].uop.ldq_idx
+                with m.If(dcache.resps[w].bits.uop.uses_ldq):
+                    ldq_idx = dcache.resps[w].bits.uop.ldq_idx
                     iresp = self.exec_iresps[w]
                     fresp = self.exec_fresps[w]
 
                     m.d.comb += [
-                        iresp.uop.eq(ldq[ldq_idx].uop),
-                        fresp.uop.eq(ldq[ldq_idx].uop),
+                        iresp.bits.uop.eq(ldq[ldq_idx].uop),
+                        fresp.bits.uop.eq(ldq[ldq_idx].uop),
                         iresp.valid.eq(
                             ldq[ldq_idx].uop.dst_rtype == RegisterType.FIX),
                         fresp.valid.eq(
                             ldq[ldq_idx].uop.dst_rtype == RegisterType.FLT),
-                        iresp.data.eq(dcache.resps[w].data),
-                        fresp.data.eq(dcache.resps[w].data),
+                        iresp.bits.data.eq(dcache.resps[w].bits.data),
+                        fresp.bits.data.eq(dcache.resps[w].bits.data),
                         dmem_resp_fire[w].eq(1),
                     ]
 
                     m.d.sync += ldq[ldq_idx].succeeded.eq(iresp.valid
                                                           | fresp.valid)
-                with m.If(dcache.resps[w].uop.uses_stq):
-                    stq_idx = dcache.resps[w].uop.stq_idx
+                with m.If(dcache.resps[w].bits.uop.uses_stq):
+                    stq_idx = dcache.resps[w].bits.uop.stq_idx
                     m.d.comb += dmem_resp_fire[w].eq(1)
                     m.d.sync += stq[stq_idx].succeeded.eq(1)
 
@@ -1168,10 +1176,10 @@ class LoadStoreUnit(Elaboratable):
                 ]
 
                 m.d.comb += [
-                    iresp.uop.eq(ldq_e.uop),
+                    iresp.bits.uop.eq(ldq_e.uop),
+                    iresp.bits.data.eq(load_gen.data_out),
                     iresp.valid.eq((ldq_e.uop.dst_rtype == RegisterType.FIX)
                                    & data_valid & live),
-                    iresp.data.eq(load_gen.data_out),
                 ]
 
                 with m.If(data_valid & live):

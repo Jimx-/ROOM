@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth import tracer
 
 from room.consts import *
 from room.branch import BranchUpdate
@@ -22,6 +23,54 @@ def generate_imm_type(ip):
 
 def generate_imm_rm(ip):
     return ip[:3]
+
+
+class Valid:
+
+    def __init__(self, cls, *args, name=None, src_loc_at=0, **kwargs):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.bits = cls(name=f'{name}_bits', *args, **kwargs)
+        self.valid = Signal(name=f'{name}_valid')
+
+    @property
+    def fire(self):
+        return self.valid
+
+    def eq(self, rhs):
+        return [
+            self.bits.eq(rhs.bits),
+            self.valid.eq(rhs.valid),
+        ]
+
+
+class Decoupled:
+
+    def __init__(self, cls, *args, name=None, src_loc_at=0, **kwargs):
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.bits = cls(name=f'{name}_bits', *args, **kwargs)
+        self.valid = Signal(name=f'{name}_valid')
+        self.ready = Signal(name=f'{name}_ready')
+
+    @property
+    def fire(self):
+        return self.valid & self.ready
+
+    def connect(self, subord):
+        stmts = []
+
+        if getattr(self.bits, 'connect', None) is not None:
+            stmts += self.bits.connect(subord.bits)
+        else:
+            stmts += subord.bits.eq(self.bits)
+
+        stmts.append(subord.valid.eq(self.valid))
+        stmts.append(self.ready.eq(subord.ready))
+
+        return stmts
 
 
 def _incr(signal, modulo):
@@ -141,16 +190,15 @@ class Pipe(Elaboratable):
         self.in_valid = Signal()
         self.in_data = Signal(width)
 
-        self.out_valid = Signal()
-        self.out_data = Signal(width)
+        self.out = Valid(Signal, width)
 
     def elaborate(self, platform):
         m = Module()
 
         if self.depth == 0:
             m.d.comb += [
-                self.out_valid.eq(self.in_valid),
-                self.out_data.eq(self.in_data),
+                self.out.valid.eq(self.in_valid),
+                self.out.bits.eq(self.in_data),
             ]
 
         else:
@@ -170,8 +218,8 @@ class Pipe(Elaboratable):
                     m.d.sync += data[i].eq(data[i - 1])
 
             m.d.comb += [
-                self.out_valid.eq(valids[-1]),
-                self.out_data.eq(data[-1]),
+                self.out.valid.eq(valids[-1]),
+                self.out.bits.eq(data[-1]),
             ]
 
         return m
@@ -182,30 +230,26 @@ class Arbiter(Elaboratable):
     def __init__(self, width, n):
         self.n = n
 
-        self.in_data = [Signal(width, name=f'in{i}') for i in range(n)]
-        self.in_valid = Signal(n)
-        self.in_ready = Signal(n)
+        self.inp = [Decoupled(Signal, width, name=f'in{i}') for i in range(n)]
 
-        self.out_data = Signal(width)
-        self.out_valid = Signal()
-        self.out_ready = Signal()
+        self.out = Decoupled(Signal, width)
 
     def elaborate(self, platform):
         m = Module()
 
-        m.d.comb += self.out_valid.eq(0)
+        m.d.comb += self.out.valid.eq(0)
 
         for i in reversed(range(self.n)):
-            with m.If(self.in_valid[i]):
+            with m.If(self.inp[i].valid):
                 m.d.comb += [
-                    self.out_valid.eq(1),
-                    self.out_data.eq(self.in_data[i]),
+                    self.out.valid.eq(1),
+                    self.out.bits.eq(self.inp[i].bits),
                 ]
 
         ready = 1
         for i in range(self.n):
-            m.d.comb += self.in_ready[i].eq(self.out_ready & ready)
+            m.d.comb += self.inp[i].ready.eq(self.out.ready & ready)
 
-            ready &= ~(self.in_valid[i] & self.in_ready[i])
+            ready &= ~(self.inp[i].fire)
 
         return m

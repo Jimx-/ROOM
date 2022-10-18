@@ -5,6 +5,7 @@ from enum import IntEnum
 from room.consts import *
 from room.types import MicroOp
 from room.branch import BranchUpdate
+from room.utils import Valid
 
 
 class IssueQueueWakeup(Record):
@@ -12,8 +13,10 @@ class IssueQueueWakeup(Record):
     def __init__(self, num_pregs, name=None, src_loc_at=0):
         self.num_pregs = num_pregs
 
-        super().__init__([('valid', 1), ('pdst', range(num_pregs)),
-                          ('poisoned', 1)],
+        super().__init__([
+            ('pdst', range(num_pregs)),
+            ('poisoned', 1),
+        ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
 
@@ -40,7 +43,7 @@ class IssueSlot(Elaboratable):
         self.gnt = Signal()
 
         self.wakeup_ports = [
-            IssueQueueWakeup(num_pregs, name=f'wakeup_port{i}')
+            Valid(IssueQueueWakeup, num_pregs, name=f'wakeup_port{i}')
             for i in range(num_wakeup_ports)
         ]
 
@@ -82,11 +85,11 @@ class IssueSlot(Elaboratable):
             ]
 
         for wu in self.wakeup_ports:
-            with m.If(wu.valid & (wu.pdst == next_uop.prs1)):
+            with m.If(wu.valid & (wu.bits.pdst == next_uop.prs1)):
                 m.d.sync += p1.eq(1)
-            with m.If(wu.valid & (wu.pdst == next_uop.prs2)):
+            with m.If(wu.valid & (wu.bits.pdst == next_uop.prs2)):
                 m.d.sync += p2.eq(1)
-            with m.If(wu.valid & (wu.pdst == next_uop.prs3)):
+            with m.If(wu.valid & (wu.bits.pdst == next_uop.prs3)):
                 m.d.sync += p3.eq(1)
 
         with m.If(self.kill):
@@ -164,7 +167,7 @@ class IssueUnit(Elaboratable):
         ]
 
         self.wakeup_ports = [
-            IssueQueueWakeup(num_pregs, name=f'wakeup_port{i}')
+            Valid(IssueQueueWakeup, num_pregs, name=f'wakeup_port{i}')
             for i in range(self.num_wakeup_ports)
         ]
 
