@@ -2,7 +2,7 @@ from amaranth import *
 from enum import IntEnum
 
 from room.consts import *
-from room.utils import Pipe
+from room.utils import Pipe, Valid, Decoupled
 
 
 class FPUOperator(IntEnum):
@@ -170,11 +170,8 @@ class FPUFMA(Elaboratable):
         self.ftyp = _fmt_ftypes[format]
         self.latency = latency
 
-        self.inp = FPUInput(self.width)
-        self.inp_valid = Signal()
-
-        self.out = FPUResult(self.width)
-        self.out_valid = Signal()
+        self.inp = Valid(FPUInput, self.width)
+        self.out = Valid(FPUResult, self.width)
 
     def elaborate(self, platform):
         m = Module()
@@ -190,10 +187,10 @@ class FPUFMA(Elaboratable):
         s1_valid = Signal()
         s1_inp = FPUInput(self.width)
 
-        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp))
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp.bits))
         m.d.comb += [
-            inp_pipe.in_valid.eq(self.inp_valid),
-            inp_pipe.in_data.eq(self.inp),
+            inp_pipe.in_valid.eq(self.inp.valid),
+            inp_pipe.in_data.eq(self.inp.bits),
             s1_valid.eq(inp_pipe.out.valid),
             s1_inp.eq(inp_pipe.out.bits),
         ]
@@ -446,8 +443,8 @@ class FPUFMA(Elaboratable):
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
             out_pipe.in_data.eq(result),
-            self.out_valid.eq(out_pipe.out.valid),
-            self.out.data.eq(out_pipe.out.bits),
+            self.out.valid.eq(out_pipe.out.valid),
+            self.out.bits.data.eq(out_pipe.out.bits),
         ]
 
         return m
@@ -468,9 +465,7 @@ class FPUDivSqrtMulti(Elaboratable):
 
         self.kill = Signal()
 
-        self.out = Signal(64)
-        self.out_valid = Signal()
-        self.out_ready = Signal()
+        self.out = Decoupled(Signal, 64)
 
     def elaborate(self, platform):
         m = Module()
@@ -593,14 +588,14 @@ class FPUDivSqrtMulti(Elaboratable):
         with m.Else():
             m.d.sync += count.eq(0)
 
-        m.d.comb += self.in_ready.eq(~start & (count == 0) & ~self.out_valid)
+        m.d.comb += self.in_ready.eq(~start & (count == 0) & ~self.out.valid)
 
         with m.If(self.kill):
-            m.d.sync += self.out_valid.eq(0)
+            m.d.sync += self.out.valid.eq(0)
         with m.Elif(count == max_iters):
-            m.d.sync += self.out_valid.eq(1)
-        with m.Elif(self.out_valid & self.out_ready):
-            m.d.sync += self.out_valid.eq(0)
+            m.d.sync += self.out.valid.eq(1)
+        with m.Elif(self.out.fire):
+            m.d.sync += self.out.valid.eq(0)
 
         quotient = Signal(PREC_BITS + 1)  # 59 bits
         remainder = Signal(PREC_BITS + 2)  # 60 bits
@@ -800,7 +795,7 @@ class FPUDivSqrtMulti(Elaboratable):
                         Cat(rounding.rounded_abs[:ftyp.man + ftyp.exp],
                             rounding.out_sign))
 
-        m.d.comb += self.out.eq(result)
+        m.d.comb += self.out.bits.eq(result)
 
         return m
 
@@ -812,11 +807,8 @@ class FPUCastMulti(Elaboratable):
         self.ftyp = FType.FP64
         self.latency = latency
 
-        self.inp = FPUInput(self.width)
-        self.inp_valid = Signal()
-
-        self.out = FPUResult(self.width)
-        self.out_valid = Signal()
+        self.inp = Valid(FPUInput, self.width)
+        self.out = Valid(FPUResult, self.width)
 
     def elaborate(self, platform):
         m = Module()
@@ -834,10 +826,10 @@ class FPUCastMulti(Elaboratable):
         s1_valid = Signal()
         s1_inp = FPUInput(self.width)
 
-        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp))
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp.bits))
         m.d.comb += [
-            inp_pipe.in_valid.eq(self.inp_valid),
-            inp_pipe.in_data.eq(self.inp),
+            inp_pipe.in_valid.eq(self.inp.valid),
+            inp_pipe.in_data.eq(self.inp.bits),
             s1_valid.eq(inp_pipe.out.valid),
             s1_inp.eq(inp_pipe.out.bits),
         ]
@@ -1118,8 +1110,8 @@ class FPUCastMulti(Elaboratable):
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
             out_pipe.in_data.eq(result),
-            self.out_valid.eq(out_pipe.out.valid),
-            self.out.data.eq(out_pipe.out.bits),
+            self.out.valid.eq(out_pipe.out.valid),
+            self.out.bits.data.eq(out_pipe.out.bits),
         ]
 
         return m
@@ -1132,11 +1124,8 @@ class FPUComp(Elaboratable):
         self.ftyp = _fmt_ftypes[format]
         self.latency = latency
 
-        self.inp = FPUInput(self.width)
-        self.inp_valid = Signal()
-
-        self.out = FPUResult(self.width)
-        self.out_valid = Signal()
+        self.inp = Valid(FPUInput, self.width)
+        self.out = Valid(FPUResult, self.width)
 
     def elaborate(self, platform):
         m = Module()
@@ -1148,10 +1137,10 @@ class FPUComp(Elaboratable):
         s1_valid = Signal()
         s1_inp = FPUInput(self.width)
 
-        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp))
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp.bits))
         m.d.comb += [
-            inp_pipe.in_valid.eq(self.inp_valid),
-            inp_pipe.in_data.eq(self.inp),
+            inp_pipe.in_valid.eq(self.inp.valid),
+            inp_pipe.in_data.eq(self.inp.bits),
             s1_valid.eq(inp_pipe.out.valid),
             s1_inp.eq(inp_pipe.out.bits),
         ]
@@ -1283,8 +1272,8 @@ class FPUComp(Elaboratable):
         m.d.comb += [
             out_pipe.in_valid.eq(s1_valid),
             out_pipe.in_data.eq(result),
-            self.out_valid.eq(out_pipe.out.valid),
-            self.out.data.eq(out_pipe.out.bits),
+            self.out.valid.eq(out_pipe.out.valid),
+            self.out.bits.data.eq(out_pipe.out.bits),
         ]
 
         return m

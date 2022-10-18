@@ -478,12 +478,12 @@ def test_alu_xor(xlen):
 def mul_unittest(mul, a, b, fn, expected, dw32=False):
 
     def proc():
-        yield mul.req.in1.eq(a)
-        yield mul.req.in2.eq(b)
-        yield mul.req.fn.eq(fn)
+        yield mul.req.bits.in1.eq(a)
+        yield mul.req.bits.in2.eq(b)
+        yield mul.req.bits.fn.eq(fn)
         if dw32:
-            yield mul.req.dw.eq(ALUWidth.DW_32)
-        yield mul.req_valid.eq(1)
+            yield mul.req.bits.dw.eq(ALUWidth.DW_32)
+        yield mul.req.valid.eq(1)
         yield
 
         for _ in range(3):
@@ -653,19 +653,19 @@ def test_mul_mulhu(xlen):
 def div_unittest(div, a, b, fn, expected, dw32=False):
 
     def proc():
-        yield div.req.in1.eq(a)
-        yield div.req.in2.eq(b)
-        yield div.req.fn.eq(fn)
+        yield div.req.bits.in1.eq(a)
+        yield div.req.bits.in2.eq(b)
+        yield div.req.bits.fn.eq(fn)
         if dw32:
-            yield div.req.dw.eq(ALUWidth.DW_32)
-        yield div.req_valid.eq(1)
+            yield div.req.bits.dw.eq(ALUWidth.DW_32)
+        yield div.req.valid.eq(1)
         yield
 
-        while not (yield div.resp_valid):
+        while not (yield div.resp.valid):
             yield
 
-        out = yield div.resp_data
-        yield div.resp_ready.eq(1)
+        out = yield div.resp.bits
+        yield div.resp.ready.eq(1)
         yield
         assert out == expected
 

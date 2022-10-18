@@ -7,7 +7,7 @@ from room.types import MicroOp
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
-from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe, Decoupled
+from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe, Valid, Decoupled
 
 
 class ExecReq:
@@ -422,8 +422,7 @@ class Multiplier(Elaboratable):
         self.width = width
         self.latency = latency
 
-        self.req = MulDivReq(width)
-        self.req_valid = Signal()
+        self.req = Valid(MulDivReq, width)
 
         self.resp_data = Signal(width)
 
@@ -433,14 +432,14 @@ class Multiplier(Elaboratable):
         in_req = MulDivReq(self.width, name='in')
         in_valid = Signal()
         m.d.sync += [
-            in_req.eq(self.req),
-            in_valid.eq(self.req_valid),
+            in_req.eq(self.req.bits),
+            in_valid.eq(self.req.valid),
         ]
 
         fn = in_req.fn
         h = (fn == ALUOperator.MULH) | (fn == ALUOperator.MULHU) | (
             fn == ALUOperator.MULHSU)
-        half = (self.width > 32) & (self.req.dw == ALUWidth.DW_32)
+        half = (self.width > 32) & (in_req.dw == ALUWidth.DW_32)
         lhs_signed = (fn == ALUOperator.MULH) | (fn == ALUOperator.MULHSU)
         rhs_signed = (fn == ALUOperator.MULH)
 
@@ -485,11 +484,11 @@ class MultiplierUnit(PipelinedFunctionalUnit):
 
         mul = m.submodules.mul = Multiplier(self.width, self.latency)
         m.d.comb += [
-            mul.req.fn.eq(self.req.bits.uop.alu_fn),
-            mul.req.dw.eq(self.req.bits.uop.alu_dw),
-            mul.req.in1.eq(self.req.bits.rs1_data),
-            mul.req.in2.eq(self.req.bits.rs2_data),
-            mul.req_valid.eq(self.req.valid),
+            mul.req.bits.fn.eq(self.req.bits.uop.alu_fn),
+            mul.req.bits.dw.eq(self.req.bits.uop.alu_dw),
+            mul.req.bits.in1.eq(self.req.bits.rs1_data),
+            mul.req.bits.in2.eq(self.req.bits.rs2_data),
+            mul.req.valid.eq(self.req.valid),
         ]
 
         m.d.comb += self.resp.bits.data.eq(mul.resp_data)
@@ -537,13 +536,8 @@ class IntDiv(Elaboratable):
     def __init__(self, width):
         self.width = width
 
-        self.req = MulDivReq(width)
-        self.req_valid = Signal()
-        self.req_ready = Signal()
-
-        self.resp_data = Signal(width)
-        self.resp_valid = Signal()
-        self.resp_ready = Signal()
+        self.req = Decoupled(MulDivReq, width)
+        self.resp = Decoupled(Signal, width)
 
         self.kill = Signal()
 
@@ -556,9 +550,9 @@ class IntDiv(Elaboratable):
         divisor = Signal(self.width)
         remainder = Signal(2 * self.width + 1)
 
-        fn = self.req.fn
+        fn = self.req.bits.fn
         h = (fn == ALUOperator.REM) | (fn == ALUOperator.REMU)
-        half_width = (self.width > 32) & (self.req.dw == ALUWidth.DW_32)
+        half_width = (self.width > 32) & (self.req.bits.dw == ALUWidth.DW_32)
         lhs_signed = (fn == ALUOperator.DIV) | (fn == ALUOperator.REM)
         rhs_signed = lhs_signed
 
@@ -568,8 +562,8 @@ class IntDiv(Elaboratable):
                      x[self.width // 2:])
             return Cat(x[:self.width // 2], hi), sign
 
-        lhs_in, lhs_sign = sext(self.req.in1, lhs_signed)
-        rhs_in, rhs_sign = sext(self.req.in2, rhs_signed)
+        lhs_in, lhs_sign = sext(self.req.bits.in1, lhs_signed)
+        rhs_in, rhs_sign = sext(self.req.bits.in2, rhs_signed)
 
         is_hi = Signal()
         res_hi = Signal()
@@ -578,11 +572,11 @@ class IntDiv(Elaboratable):
 
         with m.FSM():
             with m.State('IDLE'):
-                m.d.comb += self.req_ready.eq(1)
+                m.d.comb += self.req.ready.eq(1)
 
-                with m.If(self.req_valid & self.req_ready & ~self.kill):
+                with m.If(self.req.fire & ~self.kill):
                     m.d.sync += [
-                        req.eq(self.req),
+                        req.eq(self.req.bits),
                         neg_out.eq(Mux(h, lhs_sign, lhs_sign ^ rhs_sign)),
                         count.eq(0),
                         divisor.eq(Cat(rhs_in, rhs_sign)),
@@ -646,16 +640,16 @@ class IntDiv(Elaboratable):
                     m.next = 'DIV_DONE'
 
             with m.State('DIV_DONE'):
-                m.d.comb += self.resp_valid.eq(~self.kill)
+                m.d.comb += self.resp.valid.eq(~self.kill)
 
-                with m.If(self.kill | (self.resp_valid & self.resp_ready)):
+                with m.If(self.kill | self.resp.fire):
                     m.next = 'IDLE'
 
         result_lo = result[:self.width // 2]
         result_hi = Mux(half_width,
                         Repl(result[self.width // 2 - 1], self.width // 2),
                         result[self.width // 2:])
-        m.d.comb += self.resp_data.eq(Cat(result_lo, result_hi))
+        m.d.comb += self.resp.bits.eq(Cat(result_lo, result_hi))
 
         return m
 
@@ -673,15 +667,15 @@ class DivUnit(IterativeFunctionalUnit):
         div = m.submodules.div = IntDiv(self.width)
 
         m.d.comb += [
-            div.req.fn.eq(self.req.bits.uop.alu_fn),
-            div.req.dw.eq(self.req.bits.uop.alu_dw),
-            div.req.in1.eq(self.req.bits.rs1_data),
-            div.req.in2.eq(self.req.bits.rs2_data),
-            div.req_valid.eq(self.req.valid),
-            self.req.ready.eq(div.req_ready),
-            self.resp.bits.data.eq(div.resp_data),
-            self.resp.valid.eq(div.resp_valid),
-            div.resp_ready.eq(self.resp.ready),
+            div.req.bits.fn.eq(self.req.bits.uop.alu_fn),
+            div.req.bits.dw.eq(self.req.bits.uop.alu_dw),
+            div.req.bits.in1.eq(self.req.bits.rs1_data),
+            div.req.bits.in2.eq(self.req.bits.rs2_data),
+            div.req.valid.eq(self.req.valid),
+            self.req.ready.eq(div.req.ready),
+            self.resp.bits.data.eq(div.resp.bits),
+            self.resp.valid.eq(div.resp.valid),
+            div.resp.ready.eq(self.resp.ready),
             div.kill.eq(self.do_kill),
         ]
 
@@ -718,17 +712,17 @@ class IntToFPUnit(PipelinedFunctionalUnit):
         typ = generate_imm_type(self.req.bits.uop.imm_packed)
 
         m.d.comb += [
-            ifpu.inp_valid.eq(self.req.valid & cast_en),
-            ifpu.inp.fn.eq(FPUOperator.I2F),
-            ifpu.inp.fn_mod.eq(typ[0]),
-            ifpu.inp.in1.eq(self.req.bits.rs1_data),
-            ifpu.inp.dst_fmt.eq(
+            ifpu.inp.valid.eq(self.req.valid & cast_en),
+            ifpu.inp.bits.fn.eq(FPUOperator.I2F),
+            ifpu.inp.bits.fn_mod.eq(typ[0]),
+            ifpu.inp.bits.in1.eq(self.req.bits.rs1_data),
+            ifpu.inp.bits.dst_fmt.eq(
                 Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
-            ifpu.inp.int_fmt.eq(Cat(typ[1], 1)),
+            ifpu.inp.bits.int_fmt.eq(Cat(typ[1], 1)),
         ]
 
         m.d.comb += self.resp.bits.data.eq(
-            Mux(ifpu.out_valid, ifpu.out.data, in_pipe.out.bits))
+            Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits))
 
         return m
 
@@ -928,62 +922,62 @@ class FPUUnit(PipelinedFunctionalUnit):
 
         def set_fu_input(inp):
             m.d.comb += [
-                inp.in1.eq(self.req.bits.rs1_data),
-                inp.in2.eq(self.req.bits.rs2_data),
-                inp.in3.eq(self.req.bits.rs3_data),
-                inp.fn.eq(fma_op),
-                inp.fn_mod.eq(fma_op_mod),
-                inp.rm.eq(fp_rm),
-                inp.src_fmt.eq(fmt_in),
-                inp.dst_fmt.eq(fmt_out),
-                inp.int_fmt.eq(fmt_int),
+                inp.bits.in1.eq(self.req.bits.rs1_data),
+                inp.bits.in2.eq(self.req.bits.rs2_data),
+                inp.bits.in3.eq(self.req.bits.rs3_data),
+                inp.bits.fn.eq(fma_op),
+                inp.bits.fn_mod.eq(fma_op_mod),
+                inp.bits.rm.eq(fp_rm),
+                inp.bits.src_fmt.eq(fmt_in),
+                inp.bits.dst_fmt.eq(fmt_out),
+                inp.bits.int_fmt.eq(fmt_int),
             ]
 
             with m.If(swap32):
-                m.d.comb += inp.in3.eq(self.req.bits.rs2_data)
+                m.d.comb += inp.bits.in3.eq(self.req.bits.rs2_data)
 
         dfma = m.submodules.dfma = FPUFMA(self.width,
                                           FPFormat.D,
                                           latency=self.fma_latency)
         set_fu_input(dfma.inp)
-        m.d.comb += dfma.inp_valid.eq(self.req.valid & fma_en
+        m.d.comb += dfma.inp.valid.eq(self.req.valid & fma_en
                                       & (fmt_out == FPFormat.D))
 
         sfma = m.submodules.sfma = FPUFMA(32,
                                           FPFormat.S,
                                           latency=self.fma_latency)
         set_fu_input(sfma.inp)
-        m.d.comb += sfma.inp_valid.eq(self.req.valid & fma_en
+        m.d.comb += sfma.inp.valid.eq(self.req.valid & fma_en
                                       & (fmt_out == FPFormat.S))
 
         fpiu = m.submodules.fpiu = FPUCastMulti(latency=self.fma_latency)
         set_fu_input(fpiu.inp)
-        m.d.comb += fpiu.inp_valid.eq(self.req.valid & cast_en)
+        m.d.comb += fpiu.inp.valid.eq(self.req.valid & cast_en)
 
         dcmp = m.submodules.dcmp = FPUComp(self.width,
                                            FPFormat.D,
                                            latency=self.fma_latency)
         set_fu_input(dcmp.inp)
-        m.d.comb += dcmp.inp_valid.eq(self.req.valid & cmp_en
+        m.d.comb += dcmp.inp.valid.eq(self.req.valid & cmp_en
                                       & (fmt_in == FPFormat.D))
 
         scmp = m.submodules.scmp = FPUComp(32,
                                            FPFormat.S,
                                            latency=self.fma_latency)
         set_fu_input(scmp.inp)
-        m.d.comb += scmp.inp_valid.eq(self.req.valid & cmp_en
+        m.d.comb += scmp.inp.valid.eq(self.req.valid & cmp_en
                                       & (fmt_in == FPFormat.S))
 
         m.d.comb += self.resp.bits.data.eq(
             Mux(
-                dfma.out_valid, dfma.out.data,
+                dfma.out.valid, dfma.out.bits.data,
                 Mux(
-                    sfma.out_valid, sfma.out.data,
+                    sfma.out.valid, sfma.out.bits.data,
                     Mux(
-                        fpiu.out_valid, fpiu.out.data,
+                        fpiu.out.valid, fpiu.out.bits.data,
                         Mux(
-                            dcmp.out_valid, dcmp.out.data,
-                            Mux(scmp.out_valid, scmp.out.data,
+                            dcmp.out.valid, dcmp.out.bits.data,
+                            Mux(scmp.out.valid, scmp.out.bits.data,
                                 in_pipe.out.bits))))))
 
         return m
@@ -1010,9 +1004,9 @@ class FDivUnit(IterativeFunctionalUnit):
                 Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
             fdiv.in_valid.eq(self.req.valid),
             self.req.ready.eq(fdiv.in_ready),
-            self.resp.bits.data.eq(fdiv.out),
-            self.resp.valid.eq(fdiv.out_valid),
-            fdiv.out_ready.eq(self.resp.ready),
+            self.resp.bits.data.eq(fdiv.out.bits),
+            self.resp.valid.eq(fdiv.out.valid),
+            fdiv.out.ready.eq(self.resp.ready),
             fdiv.kill.eq(self.do_kill),
         ]
 

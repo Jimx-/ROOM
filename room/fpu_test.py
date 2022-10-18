@@ -16,20 +16,20 @@ def mask_int(data, fmt):
 def fma_unittest(fma, a, b, c, fn, fn_mod, expected):
 
     def proc():
-        yield fma.inp.in1.eq(a)
-        yield fma.inp.in2.eq(b)
-        yield fma.inp.in3.eq(c)
-        yield fma.inp.fn.eq(fn)
-        yield fma.inp.fn_mod.eq(fn_mod)
-        yield fma.inp_valid.eq(1)
+        yield fma.inp.bits.in1.eq(a)
+        yield fma.inp.bits.in2.eq(b)
+        yield fma.inp.bits.in3.eq(c)
+        yield fma.inp.bits.fn.eq(fn)
+        yield fma.inp.bits.fn_mod.eq(fn_mod)
+        yield fma.inp.valid.eq(1)
         yield
-        yield fma.inp_valid.eq(0)
+        yield fma.inp.valid.eq(0)
 
         for _ in range(3):
             yield
 
-        assert (yield fma.out_valid)
-        out = yield fma.out.data
+        assert (yield fma.out.valid)
+        out = yield fma.out.bits.data
         assert out == expected
 
     return proc
@@ -75,10 +75,10 @@ def fdiv_unittest(fdiv, a, b, is_sqrt, fmt, expected):
         yield
         yield fdiv.in_valid.eq(0)
 
-        while not (yield fdiv.out_valid):
+        while not (yield fdiv.out.valid):
             yield
 
-        out = yield fdiv.out
+        out = yield fdiv.out.bits
         assert out == expected
 
     return proc
@@ -144,22 +144,22 @@ def fp_cast_unittest(dut,
                      rm=RoundingMode.RNE):
 
     def proc():
-        yield dut.inp.in1.eq(a)
-        yield dut.inp.fn.eq(fn)
-        yield dut.inp.fn_mod.eq(fn_mod)
-        yield dut.inp.rm.eq(rm)
-        yield dut.inp.src_fmt.eq(src_fmt)
-        yield dut.inp.dst_fmt.eq(dst_fmt)
-        yield dut.inp.int_fmt.eq(int_fmt)
-        yield dut.inp_valid.eq(1)
+        yield dut.inp.bits.in1.eq(a)
+        yield dut.inp.bits.fn.eq(fn)
+        yield dut.inp.bits.fn_mod.eq(fn_mod)
+        yield dut.inp.bits.rm.eq(rm)
+        yield dut.inp.bits.src_fmt.eq(src_fmt)
+        yield dut.inp.bits.dst_fmt.eq(dst_fmt)
+        yield dut.inp.bits.int_fmt.eq(int_fmt)
+        yield dut.inp.valid.eq(1)
         yield
-        yield dut.inp_valid.eq(0)
+        yield dut.inp.valid.eq(0)
 
         for _ in range(3):
             yield
 
-        assert (yield dut.out_valid)
-        out = yield dut.out.data
+        assert (yield dut.out.valid)
+        out = yield dut.out.bits.data
 
         if fn == FPUOperator.I2F and dst_fmt == FPFormat.S:
             out = out & ((1 << 32) - 1)
