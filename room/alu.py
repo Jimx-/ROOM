@@ -290,3 +290,28 @@ class IntDiv(Elaboratable):
         m.d.comb += self.resp.bits.eq(Cat(result_lo, result_hi))
 
         return m
+
+
+class AMODataGen(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.mask = Signal(width // 8)
+        self.cmd = Signal(MemoryCommand)
+        self.lhs = Signal(width)
+        self.rhs = Signal(width)
+        self.out = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        out = self.rhs
+
+        wmask = Signal(self.width)
+        for i in range(len(self.mask)):
+            m.d.comb += wmask[i * 8:(i + 1) * 8].eq(Repl(self.mask[i], 8))
+
+        m.d.comb += self.out.eq(wmask & out | ~wmask & self.lhs)
+
+        return m

@@ -24,6 +24,14 @@ from room.utils import Arbiter, Valid, Decoupled
 from roomsoc.interconnect import wishbone
 
 
+class HasCoreParams:
+
+    def __init__(self, params):
+        self.params = params
+
+        self.xlen = params['xlen']
+
+
 class WritebackDebug(Record):
 
     def __init__(self, params, name=None, src_loc_at=0):

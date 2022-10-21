@@ -244,6 +244,14 @@ class MemoryCommand(IntEnum):
     READ = 1
     WRITE = 2
 
+    @staticmethod
+    def is_read(cmd):
+        return cmd == MemoryCommand.READ
+
+    @staticmethod
+    def is_write(cmd):
+        return cmd == MemoryCommand.WRITE
+
 
 class CSRCommand(IntEnum):
     X = 0

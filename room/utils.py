@@ -82,10 +82,21 @@ def _incr(signal, modulo):
 
 class BranchKillableFIFO(Elaboratable):
 
-    def __init__(self, entries, params, cls, *args, flow=True, **kwargs):
+    def __init__(self,
+                 entries,
+                 params,
+                 cls,
+                 *args,
+                 flow=True,
+                 flush_fn=None,
+                 **kwargs):
         self.entries = entries
         self.flow = flow
         max_br_count = params['max_br_count']
+
+        if flush_fn is None:
+            flush_fn = lambda _: 1
+        self.flush_fn = flush_fn
 
         self.cls = cls
         self.args = args
@@ -135,7 +146,7 @@ class BranchKillableFIFO(Elaboratable):
         for i in range(self.entries):
             m.d.sync += valids[i].eq(
                 valids[i] & ~self.br_update.br_mask_killed(br_masks[i])
-                & ~self.flush)
+                & ~(self.flush & self.flush_fn(mem[i])))
 
             with m.If(valids[i]):
                 m.d.sync += br_masks[i].eq(
