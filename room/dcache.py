@@ -22,7 +22,6 @@ class HasDCacheParams(HasCoreParams):
 
         self.mem_width = params['mem_width']
         dcache_params = params['dcache_params']
-        self.n_banks = dcache_params['n_banks']
         self.n_sets = dcache_params['n_sets']
         self.n_ways = dcache_params['n_ways']
         self.block_bytes = dcache_params['block_bytes']
@@ -42,6 +41,16 @@ class HasDCacheParams(HasCoreParams):
         self.n_mshrs = dcache_params['n_mshrs']
         self.sdq_size = dcache_params['sdq_size']
         self.rpq_size = dcache_params['rpq_size']
+        self.n_data_banks = dcache_params['n_data_banks']
+
+    def addr_block_offset(self, addr):
+        return addr[:self.block_off_bits]
+
+    def addr_index(self, addr):
+        return addr[self.block_off_bits:self.untag_bits]
+
+    def addr_tag(self, addr):
+        return addr[self.untag_bits:self.untag_bits + self.tag_bits]
 
 
 class DCacheReqType(IntEnum):
@@ -104,44 +113,51 @@ class CacheState(IntEnum):
     def is_valid(state):
         return state != CacheState.NOTHING
 
+    @staticmethod
+    def on_access(m, state, cmd):
+        cmd_is_write = MemoryCommand.is_write(cmd)
 
-class CacheStateMachine(Elaboratable):
+        is_hit = Signal()
+        next_state = Signal(CacheState)
 
-    def __init__(self):
-        self.state = Signal(CacheState)
-
-        self.grow_cmd = Signal(MemoryCommand)
-        self.grow_hit = Signal()
-        self.grow_next = Signal(CacheState)
-
-        self.shrink_cmd = Signal(MemoryCommand)
-        self.shrink_dirty = Signal()
-        self.shrink_next = Signal(CacheState)
-
-    def elaborate(self, platform):
-        m = Module()
-
-        grow_is_write = MemoryCommand.is_write(self.grow_cmd)
-
-        with m.Switch(self.state):
+        with m.Switch(state):
             with m.Case(CacheState.NOTHING):
                 pass
+
             with m.Case(CacheState.CLEAN):
                 m.d.comb += [
-                    self.grow_hit.eq(1),
-                    self.grow_next.eq(
-                        Mux(grow_is_write, CacheState.DIRTY,
-                            CacheState.CLEAN)),
+                    is_hit.eq(1),
+                    next_state.eq(
+                        Mux(cmd_is_write, CacheState.DIRTY, CacheState.CLEAN)),
                 ]
             with m.Case(CacheState.DIRTY):
                 m.d.comb += [
-                    self.grow_hit.eq(1),
-                    self.grow_next.eq(CacheState.DIRTY),
+                    is_hit.eq(1),
+                    next_state.eq(CacheState.DIRTY),
                 ]
 
-        m.d.comb += self.shrink_dirty.eq(self.state == CacheState.DIRTY)
+        return is_hit, next_state
 
-        return m
+    @staticmethod
+    def on_sec_access(m, state, cmd_pri, cmd_sec):
+        hit_pri, next_state_pri = CacheState.on_access(m, state, cmd_pri)
+        hit_sec, next_state_sec = CacheState.on_access(m, state, cmd_sec)
+
+        hit_again = hit_pri & hit_sec
+
+        sec_is_write = MemoryCommand.is_write(cmd_sec)
+        dirtier_state = Mux(sec_is_write, next_state_sec, next_state_pri)
+        dirtier_cmd = Mux(sec_is_write, cmd_sec, cmd_pri)
+
+        return hit_again, dirtier_state, dirtier_cmd
+
+    @staticmethod
+    def on_cache_control(m, state, cmd):
+        is_dirty = Signal()
+
+        m.d.comb += is_dirty.eq(state == CacheState.DIRTY)
+
+        return is_dirty
 
 
 class Metadata(HasDCacheParams, Record):
@@ -354,6 +370,8 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
         self.req = Decoupled(WritebackReq, params)
         self.resp = Signal()
 
+        self.idx = Valid(Signal, self.index_bits)
+
         self.meta_read = Decoupled(MetaReadReq, params)
         self.data_read = Decoupled(DataReadReq, params)
         self.data_resp = Signal(self.row_bits)
@@ -363,6 +381,12 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
 
         req = WritebackReq(self.params)
 
+        state_invalid = Signal()
+        m.d.comb += [
+            self.idx.valid.eq(~state_invalid),
+            self.idx.bits.eq(req.idx),
+        ]
+
         wb_buffer = Array(
             Signal(self.row_bits, name=f'wb_buffer{i}')
             for i in range(self.refill_cycles))
@@ -370,7 +394,10 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
 
         with m.FSM():
             with m.State('INVALID'):
-                m.d.comb += self.req.ready.eq(1)
+                m.d.comb += [
+                    state_invalid.eq(1),
+                    self.req.ready.eq(1),
+                ]
 
                 with m.If(self.req.fire):
                     m.d.sync += [
@@ -525,9 +552,8 @@ class MSHR(HasDCacheParams, Elaboratable):
         m = Module()
 
         req = MSHRReq(self.params)
-        req_idx = req.addr[self.block_off_bits:self.block_off_bits +
-                           self.index_bits]
-        req_tag = req.addr[self.block_off_bits + self.index_bits:]
+        req_idx = self.addr_index(req.addr)
+        req_tag = self.addr_tag(req.addr)
 
         state_invalid = Signal()
 
@@ -570,12 +596,24 @@ class MSHR(HasDCacheParams, Elaboratable):
             m.d.sync += commit_line.eq(0)
 
         new_state = Signal(CacheState)
-        csm = m.submodules.csm = CacheStateMachine()
+
+        is_hit_again, dirtier_state, dirtier_cmd = CacheState.on_sec_access(
+            m, new_state, req.uop.mem_cmd, self.req.uop.mem_cmd)
+        block_sec_req = Signal()
+        sec_ready = ~block_sec_req
+
+        m.d.comb += self.req_sec_ready.eq(sec_ready & rpq.w_rdy)
+
+        with m.If(self.req_sec_valid & self.req_sec_ready):
+            m.d.sync += req.uop.mem_cmd.eq(dirtier_cmd)
+            with m.If(is_hit_again):
+                m.d.sync += new_state.eq(dirtier_state)
 
         with m.FSM():
             with m.State('INVALID'):
                 m.d.comb += [
                     state_invalid.eq(1),
+                    block_sec_req.eq(1),
                     self.req_pri_ready.eq(1),
                 ]
 
@@ -583,13 +621,11 @@ class MSHR(HasDCacheParams, Elaboratable):
                     m.d.sync += req.eq(self.req)
 
                     with m.If(self.req.tag_match):
-                        m.d.comb += [
-                            csm.state.eq(self.req.old_meta.state),
-                            csm.grow_cmd.eq(self.req.uop.mem_cmd),
-                        ]
+                        is_hit, next_state = CacheState.on_access(
+                            m, self.req.old_meta.state, self.req.uop.mem_cmd)
 
-                        with m.If(csm.grow_hit):
-                            m.d.sync += new_state.eq(csm.grow_next)
+                        with m.If(is_hit):
+                            m.d.sync += new_state.eq(next_state)
                             m.next = 'DRAIN_REPLAY'
 
                     with m.Else():
@@ -649,7 +685,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     rpq.r_data.uop.mem_cmd) & ~MemoryCommand.is_write(
                         rpq.r_data.uop.mem_cmd)
 
-                rp_addr = Cat(rpq.r_data.addr[:self.block_off_bits], req_idx,
+                rp_addr = Cat(self.addr_block_offset(rpq.r_data.addr), req_idx,
                               req_tag)
 
                 m.d.comb += [
@@ -698,11 +734,12 @@ class MSHR(HasDCacheParams, Elaboratable):
                 m.next = 'META_RESP_2'
 
             with m.State('META_RESP_2'):
-                m.d.comb += csm.state.eq(self.meta_resp.bits.state),
+                needs_wb = CacheState.on_cache_control(
+                    m, self.meta_resp.bits.state, MemoryCommand.WRITE)
 
                 with m.If(~self.meta_resp.valid):
                     m.next = 'META_READ'
-                with m.Elif(csm.shrink_dirty):
+                with m.Elif(needs_wb):
                     m.next = 'WB_REQ'
                 with m.Else():
                     m.next = 'COMMIT_LINE'
@@ -748,24 +785,23 @@ class MSHR(HasDCacheParams, Elaboratable):
                     self.replay.bits.uop.br_mask.eq(rpq.r_br_mask),
                     self.replay.bits.way_en.eq(req.way_en),
                     self.replay.bits.addr.eq(
-                        Cat(rpq.r_data.addr[:self.block_off_bits], req_idx,
+                        Cat(self.addr_block_offset(rpq.r_data.addr), req_idx,
                             req_tag)),
                     rpq.r_en.eq(self.replay.ready),
                 ]
 
                 with m.If(self.replay.fire
                           & MemoryCommand.is_write(rpq.r_data.uop.mem_cmd)):
-                    m.d.comb += [
-                        csm.state.eq(new_state),
-                        csm.grow_cmd.eq(rpq.r_data.uop.mem_cmd),
-                    ]
-                    m.d.sync += new_state.eq(csm.grow_next)
+                    _, next_state = CacheState.on_access(
+                        m, new_state, rpq.r_data.uop.mem_cmd)
+                    m.d.sync += new_state.eq(next_state)
 
                 with m.If(~rpq.r_rdy & ~rpq.w_en):
                     m.next = 'META_WRITE'
 
             with m.State('META_WRITE'):
                 m.d.comb += [
+                    block_sec_req.eq(1),
                     self.meta_write.valid.eq(1),
                     self.meta_write.bits.idx.eq(req_idx),
                     self.meta_write.bits.way_en.eq(req.way_en),
@@ -777,6 +813,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     m.next = 'MEM_FINISH'
 
             with m.State('MEM_FINISH'):
+                m.d.comb += block_sec_req.eq(1)
                 m.next = 'INVALID'
 
         return m
@@ -905,11 +942,11 @@ class MSHRFile(HasDCacheParams, Elaboratable):
         ]
 
         idx_match = Array(
-            Signal(name='idx_match{i}') for i in range(self.mem_width))
+            Signal(name=f'idx_match{i}') for i in range(self.mem_width))
         tag_match = Array(
-            Signal(name='tag_match{i}') for i in range(self.mem_width))
+            Signal(name=f'tag_match{i}') for i in range(self.mem_width))
         way_match = Array(
-            Signal(name='way_match{i}') for i in range(self.mem_width))
+            Signal(name=f'way_match{i}') for i in range(self.mem_width))
         for w in range(self.mem_width):
             for i in range(self.n_mshrs):
                 with m.If(idx_matches[w][i]):
@@ -938,12 +975,12 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
             for w in range(self.mem_width):
                 m.d.comb += [
-                    idx_matches[w][i].eq(mshr.idx.valid & (
-                        mshr.idx.bits == self.req[w].bits.
-                        addr[self.block_off_bits:self.untag_bits])),
+                    idx_matches[w][i].eq(mshr.idx.valid
+                                         & (mshr.idx.bits == self.addr_index(
+                                             self.req[w].bits.addr))),
                     tag_matches[w][i].eq(mshr.tag.valid
-                                         & (mshr.tag.bits == self.req[w].bits.
-                                            addr[self.untag_bits:])),
+                                         & (mshr.tag.bits == self.addr_tag(
+                                             self.req[w].bits.addr))),
                     way_matches[w][i].eq(
                         mshr.way.valid
                         & (mshr.way.bits == self.req[w].bits.way_en)),
@@ -1152,7 +1189,8 @@ class DCache(HasDCacheParams, Elaboratable):
         m.d.comb += meta_write_arb.out.ready.eq(
             Cat(m.write.ready for m in meta) != 0)
 
-        data = DuplicatedDataArray(self.params) if self.n_banks == 1 else None
+        data = DuplicatedDataArray(
+            self.params) if self.n_data_banks == 1 else None
         m.submodules.data = data
 
         # 0 - LSU, 1 - MSHR refill
@@ -1191,9 +1229,7 @@ class DCache(HasDCacheParams, Elaboratable):
                 self.req[w].ready.eq(req_ready),
                 meta_read_arb[w].inp[3].valid.eq(self.req[w].valid),
                 meta_read_arb[w].inp[3].bits.idx.eq(
-                    self.req[w].bits.addr[self.
-                                          block_off_bits:self.block_off_bits +
-                                          self.index_bits]),
+                    self.addr_index(self.req[w].bits.addr)),
                 data_read_arb[w].inp[2].valid.eq(self.req[w].valid),
                 data_read_arb[w].inp[2].bits.addr.eq(self.req[w].bits.addr),
                 data_read_arb[w].inp[2].bits.way_en.eq(Repl(1, self.n_ways)),
@@ -1215,7 +1251,7 @@ class DCache(HasDCacheParams, Elaboratable):
                                   & data_read_arb[0].inp[0].ready),
             meta_read_arb[0].inp[0].valid.eq(mshrs.replay.valid),
             meta_read_arb[0].inp[0].bits.idx.eq(
-                mshrs.replay.bits.addr[self.block_off_bits:]),
+                self.addr_index(mshrs.replay.bits.addr)),
             data_read_arb[0].inp[0].valid.eq(mshrs.replay.valid),
             data_read_arb[0].inp[0].bits.addr.eq(mshrs.replay.bits.addr),
             data_read_arb[0].inp[0].bits.way_en.eq(mshrs.replay.bits.way_en),
@@ -1347,6 +1383,8 @@ class DCache(HasDCacheParams, Elaboratable):
             for i in range(self.mem_width)
         ]
 
+        s1_wb_idx_matches = Signal(self.mem_width)
+
         for w in range(self.mem_width):
             with m.Switch(s1_type):
                 with m.Case(DCacheReqType.MSHR_META):
@@ -1361,10 +1399,12 @@ class DCache(HasDCacheParams, Elaboratable):
 
                 with m.Default():
                     m.d.comb += s1_tag_match_way[w].eq(
-                        Cat((meta[w].resp[i].tag == s1_addr[w]
-                             [self.untag_bits:])
+                        Cat((meta[w].resp[i].tag == self.addr_tag(s1_addr[w]))
                             & CacheState.is_valid(meta[w].resp[i].state)
                             for i in range(self.n_ways)))
+
+            m.d.comb += s1_wb_idx_matches[w].eq(
+                wb.idx.valid & (self.addr_index(s1_addr[w]) == wb.idx.bits))
 
         s1_replace_way = Signal(range(self.n_ways))
         s1_replace_way_en = Signal(self.n_ways)
@@ -1395,15 +1435,14 @@ class DCache(HasDCacheParams, Elaboratable):
             Signal(CacheState, name=f's2_new_hit_state{i}')
             for i in range(self.mem_width)
         ]
+        s2_state_is_hit = Signal(self.mem_width)
         s2_hit = Signal(self.mem_width)
+        s2_wb_idx_matches = Signal.like(s1_wb_idx_matches)
 
         s2_metadata = [[
             Metadata(self.params, name=f's2_metadata{i}_{w}')
             for w in range(self.n_ways)
         ] for i in range(self.mem_width)]
-
-        csm = [CacheStateMachine() for _ in range(self.mem_width)]
-        m.submodules += csm
 
         s2_replace_way_en = Signal.like(s1_replace_way_en)
         s2_replace_meta = [
@@ -1426,20 +1465,25 @@ class DCache(HasDCacheParams, Elaboratable):
                                    (s1_type == DCacheReqType.LSU)
                                    & s1_req[w].uop.uses_stq)),
                 s2_tag_match_way[w].eq(s1_tag_match_way[w]),
-                s2_replace_way_en.eq(s1_replace_way_en),
-                s2_need_resp.eq(s1_need_resp),
             ]
+
+            is_hit, next_state = CacheState.on_access(m, s2_hit_state[w],
+                                                      s2_req[w].uop.mem_cmd)
 
             m.d.comb += [
-                csm[w].state.eq(s2_hit_state[w]),
-                csm[w].grow_cmd.eq(s2_req[w].uop.mem_cmd),
-                s2_new_hit_state[w].eq(csm[w].grow_next),
+                s2_state_is_hit[w].eq(is_hit),
+                s2_new_hit_state[w].eq(next_state),
             ]
 
-        m.d.sync += s2_type.eq(s1_type)
+        m.d.sync += [
+            s2_type.eq(s1_type),
+            s2_replace_way_en.eq(s1_replace_way_en),
+            s2_need_resp.eq(s1_need_resp),
+            s2_wb_idx_matches.eq(s1_wb_idx_matches),
+        ]
 
         m.d.comb += s2_hit.eq(
-            Cat((s2_tag_match[w] & csm[w].grow_hit
+            Cat((s2_tag_match[w] & s2_state_is_hit[w]
                  & (s2_new_hit_state[w] == s2_hit_state[w]))
                 | (s2_type == DCacheReqType.REPLAY)
                 | (s2_type == DCacheReqType.WRITEBACK)
@@ -1476,6 +1520,7 @@ class DCache(HasDCacheParams, Elaboratable):
         s2_nack_victim = Signal(self.mem_width)
         s2_nack_mshr = Signal(self.mem_width)
         s2_nack_data = Signal(self.mem_width)
+        s2_nack_wb = Signal(self.mem_width)
 
         m.d.comb += [
             s2_nack_victim.eq(
@@ -1485,12 +1530,15 @@ class DCache(HasDCacheParams, Elaboratable):
                 Cat(s2_valid[w] & ~s2_hit[w] & ~mshrs.req[w].ready
                     for w in range(self.mem_width))),
             s2_nack_data.eq(data.nack),
+            s2_nack_wb.eq(
+                Cat(s2_valid[w] & ~s2_hit[w] & s2_wb_idx_matches[w]
+                    for w in range(self.mem_width))),
         ]
 
         s2_nack = Signal(self.mem_width)
         m.d.comb += s2_nack.eq(
             Cat((s2_nack_mshr[w] | s2_nack_victim[w]
-                 | s2_nack_data[w])
+                 | s2_nack_data[w] | s2_nack_wb[w])
                 & (s2_type != DCacheReqType.REPLAY)
                 for w in range(self.mem_width)))
 
@@ -1520,7 +1568,7 @@ class DCache(HasDCacheParams, Elaboratable):
             m.d.comb += [
                 mshrs.req[w].valid.eq(
                     s2_valid[w] & ~s2_hit[w] & ~s2_nack_data[w]
-                    & ~s2_nack_mshr[w] & ~s2_nack_victim[w]
+                    & ~s2_nack_victim[w] & ~s2_nack_wb[w]
                     & (s2_type == DCacheReqType.LSU)
                     & ~self.br_update.uop_killed(s2_req[w].uop)
                     & ~(self.exception & s2_req[w].uop.uses_ldq)
