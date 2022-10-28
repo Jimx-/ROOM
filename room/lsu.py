@@ -3,33 +3,32 @@ from amaranth import tracer
 from amaranth.utils import log2_int
 
 from room.consts import *
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.fu import ExecResp
 from room.branch import BranchUpdate
 from room.rob import CommitReq, Exception
 from room.exc import Cause
-from room.utils import Valid, Decoupled
+from room.utils import Valid, Decoupled, wrap_incr
 
 from roomsoc.interconnect import wishbone
 
 
-class LSUDebug(Record):
+class LSUDebug(HasCoreParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
-        xlen = params['xlen']
-        num_pregs = params['num_pregs']
+        HasCoreParams.__init__(self, params)
 
-        super().__init__([
+        Record.__init__(self, [
             ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
-            ('opcode', Shape.cast(UOpCode).width),
-            ('addr', xlen),
-            ('data', xlen),
-            ('prs1', range(num_pregs)),
-            ('prs2', range(num_pregs)),
+            ('opcode', UOpCode),
+            ('addr', self.xlen),
+            ('data', self.xlen),
+            ('prs1', range(self.num_pregs)),
+            ('prs2', range(self.num_pregs)),
         ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
 
 
 class RRPriorityEncoder(Elaboratable):
@@ -67,9 +66,11 @@ class RRPriorityEncoder(Elaboratable):
         return m
 
 
-class DCacheReq:
+class DCacheReq(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
@@ -77,17 +78,19 @@ class DCacheReq:
         self.kill = Signal(name=f'{name}_kill')
 
         self.addr = Signal(32, name=f'{name}_addr')
-        self.data = Signal(params['xlen'], name=f'{name}_data')
+        self.data = Signal(self.xlen, name=f'{name}_data')
 
 
-class DCacheResp:
+class DCacheResp(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
         self.uop = MicroOp(params, name=f'{name}_uop')
-        self.data = Signal(params['xlen'], name=f'{name}_data')
+        self.data = Signal(self.xlen, name=f'{name}_data')
 
 
 class StoreGen(Elaboratable):
@@ -164,12 +167,10 @@ class LoadGen(Elaboratable):
         return m
 
 
-class DataCache(Elaboratable):
+class DataCache(HasCoreParams, Elaboratable):
 
     def __init__(self, params):
-        self.xlen = params['xlen']
-        self.mem_width = params['mem_width']
-        self.params = params
+        super().__init__(params)
 
         self.dbus = wishbone.Interface(data_width=self.xlen,
                                        addr_width=30,
@@ -294,30 +295,30 @@ class DataCache(Elaboratable):
         return m
 
 
-class LDQEntry:
+class LDQEntry(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
-
-        stq_size = params['stq_size']
 
         self.valid = Signal(name=f'{name}_valid')
         self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.addr = Signal(params['vaddr_bits_extended'], name=f'{name}_addr')
+        self.addr = Signal(self.vaddr_bits_extended, name=f'{name}_addr')
         self.addr_valid = Signal(name=f'{name}_addr_valid')
 
         self.executed = Signal(name=f'{name}_executed')
         self.succeeded = Signal(name=f'{name}_succeeded')
         self.order_fail = Signal(name=f'{name}_order_fail')
 
-        self.st_dep_mask = Signal(stq_size, name=f'{name}_st_dep_mask')
-        self.next_stq_idx = Signal(range(stq_size),
+        self.st_dep_mask = Signal(self.stq_size, name=f'{name}_st_dep_mask')
+        self.next_stq_idx = Signal(range(self.stq_size),
                                    name=f'{name}_next_stq_idx')
 
         self.forwarded = Signal(name=f'{name}_forwarded')
-        self.forward_stq_idx = Signal(range(stq_size),
+        self.forward_stq_idx = Signal(range(self.stq_size),
                                       name=f'{name}_forward_stq_idx')
 
     def eq(self, rhs):
@@ -333,18 +334,20 @@ class LDQEntry:
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
-class STQEntry:
+class STQEntry(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
         self.valid = Signal(name=f'{name}_valid')
         self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.addr = Signal(params['vaddr_bits_extended'], name=f'{name}_addr')
+        self.addr = Signal(self.vaddr_bits_extended, name=f'{name}_addr')
         self.addr_valid = Signal(name=f'{name}_addr_valid')
-        self.data = Signal(params['xlen'], name=f'{name}_data')
+        self.data = Signal(self.xlen, name=f'{name}_data')
         self.data_valid = Signal(name=f'{name}_data_valid')
 
         self.committed = Signal(name=f'{name}_committed')
@@ -364,13 +367,6 @@ class STQEntry:
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
-def _incr(signal, modulo):
-    if modulo == 2**len(signal):
-        return (signal + 1)[:len(signal)]
-    else:
-        return Mux(signal == modulo - 1, 0, signal + 1)
-
-
 def gen_byte_mask(addr, size):
     return Mux(
         size == 0, 1 << addr[:3],
@@ -378,15 +374,11 @@ def gen_byte_mask(addr, size):
             Mux(size == 2, Mux(addr[2], 0xf0, 0xf), Mux(size == 3, 0xff, 0))))
 
 
-class LoadStoreUnit(Elaboratable):
+class LoadStoreUnit(HasCoreParams, Elaboratable):
 
     def __init__(self, dbus, params, sim_debug=False):
-        self.xlen = params['xlen']
-        self.core_width = params['core_width']
-        self.ldq_size = params['ldq_size']
-        self.stq_size = params['stq_size']
-        self.mem_width = params['mem_width']
-        self.params = params
+        super().__init__(params)
+
         self.sim_debug = sim_debug
 
         self.dbus = dbus
@@ -409,25 +401,25 @@ class LoadStoreUnit(Elaboratable):
         ]
 
         self.exec_reqs = [
-            Valid(ExecResp, self.xlen, self.params, name=f'exec_req{i}')
+            Valid(ExecResp, self.xlen, params, name=f'exec_req{i}')
             for i in range(self.mem_width)
         ]
 
-        self.fp_std = Decoupled(ExecResp, self.xlen, self.params)
+        self.fp_std = Decoupled(ExecResp, self.xlen, params)
 
         self.exec_iresps = [
-            Decoupled(ExecResp, self.xlen, self.params, name=f'exec_iresp{i}')
+            Decoupled(ExecResp, self.xlen, params, name=f'exec_iresp{i}')
             for i in range(self.mem_width)
         ]
 
         self.exec_fresps = [
-            Decoupled(ExecResp, self.xlen, self.params, name=f'exec_fresp{i}')
+            Decoupled(ExecResp, self.xlen, params, name=f'exec_fresp{i}')
             for i in range(self.mem_width)
         ]
 
         self.clear_busy = [
             Valid(Signal,
-                  range(self.core_width * params['num_rob_rows']),
+                  range(self.core_width * self.num_rob_rows),
                   name=f'clear_busy{i}') for i in range(self.mem_width + 1)
         ]
 
@@ -491,9 +483,9 @@ class LoadStoreUnit(Elaboratable):
         for w in range(self.core_width):
             m.d.comb += [
                 self.ldq_full[w].eq(
-                    _incr(ldq_w_idx, self.ldq_size) == ldq_head),
+                    wrap_incr(ldq_w_idx, self.ldq_size) == ldq_head),
                 self.stq_full[w].eq(
-                    _incr(stq_w_idx, self.stq_size) == stq_head),
+                    wrap_incr(stq_w_idx, self.stq_size) == stq_head),
                 self.dis_ldq_idx[w].eq(ldq_w_idx),
                 self.dis_stq_idx[w].eq(stq_w_idx),
             ]
@@ -524,13 +516,13 @@ class LoadStoreUnit(Elaboratable):
                     stq[self.dis_stq_idx[w]].succeeded.eq(0),
                 ]
 
-            ldq_w_idx = Mux(dis_w_ldq, _incr(ldq_w_idx, self.ldq_size),
+            ldq_w_idx = Mux(dis_w_ldq, wrap_incr(ldq_w_idx, self.ldq_size),
                             ldq_w_idx)
 
             next_live_store_mask = Mux(dis_w_stq,
                                        next_live_store_mask | (1 << stq_w_idx),
                                        next_live_store_mask)
-            stq_w_idx = Mux(dis_w_stq, _incr(stq_w_idx, self.stq_size),
+            stq_w_idx = Mux(dis_w_stq, wrap_incr(stq_w_idx, self.stq_size),
                             stq_w_idx)
 
         m.d.sync += [
@@ -730,7 +722,7 @@ class LoadStoreUnit(Elaboratable):
                 m.d.sync += [
                     stq_execute_head.eq(
                         Mux(dmem_req.ready,
-                            _incr(stq_execute_head, self.stq_size),
+                            wrap_incr(stq_execute_head, self.stq_size),
                             stq_execute_head)),
                     stq[stq_execute_head].succeeded.eq(0),
                 ]
@@ -1249,10 +1241,10 @@ class LoadStoreUnit(Elaboratable):
                 ]
 
             next_stq_commit_head = Mux(
-                commit_store, _incr(next_stq_commit_head, self.stq_size),
+                commit_store, wrap_incr(next_stq_commit_head, self.stq_size),
                 next_stq_commit_head)
-            next_ldq_head = Mux(commit_load, _incr(next_ldq_head,
-                                                   self.ldq_size),
+            next_ldq_head = Mux(commit_load,
+                                wrap_incr(next_ldq_head, self.ldq_size),
                                 next_ldq_head)
 
         m.d.sync += [
@@ -1271,12 +1263,12 @@ class LoadStoreUnit(Elaboratable):
                 stq[stq_head].data_valid.eq(0),
                 stq[stq_head].committed.eq(0),
                 stq[stq_head].succeeded.eq(0),
-                stq_head.eq(_incr(stq_head, self.stq_size)),
+                stq_head.eq(wrap_incr(stq_head, self.stq_size)),
             ]
 
             with m.If(stq[stq_head].uop.is_fence):
                 m.d.sync += stq_execute_head.eq(
-                    _incr(stq_execute_head, self.stq_size))
+                    wrap_incr(stq_execute_head, self.stq_size))
 
         #
         # Exception

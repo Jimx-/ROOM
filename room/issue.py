@@ -3,7 +3,7 @@ from amaranth.lib.coding import Encoder
 from enum import IntEnum
 
 from room.consts import *
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.utils import Valid
 
@@ -21,7 +21,7 @@ class IssueQueueWakeup(Record):
                          src_loc_at=1 + src_loc_at)
 
 
-class IssueSlot(Elaboratable):
+class IssueSlot(HasCoreParams, Elaboratable):
 
     class State(IntEnum):
         INVALID = 0
@@ -29,8 +29,7 @@ class IssueSlot(Elaboratable):
         VALID_2 = 2
 
     def __init__(self, num_wakeup_ports, params):
-        self.params = params
-        num_pregs = params['num_pregs']
+        super().__init__(params)
 
         self.valid = Signal()
 
@@ -43,7 +42,7 @@ class IssueSlot(Elaboratable):
         self.gnt = Signal()
 
         self.wakeup_ports = [
-            Valid(IssueQueueWakeup, num_pregs, name=f'wakeup_port{i}')
+            Valid(IssueQueueWakeup, self.num_pregs, name=f'wakeup_port{i}')
             for i in range(num_wakeup_ports)
         ]
 
@@ -140,17 +139,17 @@ class IssueSlot(Elaboratable):
         return m
 
 
-class IssueUnit(Elaboratable):
+class IssueUnit(HasCoreParams, Elaboratable):
 
     def __init__(self, issue_width, num_issue_slots, dispatch_width,
                  num_wakeup_ports, iq_type, params):
-        self.params = params
+        super().__init__(params)
+
         self.issue_width = issue_width
         self.num_issue_slots = num_issue_slots
         self.dispatch_width = dispatch_width
         self.num_wakeup_ports = num_wakeup_ports
         self.iq_type = iq_type
-        num_pregs = params['num_pregs']
 
         self.dis_uops = [
             MicroOp(params, name=f'dis_uop{i}') for i in range(dispatch_width)
@@ -167,7 +166,7 @@ class IssueUnit(Elaboratable):
         ]
 
         self.wakeup_ports = [
-            Valid(IssueQueueWakeup, num_pregs, name=f'wakeup_port{i}')
+            Valid(IssueQueueWakeup, self.num_pregs, name=f'wakeup_port{i}')
             for i in range(self.num_wakeup_ports)
         ]
 

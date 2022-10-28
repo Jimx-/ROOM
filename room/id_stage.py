@@ -2,31 +2,31 @@ from amaranth import *
 import riscvmodel.insn as insn
 
 from room.consts import *
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.branch import BranchMaskAllocator, BranchUpdate
 from room.exc import Cause
 from room.fpu import FPFormat
 
 
-class IDDebug(Record):
+class IDDebug(HasCoreParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
-        max_br_count = params['max_br_count']
+        HasCoreParams.__init__(self, params)
 
-        super().__init__([
+        Record.__init__(self, [
             ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
-            ('br_mask', max_br_count),
+            ('br_mask', self.max_br_count),
         ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
 
 
 class BranchSignals(Record):
 
     def __init__(self, vaddr_bits, name=None, src_loc_at=0):
         super().__init__([
-            ('cfi_type', Shape.cast(CFIType).width),
+            ('cfi_type', CFIType),
             ('target', vaddr_bits),
         ],
                          name=name,
@@ -69,11 +69,10 @@ class BranchDecoder(Elaboratable):
         return m
 
 
-class DecodeUnit(Elaboratable):
+class DecodeUnit(HasCoreParams, Elaboratable):
 
     def __init__(self, params):
-        self.xlen = params['xlen']
-        self.use_fpu = params['use_fpu']
+        super().__init__(params)
 
         self.in_uop = MicroOp(params)
         self.out_uop = MicroOp(params)
@@ -738,12 +737,11 @@ class DecodeUnit(Elaboratable):
         return m
 
 
-class DecodeStage(Elaboratable):
+class DecodeStage(HasCoreParams, Elaboratable):
 
     def __init__(self, params, sim_debug=False):
-        self.xlen = params['xlen']
-        self.core_width = params['core_width']
-        self.params = params
+        super().__init__(params)
+
         self.sim_debug = sim_debug
 
         self.fetch_packet = [MicroOp(params) for _ in range(self.core_width)]

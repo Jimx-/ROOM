@@ -2,6 +2,7 @@ from amaranth import *
 import riscvmodel.csrnames as csrnames
 
 from room.csr import *
+from room.types import HasCoreParams
 
 
 def mcontrol_layout(xlen):
@@ -43,28 +44,27 @@ def tdata1_layout(xlen):
     ]
 
 
-class Breakpoint(Record):
+class Breakpoint(HasCoreParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
-        self.xlen = params['xlen']
+        HasCoreParams.__init__(self, params)
 
-        super().__init__([
+        Record.__init__(self, [
             ('control', mcontrol_layout(self.xlen)),
             ('dmode', 1),
             ('address', 32),
         ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
 
     def address_match(self, addr):
         return addr == self.address
 
 
-class BreakpointUnit(Elaboratable, AutoCSR):
+class BreakpointUnit(HasCoreParams, Elaboratable, AutoCSR):
 
     def __init__(self, params):
-        self.xlen = params['xlen']
-        self.num_breakpoints = params['num_breakpoints']
+        HasCoreParams.__init__(self, params)
 
         self.debug = Signal()
 
@@ -118,18 +118,17 @@ class BreakpointUnit(Elaboratable, AutoCSR):
         return m
 
 
-class BreakpointMatcher(Elaboratable):
+class BreakpointMatcher(HasCoreParams, Elaboratable):
 
     def __init__(self, params):
-        self.vaddr_bits = params['vaddr_bits_extended']
-        self.num_breakpoints = params['num_breakpoints']
+        super().__init__(params)
 
         self.bp = [
             Breakpoint(params, name=f'bp{i}')
             for i in range(self.num_breakpoints)
         ]
 
-        self.pc = Signal(self.vaddr_bits)
+        self.pc = Signal(self.vaddr_bits_extended)
 
         self.exc_if = Signal()
         self.debug_if = Signal()

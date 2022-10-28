@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import *
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.fu import ExecResp
 from room.regfile import RegisterFile, RegisterRead
 from room.branch import BranchUpdate
@@ -10,19 +10,16 @@ from room.ex_stage import ExecUnits
 from room.utils import Valid, Decoupled, Arbiter
 
 
-class FPPipeline(Elaboratable):
+class FPPipeline(HasCoreParams, Elaboratable):
 
     def __init__(self, params, sim_debug=False):
-        self.xlen = params['xlen']
-        self.flen = params['flen']
-        self.mem_width = params['mem_width']
-        self.params = params
+        super().__init__(params)
+
         self.sim_debug = sim_debug
 
-        self.issue_params = params['issue_params'][IssueQueueType.FP]
-        self.num_wakeup_ports = self.issue_params[
-            'issue_width'] + self.mem_width
-        self.dispatch_width = self.issue_params['dispatch_width']
+        self.iq_params = self.issue_params[IssueQueueType.FP]
+        self.num_wakeup_ports = self.iq_params['issue_width'] + self.mem_width
+        self.dispatch_width = self.iq_params['dispatch_width']
 
         self.dis_uops = [
             MicroOp(params, name=f'dis_uop{i}')
@@ -60,8 +57,8 @@ class FPPipeline(Elaboratable):
         #
 
         issue_unit = m.submodules.issue_unit = IssueUnit(
-            self.issue_params['issue_width'], self.issue_params['num_entries'],
-            self.issue_params['dispatch_width'], self.num_wakeup_ports,
+            self.iq_params['issue_width'], self.iq_params['num_entries'],
+            self.iq_params['dispatch_width'], self.num_wakeup_ports,
             IssueQueueType.FP, self.params)
 
         for quop, duop in zip(issue_unit.dis_uops, self.dis_uops):
@@ -108,7 +105,7 @@ class FPPipeline(Elaboratable):
         fregfile = m.submodules.fregfile = RegisterFile(
             rports=exec_units.frf_read_ports,
             wports=exec_units.frf_write_ports + self.mem_width,
-            num_regs=self.params['num_fp_pregs'],
+            num_regs=self.num_fp_pregs,
             data_width=self.flen)
 
         fregread = m.submodules.fregread = RegisterRead(

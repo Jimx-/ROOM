@@ -85,7 +85,7 @@ class Top(Elaboratable):
         self.debug_rom_image = debug_rom_image
         self.ram_image = ram_image
         self.clk_freq = clk_freq
-        self.core_params = Core.validate_params(core_params)
+        self.core_params = core_params
         self.sim_debug = sim_debug
 
         self.axil_master = axi.AXILiteInterface(data_width=32,

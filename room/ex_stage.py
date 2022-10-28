@@ -4,30 +4,29 @@ from room.consts import *
 from room.fu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.utils import Valid, Decoupled, BranchKillableFIFO, Arbiter, generate_imm
 
 
-class ExecDebug(Record):
+class ExecDebug(HasCoreParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
-        xlen = params['xlen']
-        num_pregs = params['num_pregs']
+        HasCoreParams.__init__(self, params)
 
-        super().__init__([
+        Record.__init__(self, [
             ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
-            ('opcode', Shape.cast(UOpCode).width),
-            ('prs1', range(num_pregs)),
-            ('rs1_data', xlen),
-            ('prs2', range(num_pregs)),
-            ('rs2_data', xlen),
+            ('opcode', UOpCode),
+            ('prs1', range(self.num_pregs)),
+            ('rs1_data', self.xlen),
+            ('prs2', range(self.num_pregs)),
+            ('rs2_data', self.xlen),
         ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
 
 
-class ExecUnit(Elaboratable):
+class ExecUnit(HasCoreParams, Elaboratable):
 
     def __init__(self,
                  data_width,
@@ -49,7 +48,8 @@ class ExecUnit(Elaboratable):
                  has_ifpu=False,
                  has_fpiu=False,
                  sim_debug=False):
-        self.params = params
+        super().__init__(params)
+
         self.data_width = data_width
         self.irf_read = irf_read
         self.irf_write = irf_write
@@ -433,11 +433,12 @@ class FPUExecUnit(ExecUnit):
         return m
 
 
-class ExecUnits(Elaboratable):
+class ExecUnits(HasCoreParams, Elaboratable):
 
     def __init__(self, is_fpu, params, sim_debug=False):
+        super().__init__(params)
+
         self.exec_units = []
-        self.issue_params = params['issue_params']
         self.is_fpu = is_fpu
 
         self.irf_readers = 0
@@ -449,8 +450,7 @@ class ExecUnits(Elaboratable):
             self.exec_debug = []
 
         if not is_fpu:
-            mem_width = self.issue_params[IssueQueueType.MEM]['issue_width']
-            for i in range(mem_width):
+            for i in range(self.mem_width):
                 eu = ALUExecUnit(params,
                                  has_alu=False,
                                  has_mem=True,

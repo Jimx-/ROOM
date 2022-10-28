@@ -5,10 +5,10 @@ from enum import IntEnum
 
 from room.consts import *
 from room.fu import ExecResp
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.exc import Cause
-from room.utils import Valid
+from room.utils import Valid, wrap_incr, wrap_decr
 
 
 class FlushType(IntEnum):
@@ -19,35 +19,22 @@ class FlushType(IntEnum):
     NEXT = 4
 
 
-def _incr(signal, modulo):
-    if modulo == 2**len(signal):
-        return (signal + 1)[:len(signal)]
-    else:
-        return Mux(signal == modulo - 1, 0, signal + 1)
-
-
-def _decr(signal, modulo):
-    if modulo == 2**len(signal):
-        return (signal - 1)[:len(signal)]
-    else:
-        return Mux(signal == 0, modulo - 1, signal - 1)
-
-
-class CommitReq:
+class CommitReq(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        core_width = params['core_width']
-
-        self.valids = Signal(core_width, name=f'{name}_valids')
+        self.valids = Signal(self.core_width, name=f'{name}_valids')
         self.uops = [
-            MicroOp(params, name=f'{name}_uop{i}') for i in range(core_width)
+            MicroOp(params, name=f'{name}_uop{i}')
+            for i in range(self.core_width)
         ]
 
         self.rollback = Signal(name=f'{name}_rollback')
-        self.rollback_valids = Signal(core_width,
+        self.rollback_valids = Signal(self.core_width,
                                       name=f'{name}_rollback_valids')
 
     def eq(self, rhs):
@@ -60,38 +47,36 @@ class CommitReq:
         ] + [luop.eq(ruop) for luop, ruop in zip(self.uops, rhs.uops)]
 
 
-class CommitExceptionReq(Record):
+class CommitExceptionReq(HasCoreParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
-        self.xlen = params['xlen']
+        HasCoreParams.__init__(self, params)
 
-        _uop = MicroOp(params)
-
-        super().__init__([
+        Record.__init__(self, [
             ('valid', 1),
-            ('ftq_idx', _uop.ftq_idx.width),
-            ('pc_lsb', _uop.pc_lsb.width),
+            ('ftq_idx', range(self.ftq_size)),
+            ('pc_lsb', range(self.fetch_bytes)),
             ('is_rvc', 1),
             ('cause', self.xlen),
-            ('flush_type', Shape.cast(FlushType).width),
+            ('flush_type', FlushType),
         ],
-                         name=name,
-                         src_loc_at=src_loc_at + 1)
+                        name=name,
+                        src_loc_at=src_loc_at + 1)
 
 
-class Exception:
+class Exception(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
-
-        xlen = params['xlen']
 
         self.valid = Signal(name=f'{name}_valid')
 
         self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.cause = Signal(xlen, name=f'{name}_cause')
+        self.cause = Signal(self.xlen, name=f'{name}_cause')
 
     def eq(self, rhs):
         return [
@@ -103,13 +88,10 @@ class Exception:
         ]
 
 
-class ReorderBuffer(Elaboratable):
+class ReorderBuffer(HasCoreParams, Elaboratable):
 
     def __init__(self, num_wakeup_ports, params):
-        self.params = params
-        self.core_width = params['core_width']
-        self.num_rob_rows = params['num_rob_rows']
-        mem_width = params['mem_width']
+        super().__init__(params)
 
         self.enq_uops = [
             MicroOp(params, name=f'enq_uop{i}') for i in range(self.core_width)
@@ -119,7 +101,7 @@ class ReorderBuffer(Elaboratable):
 
         self.wb_resps = [
             Valid(ExecResp,
-                  max(params['xlen'], params['flen']),
+                  max(self.xlen, self.flen),
                   params,
                   name=f'wb_resp{i}') for i in range(num_wakeup_ports)
         ]
@@ -127,7 +109,7 @@ class ReorderBuffer(Elaboratable):
         self.lsu_clear_busy = [
             Valid(Signal,
                   range(self.core_width * self.num_rob_rows),
-                  name=f'lsu_clear_busy{i}') for i in range(mem_width + 1)
+                  name=f'lsu_clear_busy{i}') for i in range(self.mem_width + 1)
         ]
 
         self.commit_req = CommitReq(params, name='commit_req')
@@ -359,14 +341,14 @@ class ReorderBuffer(Elaboratable):
 
         with m.If(commit_row):
             m.d.sync += [
-                rob_head.eq(_incr(rob_head, self.num_rob_rows)),
+                rob_head.eq(wrap_incr(rob_head, self.num_rob_rows)),
                 rob_head_lsb.eq(0),
             ]
             m.d.comb += do_deq.eq(1)
 
         with m.If(state_is_rollback & ((rob_tail != rob_head) | maybe_full)):
             m.d.sync += [
-                rob_tail.eq(_decr(rob_tail, self.num_rob_rows)),
+                rob_tail.eq(wrap_decr(rob_tail, self.num_rob_rows)),
                 rob_tail_lsb.eq(self.core_width - 1)
             ]
             m.d.comb += do_deq.eq(1)
@@ -376,13 +358,13 @@ class ReorderBuffer(Elaboratable):
         with m.Elif(self.br_update.br_res.mispredict):
             m.d.sync += [
                 rob_tail.eq(
-                    _incr(get_row(self.br_update.br_res.uop.rob_idx),
-                          self.num_rob_rows)),
+                    wrap_incr(get_row(self.br_update.br_res.uop.rob_idx),
+                              self.num_rob_rows)),
                 rob_tail_lsb.eq(0),
             ]
         with m.Elif((self.enq_valids != 0) & ~self.enq_partial_stalls):
             m.d.sync += [
-                rob_tail.eq(_incr(rob_tail, self.num_rob_rows)),
+                rob_tail.eq(wrap_incr(rob_tail, self.num_rob_rows)),
                 rob_tail_lsb.eq(0),
             ]
             m.d.comb += do_enq.eq(1)

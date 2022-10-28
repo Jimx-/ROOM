@@ -6,6 +6,7 @@ import riscvmodel.csrnames as csrnames
 from enum import IntEnum
 
 from room.csr import *
+from room.types import HasCoreParams
 
 
 class CoreInterrupts(Record):
@@ -142,10 +143,10 @@ dcsr_layout = [
 ]
 
 
-class ExceptionUnit(Elaboratable, AutoCSR):
+class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
     def __init__(self, params):
-        self.xlen = params['xlen']
+        HasCoreParams.__init__(self, params)
 
         self.interrupts = CoreInterrupts()
 

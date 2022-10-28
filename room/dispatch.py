@@ -1,13 +1,12 @@
 from amaranth import *
 
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 
 
-class Dispatcher(Elaboratable):
+class Dispatcher(HasCoreParams, Elaboratable):
 
     def __init__(self, params):
-        self.core_width = params['core_width']
-        self.issue_params = params['issue_params']
+        super().__init__(params)
 
         self.ren_valids = Signal(self.core_width)
         self.ren_uops = [
@@ -41,7 +40,7 @@ class Dispatcher(Elaboratable):
             rr &= qr
         m.d.comb += self.ready.eq(rr)
 
-        for (typ, q), iq, valids in zip(self.issue_params.items(),
+        for (typ, _), iq, valids in zip(self.issue_params.items(),
                                         self.dis_uops, self.dis_valids):
             for uop, iq_uop, rv, v in zip(self.ren_uops, iq, self.ren_valids,
                                           valids):

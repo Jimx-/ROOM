@@ -6,8 +6,7 @@ from enum import IntEnum
 
 from room.consts import *
 from room.alu import AMODataGen
-from room.core import HasCoreParams
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.lsu import LoadGen, StoreGen
 from room.utils import Valid, Decoupled, Arbiter, BranchKillableFIFO
@@ -20,7 +19,6 @@ class HasDCacheParams(HasCoreParams):
     def __init__(self, params):
         super().__init__(params)
 
-        self.mem_width = params['mem_width']
         dcache_params = params['dcache_params']
         self.n_sets = dcache_params['n_sets']
         self.n_ways = dcache_params['n_ways']

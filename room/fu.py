@@ -2,7 +2,7 @@ from amaranth import *
 from amaranth import tracer
 
 from room.consts import *
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.alu import ALU, Multiplier, IntDiv
@@ -29,13 +29,13 @@ class ExecReq:
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
-class ExecResp:
+class ExecResp(HasCoreParams):
 
     def __init__(self, data_width, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
-
-        self.vaddr_bits = params['vaddr_bits']
 
         self.uop = MicroOp(params, name=f'{name}_uop')
 
@@ -47,9 +47,11 @@ class ExecResp:
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
-class FunctionalUnit(Elaboratable):
+class FunctionalUnit(HasCoreParams, Elaboratable):
 
     def __init__(self, data_width, params, is_jmp=False, is_alu=False):
+        super().__init__(params)
+
         self.is_jmp = is_jmp
 
         self.req = Decoupled(ExecReq, data_width, params)
@@ -136,8 +138,6 @@ class PipelinedFunctionalUnit(FunctionalUnit):
 class ALUUnit(PipelinedFunctionalUnit):
 
     def __init__(self, data_width, params, is_jmp=False, num_stages=1):
-        self.xlen = params['xlen']
-
         super().__init__(num_stages,
                          data_width,
                          params,
@@ -444,9 +444,8 @@ class FPUUnit(PipelinedFunctionalUnit):
 
     def __init__(self, width, params):
         self.width = width
-        self.fma_latency = params['fma_latency']
 
-        super().__init__(self.fma_latency, width, params)
+        super().__init__(params['fma_latency'], width, params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)

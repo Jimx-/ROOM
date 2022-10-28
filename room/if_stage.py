@@ -5,9 +5,10 @@ from amaranth.lib.coding import PriorityEncoder
 from room.consts import *
 from room.rvc import RVCDecoder
 from room.id_stage import BranchDecoder
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.breakpoint import Breakpoint, BreakpointMatcher
 from room.icache import ICache
+from room.utils import wrap_incr
 
 
 class GetPCResp(Record):
@@ -36,33 +37,33 @@ class IFDebug(Record):
                          src_loc_at=1 + src_loc_at)
 
 
-class FetchBundle:
+class FetchBundle(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
-
-        fetch_width = params['fetch_width']
-        ftq_size = params['fetch_buffer_size']
 
         self.pc = Signal(32, name=f'{name}_pc')
         self.next_pc = Signal(32, name=f'{name}_next_pc')
         self.insts = [
-            Signal(32, name=f'{name}_inst{i}') for i in range(fetch_width)
+            Signal(32, name=f'{name}_inst{i}') for i in range(self.fetch_width)
         ]
         self.exp_insts = [
-            Signal(32, name=f'{name}_exp_inst{i}') for i in range(fetch_width)
+            Signal(32, name=f'{name}_exp_inst{i}')
+            for i in range(self.fetch_width)
         ]
-        self.mask = Signal(fetch_width)
+        self.mask = Signal(self.fetch_width)
 
         self.cfi_valid = Signal(name=f'{name}_cfi_valid')
-        self.cfi_idx = Signal(range(fetch_width), name=f'{name}_cfi_idx')
+        self.cfi_idx = Signal(range(self.fetch_width), name=f'{name}_cfi_idx')
         self.cfi_type = Signal(CFIType, name=f'{name}_cfi_type')
 
-        self.ftq_idx = Signal(range(ftq_size), name=f'{name}_ftq_size')
+        self.ftq_idx = Signal(range(self.ftq_size), name=f'{name}_ftq_size')
 
-        self.bp_exc_if = Signal(fetch_width, name=f'{name}_bp_exc_if')
-        self.bp_debug_if = Signal(fetch_width, name=f'{name}_bp_debug_if')
+        self.bp_exc_if = Signal(self.fetch_width, name=f'{name}_bp_exc_if')
+        self.bp_debug_if = Signal(self.fetch_width, name=f'{name}_bp_debug_if')
 
     def eq(self, rhs):
         ret = [
@@ -83,14 +84,14 @@ class FetchBundle:
         return ret
 
 
-class FetchBuffer(Elaboratable):
+class FetchBuffer(HasCoreParams, Elaboratable):
 
     def __init__(self, params, sim_debug=False):
+        super().__init__(params)
+
         self.sim_debug = sim_debug
-        self.params = params
-        self.fetch_width = params['fetch_width']
-        self.core_width = params['core_width']
-        self.depth = params['fetch_buffer_size']
+
+        self.depth = self.fetch_buffer_size
 
         self.w_data = FetchBundle(params)
         self.r_data = [
@@ -246,18 +247,10 @@ class FetchBuffer(Elaboratable):
         return m
 
 
-def _incr(signal, modulo):
-    if modulo == 2**len(signal):
-        return signal + 1
-    else:
-        return Mux(signal == modulo - 1, 0, signal + 1)
-
-
-class FetchTargetQueue(Elaboratable):
+class FetchTargetQueue(HasCoreParams, Elaboratable):
 
     def __init__(self, params):
-        self.ftq_size = params['fetch_buffer_size']
-        self.fetch_bytes = params['fetch_bytes']
+        super().__init__(params)
 
         self.w_data = FetchBundle(params)
         self.w_idx = Signal(range(self.ftq_size))
@@ -284,8 +277,8 @@ class FetchTargetQueue(Elaboratable):
         w_ptr = Signal(range(self.ftq_size), reset=1)
         deq_ptr = Signal(range(self.ftq_size))
 
-        full = (_incr(_incr(w_ptr, self.ftq_size), self.ftq_size)
-                == deq_ptr) | (_incr(w_ptr, self.ftq_size) == deq_ptr)
+        full = (wrap_incr(wrap_incr(w_ptr, self.ftq_size), self.ftq_size)
+                == deq_ptr) | (wrap_incr(w_ptr, self.ftq_size) == deq_ptr)
 
         pcs = Array(
             Signal(32 - pc_lsb_w, name=f'pc{i}') for i in range(self.ftq_size))
@@ -293,7 +286,7 @@ class FetchTargetQueue(Elaboratable):
         with m.If(self.w_en & self.w_rdy):
             m.d.sync += [
                 pcs[w_ptr].eq(self.w_data.pc >> pc_lsb_w),
-                w_ptr.eq(_incr(w_ptr, self.ftq_size)),
+                w_ptr.eq(wrap_incr(w_ptr, self.ftq_size)),
             ]
 
         m.d.comb += self.w_idx.eq(w_ptr)
@@ -304,10 +297,10 @@ class FetchTargetQueue(Elaboratable):
         m.d.comb += self.w_rdy.eq(~full)
 
         with m.If(self.redirect_valid):
-            m.d.sync += w_ptr.eq(_incr(self.redirect_idx, self.ftq_size))
+            m.d.sync += w_ptr.eq(wrap_incr(self.redirect_idx, self.ftq_size))
 
         for get_pc_idx, get_pc in zip(self.get_pc_idx, self.get_pc):
-            next_idx = _incr(get_pc_idx, self.ftq_size)
+            next_idx = wrap_incr(get_pc_idx, self.ftq_size)
             next_is_w = (next_idx == w_ptr) & self.w_en & self.w_rdy
 
             m.d.sync += [
@@ -322,22 +315,16 @@ class FetchTargetQueue(Elaboratable):
         return m
 
 
-class IFStage(Elaboratable):
+class IFStage(HasCoreParams, Elaboratable):
 
     def __init__(self, ibus, params, sim_debug=False):
+        super().__init__(params)
+
         self.ibus = ibus
-        self.params = params
         self.enable_icache = params.get('icache_params') is not None
         self.sim_debug = sim_debug
 
-        self.vaddr_bits = params['vaddr_bits_extended']
-        self.fetch_width = params['fetch_width']
-        self.fetch_bytes = params['fetch_bytes']
-        self.core_width = params['core_width']
-        self.fetch_buffer_size = params['fetch_buffer_size']
-        self.fetch_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
-        ftq_size = self.fetch_buffer_size
-        self.num_breakpoints = params['num_breakpoints']
+        self.fetch_addr_shift = Shape.cast(range(self.fetch_bytes)).width
 
         if not self.enable_icache:
             assert self.fetch_bytes * 8 == self.ibus.data_width
@@ -349,18 +336,18 @@ class IFStage(Elaboratable):
         self.fetch_packet_valid = Signal()
         self.fetch_packet_ready = Signal()
 
-        self.commit = Signal(range(ftq_size))
+        self.commit = Signal(range(self.ftq_size))
         self.commit_valid = Signal()
 
         self.get_pc_idx = [
-            Signal(ftq_size, name=f'get_pc_idx{i}') for i in range(2)
+            Signal(self.ftq_size, name=f'get_pc_idx{i}') for i in range(2)
         ]
         self.get_pc = [GetPCResp(name=f'get_pc{i}') for i in range(2)]
 
         self.redirect_valid = Signal()
         self.redirect_pc = Signal(32)
         self.redirect_flush = Signal()
-        self.redirect_ftq_idx = Signal(range(ftq_size))
+        self.redirect_ftq_idx = Signal(range(self.ftq_size))
 
         self.flush_icache = Signal()
 
@@ -587,8 +574,8 @@ class IFStage(Elaboratable):
                 inst1 = s3_data[0:32]
                 dec0 = RVCDecoder()
                 dec1 = RVCDecoder()
-                br_dec0 = BranchDecoder(self.vaddr_bits)
-                br_dec1 = BranchDecoder(self.vaddr_bits)
+                br_dec0 = BranchDecoder(self.vaddr_bits_extended)
+                br_dec1 = BranchDecoder(self.vaddr_bits_extended)
                 m.submodules += [dec0, dec1, br_dec0, br_dec1]
 
                 pc0 = f3_aligned_pc - 2
@@ -619,7 +606,7 @@ class IFStage(Elaboratable):
                 inst = Signal(32)
                 pc = f3_aligned_pc + (w * 2)
                 dec = RVCDecoder()
-                br_dec = BranchDecoder(self.vaddr_bits)
+                br_dec = BranchDecoder(self.vaddr_bits_extended)
                 m.submodules += [dec, br_dec]
 
                 m.d.comb += [

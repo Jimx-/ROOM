@@ -1,42 +1,49 @@
 from amaranth import *
 from amaranth.utils import log2_int
 
+from room.types import HasCoreParams
 from room.utils import Valid, Decoupled
 
 
-class ICacheReq(Record):
+class HasICacheParams(HasCoreParams):
 
-    def __init__(self, params, name=None, src_loc_at=0):
-        vaddr_bits = params['vaddr_bits_extended']
+    def __init__(self, params):
+        super().__init__(params)
 
-        super().__init__([
-            ('addr', vaddr_bits),
-        ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
-
-
-class ICacheResp(Record):
-
-    def __init__(self, params, name=None, src_loc_at=0):
-        fetch_bytes = params['fetch_bytes']
-
-        super().__init__([
-            ('data', fetch_bytes * 8),
-        ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
-
-
-class ICache(Elaboratable):
-
-    def __init__(self, ibus, params):
         icache_params = params['icache_params']
         self.n_sets = icache_params['n_sets']
         self.n_ways = icache_params['n_ways']
         self.block_bytes = icache_params['block_bytes']
-        self.fetch_bytes = params['fetch_bytes']
-        self.params = params
+
+
+class ICacheReq(HasCoreParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('addr', self.vaddr_bits_extended),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
+class ICacheResp(HasCoreParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('data', self.fetch_bytes * 8),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
+class ICache(HasICacheParams, Elaboratable):
+
+    def __init__(self, ibus, params):
+        super().__init__(params)
 
         self.ibus = ibus
 

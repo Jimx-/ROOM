@@ -2,12 +2,14 @@ from amaranth import *
 from amaranth import tracer
 
 from room.consts import *
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 
 
-class BranchResolution:
+class BranchResolution(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
@@ -18,7 +20,7 @@ class BranchResolution:
         self.taken = Signal(name=f'{name}_taken')
         self.pc_sel = Signal(PCSel, name=f'{name}_pc_sel')
         self.target_offset = Signal(signed(32), name=f'{name}_target_offset')
-        self.jalr_target = Signal(params['vaddr_bits_extended'],
+        self.jalr_target = Signal(self.vaddr_bits_extended,
                                   name=f'{name}_jalr_target')
 
     def eq(self, rhs):
@@ -35,16 +37,17 @@ class BranchResolution:
         return [getattr(self, n).eq(getattr(rhs, n)) for n in names]
 
 
-class BranchUpdate:
+class BranchUpdate(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        max_br_count = params['max_br_count']
-
-        self.resolve_mask = Signal(max_br_count, name=f'{name}_resolve_mask')
-        self.mispredict_mask = Signal(max_br_count,
+        self.resolve_mask = Signal(self.max_br_count,
+                                   name=f'{name}_resolve_mask')
+        self.mispredict_mask = Signal(self.max_br_count,
                                       name=f'{name}_mispredict_mask')
 
         ###
@@ -65,11 +68,10 @@ class BranchUpdate:
         return self.br_mask_killed(uop.br_mask)
 
 
-class BranchMaskAllocator(Elaboratable):
+class BranchMaskAllocator(HasCoreParams, Elaboratable):
 
     def __init__(self, params):
-        self.core_width = params['core_width']
-        self.max_br_count = params['max_br_count']
+        super().__init__(params)
 
         self.is_branch = Signal(self.core_width)
         self.reqs = Signal(self.core_width)

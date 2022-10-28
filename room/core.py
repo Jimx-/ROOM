@@ -3,7 +3,7 @@ from amaranth.utils import log2_int
 
 from room.consts import *
 from room.fu import ExecResp
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 
 from room.if_stage import IFStage, IFDebug
 from room.id_stage import DecodeStage, IDDebug
@@ -19,33 +19,24 @@ from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts
 from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
-from room.utils import Arbiter, Valid, Decoupled
+from room.utils import Arbiter, Valid
 
 from roomsoc.interconnect import wishbone
 
 
-class HasCoreParams:
-
-    def __init__(self, params):
-        self.params = params
-
-        self.xlen = params['xlen']
-
-
-class WritebackDebug(Record):
+class WritebackDebug(HasCoreParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
-        xlen = params['xlen']
-        num_pregs = params['num_pregs']
+        HasCoreParams.__init__(self, params)
 
-        super().__init__([
+        Record.__init__(self, [
             ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
-            ('pdst', range(num_pregs)),
-            ('data', xlen),
+            ('pdst', range(self.num_pregs)),
+            ('data', self.xlen),
         ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
 
 
 class CommitDebug(Record):
@@ -59,23 +50,20 @@ class CommitDebug(Record):
                          src_loc_at=1 + src_loc_at)
 
 
-class CoreDebug:
+class CoreDebug(HasCoreParams):
 
     def __init__(self, params):
-        fetch_width = params['fetch_width']
-        core_width = params['fetch_width']
-        max_br_count = params['max_br_count']
+        super().__init__(params)
 
-        issue_params = params['issue_params']
-        mem_width = params['mem_width']
-        int_width = issue_params[IssueQueueType.INT]['issue_width']
+        int_width = self.issue_params[IssueQueueType.INT]['issue_width']
 
         self.if_debug = [
-            IFDebug(name=f'if_debug{i}') for i in range(fetch_width)
+            IFDebug(name=f'if_debug{i}') for i in range(self.fetch_width)
         ]
 
         self.id_debug = [
-            IDDebug(params, name=f'id_debug{i}') for i in range(core_width)
+            IDDebug(params, name=f'id_debug{i}')
+            for i in range(self.core_width)
         ]
 
         self.ex_debug = [
@@ -83,20 +71,22 @@ class CoreDebug:
         ]
 
         self.mem_debug = [
-            LSUDebug(params, name=f'mem_debug{i}') for i in range(mem_width)
+            LSUDebug(params, name=f'mem_debug{i}')
+            for i in range(self.mem_width)
         ]
 
         self.wb_debug = [
             WritebackDebug(params, name=f'wb_debug{i}')
-            for i in range(mem_width + int_width)
+            for i in range(self.mem_width + int_width)
         ]
 
         self.commit_debug = [
-            CommitDebug(name=f'commit_debug{i}') for i in range(core_width)
+            CommitDebug(name=f'commit_debug{i}')
+            for i in range(self.core_width)
         ]
 
-        self.branch_resolve = Signal(max_br_count)
-        self.branch_mispredict = Signal(max_br_count)
+        self.branch_resolve = Signal(self.max_br_count)
+        self.branch_mispredict = Signal(self.max_br_count)
         self.flush_pipeline = Signal()
 
     def eq(self, rhs):
@@ -129,19 +119,18 @@ class CoreDebug:
         return ret
 
 
-class Core(Elaboratable):
+class Core(HasCoreParams, Elaboratable):
 
     def __init__(self, params, sim_debug=False):
-        self.params = params
-        self.xlen = params['xlen']
-        self.core_width = params['core_width']
+        super().__init__(params)
+
         self.sim_debug = sim_debug
 
         self.interrupts = CoreInterrupts()
         self.debug_entry = Signal(32)
 
-        ibus_addr_shift = Shape.cast(range(params['fetch_bytes'])).width
-        self.ibus = wishbone.Interface(data_width=params['fetch_width'] * 16,
+        ibus_addr_shift = Shape.cast(range(self.fetch_bytes)).width
+        self.ibus = wishbone.Interface(data_width=self.fetch_width * 16,
                                        addr_width=32 - ibus_addr_shift,
                                        granularity=8,
                                        name='ibus')
@@ -156,26 +145,8 @@ class Core(Elaboratable):
         if sim_debug:
             self.core_debug = CoreDebug(params)
 
-    @staticmethod
-    def validate_params(params):
-        xlen = params['xlen']
-        vaddr_bits = params['vaddr_bits']
-        params['vaddr_bits_extended'] = vaddr_bits + (vaddr_bits < xlen)
-
-        params['fetch_bytes'] = params['fetch_width'] << 1
-        params['mem_width'] = params['issue_params'][
-            IssueQueueType.MEM]['issue_width']
-
-        params['num_pregs'] = max(params['num_int_pregs'],
-                                  params['num_fp_pregs'])
-
-        return params
-
     def elaborate(self, platform):
         m = Module()
-
-        mem_width = self.params['mem_width']
-        use_fpu = self.params['use_fpu']
 
         csr = m.submodules.csr = CSRFile(self.params, width=self.xlen)
 
@@ -201,7 +172,7 @@ class Core(Elaboratable):
         # Floating point pipeline
         #
 
-        if use_fpu:
+        if self.use_fpu:
             fp_pipeline = m.submodules.fp_pipeline = FPPipeline(
                 self.params, sim_debug=self.sim_debug)
 
@@ -258,20 +229,20 @@ class Core(Elaboratable):
         exec_units = m.submodules.exec_units = ExecUnits(
             False, self.params, sim_debug=self.sim_debug)
 
-        num_int_iss_wakeup_ports = exec_units.irf_write_ports + mem_width
+        num_int_iss_wakeup_ports = exec_units.irf_write_ports + self.mem_width
         num_int_ren_wakeup_ports = num_int_iss_wakeup_ports
-        num_fp_wakeup_ports = len(fp_pipeline.wakeups) if use_fpu else 0
+        num_fp_wakeup_ports = len(fp_pipeline.wakeups) if self.use_fpu else 0
 
         ren_stage = m.submodules.rename_stage = RenameStage(
-            num_pregs=self.params['num_int_pregs'],
+            num_pregs=self.num_int_pregs,
             num_wakeup_ports=num_int_ren_wakeup_ports,
             is_float=False,
             params=self.params)
 
         fp_ren_stage = None
-        if use_fpu:
+        if self.use_fpu:
             fp_ren_stage = m.submodules.fp_rename_stage = RenameStage(
-                num_pregs=self.params['num_fp_pregs'],
+                num_pregs=self.num_fp_pregs,
                 num_wakeup_ports=num_fp_wakeup_ports,
                 is_float=True,
                 params=self.params)
@@ -286,7 +257,7 @@ class Core(Elaboratable):
             ren_stage.br_update.eq(br_update),
         ]
 
-        if use_fpu:
+        if self.use_fpu:
             for a, b in zip(fp_ren_stage.dec_uops, dec_stage.uops):
                 m.d.comb += a.eq(b)
             m.d.comb += [
@@ -308,7 +279,7 @@ class Core(Elaboratable):
         dispatcher = m.submodules.dispatcher = Dispatcher(self.params)
 
         issue_units = dict()
-        for typ, qp in self.params['issue_params'].items():
+        for typ, qp in self.issue_params.items():
             if typ != IssueQueueType.FP:
                 iq = IssueUnit(qp['issue_width'], qp['num_entries'],
                                qp['dispatch_width'], num_int_iss_wakeup_ports,
@@ -334,7 +305,7 @@ class Core(Elaboratable):
         for w in range(self.core_width):
             i_uop = ren_stage.ren2_uops[w]
             f_uop = fp_ren_stage.ren2_uops[
-                w] if use_fpu else ren_stage.ren2_uops[w]
+                w] if self.use_fpu else ren_stage.ren2_uops[w]
 
             m.d.comb += [
                 dis_uops[w].prs1.eq(
@@ -366,8 +337,9 @@ class Core(Elaboratable):
                         & f_uop.prs2_busy)),
                 dis_uops[w].prs3_busy.eq(dis_uops[w].frs3_en
                                          & f_uop.prs3_busy),
-                ren_stalls[w].eq(ren_stage.stalls[w]
-                                 | (fp_ren_stage.stalls[w] if use_fpu else 0)),
+                ren_stalls[w].eq(
+                    ren_stage.stalls[w]
+                    | (fp_ren_stage.stalls[w] if self.use_fpu else 0)),
             ]
 
         rob_ready = Signal()
@@ -421,7 +393,7 @@ class Core(Elaboratable):
         #
 
         rob = m.submodules.rob = ReorderBuffer(
-            exec_units.irf_write_ports + mem_width + num_fp_wakeup_ports,
+            exec_units.irf_write_ports + self.mem_width + num_fp_wakeup_ports,
             self.params)
         rob_flush_d1 = Record(rob.flush.layout)
         m.d.sync += rob_flush_d1.eq(rob.flush)
@@ -446,7 +418,7 @@ class Core(Elaboratable):
         ]
 
         m.d.comb += ren_stage.commit.eq(rob.commit_req)
-        if use_fpu:
+        if self.use_fpu:
             m.d.comb += fp_ren_stage.commit.eq(rob.commit_req)
 
         for w, dis_uop in enumerate(dis_uops):
@@ -528,7 +500,7 @@ class Core(Elaboratable):
                                      | rob.commit_exc.valid),
         ]
 
-        if use_fpu:
+        if self.use_fpu:
             m.d.comb += [
                 fp_pipeline.br_update.eq(br_update),
                 fp_pipeline.flush_pipeline.eq(rob_flush_d1.valid),
@@ -562,11 +534,12 @@ class Core(Elaboratable):
         # Issue queue
         #
 
-        for (typ, qp), duops, dvalids, dready in zip(
-                self.params['issue_params'].items(), dispatcher.dis_uops,
-                dispatcher.dis_valids, dispatcher.iq_ready):
+        for (typ, qp), duops, dvalids, dready in zip(self.issue_params.items(),
+                                                     dispatcher.dis_uops,
+                                                     dispatcher.dis_valids,
+                                                     dispatcher.iq_ready):
             if typ == IssueQueueType.FP:
-                if use_fpu:
+                if self.use_fpu:
                     for quop, duop in zip(fp_pipeline.dis_uops, duops):
                         m.d.comb += quop.eq(duop)
 
@@ -591,8 +564,9 @@ class Core(Elaboratable):
         # Wakeup (issue & rename)
         #
 
-        mem_wbarb = m.submodules.mem_wbarb = Arbiter(1 + use_fpu, ExecResp,
-                                                     self.xlen, self.params)
+        mem_wbarb = m.submodules.mem_wbarb = Arbiter(1 + self.use_fpu,
+                                                     ExecResp, self.xlen,
+                                                     self.params)
 
         m.d.comb += lsu.exec_iresps[0].connect(mem_wbarb.inp[0])
 
@@ -614,7 +588,7 @@ class Core(Elaboratable):
         int_iss_wakeups.append(arb_wakeup)
         int_ren_wakeups.append(arb_wakeup)
 
-        for w in range(1, mem_width):
+        for w in range(1, self.mem_width):
             resp = lsu.exec_iresps[w]
 
             wakeup = Valid(ExecResp,
@@ -630,7 +604,7 @@ class Core(Elaboratable):
             int_iss_wakeups.append(wakeup)
             int_ren_wakeups.append(wakeup)
 
-        for i, eu in enumerate(exec_units, mem_width):
+        for i, eu in enumerate(exec_units, self.mem_width):
             if eu.irf_write:
                 resp = eu.iresp
 
@@ -658,7 +632,7 @@ class Core(Elaboratable):
                     iwp.bits.pdst.eq(wu.bits.uop.pdst),
                 ]
 
-        if use_fpu:
+        if self.use_fpu:
             for rwp, wu in zip(fp_ren_stage.wakeup_ports, fp_pipeline.wakeups):
                 m.d.comb += rwp.eq(wu)
 
@@ -674,9 +648,7 @@ class Core(Elaboratable):
         iss_uops = []
         iss_fu_types = []
         iss_valids = Signal(
-            sum([
-                p['issue_width'] for p in self.params['issue_params'].values()
-            ]))
+            sum([p['issue_width'] for p in self.issue_params.values()]))
         for iq in iqs_mem_int:
             iss_uops.extend(iq.iss_uops)
             iss_fu_types.extend(iq.fu_types)
@@ -684,14 +656,13 @@ class Core(Elaboratable):
 
         iregfile = m.submodules.iregfile = RegisterFile(
             rports=exec_units.irf_read_ports,
-            wports=exec_units.irf_write_ports + mem_width,
-            num_regs=self.params['num_int_pregs'],
+            wports=exec_units.irf_write_ports + self.mem_width,
+            num_regs=self.num_int_pregs,
             data_width=self.xlen)
 
         iregread = m.submodules.iregread = RegisterRead(
-            issue_width=sum([
-                p['issue_width'] for p in self.params['issue_params'].values()
-            ]),
+            issue_width=sum(
+                [p['issue_width'] for p in self.issue_params.values()]),
             num_rports=exec_units.irf_read_ports,
             rports_array=[2] * exec_units.irf_readers,
             reg_width=self.xlen,
@@ -816,7 +787,7 @@ class Core(Elaboratable):
             rob.lsu_exc.eq(lsu.lsu_exc),
         ]
 
-        if use_fpu:
+        if self.use_fpu:
             m.d.comb += fp_pipeline.to_lsu.connect(lsu.fp_std)
 
         if self.sim_debug:
@@ -827,10 +798,8 @@ class Core(Elaboratable):
         # Branch resolution
         #
 
-        max_br_count = self.params['max_br_count']
-
-        resolve_mask = Const(0, max_br_count)
-        mispredict_mask = Const(0, max_br_count)
+        resolve_mask = Const(0, self.max_br_count)
+        mispredict_mask = Const(0, self.max_br_count)
         for br_res in br_infos:
             resolve_mask |= (br_res.valid << br_res.uop.br_tag)
             mispredict_mask |= (
@@ -904,8 +873,8 @@ class Core(Elaboratable):
             ]
 
         for i, (wp, iresp) in enumerate(
-                zip(iregfile.write_ports[1:mem_width], lsu.exec_iresps[1:]),
-                1):
+                zip(iregfile.write_ports[1:self.mem_width],
+                    lsu.exec_iresps[1:]), 1):
             m.d.comb += [
                 wp.valid.eq(iresp.valid & iresp.bits.uop.rf_wen()
                             & (iresp.bits.uop.dst_rtype == RegisterType.FIX)),
@@ -925,7 +894,7 @@ class Core(Elaboratable):
 
         for i, (eu, wp) in enumerate(
                 zip([eu for eu in exec_units if eu.irf_write],
-                    iregfile.write_ports[mem_width:]), mem_width):
+                    iregfile.write_ports[self.mem_width:]), self.mem_width):
             m.d.comb += [
                 wp.valid.eq(eu.iresp.valid & eu.iresp.bits.uop.rf_wen()
                             &
@@ -950,7 +919,7 @@ class Core(Elaboratable):
                     wb_debug.data.eq(wp.bits.data),
                 ]
 
-        if use_fpu:
+        if self.use_fpu:
             for wp, fresp in zip(fp_pipeline.mem_wb_ports, lsu.exec_fresps):
                 m.d.comb += fresp.connect(wp)
 
@@ -965,17 +934,17 @@ class Core(Elaboratable):
 
         m.d.comb += rob.wb_resps[0].eq(mem_wbarb.out)
 
-        for rob_wb, iresp in zip(rob.wb_resps[1:mem_width],
+        for rob_wb, iresp in zip(rob.wb_resps[1:self.mem_width],
                                  lsu.exec_iresps[1:]):
             m.d.comb += rob_wb.eq(iresp)
 
-        for rob_wb, eu in zip(rob.wb_resps[mem_width:],
+        for rob_wb, eu in zip(rob.wb_resps[self.mem_width:],
                               [eu for eu in exec_units if eu.irf_write]):
             m.d.comb += rob_wb.eq(eu.iresp)
 
-        if use_fpu:
+        if self.use_fpu:
             for rob_wb, fresp in zip(
-                    rob.wb_resps[mem_width + exec_units.irf_write_ports:],
+                    rob.wb_resps[self.mem_width + exec_units.irf_write_ports:],
                     fp_pipeline.wakeups):
                 m.d.comb += rob_wb.eq(fresp)
 

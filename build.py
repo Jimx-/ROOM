@@ -91,7 +91,7 @@ class Top(Elaboratable):
 
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
-        core = Core(Core.validate_params(core_params))
+        core = Core(core_params)
 
         debug_module = DebugModule(self.debug_rom_image)
         m.d.comb += [

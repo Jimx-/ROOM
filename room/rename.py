@@ -2,7 +2,7 @@ from amaranth import *
 from amaranth.lib.coding import PriorityEncoder, Decoder
 
 from room.consts import *
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.rob import CommitReq
 from room.fu import ExecResp
@@ -44,25 +44,26 @@ class RemapReq(Record):
                          src_loc_at=1 + src_loc_at)
 
 
-class MapTable(Elaboratable):
+class MapTable(HasCoreParams, Elaboratable):
 
-    def __init__(self, core_width, num_lregs, num_pregs, max_br_count,
-                 is_float, params):
-        self.core_width = core_width
+    def __init__(self, num_lregs, num_pregs, is_float, params):
+        super().__init__(params)
+
         self.num_lregs = num_lregs
         self.num_pregs = num_pregs
-        self.max_br_count = max_br_count
         self.is_float = is_float
 
         self.map_reqs = [
-            MapReq(num_lregs, name=f'map_req{i}') for i in range(core_width)
+            MapReq(num_lregs, name=f'map_req{i}')
+            for i in range(self.core_width)
         ]
         self.map_resps = [
-            MapResp(num_pregs, name=f'map_resp{i}') for i in range(core_width)
+            MapResp(num_pregs, name=f'map_resp{i}')
+            for i in range(self.core_width)
         ]
         self.remap_reqs = [
             RemapReq(num_lregs, num_pregs, name=f'remap_req{i}')
-            for i in range(core_width)
+            for i in range(self.core_width)
         ]
 
         self.ren_br_valids = Signal(self.core_width)
@@ -130,26 +131,26 @@ class MapTable(Elaboratable):
         return m
 
 
-class Freelist(Elaboratable):
+class Freelist(HasCoreParams, Elaboratable):
 
-    def __init__(self, core_width, num_pregs, max_br_count, params):
-        self.core_width = core_width
+    def __init__(self, num_pregs, params):
+        super().__init__(params)
+
         self.num_pregs = num_pregs
-        self.max_br_count = max_br_count
 
-        self.reqs = Signal(core_width)
+        self.reqs = Signal(self.core_width)
         self.alloc_pregs = [
             Signal(range(num_pregs), name=f'alloc_preg{i}')
-            for i in range(core_width)
+            for i in range(self.core_width)
         ]
-        self.alloc_valids = [Signal() for _ in range(core_width)]
+        self.alloc_valids = [Signal() for _ in range(self.core_width)]
 
         self.dealloc_pregs = [
             Signal(range(num_pregs), name=f'dealloc_preg{i}')
-            for i in range(core_width)
+            for i in range(self.core_width)
         ]
         self.dealloc_valids = [
-            Signal(name=f'dealloc_valid{i}') for i in range(core_width)
+            Signal(name=f'dealloc_valid{i}') for i in range(self.core_width)
         ]
 
         self.ren_br_valids = Signal(self.core_width)
@@ -267,10 +268,11 @@ class BusyResp(Record):
                          src_loc_at=1 + src_loc_at)
 
 
-class BusyTable(Elaboratable):
+class BusyTable(HasCoreParams, Elaboratable):
 
     def __init__(self, num_pregs, num_wakeup_ports, is_float, params):
-        self.core_width = params['core_width']
+        super().__init__(params)
+
         self.num_pregs = num_pregs
         self.is_float = is_float
 
@@ -331,12 +333,11 @@ class BusyTable(Elaboratable):
         return m
 
 
-class RenameStage(Elaboratable):
+class RenameStage(HasCoreParams, Elaboratable):
 
     def __init__(self, num_pregs, num_wakeup_ports, is_float, params):
-        self.params = params
-        self.core_width = params['core_width']
-        self.max_br_count = params['max_br_count']
+        super().__init__(params)
+
         self.num_pregs = num_pregs
         self.num_wakeup_ports = num_wakeup_ports
         self.is_float = is_float
@@ -358,15 +359,13 @@ class RenameStage(Elaboratable):
         self.ren2_mask = Signal(self.core_width)
 
         self.wakeup_ports = [
-            Valid(ExecResp,
-                  params['xlen'],
-                  self.params,
-                  name=f'wakeup_port{i}') for i in range(self.num_wakeup_ports)
+            Valid(ExecResp, self.xlen, self.params, name=f'wakeup_port{i}')
+            for i in range(self.num_wakeup_ports)
         ]
 
         self.br_update = BranchUpdate(params)
 
-        self.commit = CommitReq(self.params)
+        self.commit = CommitReq(params)
 
         self.stalls = Signal(self.core_width)
 
@@ -491,14 +490,10 @@ class RenameStage(Elaboratable):
                                      & ren2_uops[w].allocate_brtag()),
             ]
 
-        map_table = m.submodules.map_table = MapTable(self.core_width, 32,
-                                                      self.num_pregs,
-                                                      self.max_br_count,
+        map_table = m.submodules.map_table = MapTable(32, self.num_pregs,
                                                       self.is_float,
                                                       self.params)
-        freelist = m.submodules.freelist = Freelist(self.core_width,
-                                                    self.num_pregs,
-                                                    self.max_br_count,
+        freelist = m.submodules.freelist = Freelist(self.num_pregs,
                                                     self.params)
         busy_table = m.submodules.busy_table = BusyTable(
             self.num_pregs, self.num_wakeup_ports, self.is_float, self.params)

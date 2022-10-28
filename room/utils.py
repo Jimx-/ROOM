@@ -2,7 +2,22 @@ from amaranth import *
 from amaranth import tracer
 
 from room.consts import *
+from room.types import HasCoreParams
 from room.branch import BranchUpdate
+
+
+def wrap_incr(signal, modulo):
+    if modulo == 2**len(signal):
+        return (signal + 1)[:len(signal)]
+    else:
+        return Mux(signal == modulo - 1, 0, signal + 1)
+
+
+def wrap_decr(signal, modulo):
+    if modulo == 2**len(signal):
+        return (signal - 1)[:len(signal)]
+    else:
+        return Mux(signal == 0, modulo - 1, signal - 1)
 
 
 def generate_imm(ip, sel):
@@ -73,14 +88,7 @@ class Decoupled:
         return stmts
 
 
-def _incr(signal, modulo):
-    if modulo == 2**len(signal):
-        return (signal + 1)[:len(signal)]
-    else:
-        return Mux(signal == modulo - 1, 0, signal + 1)
-
-
-class BranchKillableFIFO(Elaboratable):
+class BranchKillableFIFO(HasCoreParams, Elaboratable):
 
     def __init__(self,
                  entries,
@@ -90,9 +98,10 @@ class BranchKillableFIFO(Elaboratable):
                  flow=True,
                  flush_fn=None,
                  **kwargs):
+        super().__init__(params)
+
         self.entries = entries
         self.flow = flow
-        max_br_count = params['max_br_count']
 
         if flush_fn is None:
             flush_fn = lambda _: 1
@@ -103,12 +112,12 @@ class BranchKillableFIFO(Elaboratable):
         self.kwargs = kwargs
 
         self.w_data = cls(*args, **kwargs)
-        self.w_br_mask = Signal(max_br_count)
+        self.w_br_mask = Signal(self.max_br_count)
         self.w_en = Signal()
         self.w_rdy = Signal()
 
         self.r_data = cls(*args, **kwargs)
-        self.r_br_mask = Signal(max_br_count)
+        self.r_br_mask = Signal(self.max_br_count)
         self.r_en = Signal()
         self.r_rdy = Signal()
 
@@ -157,7 +166,7 @@ class BranchKillableFIFO(Elaboratable):
                 br_masks[w_ptr].eq(
                     self.br_update.get_new_br_mask(self.w_br_mask)),
                 valids[w_ptr].eq(1),
-                w_ptr.eq(_incr(w_ptr, self.entries)),
+                w_ptr.eq(wrap_incr(w_ptr, self.entries)),
             ]
 
             for i in range(self.entries):
@@ -167,7 +176,7 @@ class BranchKillableFIFO(Elaboratable):
         with m.If(do_deq):
             m.d.sync += [
                 valids[r_ptr].eq(0),
-                r_ptr.eq(_incr(r_ptr, self.entries)),
+                r_ptr.eq(wrap_incr(r_ptr, self.entries)),
             ]
 
         with m.If(do_enq ^ do_deq):

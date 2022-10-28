@@ -2,7 +2,7 @@ from amaranth import *
 from amaranth.hdl.rec import DIR_FANIN, DIR_FANOUT
 
 from room.consts import *
-from room.types import MicroOp
+from room.types import HasCoreParams, MicroOp
 from room.fu import ExecReq
 from room.branch import BranchUpdate
 from room.utils import Decoupled
@@ -349,12 +349,13 @@ class RegReadDecoder(Elaboratable):
         return m
 
 
-class RegisterRead(Elaboratable):
+class RegisterRead(HasCoreParams, Elaboratable):
 
     def __init__(self, issue_width, num_rports, rports_array, reg_width,
                  params):
+        super().__init__(params)
+
         self.issue_width = issue_width
-        self.params = params
         self.rports_array = rports_array
         self.data_width = reg_width
 
@@ -364,7 +365,7 @@ class RegisterRead(Elaboratable):
         self.iss_valids = Signal(issue_width)
 
         self.read_ports = [
-            RFReadPort(Shape.cast(range(params['num_pregs'])).width,
+            RFReadPort(Shape.cast(range(self.num_pregs)).width,
                        self.data_width,
                        name=f'read_port{i}') for i in range(num_rports)
         ]
