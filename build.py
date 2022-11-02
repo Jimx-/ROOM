@@ -60,6 +60,7 @@ core_params = dict(
     use_fpu=True,
     flen=64,
     fma_latency=4,
+    io_regions={0x80000000: 0x80000000},
 )
 
 
@@ -92,6 +93,7 @@ class Top(Elaboratable):
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
         core = Core(core_params)
+        soc.add_cpu(core)
 
         debug_module = DebugModule(self.debug_rom_image)
         m.d.comb += [
@@ -116,8 +118,6 @@ class Top(Elaboratable):
                     init=self.ram_image)
 
         soc.add_controller()
-
-        soc.add_cpu(core)
 
         soc.add_peripheral('uart', self.uart)
         soc.add_peripheral('sdc', self.sdc)

@@ -60,6 +60,7 @@ class Instruction:
         self.data = 0
 
     def commit(self, table):
+        uop_id = f'{self.uop_id:x}'
         pc = f'{self.pc:x}'
 
         inst = f'{self.inst:032b}'
@@ -276,8 +277,8 @@ class Instruction:
         if illegal_insn:
             inst_text = Text(hex(self.inst), style='red')
 
-        table.add_row(pc, inst_text, note_text)
-        return (pc, inst_text, note_text)
+        table.add_row(uop_id, pc, inst_text, note_text)
+        return (uop_id, pc, inst_text, note_text)
 
 
 class TraceParser:
@@ -290,6 +291,7 @@ class TraceParser:
 
         table = Table(title='Instruction trace')
 
+        table.add_column('ID')
         table.add_column('PC', justify='right', style='cyan', no_wrap=True)
         table.add_column('Instruction')
         table.add_column('Note')
@@ -399,9 +401,9 @@ class TraceParser:
                 if inst is None:
                     raise ValueError(f'Micro-op {id} not found')
 
-                pc, uop, note = inst.commit(table)
+                uop_id, pc, uop, note = inst.commit(table)
                 if csv_file is not None:
-                    csv_file.write(f'"{pc}","{uop}","{note}"\n')
+                    csv_file.write(f'"{uop_id}","{pc}","{uop}","{note}"\n')
 
                 self.insts.pop(id)
 

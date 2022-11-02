@@ -128,6 +128,8 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
 
         self.flush = CommitExceptionReq(params)
 
+        self.commit_load_at_head = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -172,6 +174,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
 
         rob_head_valids = Signal(self.core_width)
         rob_head_busy = Signal(self.core_width)
+        rob_head_uses_ldq = Signal(self.core_width)
 
         for w in range(self.core_width):
             rob_valid = Array(
@@ -243,8 +246,11 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
             with m.If(will_commit[w]):
                 m.d.sync += rob_valid[rob_head].eq(0)
 
-            m.d.comb += rob_head_valids[w].eq(rob_valid[rob_head])
-            m.d.comb += rob_head_busy[w].eq(rob_busy[rob_head])
+            m.d.comb += [
+                rob_head_valids[w].eq(rob_valid[rob_head]),
+                rob_head_busy[w].eq(rob_busy[rob_head]),
+                rob_head_uses_ldq[w].eq(rob_uop[rob_head].uses_ldq),
+            ]
 
         exception_thrown = Signal()
         exception_thrown_d1 = Signal()
@@ -408,5 +414,12 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
             self.ready.eq(state_is_normal & ~full),
             self.empty.eq(empty),
         ]
+
+        commit_head_uses_ldq = Signal()
+        for w in reversed(range(self.core_width)):
+            with m.If(rob_head_valids[w]):
+                m.d.comb += commit_head_uses_ldq.eq(rob_head_uses_ldq[w])
+        m.d.sync += self.commit_load_at_head.eq(commit_head_uses_ldq
+                                                & (will_commit == 0))
 
         return m

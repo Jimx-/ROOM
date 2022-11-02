@@ -126,7 +126,8 @@ class PipelinedFunctionalUnit(FunctionalUnit):
             m.d.comb += [
                 self.resp.valid.eq(
                     self.req.valid
-                    & ~self.br_update.uop_killed(self.req.bits.uop)),
+                    & ~self.br_update.uop_killed(self.req.bits.uop)
+                    & ~self.req.bits.kill),
                 self.resp.bits.uop.eq(self.req.bits.uop),
                 self.resp.bits.uop.br_mask.eq(
                     self.br_update.get_new_br_mask(self.req.bits.uop.br_mask)),
@@ -297,10 +298,15 @@ class AddrGenUnit(PipelinedFunctionalUnit):
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
+        sum = self.req.bits.rs1_data.as_signed(
+        ) + self.req.bits.uop.imm_packed[8:20].as_signed()
+        ea_sign = Mux(sum[self.vaddr_bits - 1],
+                      ~sum[self.vaddr_bits:self.xlen] == 0,
+                      sum[self.vaddr_bits:self.xlen] != 0)
+        eff_addr = Cat(sum[:self.vaddr_bits], ea_sign).as_unsigned()
+
         m.d.comb += [
-            self.resp.bits.addr.eq(
-                self.req.bits.rs1_data +
-                self.req.bits.uop.imm_packed[8:20].as_signed()),
+            self.resp.bits.addr.eq(eff_addr),
             self.resp.bits.data.eq(self.req.bits.rs2_data),
         ]
 

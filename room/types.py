@@ -17,6 +17,8 @@ class HasCoreParams:
         self.vaddr_bits_extended = self.vaddr_bits + (self.vaddr_bits <
                                                       self.xlen)
 
+        self.io_regions = params['io_regions']
+
         #
         # Instruction fetch
         #

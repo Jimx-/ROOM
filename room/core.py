@@ -745,10 +745,10 @@ class Core(HasCoreParams, Elaboratable):
         jmp_pc_req = Signal.like(iss_uops[0].ftq_idx)
         jmp_pc_valid = Signal()
 
-        with m.If(jmp_pc_valid):
-            m.d.comb += if_stage.get_pc_idx[0].eq(jmp_pc_req)
-        with m.Elif(rob.flush.valid):
+        with m.If(rob.flush.valid):
             m.d.comb += if_stage.get_pc_idx[0].eq(rob.flush.ftq_idx)
+        with m.Elif(jmp_pc_valid):
+            m.d.comb += if_stage.get_pc_idx[0].eq(jmp_pc_req)
 
         for eu, iss_uop, iss_valid in zip(exec_units, iss_uops, iss_valids):
             if not eu.has_jmp_unit: continue
@@ -785,6 +785,7 @@ class Core(HasCoreParams, Elaboratable):
             lsu.br_update.eq(br_update),
             lsu.exception.eq(rob_flush_d1.valid),
             rob.lsu_exc.eq(lsu.lsu_exc),
+            lsu.commit_load_at_head.eq(rob.commit_load_at_head),
         ]
 
         if self.use_fpu:

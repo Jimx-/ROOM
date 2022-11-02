@@ -17,8 +17,6 @@ void serial_putc(char c)
 
     mmio_write32((void*)UART_DATA_ADDRESS, (unsigned int)c);
 
-    __asm__ __volatile__ ("fence o,io" : : : "memory");
-
     for (;;) {
         status = mmio_read32((void*)UART_STATUS_ADDRESS);
 

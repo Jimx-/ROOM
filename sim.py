@@ -64,6 +64,7 @@ core_params = dict(
     use_fpu=True,
     flen=64,
     fma_latency=4,
+    io_regions={0x80000000: 0x80000000},
 )
 
 
@@ -110,6 +111,7 @@ class Top(Elaboratable):
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
         core = Core(self.core_params, sim_debug=self.sim_debug)
+        soc.add_cpu(core)
 
         if self.sim_debug:
             m.d.comb += self.core_debug.eq(core.core_debug)
@@ -136,8 +138,6 @@ class Top(Elaboratable):
                     init=self.ram_image)
 
         soc.add_controller()
-
-        soc.add_cpu(core)
 
         uart = UART(divisor=int(self.clk_freq // 115200))
         soc.add_peripheral('uart', uart)

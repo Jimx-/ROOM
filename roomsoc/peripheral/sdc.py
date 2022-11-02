@@ -244,15 +244,16 @@ class SDCommandPHY(Elaboratable):
         resp_len = Signal(7)
         with_response = Signal()
 
-        crc = m.submodules.crc = CommandCRC7()
+        cmd_crc = m.submodules.cmd_crc = CommandCRC7()
         crc_enable = Signal()
-        crc_in = Array(Signal(name=f'crc_in{i}') for i in range(len(crc.crc)))
+        crc_in = Array(
+            Signal(name=f'crc_in{i}') for i in range(len(cmd_crc.crc)))
         crc_val = Array(
-            Signal(name=f'crc_val{i}') for i in range(len(crc.crc)))
+            Signal(name=f'crc_val{i}') for i in range(len(cmd_crc.crc)))
         crc_match = Signal()
         m.d.comb += [
-            crc.en.eq(self.clock_posedge & crc_enable),
-            Cat(*crc_val).eq(crc.crc),
+            cmd_crc.en.eq(self.clock_posedge & crc_enable),
+            Cat(*crc_val).eq(cmd_crc.crc),
         ]
 
         cmd_data_i = Signal()
@@ -277,7 +278,7 @@ class SDCommandPHY(Elaboratable):
                         resp_idx.eq(0),
                         self.cmd_oe.eq(0),
                         self.finish.eq(0),
-                        crc.clear.eq(1),
+                        cmd_crc.clear.eq(1),
                     ]
 
                     with m.If(self.start):
@@ -290,9 +291,9 @@ class SDCommandPHY(Elaboratable):
 
                 with m.Case(self.State.SETUP_CRC):
                     m.d.sync += [
-                        crc.clear.eq(0),
+                        cmd_crc.clear.eq(0),
                         crc_enable.eq(1),
-                        crc.bit.eq(cmd[39 - counter]),
+                        cmd_crc.bit.eq(cmd[39 - counter]),
                         state.eq(self.State.WRITE),
                     ]
 
@@ -304,7 +305,7 @@ class SDCommandPHY(Elaboratable):
                         ]
 
                         with m.If(counter < 39):
-                            m.d.sync += crc.bit.eq(cmd[38 - counter])
+                            m.d.sync += cmd_crc.bit.eq(cmd[38 - counter])
                         with m.Else():
                             m.d.sync += crc_enable.eq(0)
 
@@ -338,7 +339,7 @@ class SDCommandPHY(Elaboratable):
                     m.d.sync += [
                         self.finish.eq(1),
                         crc_enable.eq(0),
-                        crc.clear.eq(1),
+                        cmd_crc.clear.eq(1),
                         counter.eq(0),
                         self.cmd_oe.eq(0),
                         state.eq(self.State.IDLE),
@@ -347,7 +348,7 @@ class SDCommandPHY(Elaboratable):
                 with m.Case(self.State.READ_WAIT):
                     m.d.sync += [
                         crc_enable.eq(0),
-                        crc.clear.eq(1),
+                        cmd_crc.clear.eq(1),
                         counter.eq(1),
                         self.cmd_oe.eq(0),
                         resp[127].eq(cmd_data_i),
@@ -358,7 +359,7 @@ class SDCommandPHY(Elaboratable):
 
                 with m.Case(self.State.READ):
                     m.d.sync += [
-                        crc.clear.eq(0),
+                        cmd_crc.clear.eq(0),
                         crc_enable.eq((resp_len != 127) | (counter > 7)),
                         self.cmd_oe.eq(0),
                     ]
@@ -372,7 +373,7 @@ class SDCommandPHY(Elaboratable):
                                 resp[119 - resp_idx].eq(cmd_data_i),
                             ]
 
-                        m.d.sync += crc.bit.eq(cmd_data_i)
+                        m.d.sync += cmd_crc.bit.eq(cmd_data_i)
 
                     with m.Elif(counter - resp_len <= 7):
                         m.d.sync += [
@@ -397,7 +398,7 @@ class SDCommandPHY(Elaboratable):
                         self.index_ok.eq(
                             Cat(*cmd)[32:38] == Cat(*resp)[120:126]),
                         crc_enable.eq(0),
-                        crc.clear.eq(1),
+                        cmd_crc.clear.eq(1),
                         counter.eq(0),
                         self.cmd_oe.eq(0),
                         self.response.eq(Cat(*resp)[:120]),

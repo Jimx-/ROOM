@@ -6,12 +6,40 @@ from roomsoc.peripheral import Peripheral
 from roomsoc.interconnect import wishbone, axi
 
 
+class SoCRegion:
+
+    def __init__(self, origin=None, size=None, mode='rw', cacheable=True):
+        self.origin = origin
+        self.size = size
+        self.size_pow2 = 2**log2_int(size, False)
+        self.mode = mode
+        self.cacheable = cacheable
+
+    def __str__(self):
+        r = ''
+        if self.origin is not None:
+            r += f'Origin: 0x{self.origin:08x}, '
+        if self.size is not None:
+            r += f'Size: 0x{self.size:08x}, '
+        r += f'Mode: {self.mode}, '
+        r += f'Cacheable: {self.cacheable}'
+
+        return r
+
+
+class SoCIORegion(SoCRegion):
+    pass
+
+
 class BusHelper(Elaboratable):
 
     def __init__(self, standard='wishbone', data_width=32, addr_width=32):
         self.standard = standard
         self.data_width = data_width
         self.addr_width = addr_width
+
+        self.regions = dict()
+        self.io_regions = dict()
 
         self.masters = dict()
         self.slaves = dict()
@@ -20,6 +48,78 @@ class BusHelper(Elaboratable):
         self.decoder = wishbone.Decoder(data_width=self.data_width,
                                         addr_width=self.get_addr_width(),
                                         granularity=8)
+
+    def check_regions_overlap(self, regions):
+        i = 0
+        while i < len(regions):
+            n0 = list(regions.keys())[i]
+            r0 = regions[n0]
+            for n1 in list(regions.keys())[i + 1:]:
+                r1 = regions[n1]
+                if r0.origin >= (r1.origin + r1.size_pow2):
+                    continue
+                if r1.origin >= (r0.origin + r0.size_pow2):
+                    continue
+                return (n0, n1)
+            i += 1
+        return None
+
+    def alloc_region(self, name, size, cacheable=True):
+        if not cacheable:
+            search_regions = self.io_regions
+        else:
+            search_regions = {
+                'main': SoCRegion(origin=0, size=2**self.address_width - 1)
+            }
+
+        for _, search_region in search_regions.items():
+            origin = search_region.origin
+            while (origin + size) < (search_region.origin +
+                                     search_region.size_pow2):
+                if (origin % size):
+                    origin += (origin - origin % size)
+                    continue
+
+                candidate = SoCRegion(origin=origin,
+                                      size=size,
+                                      cacheable=cacheable)
+                overlap = False
+
+                for _, allocated in self.regions.items():
+                    if self.check_regions_overlap({
+                            '0': allocated,
+                            '1': candidate
+                    }) is not None:
+                        origin += size
+                        overlap = True
+                        break
+                if not overlap:
+                    return candidate
+
+        raise ValueError('Not enough address space to allocate region.')
+
+    def add_region(self, name, region):
+        if name in self.regions.keys() or name in self.io_regions.keys():
+            raise ValueError(f'{name} already declared as a region')
+
+        if isinstance(region, SoCIORegion):
+            self.io_regions[name] = region
+            overlap = self.check_regions_overlap(self.io_regions)
+            if overlap is not None:
+                raise ValueError(
+                    f'IO region overlap between {overlap[0]} and {overlap[1]}')
+        elif isinstance(region, SoCRegion):
+            if region.origin is None:
+                region = self.alloc_region(name, region.size, region.cacheable)
+                self.regions[name] = region
+            else:
+                self.regions[name] = region
+
+                overlap = self.check_regions_overlap(self.regions)
+                if overlap is not None:
+                    raise ValueError(
+                        f'Region overlap between {overlap[0]} and {overlap[1]}'
+                    )
 
     def add_adapter(self, name, interface, direction='m2s'):
 
@@ -99,13 +199,25 @@ class BusHelper(Elaboratable):
 
         print(f'Add {name} as bus master.')
 
-    def add_slave(self, name=None, slave=None, **kwargs):
+    def add_slave(self, name=None, slave=None, region=None):
+        if name is None and region is None:
+            raise ValueError(
+                'Either name or region should be provided for a bus slave.')
+
         if name is None:
             name = f'slave{len(self.slaves)}'
 
+        if region is None:
+            region = self.regions.get(name, None)
+            if region is None:
+                raise ValueError(f'Region {name} not found')
+        else:
+            self.add_region(name, region)
+            region = self.regions[name]
+
         slave = self.add_adapter(name, slave, 's2m')
         self.slaves[name] = slave
-        self.decoder.add(slave, **kwargs)
+        self.decoder.add(slave, addr=region.origin)
 
         print(f'Add {name} as bus slave.')
 
@@ -177,6 +289,12 @@ class SoC(Elaboratable):
     def add_cpu(self, cpu):
         self.cpu = cpu
 
+        for n, (origin, size) in enumerate(self.cpu.io_regions.items()):
+            self.bus.add_region(
+                f'io{n}', SoCIORegion(origin=origin,
+                                      size=size,
+                                      cacheable=False))
+
         for n, cpu_bus in enumerate(self.cpu.periph_buses):
             self.bus.add_master(name=f'cpu_bus{n}', master=cpu_bus)
 
@@ -198,16 +316,27 @@ class SoC(Elaboratable):
 
         ram_bus.memory_map = MemoryMap(data_width=8, addr_width=log2_int(size))
 
-        self.bus.add_slave(name, ram_bus, addr=origin)
+        self.bus.add_slave(name, ram_bus,
+                           SoCRegion(origin=origin, size=size, mode=mode))
 
         self.peripherals[name] = ram
 
     def add_rom(self, name, origin, size, init=[], mode='r'):
         self.add_ram(name, origin, size, init, mode=mode)
 
-    def add_peripheral(self, name, periph, *, as_submodule=True, **kwargs):
+    def add_peripheral(self,
+                       name,
+                       periph,
+                       *,
+                       as_submodule=True,
+                       origin=None,
+                       cacheable=False):
         bus = getattr(periph, 'bus')
-        self.bus.add_slave(name, bus, **kwargs)
+        self.bus.add_slave(
+            name, bus,
+            SoCRegion(origin=origin,
+                      size=2**bus.memory_map.addr_width,
+                      cacheable=cacheable))
 
         if as_submodule:
             self.peripherals[name] = periph

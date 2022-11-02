@@ -308,6 +308,7 @@ class LDQEntry(HasCoreParams):
 
         self.addr = Signal(self.vaddr_bits_extended, name=f'{name}_addr')
         self.addr_valid = Signal(name=f'{name}_addr_valid')
+        self.addr_uncacheable = Signal(name=f'{name}_addr_uncacheable')
 
         self.executed = Signal(name=f'{name}_executed')
         self.succeeded = Signal(name=f'{name}_succeeded')
@@ -426,6 +427,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         self.commit = CommitReq(params)
         self.exception = Signal()
 
+        self.commit_load_at_head = Signal()
+
         self.br_update = BranchUpdate(params)
 
         self.lsu_exc = Exception(params, name='lsu_exc')
@@ -542,14 +545,32 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     lsu_debug.prs2.eq(req.bits.uop.prs2),
                 ]
 
+        s0_block_load_mask = Array(
+            Signal(name=f's0_block_load_mask{i}')
+            for i in range(self.ldq_size))
+        s1_block_load_mask = Array(
+            Signal(name=f's1_block_load_mask{i}')
+            for i in range(self.ldq_size))
+        s2_block_load_mask = Array(
+            Signal(name=f's2_block_load_mask{i}')
+            for i in range(self.ldq_size))
+
+        m.d.sync += [
+            Cat(*s1_block_load_mask).eq(Cat(*s0_block_load_mask)),
+            Cat(*s2_block_load_mask).eq(Cat(*s1_block_load_mask)),
+        ]
+
         ldq_retry_enc = RRPriorityEncoder(self.ldq_size)
         m.submodules += ldq_retry_enc
         for i in range(self.ldq_size):
             m.d.comb += ldq_retry_enc.i[i].eq(ldq[i].addr_valid
                                               & ~ldq[i].executed
-                                              & ~ldq[i].succeeded)
+                                              & ~ldq[i].succeeded
+                                              & ~s0_block_load_mask[i]
+                                              & ~s1_block_load_mask[i])
         m.d.comb += ldq_retry_enc.head_or_tail.eq(ldq_head)
-        ldq_retry_idx = ldq_retry_enc.o
+        ldq_retry_idx = Signal(range(self.ldq_size))
+        m.d.sync += ldq_retry_idx.eq(ldq_retry_enc.o)
         ldq_retry_e = ldq[ldq_retry_idx]
         s1_ldq_retry_idx = Signal(range(self.ldq_size))
         m.d.sync += s1_ldq_retry_idx.eq(ldq_retry_idx)
@@ -591,14 +612,19 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     self.exec_reqs[w].valid
                     & self.exec_reqs[w].bits.uop.is_sta
                     & self.exec_reqs[w].bits.uop.is_std),
-                can_fire_load_retry[w].eq(ldq_retry_e.valid
-                                          & ldq_retry_e.addr_valid
-                                          & ~ldq_retry_e.executed
-                                          & ~ldq_retry_e.succeeded
-                                          & ~s1_executing_loads[ldq_retry_idx]
-                                          & (w == 0)
-                                          & (ldq_retry_e.st_dep_mask == 0)
-                                          & ~ldq_retry_e.order_fail),
+                can_fire_load_retry[w].
+                eq(ldq_retry_e.valid
+                   & ldq_retry_e.addr_valid
+                   & ~ldq_retry_e.executed
+                   & ~ldq_retry_e.succeeded
+                   & ~s1_executing_loads[ldq_retry_idx]
+                   & ~ldq_retry_e.order_fail
+                   & ~s1_block_load_mask[ldq_retry_idx]
+                   & ~s2_block_load_mask[ldq_retry_idx]
+                   & (w == 0)
+                   & (~ldq_retry_e.addr_uncacheable
+                      | (self.commit_load_at_head & (ldq_head == ldq_retry_idx)
+                         & (ldq_retry_e.st_dep_mask == 0)))),
                 can_fire_store_commit[w].eq(stq_commit_e.valid
                                             & ~stq_commit_e.uop.exception
                                             & ~stq_commit_e.uop.is_fence
@@ -621,7 +647,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 will_fire = can_fire & ~(uses_dc & ~dc_avail) & ~(uses_cam
                                                                   & ~cam_avail)
                 dc_avail &= ~(will_fire & uses_dc)
-                cam_avail &= ~(will_fire & uses_dc)
+                cam_avail &= ~(will_fire & uses_cam)
                 return will_fire, dc_avail, cam_avail
 
             will_fire_load_incoming_, dc_avail, cam_avail = sched(
@@ -646,6 +672,19 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 will_fire_store_commit[w].eq(will_fire_store_commit_),
             ]
 
+            with m.If(will_fire_load_retry[w]):
+                m.d.comb += s0_block_load_mask[ldq_retry_idx].eq(1)
+            with m.Elif(will_fire_load_incoming[w]):
+                m.d.comb += s0_block_load_mask[
+                    self.exec_reqs[w].bits.uop.ldq_idx].eq(1)
+
+        s0_tlb_uncacheable = Signal(self.mem_width)
+        for w in range(self.mem_width):
+            for origin, size in self.io_regions.items():
+                with m.If((self.exec_reqs[w].bits.addr >= origin)
+                          & (self.exec_reqs[w].bits.addr < (origin + size))):
+                    m.d.comb += s0_tlb_uncacheable[w].eq(1)
+
         for w in range(self.mem_width):
             with m.If(will_fire_load_incoming[w]):
                 ldq_idx = self.exec_reqs[w].bits.uop.ldq_idx
@@ -653,6 +692,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     ldq[ldq_idx].addr.eq(self.exec_reqs[w].bits.addr),
                     ldq[ldq_idx].addr_valid.eq(1),
                     ldq[ldq_idx].uop.pdst.eq(self.exec_reqs[w].bits.uop.pdst),
+                    ldq[ldq_idx].addr_uncacheable.eq(s0_tlb_uncacheable[w]),
                 ]
 
             with m.If(will_fire_sta_incoming[w] | will_fire_stad_incoming[w]):
@@ -698,7 +738,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
             with m.If(will_fire_load_incoming[w]):
                 m.d.comb += [
-                    dmem_req.valid.eq(1),
+                    dmem_req.valid.eq(~s0_tlb_uncacheable[w]),
                     dmem_req.bits.uop.eq(self.exec_reqs[w].bits.uop),
                     dmem_req.bits.addr.eq(self.exec_reqs[w].bits.addr),
                     s0_executing_loads[self.exec_reqs[w].bits.uop.ldq_idx].eq(
@@ -779,6 +819,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             for i in range(self.mem_width)
         ]
 
+        fired_tlb_uncacheable = Signal.like(s0_tlb_uncacheable)
+
         for w in range(self.mem_width):
             req_killed = self.br_update.uop_killed(self.exec_reqs[w].bits.uop)
 
@@ -799,7 +841,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                         self.exec_reqs[w].bits.uop.br_mask)),
                 fired_load_incoming[w].eq(will_fire_load_incoming[w]
                                           & ~req_killed),
-                fired_load_retry[w].eq(will_fire_load_retry[w] & ~req_killed),
+                fired_load_retry[w].eq(
+                    will_fire_load_retry[w]
+                    & ~self.br_update.uop_killed(ldq_retry_e.uop)),
                 fired_sta_incoming[w].eq(will_fire_sta_incoming[w]
                                          & ~req_killed),
                 fired_std_incoming[w].eq(will_fire_std_incoming[w]
@@ -821,6 +865,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                         stq[self.exec_reqs[w].bits.uop.stq_idx].uop.br_mask)),
                 fired_mem_addr[w].eq(dcache.reqs[w].bits.addr),
                 fired_req_addr[w].eq(self.exec_reqs[w].bits.addr),
+                fired_tlb_uncacheable[w].eq(s0_tlb_uncacheable[w]),
             ]
 
         stdf_killed = self.br_update.uop_killed(self.fp_std.bits.uop)
@@ -957,6 +1002,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             for i in range(self.mem_width)
         ]
 
+        can_forward = Signal(self.mem_width)
+
         for w in range(self.mem_width):
             m.d.comb += [
                 cam_addr[w].eq(
@@ -973,6 +1020,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 cam_stq_idx[w].eq(
                     Mux(fired_sta_incoming[w] | fired_stad_incoming[w],
                         fired_incoming_uop[w].stq_idx, 0)),
+                can_forward[w].eq(
+                    Mux(fired_load_incoming[w], ~fired_tlb_uncacheable[w],
+                        ~ldq[cam_ldq_idx[w]].addr_uncacheable)),
             ]
 
         ldst_addr_matches = [
@@ -1043,7 +1093,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 with m.If(do_ld_search[w] & stq[i].valid
                           & fired_ldq_e[w].st_dep_mask[i]):
                     with m.If(((cam_mask[w] & write_mask) == cam_mask[w])
-                              & addr_matches[w] & ~stq[i].uop.is_fence):
+                              & addr_matches[w] & ~stq[i].uop.is_fence
+                              & can_forward[w]):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
                             ldst_forward_matches[w][i].eq(1),
