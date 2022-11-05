@@ -19,7 +19,11 @@ void usleep(unsigned int us)
     cycles0 = get_cycle32();
     for (;;) {
         cycles1 = get_cycle32();
+#ifdef __SIM__
+        if (cycles1 - cycles0 >= (us >> 10)) break;
+#else
         if (cycles1 - cycles0 >= us * 50) break;
+#endif
     }
 }
 

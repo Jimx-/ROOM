@@ -6,6 +6,10 @@ CFLAGS	= -march=rv64imfd -mabi=lp64d -nostdlib -nostartfiles -g
 CFLAGS	+= -I../include/ -Ifat/src/ -I$(RISCV)/riscv64-unknown-elf/include/
 LDFLAGS	= -melf64lriscv -Tlinker.ld
 
+ifdef SIM
+CFLAGS	+= -D__SIM__
+endif
+
 SRCS	= start.S main.c serial.c memset.S memcpy.S string.c vsprintf.c sd.c
 SRCS	+= fat/src/fat_access.c fat/src/fat_filelib.c fat/src/fat_misc.c fat/src/fat_table.c \
 			fat/src/fat_cache.c fat/src/fat_format.c fat/src/fat_string.c fat/src/fat_write.c

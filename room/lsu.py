@@ -672,12 +672,6 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 will_fire_store_commit[w].eq(will_fire_store_commit_),
             ]
 
-            with m.If(will_fire_load_retry[w]):
-                m.d.comb += s0_block_load_mask[ldq_retry_idx].eq(1)
-            with m.Elif(will_fire_load_incoming[w]):
-                m.d.comb += s0_block_load_mask[
-                    self.exec_reqs[w].bits.uop.ldq_idx].eq(1)
-
         s0_tlb_uncacheable = Signal(self.mem_width)
         for w in range(self.mem_width):
             for origin, size in self.io_regions.items():
@@ -867,6 +861,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 fired_req_addr[w].eq(self.exec_reqs[w].bits.addr),
                 fired_tlb_uncacheable[w].eq(s0_tlb_uncacheable[w]),
             ]
+
+            with m.If(will_fire_load_retry[w] & dmem_req_fired[w]):
+                m.d.comb += s0_block_load_mask[ldq_retry_idx].eq(1)
+            with m.Elif(will_fire_load_incoming[w]):
+                m.d.comb += s0_block_load_mask[
+                    self.exec_reqs[w].bits.uop.ldq_idx].eq(1)
 
         stdf_killed = self.br_update.uop_killed(self.fp_std.bits.uop)
         fired_stdf_uop = MicroOp(self.params)

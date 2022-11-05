@@ -5,13 +5,17 @@ rtl/wrapper.v
 results.xml
 sim_build
 *.vcd
+*.fst
+*.fst.hier
 
 # Generated files
+build
 include/generated/
 
 # Object files
 *.o
 *.d
+obj_dir
 
 # Debug ROM
 debug_rom*

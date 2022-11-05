@@ -21,7 +21,7 @@ SECTIONS
     *(.srodata .srodata.*)
   } >ROM
 
-  . = ALIGN(4);
+  . = ALIGN(8);
 
   PROVIDE (__etext = .);
   PROVIDE (_etext = .);
@@ -29,12 +29,12 @@ SECTIONS
 
   .data :
   {
-    . = . + 4;
+    . = . + 8;
     _sdata = .;
     *(.rdata)
     *(.data .data.*)
     *(.sdata .sdata.*)
-    . = ALIGN(4);
+    . = ALIGN(8);
     _edata = .;
   } >RAM
 
@@ -49,7 +49,7 @@ SECTIONS
     *(.sbss*)
     *(.bss .bss.*)
     *(COMMON)
-    . = ALIGN(4);
+    . = ALIGN(8);
     _ebss = .;
   } >RAM
 

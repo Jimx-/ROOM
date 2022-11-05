@@ -45,8 +45,9 @@
 
 #define is_digit(c) ((c) >= '0' && (c) <= '9')
 
-static char* digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-static char* upper_digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+static char* digits __attribute__((section(".rodata"))) =
+    "0123456789abcdefghijklmnopqrstuvwxyz";
+static char* upper_digits __attribute__((section(".rodata"))) = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 long strtol(const char* nptr, char** endptr, int base)
 {
@@ -533,4 +534,3 @@ int snprintf(char* buf, size_t size, const char* fmt, ...)
 
     return n;
 }
-
