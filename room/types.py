@@ -43,6 +43,7 @@ class HasCoreParams:
         #
 
         self.issue_params = params['issue_params']
+        self.int_width = self.issue_params[IssueQueueType.INT]['issue_width']
         self.mem_width = self.issue_params[IssueQueueType.MEM]['issue_width']
 
         #

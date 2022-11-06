@@ -19,7 +19,6 @@ class LSUDebug(HasCoreParams, Record):
         HasCoreParams.__init__(self, params)
 
         Record.__init__(self, [
-            ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
             ('opcode', UOpCode),
             ('addr', self.xlen),
@@ -435,7 +434,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         if self.sim_debug:
             self.lsu_debug = [
-                LSUDebug(params, name=f'lsu_debug{i}')
+                Valid(LSUDebug, params, name=f'lsu_debug{i}')
                 for i in range(self.mem_width)
             ]
 
@@ -537,12 +536,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             for lsu_debug, req in zip(self.lsu_debug, self.exec_reqs):
                 m.d.comb += [
                     lsu_debug.valid.eq(req.valid),
-                    lsu_debug.uop_id.eq(req.bits.uop.uop_id),
-                    lsu_debug.opcode.eq(req.bits.uop.opcode),
-                    lsu_debug.addr.eq(req.bits.addr),
-                    lsu_debug.data.eq(req.bits.data),
-                    lsu_debug.prs1.eq(req.bits.uop.prs1),
-                    lsu_debug.prs2.eq(req.bits.uop.prs2),
+                    lsu_debug.bits.uop_id.eq(req.bits.uop.uop_id),
+                    lsu_debug.bits.opcode.eq(req.bits.uop.opcode),
+                    lsu_debug.bits.addr.eq(req.bits.addr),
+                    lsu_debug.bits.data.eq(req.bits.data),
+                    lsu_debug.bits.prs1.eq(req.bits.uop.prs1),
+                    lsu_debug.bits.prs2.eq(req.bits.uop.prs2),
                 ]
 
         s0_block_load_mask = Array(

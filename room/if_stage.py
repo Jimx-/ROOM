@@ -8,7 +8,7 @@ from room.id_stage import BranchDecoder
 from room.types import HasCoreParams, MicroOp
 from room.breakpoint import Breakpoint, BreakpointMatcher
 from room.icache import ICache
-from room.utils import wrap_incr
+from room.utils import wrap_incr, Valid
 
 
 class GetPCResp(Record):
@@ -28,7 +28,6 @@ class IFDebug(Record):
 
     def __init__(self, name=None, src_loc_at=0):
         super().__init__([
-            ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
             ('pc', 32),
             ('inst', 32),
@@ -105,7 +104,8 @@ class FetchBuffer(HasCoreParams, Elaboratable):
 
         if self.sim_debug:
             self.if_debug = [
-                IFDebug(name=f'if_debug{i}') for i in range(self.fetch_width)
+                Valid(IFDebug, name=f'if_debug{i}')
+                for i in range(self.fetch_width)
             ]
 
     def elaborate(self, platform):
@@ -153,9 +153,9 @@ class FetchBuffer(HasCoreParams, Elaboratable):
                 m.d.comb += [
                     in_uops[w].uop_id.eq(next_id),
                     self.if_debug[w].valid.eq(in_mask[w]),
-                    self.if_debug[w].uop_id.eq(in_uops[w].uop_id),
-                    self.if_debug[w].inst.eq(in_uops[w].inst),
-                    self.if_debug[w].pc.eq(pc),
+                    self.if_debug[w].bits.uop_id.eq(in_uops[w].uop_id),
+                    self.if_debug[w].bits.inst.eq(in_uops[w].inst),
+                    self.if_debug[w].bits.pc.eq(pc),
                 ]
 
                 next_id = Mux(in_mask[w], next_id + 1, next_id)
@@ -358,7 +358,8 @@ class IFStage(HasCoreParams, Elaboratable):
 
         if self.sim_debug:
             self.if_debug = [
-                IFDebug(name=f'if_debug{i}') for i in range(self.fetch_width)
+                Valid(IFDebug, name=f'if_debug{i}')
+                for i in range(self.fetch_width)
             ]
 
     def elaborate(self, platform):

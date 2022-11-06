@@ -14,7 +14,6 @@ class ExecDebug(HasCoreParams, Record):
         HasCoreParams.__init__(self, params)
 
         Record.__init__(self, [
-            ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
             ('opcode', UOpCode),
             ('prs1', range(self.num_pregs)),
@@ -98,7 +97,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
             self.lsu_req = Valid(ExecResp, self.data_width, params)
 
         if sim_debug:
-            self.exec_debug = ExecDebug(params, name='ex_debug')
+            self.exec_debug = Valid(ExecDebug, params, name='ex_debug')
 
     def elaborate(self, platform):
         m = Module()
@@ -106,12 +105,12 @@ class ExecUnit(HasCoreParams, Elaboratable):
         if self.sim_debug:
             m.d.comb += [
                 self.exec_debug.valid.eq(self.req.valid),
-                self.exec_debug.uop_id.eq(self.req.bits.uop.uop_id),
-                self.exec_debug.opcode.eq(self.req.bits.uop.opcode),
-                self.exec_debug.prs1.eq(self.req.bits.uop.prs1),
-                self.exec_debug.rs1_data.eq(self.req.bits.rs1_data),
-                self.exec_debug.prs2.eq(self.req.bits.uop.prs2),
-                self.exec_debug.rs2_data.eq(self.req.bits.rs2_data),
+                self.exec_debug.bits.uop_id.eq(self.req.bits.uop.uop_id),
+                self.exec_debug.bits.opcode.eq(self.req.bits.uop.opcode),
+                self.exec_debug.bits.prs1.eq(self.req.bits.uop.prs1),
+                self.exec_debug.bits.rs1_data.eq(self.req.bits.rs1_data),
+                self.exec_debug.bits.prs2.eq(self.req.bits.uop.prs2),
+                self.exec_debug.bits.rs2_data.eq(self.req.bits.rs2_data),
             ]
 
         return m

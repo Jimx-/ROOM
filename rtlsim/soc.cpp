@@ -11,6 +11,8 @@
 #include "uart.h"
 #include "sdcard.h"
 
+#include "tracer.h"
+
 #include "spdlog/spdlog.h"
 
 #ifdef VCD_OUTPUT
@@ -65,6 +67,10 @@ public:
         dut_.reset(new Vsoc_wrapper());
 
         if (!sd_image.empty()) sdcard.reset(new SDCard(sd_image));
+
+#ifdef ITRACE
+        (void)new Tracer();
+#endif
 
 #ifdef VCD_OUTPUT
         Verilated::traceEverOn(true);
@@ -128,6 +134,10 @@ private:
                 sdcard->tick(dut_->sdio_clk, dut_->sdio_cmd_o, dut_->sdio_cmd_t,
                              dut_->sdio_data_o);
         }
+
+#ifdef ITRACE
+        Tracer::get_singleton().tick();
+#endif
 
         dut_->clk = 0;
         this->eval();

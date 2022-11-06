@@ -6,6 +6,7 @@ from room.types import HasCoreParams, MicroOp
 from room.branch import BranchMaskAllocator, BranchUpdate
 from room.exc import Cause
 from room.fpu import FPFormat
+from room.utils import Valid
 
 
 class IDDebug(HasCoreParams, Record):
@@ -14,7 +15,6 @@ class IDDebug(HasCoreParams, Record):
         HasCoreParams.__init__(self, params)
 
         Record.__init__(self, [
-            ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
             ('br_mask', self.max_br_count),
         ],
@@ -768,7 +768,7 @@ class DecodeStage(HasCoreParams, Elaboratable):
 
         if sim_debug:
             self.id_debug = [
-                IDDebug(params, name=f'id_debug{i}')
+                Valid(IDDebug, params, name=f'id_debug{i}')
                 for i in range(self.core_width)
             ]
 
@@ -851,8 +851,8 @@ class DecodeStage(HasCoreParams, Elaboratable):
 
                 m.d.comb += [
                     id_debug.valid.eq(self.fire[w]),
-                    id_debug.uop_id.eq(self.uops[w].uop_id),
-                    id_debug.br_mask.eq(self.uops[w].br_mask),
+                    id_debug.bits.uop_id.eq(self.uops[w].uop_id),
+                    id_debug.bits.br_mask.eq(self.uops[w].br_mask),
                 ]
 
         return m

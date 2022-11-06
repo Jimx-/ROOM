@@ -203,29 +203,29 @@ if __name__ == "__main__":
                     valid = yield if_debug.valid
 
                     if valid:
-                        id = yield if_debug.uop_id
-                        pc = yield if_debug.pc
-                        inst = yield if_debug.inst
+                        id = yield if_debug.bits.uop_id
+                        pc = yield if_debug.bits.pc
+                        inst = yield if_debug.bits.inst
                         print(f'I {id} {pc:x} {inst:x}', file=log_file)
 
                 for id_debug in dut.core_debug.id_debug:
                     valid = yield id_debug.valid
 
                     if valid:
-                        id = yield id_debug.uop_id
-                        br_mask = yield id_debug.br_mask
+                        id = yield id_debug.bits.uop_id
+                        br_mask = yield id_debug.bits.br_mask
                         print(f'ID {id} {br_mask:x}', file=log_file)
 
                 for ex_debug in dut.core_debug.ex_debug:
                     valid = yield ex_debug.valid
 
                     if valid:
-                        id = yield ex_debug.uop_id
-                        opcode = yield ex_debug.opcode
-                        prs1 = yield ex_debug.prs1
-                        rs1_data = yield ex_debug.rs1_data
-                        prs2 = yield ex_debug.prs2
-                        rs2_data = yield ex_debug.rs2_data
+                        id = yield ex_debug.bits.uop_id
+                        opcode = yield ex_debug.bits.opcode
+                        prs1 = yield ex_debug.bits.prs1
+                        rs1_data = yield ex_debug.bits.rs1_data
+                        prs2 = yield ex_debug.bits.prs2
+                        rs2_data = yield ex_debug.bits.rs2_data
 
                         print(
                             f'EX {id} {opcode} {prs1} {rs1_data:x} {prs2} {rs2_data:x}',
@@ -235,12 +235,12 @@ if __name__ == "__main__":
                     valid = yield mem_debug.valid
 
                     if valid:
-                        id = yield mem_debug.uop_id
-                        opcode = yield mem_debug.opcode
-                        addr = yield mem_debug.addr
-                        data = yield mem_debug.data
-                        prs1 = yield mem_debug.prs1
-                        prs2 = yield mem_debug.prs2
+                        id = yield mem_debug.bits.uop_id
+                        opcode = yield mem_debug.bits.opcode
+                        addr = yield mem_debug.bits.addr
+                        data = yield mem_debug.bits.data
+                        prs1 = yield mem_debug.bits.prs1
+                        prs2 = yield mem_debug.bits.prs2
 
                         print(
                             f'MEM {id} {opcode} {prs1} {prs2} {addr:x} {data:x}',
@@ -250,16 +250,16 @@ if __name__ == "__main__":
                     valid = yield wb_debug.valid
 
                     if valid:
-                        id = yield wb_debug.uop_id
-                        pdst = yield wb_debug.pdst
-                        data = yield wb_debug.data
+                        id = yield wb_debug.bits.uop_id
+                        pdst = yield wb_debug.bits.pdst
+                        data = yield wb_debug.bits.data
                         print(f'WB {id} {pdst} {data:x}', file=log_file)
 
                 for com_debug in dut.core_debug.commit_debug:
                     valid = yield com_debug.valid
 
                     if valid:
-                        id = yield com_debug.uop_id
+                        id = yield com_debug.bits.uop_id
                         print(f'C {id}', file=log_file)
 
                 mispredict_mask = yield dut.core_debug.branch_mispredict

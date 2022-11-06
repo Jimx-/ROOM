@@ -1,0 +1,129 @@
+// -*- mode: verilog; -*-
+
+import "DPI-C" function void trace_if(int uop_id, longint pc, int insn);
+import "DPI-C" function void trace_id(int uop_id, int br_mask);
+import "DPI-C" function void trace_ex(int uop_id, int opcode, int prs1, longint rs1_data, int prs2, longint rs2_data);
+import "DPI-C" function void trace_mem(int uop_id, int opcode, longint addr, longint data, int prs1, int prs2);
+import "DPI-C" function void trace_wb(int uop_id, int pdst, longint data);
+import "DPI-C" function void trace_commit(int uop_id);
+import "DPI-C" function void trace_branch_resolve(int resolve_mask);
+import "DPI-C" function void trace_branch_mispredict(int mispredict_mask);
+import "DPI-C" function void trace_flush();
+
+module vl_trace_if
+  (
+   // Instruction fetch
+   // {% for i in range(core.fetch_width) %}
+   input wire                                  if_debug{{i}}_valid,
+   input wire [{{UOP_ID_WIDTH}}-1:0]           if_debug{{i}}_uop_id,
+   input wire [63:0]                           if_debug{{i}}_pc,
+   input wire [31:0]                           if_debug{{i}}_inst,
+   // {% endfor %}
+
+   // Instruction decode
+   // {% for i in range(core.core_width) %}
+   input wire                                  id_debug{{i}}_valid,
+   input wire [{{UOP_ID_WIDTH}}-1:0]           id_debug{{i}}_uop_id,
+   input wire [{{core.max_br_count}}-1:0]      id_debug{{i}}_br_mask,
+   // {% endfor %}
+
+   // Execute
+   // {% for i in range(core.int_width) %}
+   input wire                                  ex_debug{{i}}_valid,
+   input wire [{{UOP_ID_WIDTH}}-1:0]           ex_debug{{i}}_uop_id,
+   input wire [15:0]                           ex_debug{{i}}_opcode,
+   input wire [$clog2({{core.num_pregs}}-1):0] ex_debug{{i}}_prs1,
+   input wire [63:0]                           ex_debug{{i}}_rs1_data,
+   input wire [$clog2({{core.num_pregs}}-1):0] ex_debug{{i}}_prs2,
+   input wire [63:0]                           ex_debug{{i}}_rs2_data,
+   // {% endfor %}
+
+   // Memory load/store
+   // {% for i in range(core.mem_width) %}
+   input wire                                  mem_debug{{i}}_valid,
+   input wire [{{UOP_ID_WIDTH}}-1:0]           mem_debug{{i}}_uop_id,
+   input wire [15:0]                           mem_debug{{i}}_opcode,
+   input wire [63:0]                           mem_debug{{i}}_addr,
+   input wire [63:0]                           mem_debug{{i}}_data,
+   input wire [$clog2({{core.num_pregs}}-1):0] mem_debug{{i}}_prs1,
+   input wire [$clog2({{core.num_pregs}}-1):0] mem_debug{{i}}_prs2,
+   // {% endfor %}
+
+   // Writeback
+   // {% for i in range(core.int_width + core.mem_width) %}
+   input wire                                  wb_debug{{i}}_valid,
+   input wire [{{UOP_ID_WIDTH}}-1:0]           wb_debug{{i}}_uop_id,
+   input wire [$clog2({{core.num_pregs}}-1):0] wb_debug{{i}}_pdst,
+   input wire [63:0]                           wb_debug{{i}}_data,
+   // {% endfor %}
+
+   // Commit
+   // {% for i in range(core.core_width) %}
+   input wire                                  commit_debug{{i}}_valid,
+   input wire [{{UOP_ID_WIDTH}}-1:0]           commit_debug{{i}}_uop_id,
+   // {% endfor %}
+
+   input wire [{{core.max_br_count}}-1:0]      branch_resolve,
+   input wire [{{core.max_br_count}}-1:0]      branch_mispredict,
+
+   input wire                                  flush_pipeline,
+
+   input wire                                  clk,
+   input wire                                  rst
+);
+
+   always @(posedge clk) begin
+      if (~rst) begin
+         // {% for i in range(core.fetch_width) %}
+         if (if_debug{{i}}_valid) begin
+            trace_if(if_debug{{i}}_uop_id, if_debug{{i}}_pc, if_debug{{i}}_inst);
+         end
+         // {% endfor %}
+
+         // {% for i in range(core.core_width) %}
+         if (id_debug{{i}}_valid) begin
+            trace_id(id_debug{{i}}_uop_id, id_debug{{i}}_br_mask);
+         end
+         // {% endfor %}
+
+         // {% for i in range(core.int_width) %}
+         if (ex_debug{{i}}_valid) begin
+            trace_ex(ex_debug{{i}}_uop_id, ex_debug{{i}}_opcode, ex_debug{{i}}_prs1, ex_debug{{i}}_rs1_data,
+                     ex_debug{{i}}_prs2, ex_debug{{i}}_rs2_data);
+         end
+         // {% endfor %}
+
+         // {% for i in range(core.mem_width) %}
+         if (mem_debug{{i}}_valid) begin
+            trace_mem(mem_debug{{i}}_uop_id, mem_debug{{i}}_opcode, mem_debug{{i}}_addr, mem_debug{{i}}_data,
+                      mem_debug{{i}}_prs1, mem_debug{{i}}_prs2);
+         end
+         // {% endfor %}
+
+         // {% for i in range(core.int_width + core.mem_width) %}
+         if (wb_debug{{i}}_valid) begin
+            trace_wb(wb_debug{{i}}_uop_id, wb_debug{{i}}_pdst, wb_debug{{i}}_data);
+         end
+         // {% endfor %}
+
+         // {% for i in range(core.core_width) %}
+         if (commit_debug{{i}}_valid) begin
+            trace_commit(commit_debug{{i}}_uop_id);
+         end
+         // {% endfor %}
+
+         if (branch_resolve != {{core.max_br_count}}'b0) begin
+            trace_branch_resolve(branch_resolve);
+         end
+
+         if (branch_mispredict != {{core.max_br_count}}'b0) begin
+            trace_branch_mispredict(branch_mispredict);
+         end
+
+         if (flush_pipeline) begin
+            trace_flush();
+         end
+      end
+   end
+
+endmodule; // vl_trace_if

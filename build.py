@@ -13,6 +13,9 @@ from roomsoc.platform.kc705 import KC705Platform
 
 import argparse
 import struct
+import os
+
+from jinja2 import FileSystemLoader, Environment
 
 
 def read_mem_image(filename):
@@ -64,6 +67,71 @@ core_params = dict(
 )
 
 
+def generate_trace_if(m, core, output_dir):
+    signals = dict(
+        i_clk=ClockSignal(),
+        i_rst=ResetSignal(),
+    )
+
+    for i, if_debug in enumerate(core.core_debug.if_debug):
+        signals[f'i_if_debug{i}_valid'] = if_debug.valid
+        signals[f'i_if_debug{i}_uop_id'] = if_debug.bits.uop_id
+        signals[f'i_if_debug{i}_pc'] = if_debug.bits.pc
+        signals[f'i_if_debug{i}_inst'] = if_debug.bits.inst
+
+    for i, id_debug in enumerate(core.core_debug.id_debug):
+        signals[f'i_id_debug{i}_valid'] = id_debug.valid
+        signals[f'i_id_debug{i}_uop_id'] = id_debug.bits.uop_id
+        signals[f'i_id_debug{i}_br_mask'] = id_debug.bits.br_mask
+
+    for i, ex_debug in enumerate(core.core_debug.ex_debug):
+        signals[f'i_ex_debug{i}_valid'] = ex_debug.valid
+        signals[f'i_ex_debug{i}_uop_id'] = ex_debug.bits.uop_id
+        signals[f'i_ex_debug{i}_opcode'] = ex_debug.bits.opcode
+        signals[f'i_ex_debug{i}_prs1'] = ex_debug.bits.prs1
+        signals[f'i_ex_debug{i}_rs1_data'] = ex_debug.bits.rs1_data
+        signals[f'i_ex_debug{i}_prs2'] = ex_debug.bits.prs2
+        signals[f'i_ex_debug{i}_rs2_data'] = ex_debug.bits.rs2_data
+
+    for i, mem_debug in enumerate(core.core_debug.mem_debug):
+        signals[f'i_mem_debug{i}_valid'] = mem_debug.valid
+        signals[f'i_mem_debug{i}_uop_id'] = mem_debug.bits.uop_id
+        signals[f'i_mem_debug{i}_opcode'] = mem_debug.bits.opcode
+        signals[f'i_mem_debug{i}_addr'] = mem_debug.bits.addr
+        signals[f'i_mem_debug{i}_data'] = mem_debug.bits.data
+        signals[f'i_mem_debug{i}_prs1'] = mem_debug.bits.prs1
+        signals[f'i_mem_debug{i}_prs2'] = mem_debug.bits.prs2
+
+    for i, wb_debug in enumerate(core.core_debug.wb_debug):
+        signals[f'i_wb_debug{i}_valid'] = wb_debug.valid
+        signals[f'i_wb_debug{i}_uop_id'] = wb_debug.bits.uop_id
+        signals[f'i_wb_debug{i}_pdst'] = wb_debug.bits.pdst
+        signals[f'i_wb_debug{i}_data'] = wb_debug.bits.data
+
+    for i, com_debug in enumerate(core.core_debug.commit_debug):
+        signals[f'i_commit_debug{i}_valid'] = com_debug.valid
+        signals[f'i_commit_debug{i}_uop_id'] = com_debug.bits.uop_id
+
+    signals['i_branch_resolve'] = core.core_debug.branch_resolve
+    signals['i_branch_mispredict'] = core.core_debug.branch_mispredict
+    signals['i_flush_pipeline'] = core.core_debug.flush_pipeline
+
+    m.submodules.trace_if = Instance('vl_trace_if', **signals)
+
+    env = Environment(loader=FileSystemLoader(searchpath='rtl'))
+    config = dict(
+        core=core,
+        UOP_ID_WIDTH=10,
+    )
+
+    template = env.get_template('vl_trace_if.v.tmpl')
+    output = template.render(config)
+
+    with open(os.path.join(output_dir, 'vl_trace_if.v'), 'w') as fout:
+        fout.write(output)
+        fout.write('\n')
+
+
 class Top(Elaboratable):
 
     mem_map = {
@@ -71,11 +139,17 @@ class Top(Elaboratable):
         'sram': 0x20000000,
     }
 
-    def __init__(self, clk_freq, rom_image, debug_rom_image, ram_image=[]):
+    def __init__(self,
+                 clk_freq,
+                 rom_image,
+                 debug_rom_image,
+                 ram_image=[],
+                 sim=False):
         self.rom_image = rom_image
         self.debug_rom_image = debug_rom_image
         self.ram_image = ram_image
         self.clk_freq = clk_freq
+        self.sim = sim
 
         self.axil_master = axi.AXILiteInterface(data_width=32,
                                                 addr_width=30,
@@ -92,8 +166,11 @@ class Top(Elaboratable):
 
         soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
 
-        core = Core(core_params)
+        core = Core(core_params, sim_debug=self.sim)
         soc.add_cpu(core)
+
+        if self.sim:
+            generate_trace_if(m, core, '/tmp')
 
         debug_module = DebugModule(self.debug_rom_image)
         m.d.comb += [
@@ -149,6 +226,7 @@ if __name__ == "__main__":
                         type=int,
                         help='SoC clock frequency',
                         default=50e6)
+    parser.add_argument('--sim', action='store_true')
     args = parser.parse_args()
 
     rom = read_mem_image(args.rom)
@@ -159,7 +237,14 @@ if __name__ == "__main__":
     else:
         ram = []
 
-    top = Top(args.freq, rom_image=rom, debug_rom_image=debug_rom)
+    top = Top(args.freq,
+              rom_image=rom,
+              debug_rom_image=debug_rom,
+              sim=args.sim)
+
+    platform = None
+    if not args.sim:
+        platform = KC705Platform()
 
     with open('/tmp/soc_wrapper.v', 'w') as f:
         f.write(
@@ -196,5 +281,5 @@ if __name__ == "__main__":
                                 top.sdc.sdio_data_o,
                                 top.sdc.sdio_data_t,
                             ],
-                            platform=KC705Platform(),
+                            platform=platform,
                             name='soc_wrapper'))

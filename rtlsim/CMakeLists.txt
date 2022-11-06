@@ -4,6 +4,8 @@ ProcessorCount(N_THREADS)
 option(USE_TRACE "Enable VCD tracing" OFF)
 option(USE_TRACE_FST "Enable FST tracing" OFF)
 
+option(USE_ITRACE "Enable instruction tracing" OFF)
+
 find_package(verilator HINTS $ENV{VERILATOR_ROOT} ${VERILATOR_ROOT})
 if (NOT verilator_FOUND)
   message(FATAL_ERROR "Verilator was not found. Either install it, or set the VERILATOR_ROOT environment variable")
@@ -12,7 +14,8 @@ endif()
 set(SOURCE_FILES main.cpp
                  soc.cpp
                  uart.cpp
-                 sdcard.cpp)
+                 sdcard.cpp
+                 tracer.cpp)
 
 set(TOP_MODULE soc_wrapper)
 
@@ -30,6 +33,10 @@ if (USE_TRACE)
 elseif (USE_TRACE_FST)
    add_definitions(-DFST_OUTPUT)
    set(VL_FLAGS ${VL_FLAGS} --trace-fst --trace-threads 2 -DFST_OUTPUT)
+endif()
+
+if (USE_ITRACE)
+   add_definitions(-DITRACE)
 endif()
 
 set(LIBRARIES CONAN_PKG::spdlog

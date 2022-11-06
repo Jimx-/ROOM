@@ -30,7 +30,6 @@ class WritebackDebug(HasCoreParams, Record):
         HasCoreParams.__init__(self, params)
 
         Record.__init__(self, [
-            ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
             ('pdst', range(self.num_pregs)),
             ('data', self.xlen),
@@ -43,7 +42,6 @@ class CommitDebug(Record):
 
     def __init__(self, name=None, src_loc_at=0):
         super().__init__([
-            ('valid', 1),
             ('uop_id', MicroOp.ID_WIDTH),
         ],
                          name=name,
@@ -58,30 +56,32 @@ class CoreDebug(HasCoreParams):
         int_width = self.issue_params[IssueQueueType.INT]['issue_width']
 
         self.if_debug = [
-            IFDebug(name=f'if_debug{i}') for i in range(self.fetch_width)
+            Valid(IFDebug, name=f'if_debug{i}')
+            for i in range(self.fetch_width)
         ]
 
         self.id_debug = [
-            IDDebug(params, name=f'id_debug{i}')
+            Valid(IDDebug, params, name=f'id_debug{i}')
             for i in range(self.core_width)
         ]
 
         self.ex_debug = [
-            ExecDebug(params, name=f'ex_debug{i}') for i in range(int_width)
+            Valid(ExecDebug, params, name=f'ex_debug{i}')
+            for i in range(int_width)
         ]
 
         self.mem_debug = [
-            LSUDebug(params, name=f'mem_debug{i}')
+            Valid(LSUDebug, params, name=f'mem_debug{i}')
             for i in range(self.mem_width)
         ]
 
         self.wb_debug = [
-            WritebackDebug(params, name=f'wb_debug{i}')
+            Valid(WritebackDebug, params, name=f'wb_debug{i}')
             for i in range(self.mem_width + int_width)
         ]
 
         self.commit_debug = [
-            CommitDebug(name=f'commit_debug{i}')
+            Valid(CommitDebug, name=f'commit_debug{i}')
             for i in range(self.core_width)
         ]
 
@@ -435,7 +435,7 @@ class Core(HasCoreParams, Elaboratable):
 
                 m.d.comb += [
                     commit_debug.valid.eq(rob.commit_req.valids[w]),
-                    commit_debug.uop_id.eq(rob.commit_req.uops[w].uop_id),
+                    commit_debug.bits.uop_id.eq(rob.commit_req.uops[w].uop_id),
                 ]
 
         #
@@ -868,9 +868,9 @@ class Core(HasCoreParams, Elaboratable):
 
             m.d.comb += [
                 wb_debug.valid.eq(iregfile.write_ports[0].valid),
-                wb_debug.uop_id.eq(mem_wbarb.out.bits.uop.uop_id),
-                wb_debug.pdst.eq(mem_wbarb.out.bits.uop.pdst),
-                wb_debug.data.eq(iregfile.write_ports[0].bits.data),
+                wb_debug.bits.uop_id.eq(mem_wbarb.out.bits.uop.uop_id),
+                wb_debug.bits.pdst.eq(mem_wbarb.out.bits.uop.pdst),
+                wb_debug.bits.data.eq(iregfile.write_ports[0].bits.data),
             ]
 
         for i, (wp, iresp) in enumerate(
@@ -888,9 +888,9 @@ class Core(HasCoreParams, Elaboratable):
 
                 m.d.comb += [
                     wb_debug.valid.eq(wp.valid),
-                    wb_debug.uop_id.eq(iresp.bits.uop.uop_id),
-                    wb_debug.pdst.eq(iresp.bits.uop.pdst),
-                    wb_debug.data.eq(wp.bits.data),
+                    wb_debug.bits.uop_id.eq(iresp.bits.uop.uop_id),
+                    wb_debug.bits.pdst.eq(iresp.bits.uop.pdst),
+                    wb_debug.bits.data.eq(wp.bits.data),
                 ]
 
         for i, (eu, wp) in enumerate(
@@ -915,9 +915,9 @@ class Core(HasCoreParams, Elaboratable):
 
                 m.d.comb += [
                     wb_debug.valid.eq(wp.valid),
-                    wb_debug.uop_id.eq(eu.iresp.bits.uop.uop_id),
-                    wb_debug.pdst.eq(eu.iresp.bits.uop.pdst),
-                    wb_debug.data.eq(wp.bits.data),
+                    wb_debug.bits.uop_id.eq(eu.iresp.bits.uop.uop_id),
+                    wb_debug.bits.pdst.eq(eu.iresp.bits.uop.pdst),
+                    wb_debug.bits.data.eq(wp.bits.data),
                 ]
 
         if self.use_fpu:
