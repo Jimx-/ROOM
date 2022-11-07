@@ -6,12 +6,8 @@ namespace room {
 
 template <> Tracer* Singleton<Tracer>::m_singleton = nullptr;
 
-Tracer::Tracer() : resolve_mask_(0), mispredict_mask_(0), flush_(false) {}
-
 void Tracer::trace_if(int uop_id, uint64_t pc, uint32_t insn)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     if (insts_.find(uop_id) != insts_.end()) {
         spdlog::error("Duplicate micro-op ID: {}", uop_id);
         return;
@@ -27,8 +23,6 @@ void Tracer::trace_if(int uop_id, uint64_t pc, uint32_t insn)
 
 void Tracer::trace_id(int uop_id, int br_mask)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     auto it = insts_.find(uop_id);
     if (it == insts_.end()) {
         spdlog::error("Micro-op {} not found", uop_id);
@@ -40,8 +34,6 @@ void Tracer::trace_id(int uop_id, int br_mask)
 void Tracer::trace_ex(int uop_id, int opcode, int prs1, uint64_t rs1_data,
                       int prs2, uint64_t rs2_data)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     auto it = insts_.find(uop_id);
     if (it == insts_.end()) {
         spdlog::error("Micro-op {} not found", uop_id);
@@ -56,8 +48,6 @@ void Tracer::trace_ex(int uop_id, int opcode, int prs1, uint64_t rs1_data,
 void Tracer::trace_mem(int uop_id, int opcode, uint64_t addr, uint64_t data,
                        int prs1, int prs2)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     auto it = insts_.find(uop_id);
     if (it == insts_.end()) {
         spdlog::error("Micro-op {} not found", uop_id);
@@ -78,8 +68,6 @@ void Tracer::trace_mem(int uop_id, int opcode, uint64_t addr, uint64_t data,
 
 void Tracer::trace_wb(int uop_id, int pdst, uint64_t data)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     auto it = insts_.find(uop_id);
     if (it == insts_.end()) {
         spdlog::error("Micro-op {} not found", uop_id);
@@ -91,65 +79,39 @@ void Tracer::trace_wb(int uop_id, int pdst, uint64_t data)
 
 void Tracer::trace_commit(int uop_id)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    commit_ids_.insert(uop_id);
-}
+    auto it = insts_.find(uop_id);
+    if (it == insts_.end()) {
+        spdlog::error("Micro-op {} not found", uop_id);
+    }
 
-void Tracer::trace_branch_resolve(int resolve_mask)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    resolve_mask_ |= resolve_mask;
+    commit(it->second);
+
+    insts_.erase(it);
 }
 
 void Tracer::trace_branch_mispredict(int mispredict_mask)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    mispredict_mask_ |= mispredict_mask;
+    auto it = insts_.begin();
+
+    while (it != insts_.end()) {
+        if (it->second.br_mask & mispredict_mask)
+            it = insts_.erase(it);
+        else
+            it++;
+    }
 }
 
-void Tracer::trace_flush()
+void Tracer::trace_branch_resolve(int resolve_mask)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    flush_ = true;
+
+    for (auto& [uop_id, inst] : insts_) {
+        inst.br_mask &= ~resolve_mask;
+    }
 }
 
-void Tracer::tick()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
+void Tracer::trace_flush() { insts_.clear(); }
 
-    if (mispredict_mask_ != 0) {
-        auto it = insts_.begin();
-
-        while (it != insts_.end()) {
-            if (it->second.br_mask & mispredict_mask_)
-                it = insts_.erase(it);
-            else
-                it++;
-        }
-    }
-
-    if (resolve_mask_ != 0) {
-        for (auto& [uop_id, inst] : insts_) {
-            inst.br_mask &= ~resolve_mask_;
-        }
-    }
-
-    if (flush_) {
-        insts_.clear();
-    }
-
-    mispredict_mask_ = 0;
-    resolve_mask_ = 0;
-    flush_ = 0;
-
-    for (auto&& uop_id : commit_ids_) {
-        auto it = insts_.find(uop_id);
-
-        if (it != insts_.end()) commit(it->second);
-    }
-
-    commit_ids_.clear();
-}
+void Tracer::tick() {}
 
 void Tracer::commit(const Instruction& inst)
 {
@@ -205,17 +167,17 @@ extern "C" void trace_commit(int uop_id)
 #endif
 }
 
-extern "C" void trace_branch_resolve(int resolve_mask)
-{
-#ifdef ITRACE
-    room::Tracer::get_singleton().trace_branch_resolve(resolve_mask);
-#endif
-}
-
 extern "C" void trace_branch_mispredict(int mispredict_mask)
 {
 #ifdef ITRACE
     room::Tracer::get_singleton().trace_branch_mispredict(mispredict_mask);
+#endif
+}
+
+extern "C" void trace_branch_resolve(int resolve_mask)
+{
+#ifdef ITRACE
+    room::Tracer::get_singleton().trace_branch_resolve(resolve_mask);
 #endif
 }
 

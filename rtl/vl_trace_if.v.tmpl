@@ -6,8 +6,8 @@ import "DPI-C" function void trace_ex(int uop_id, int opcode, int prs1, longint 
 import "DPI-C" function void trace_mem(int uop_id, int opcode, longint addr, longint data, int prs1, int prs2);
 import "DPI-C" function void trace_wb(int uop_id, int pdst, longint data);
 import "DPI-C" function void trace_commit(int uop_id);
-import "DPI-C" function void trace_branch_resolve(int resolve_mask);
 import "DPI-C" function void trace_branch_mispredict(int mispredict_mask);
+import "DPI-C" function void trace_branch_resolve(int resolve_mask);
 import "DPI-C" function void trace_flush();
 
 module vl_trace_if
@@ -112,12 +112,12 @@ module vl_trace_if
          end
          // {% endfor %}
 
-         if (branch_resolve != {{core.max_br_count}}'b0) begin
-            trace_branch_resolve(branch_resolve);
-         end
-
          if (branch_mispredict != {{core.max_br_count}}'b0) begin
             trace_branch_mispredict(branch_mispredict);
+         end
+
+         if (branch_resolve != {{core.max_br_count}}'b0) begin
+            trace_branch_resolve(branch_resolve);
          end
 
          if (flush_pipeline) begin
