@@ -45,9 +45,8 @@
 
 #define is_digit(c) ((c) >= '0' && (c) <= '9')
 
-static char* digits __attribute__((section(".rodata"))) =
-    "0123456789abcdefghijklmnopqrstuvwxyz";
-static char* upper_digits __attribute__((section(".rodata"))) = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+static const char upper_digits[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 long strtol(const char* nptr, char** endptr, int base)
 {
@@ -121,7 +120,7 @@ static char* number(char* str, char* end, long num, int base, int size,
                     int precision, int type)
 {
     char c, sign, tmp[66];
-    char* dig = digits;
+    const char* dig = digits;
     int i;
 
     if (type & LARGE) dig = upper_digits;
@@ -212,7 +211,7 @@ static char* eaddr(char* str, char* end, unsigned char* addr, int size,
                    int precision, int type)
 {
     char tmp[24];
-    char* dig = digits;
+    const char* dig = digits;
     int i, len;
 
     if (type & LARGE) dig = upper_digits;

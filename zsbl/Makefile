@@ -2,7 +2,7 @@ CC	= $(RISCV)/bin/riscv64-unknown-elf-gcc
 LD	= $(RISCV)/bin/riscv64-unknown-elf-ld
 OBJCOPY	= $(RISCV)/bin/riscv64-unknown-elf-objcopy
 
-CFLAGS	= -march=rv64imfd -mabi=lp64d -nostdlib -nostartfiles -g
+CFLAGS	= -march=rv64imfd -mabi=lp64d -mcmodel=medany -nostdlib -nostartfiles -g
 CFLAGS	+= -I../include/ -Ifat/src/ -I$(RISCV)/riscv64-unknown-elf/include/
 LDFLAGS	= -melf64lriscv -Tlinker.ld
 

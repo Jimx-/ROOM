@@ -5,6 +5,7 @@ option(USE_TRACE "Enable VCD tracing" OFF)
 option(USE_TRACE_FST "Enable FST tracing" OFF)
 
 option(USE_ITRACE "Enable instruction tracing" OFF)
+option(USE_DROMAJO "Enable Dromajo co-simulation" OFF)
 
 find_package(verilator HINTS $ENV{VERILATOR_ROOT} ${VERILATOR_ROOT})
 if (NOT verilator_FOUND)
@@ -27,6 +28,9 @@ set(VL_FLAGS -O2 --language 1800-2009 --assert -Wall -Wpedantic
              -Wno-CMPCONST -Wno-UNOPTFLAT -Wno-UNSIGNED
              --x-initial unique --x-assign unique)
 
+set(LIBRARIES CONAN_PKG::spdlog
+              CONAN_PKG::cxxopts)
+
 if (USE_TRACE)
    add_definitions(-DVCD_OUTPUT)
    set(VL_FLAGS ${VL_FLAGS} --trace --trace-structs -DVCD_OUTPUT)
@@ -39,8 +43,14 @@ if (USE_ITRACE)
    add_definitions(-DITRACE)
 endif()
 
-set(LIBRARIES CONAN_PKG::spdlog
-              CONAN_PKG::cxxopts)
+if (USE_DROMAJO)
+   add_definitions(-DDROMAJO)
+   add_subdirectory(dromajo)
+
+   include_directories(dromajo/include)
+
+   set(LIBRARIES ${LIBRARIES} dromajo_cosim)
+endif()
 
 add_executable(rtlsim ${SOURCE_FILES})
 

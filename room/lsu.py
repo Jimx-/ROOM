@@ -826,8 +826,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 m.d.comb += fired_stq_e[w].eq(fired_stq_incoming_e[w])
 
             m.d.sync += [
-                dmem_req_fired[w].eq(dcache.reqs[w].valid
-                                     & dcache.reqs[w].ready),
+                dmem_req_fired[w].eq(dcache.reqs[w].fire),
                 fired_incoming_uop[w].eq(self.exec_reqs[w].bits.uop),
                 fired_incoming_uop[w].br_mask.eq(
                     self.br_update.get_new_br_mask(
@@ -836,6 +835,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                                           & ~req_killed),
                 fired_load_retry[w].eq(
                     will_fire_load_retry[w]
+                    & dcache.reqs[w].fire
                     & ~self.br_update.uop_killed(ldq_retry_e.uop)),
                 fired_sta_incoming[w].eq(will_fire_sta_incoming[w]
                                          & ~req_killed),
@@ -861,7 +861,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 fired_tlb_uncacheable[w].eq(s0_tlb_uncacheable[w]),
             ]
 
-            with m.If(will_fire_load_retry[w] & dmem_req_fired[w]):
+            with m.If(will_fire_load_retry[w] & dcache.reqs[w].fire):
                 m.d.comb += s0_block_load_mask[ldq_retry_idx].eq(1)
             with m.Elif(will_fire_load_incoming[w]):
                 m.d.comb += s0_block_load_mask[

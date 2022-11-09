@@ -3,13 +3,21 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <string>
 
 #include "singleton.h"
+
+#ifdef DROMAJO
+#include "dromajo_cosim.h"
+#endif
 
 namespace room {
 
 class Tracer : public Singleton<Tracer> {
 public:
+    Tracer(std::string_view dromajo_cfg);
+    ~Tracer();
+
     void trace_if(int uop_id, uint64_t pc, uint32_t insn);
     void trace_id(int uop_id, int br_mask);
     void trace_ex(int uop_id, int opcode, int prs1, uint64_t rs1_data, int prs2,
@@ -30,6 +38,7 @@ private:
         uint64_t pc;
         uint32_t inst;
 
+        bool decoded;
         int br_mask;
 
         int pdst;
@@ -41,9 +50,16 @@ private:
 
         uint64_t addr;
         uint64_t data;
+
+        Instruction() : decoded(false), br_mask(0), rd_data(0), addr(0), data(0)
+        {}
     };
 
     std::unordered_map<int, Instruction> insts_;
+
+#ifdef DROMAJO
+    dromajo_cosim_state_t* dromajo_state;
+#endif
 
     void commit(const Instruction& inst);
 };

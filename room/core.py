@@ -126,6 +126,8 @@ class Core(HasCoreParams, Elaboratable):
 
         self.sim_debug = sim_debug
 
+        self.reset_vector = Signal(32)
+
         self.interrupts = CoreInterrupts()
         self.debug_entry = Signal(32)
 
@@ -183,6 +185,8 @@ class Core(HasCoreParams, Elaboratable):
         if_stage = m.submodules.if_stage = IFStage(self.ibus,
                                                    self.params,
                                                    sim_debug=self.sim_debug)
+
+        m.d.comb += if_stage.reset_vector.eq(self.reset_vector)
 
         for if_bp, bp in zip(if_stage.bp, bp_unit.bp):
             m.d.comb += if_bp.eq(bp)

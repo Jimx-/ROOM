@@ -14,6 +14,7 @@ cxxopts::ParseResult parse_arguments(int argc, char* argv[])
         // clang-format off
         options.add_options()
             ("sd-image", "SD card image", cxxopts::value<std::string>()->default_value(""))
+            ("dromajo-cfg", "Dromajo config file", cxxopts::value<std::string>()->default_value(""))
             ("h,help", "Print help");
         // clang-format on
 
@@ -40,14 +41,17 @@ int main(int argc, char* argv[])
     auto options = parse_arguments(argc, argv);
 
     std::string sd_image;
+    std::string dromajo_cfg;
+
     try {
         sd_image = options["sd-image"].as<std::string>();
+        dromajo_cfg = options["dromajo-cfg"].as<std::string>();
     } catch (const OptionException& e) {
         spdlog::error("Failed to parse options: {}", e.what());
         exit(EXIT_FAILURE);
     }
 
-    room::SoC soc(sd_image);
+    room::SoC soc(sd_image, dromajo_cfg);
 
     soc.run();
 

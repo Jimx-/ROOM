@@ -56,7 +56,7 @@ void sim_trace_enable(bool enable) { trace_enabled = enable; }
 
 class SoC::Impl {
 public:
-    Impl(std::string_view sd_image)
+    Impl(std::string_view sd_image, std::string_view dromajo_cfg)
     {
         Verilated::randReset(VERILATOR_RESET_VALUE);
         Verilated::randSeed(50);
@@ -69,7 +69,7 @@ public:
         if (!sd_image.empty()) sdcard.reset(new SDCard(sd_image));
 
 #ifdef ITRACE
-        (void)new Tracer();
+        (void)new Tracer(dromajo_cfg);
 #endif
 
 #ifdef VCD_OUTPUT
@@ -82,6 +82,14 @@ public:
         trace_ = new VerilatedFstC();
         dut_->trace(trace_, 99);
         trace_->open("trace.fst");
+#endif
+    }
+
+    ~Impl()
+    {
+#if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
+        trace_->close();
+        delete trace_;
 #endif
     }
 
@@ -158,7 +166,9 @@ private:
     }
 };
 
-SoC::SoC(std::string_view sd_image) : impl_(new Impl(sd_image)) {}
+SoC::SoC(std::string_view sd_image, std::string_view dromajo_cfg)
+    : impl_(new Impl(sd_image, dromajo_cfg))
+{}
 
 SoC::~SoC() { delete impl_; }
 

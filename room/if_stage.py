@@ -320,6 +320,8 @@ class IFStage(HasCoreParams, Elaboratable):
     def __init__(self, ibus, params, sim_debug=False):
         super().__init__(params)
 
+        self.reset_vector = Signal(32)
+
         self.ibus = ibus
         self.enable_icache = params.get('icache_params') is not None
         self.sim_debug = sim_debug
@@ -396,7 +398,7 @@ class IFStage(HasCoreParams, Elaboratable):
 
         with m.If(reset_d1 & ~reset):
             m.d.comb += [
-                s0_vpc.eq(0),
+                s0_vpc.eq(self.reset_vector),
                 s0_valid.eq(1),
             ]
 

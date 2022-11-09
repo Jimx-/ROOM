@@ -64,15 +64,15 @@ core_params = dict(
     use_fpu=True,
     flen=64,
     fma_latency=4,
-    io_regions={0x80000000: 0x80000000},
+    io_regions={0xC0000000: 0x40000000},
 )
 
 
 class Top(Elaboratable):
 
     mem_map = {
-        'rom': 0x00000000,
-        'sram': 0x20000000,
+        'rom': 0x00010000,
+        'sram': 0x80000000,
     }
 
     def __init__(self,
@@ -112,6 +112,7 @@ class Top(Elaboratable):
 
         core = Core(self.core_params, sim_debug=self.sim_debug)
         soc.add_cpu(core)
+        m.d.comb += core.reset_vector.eq(0x10000)
 
         if self.sim_debug:
             m.d.comb += self.core_debug.eq(core.core_debug)
@@ -127,7 +128,7 @@ class Top(Elaboratable):
 
         soc.add_rom(name='rom',
                     origin=self.mem_map['rom'],
-                    size=0x20000,
+                    size=0x1000,
                     init=self.rom_image)
 
         soc.add_peripheral('dm', debug_module)
@@ -175,7 +176,7 @@ if __name__ == "__main__":
     if args.ram is not None:
         ram = read_mem_image(args.ram)
     else:
-        ram = []
+        ram = [0x6f]  # j 0
 
     dut = Top(args.freq, core_params, rom, debug_rom, ram, sim_debug=True)
 
@@ -326,7 +327,7 @@ if __name__ == "__main__":
 
     f = open('trace.log', 'w')
 
-    sim.add_sync_process(process_sim_debug(cycles=100, log_file=f))
+    sim.add_sync_process(process_sim_debug(cycles=300, log_file=f))
     # sim.add_sync_process(process)
     # sim.add_sync_process(process_debug, domain='debug')
     with sim.write_vcd('room.vcd'):
