@@ -1,4 +1,5 @@
 __pycache__
+.ccls-cache
 
 rtl/wrapper.v
 
@@ -16,6 +17,7 @@ include/generated/
 *.o
 *.d
 obj_dir
+bootrom*
 
 # Debug ROM
 debug_rom*

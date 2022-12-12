@@ -14,7 +14,9 @@ cxxopts::ParseResult parse_arguments(int argc, char* argv[])
         // clang-format off
         options.add_options()
             ("sd-image", "SD card image", cxxopts::value<std::string>()->default_value(""))
-            ("dromajo-cfg", "Dromajo config file", cxxopts::value<std::string>()->default_value(""))
+            ("M,memory-size", "Memory size (MB)", cxxopts::value<unsigned int>()->default_value("256"))
+            ("A,memory-addr", "Memory base address", cxxopts::value<uint64_t>()->default_value("0x80000000"))
+            ("b,bootrom", "Path to boot ROM", cxxopts::value<std::string>()->default_value(""))
             ("h,help", "Print help");
         // clang-format on
 
@@ -41,17 +43,22 @@ int main(int argc, char* argv[])
     auto options = parse_arguments(argc, argv);
 
     std::string sd_image;
-    std::string dromajo_cfg;
+    uint64_t memory_addr;
+    unsigned int memory_size_mb;
+    std::string bootrom;
 
     try {
         sd_image = options["sd-image"].as<std::string>();
-        dromajo_cfg = options["dromajo-cfg"].as<std::string>();
+        memory_addr = options["memory-addr"].as<uint64_t>();
+        memory_size_mb = options["memory-size"].as<unsigned int>();
+        bootrom = options["bootrom"].as<std::string>();
     } catch (const OptionException& e) {
         spdlog::error("Failed to parse options: {}", e.what());
         exit(EXIT_FAILURE);
     }
 
-    room::SoC soc(sd_image, dromajo_cfg);
+    room::SoC soc(sd_image, memory_addr, (size_t)memory_size_mb << 20UL,
+                  bootrom);
 
     soc.run();
 

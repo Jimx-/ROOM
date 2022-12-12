@@ -1,6 +1,8 @@
 #include "tracer.h"
 
 #include <cstdarg>
+#include <cstdlib>
+#include <unistd.h>
 
 #include "spdlog/spdlog.h"
 
@@ -54,11 +56,36 @@ static void dromajo_error_log(int hartid, const char* fmt, ...)
 }
 #endif
 
-Tracer::Tracer(std::string_view dromajo_cfg)
+Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
+               std::string_view bootrom)
 {
 #ifdef DROMAJO
-    char* argv[] = {(char*)"rtlsim", (char*)dromajo_cfg.data()};
+    char tempname[] = "/tmp/rtlsim-XXXXXX";
+
+    int tmp_fd = ::mkstemp(tempname);
+    if (tmp_fd < 0) {
+        spdlog::error("Failed to create temporary Dromajo config file");
+        throw std::runtime_error(
+            "Failed to create temporary Dromajo config file");
+    }
+
+    FILE* cfg_file = fdopen(tmp_fd, "w");
+
+    fputs("{\n", cfg_file);
+    fputs("\"version\":1,\n", cfg_file);
+    fputs("\"machine\":\"riscv64\",\n", cfg_file);
+    fprintf(cfg_file, "\"memory_size\": %lu,\n", (uint64_t)memory_size >> 20UL);
+    fprintf(cfg_file, "\"memory_base_addr\": 0x%lx,\n", memory_addr);
+    fprintf(cfg_file, "\"bios\": \"%s\"\n", bootrom.data());
+    fputs("}\n", cfg_file);
+
+    fclose(cfg_file);
+
+    char* argv[] = {(char*)"rtlsim", tempname};
+
     dromajo_state = dromajo_cosim_init(2, argv);
+
+    ::unlink(tempname);
 
     dromajo_install_new_loggers(dromajo_state, dromajo_debug_log,
                                 dromajo_error_log);
@@ -201,7 +228,7 @@ void Tracer::commit(const Instruction& inst)
 
 } // namespace room
 
-extern "C" void trace_if(int uop_id, uint64_t pc, uint32_t insn)
+extern "C" void dpi_trace_if(int uop_id, uint64_t pc, uint32_t insn)
 {
     spdlog::trace("IF uop_id={} pc={:#x} insn={:#x}", uop_id, pc, insn);
 #ifdef ITRACE
@@ -209,7 +236,7 @@ extern "C" void trace_if(int uop_id, uint64_t pc, uint32_t insn)
 #endif
 }
 
-extern "C" void trace_id(int uop_id, int br_mask)
+extern "C" void dpi_trace_id(int uop_id, int br_mask)
 {
     spdlog::trace("ID uop_id={} br_mask={:#x}", uop_id, br_mask);
 #ifdef ITRACE
@@ -217,8 +244,8 @@ extern "C" void trace_id(int uop_id, int br_mask)
 #endif
 }
 
-extern "C" void trace_ex(int uop_id, int opcode, int prs1, uint64_t rs1_data,
-                         int prs2, uint64_t rs2_data)
+extern "C" void dpi_trace_ex(int uop_id, int opcode, int prs1,
+                             uint64_t rs1_data, int prs2, uint64_t rs2_data)
 {
     spdlog::trace("EX uop_id={}", uop_id);
 #ifdef ITRACE
@@ -227,8 +254,8 @@ extern "C" void trace_ex(int uop_id, int opcode, int prs1, uint64_t rs1_data,
 #endif
 }
 
-extern "C" void trace_mem(int uop_id, int opcode, uint64_t addr, uint64_t data,
-                          int prs1, int prs2)
+extern "C" void dpi_trace_mem(int uop_id, int opcode, uint64_t addr,
+                              uint64_t data, int prs1, int prs2)
 {
     spdlog::trace("MEM uop_id={}", uop_id);
 #ifdef ITRACE
@@ -237,7 +264,7 @@ extern "C" void trace_mem(int uop_id, int opcode, uint64_t addr, uint64_t data,
 #endif
 }
 
-extern "C" void trace_wb(int uop_id, int pdst, uint64_t data)
+extern "C" void dpi_trace_wb(int uop_id, int pdst, uint64_t data)
 {
     spdlog::trace("WB uop_id={} pdst={} data={:#x}", uop_id, pdst, data);
 #ifdef ITRACE
@@ -245,7 +272,7 @@ extern "C" void trace_wb(int uop_id, int pdst, uint64_t data)
 #endif
 }
 
-extern "C" void trace_commit(int uop_id)
+extern "C" void dpi_trace_commit(int uop_id)
 {
     spdlog::trace("C uop_id={}", uop_id);
 #ifdef ITRACE
@@ -253,7 +280,7 @@ extern "C" void trace_commit(int uop_id)
 #endif
 }
 
-extern "C" void trace_branch_mispredict(int mispredict_mask)
+extern "C" void dpi_trace_branch_mispredict(int mispredict_mask)
 {
     spdlog::trace("BRK mask={:#x}", mispredict_mask);
 #ifdef ITRACE
@@ -261,7 +288,7 @@ extern "C" void trace_branch_mispredict(int mispredict_mask)
 #endif
 }
 
-extern "C" void trace_branch_resolve(int resolve_mask)
+extern "C" void dpi_trace_branch_resolve(int resolve_mask)
 {
     spdlog::trace("BRR mask={:#x}", resolve_mask);
 #ifdef ITRACE
@@ -269,7 +296,7 @@ extern "C" void trace_branch_resolve(int resolve_mask)
 #endif
 }
 
-extern "C" void trace_flush(void)
+extern "C" void dpi_trace_flush(void)
 {
     spdlog::trace("FLUSH");
 #ifdef ITRACE

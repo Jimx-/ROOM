@@ -20,7 +20,8 @@ set(SOURCE_FILES main.cpp
 
 set(TOP_MODULE soc_wrapper)
 
-set(RTL_INCLUDE /tmp)
+set(RTL_INCLUDE /tmp
+                ../rtl)
 
 set(VL_FLAGS -O2 --language 1800-2009 --assert -Wall -Wpedantic
              -Wno-WIDTH -Wno-DECLFILENAME -Wno-REDEFMACRO

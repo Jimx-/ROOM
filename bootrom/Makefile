@@ -13,7 +13,7 @@ all: $(BIN)
 $(BIN): bootrom
 	$(OBJCOPY) -O binary --only-section .text $^ $@
 
-%: %.S
+bootrom: ../rtlsim/dromajo/bootrom/bootrom.S
 	$(CC) $(CFLAGS) -o $@ $^
 
 clean:

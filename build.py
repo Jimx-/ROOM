@@ -1,11 +1,14 @@
 from amaranth import *
 from amaranth.build import *
+from amaranth.utils import log2_int
+
+from amaranth_soc.memory import MemoryMap
 
 from room.consts import *
 from room import Core
 
 from roomsoc.soc import SoC
-from roomsoc.interconnect import axi
+from roomsoc.interconnect import axi, wishbone
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 from roomsoc.peripheral.sdc import SDController
@@ -132,6 +135,45 @@ def generate_trace_if(m, core, output_dir):
         fout.write('\n')
 
 
+class DromajoRAM(Elaboratable):
+
+    def __init__(self, addr_width, data_width=32, ram_base=0x80000000):
+        self.addr_width = addr_width
+        self.data_width = data_width
+        self.ram_base = ram_base
+
+        self.bus = wishbone.Interface(addr_width=addr_width,
+                                      data_width=data_width,
+                                      granularity=8)
+        self.bus.memory_map = MemoryMap(data_width=8,
+                                        addr_width=addr_width +
+                                        log2_int(data_width // 8))
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.submodules.ram = Instance(
+            'dromajo_ram',
+            p_ADDR_WIDTH=self.addr_width,
+            p_DATA_WIDTH=self.data_width,
+            p_RAM_BASE=self.ram_base,
+            #
+            i_clk_i=ClockSignal(),
+            i_rst_i=ResetSignal(),
+            i_adr_i=self.bus.adr,
+            i_dat_i=self.bus.dat_w,
+            i_sel_i=self.bus.sel,
+            i_we_i=self.bus.we,
+            i_cyc_i=self.bus.cyc,
+            i_stb_i=self.bus.stb,
+            #
+            o_ack_o=self.bus.ack,
+            o_dat_o=self.bus.dat_r,
+        )
+
+        return m
+
+
 class Top(Elaboratable):
 
     mem_map = {
@@ -190,10 +232,19 @@ class Top(Elaboratable):
 
         soc.add_peripheral('dm', debug_module)
 
-        soc.add_ram(name='sram',
-                    origin=self.mem_map['sram'],
-                    size=0x20000,
-                    init=self.ram_image)
+        if self.sim:
+            sram = DromajoRAM(addr_width=26,
+                              data_width=32,
+                              ram_base=self.mem_map['sram'])
+            soc.add_peripheral('sram',
+                               sram,
+                               origin=self.mem_map['sram'],
+                               cacheable=True)
+        else:
+            soc.add_ram(name='sram',
+                        origin=self.mem_map['sram'],
+                        size=0x20000,
+                        init=self.ram_image)
 
         soc.add_controller()
 

@@ -15,7 +15,7 @@ namespace room {
 
 class Tracer : public Singleton<Tracer> {
 public:
-    Tracer(std::string_view dromajo_cfg);
+    Tracer(uint64_t memory_addr, size_t memory_size, std::string_view bootrom);
     ~Tracer();
 
     void trace_if(int uop_id, uint64_t pc, uint32_t insn);
