@@ -37,6 +37,7 @@ class HasDCacheParams(HasCoreParams):
         self.word_off_bits = log2_int(self.word_bits // 8)
 
         self.n_mshrs = dcache_params['n_mshrs']
+        self.n_iomshrs = dcache_params['n_iomshrs']
         self.sdq_size = dcache_params['sdq_size']
         self.rpq_size = dcache_params['rpq_size']
         self.n_data_banks = dcache_params['n_data_banks']
@@ -67,30 +68,27 @@ class DCacheReq(HasDCacheParams):
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
         self.name = name
 
-        xlen = params['xlen']
-        vaddr_bits = params['vaddr_bits_extended']
-
         self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.addr = Signal(vaddr_bits, name=f'{name}_addr')
-        self.data = Signal(xlen, name=f'{name}_data')
+        self.addr = Signal(self.vaddr_bits, name=f'{name}_addr')
+        self.data = Signal(self.xlen, name=f'{name}_data')
 
     def eq(self, rhs):
         attrs = ['uop', 'addr', 'data']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
-class DCacheResp:
+class DCacheResp(HasDCacheParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        xlen = params['xlen']
-
         self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.data = Signal(xlen, name=f'{name}_data')
+        self.data = Signal(self.xlen, name=f'{name}_data')
 
     def eq(self, rhs):
         attrs = ['uop', 'data']
@@ -817,6 +815,76 @@ class MSHR(HasDCacheParams, Elaboratable):
         return m
 
 
+class IOMSHR(HasDCacheParams, Elaboratable):
+
+    def __init__(self, id, params, dbus):
+        super().__init__(params)
+
+        self.id = id
+        self.dbus = dbus
+
+        self.req = Decoupled(DCacheReq, params)
+        self.resp = Decoupled(DCacheResp, params)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        granularity_bits = log2_int(self.xlen // 8)
+
+        req = DCacheReq(self.params)
+
+        load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
+        m.d.comb += [
+            load_gen.typ.eq(req.uop.mem_size),
+            load_gen.signed.eq(req.uop.mem_signed),
+            load_gen.addr.eq(req.addr),
+            load_gen.data_in.eq(self.dbus.dat_r),
+        ]
+
+        store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
+        m.d.comb += [
+            store_gen.typ.eq(req.uop.mem_size),
+            store_gen.addr.eq(req.addr),
+            store_gen.data_in.eq(req.data),
+        ]
+
+        send_resp = req.uop.mem_cmd == MemoryCommand.READ
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.comb += self.req.ready.eq(1)
+
+                with m.If(self.req.fire):
+                    m.d.sync += req.eq(self.req.bits)
+                    m.next = 'MEM_ACCESS'
+
+            with m.State('MEM_ACCESS'):
+                m.d.comb += [
+                    self.dbus.adr.eq(req.addr[granularity_bits:]),
+                    self.dbus.stb.eq(1),
+                    self.dbus.dat_w.eq(store_gen.data_out),
+                    self.dbus.cyc.eq(1),
+                    self.dbus.sel.eq(store_gen.mask),
+                    self.dbus.we.eq(req.uop.mem_cmd == MemoryCommand.WRITE),
+                ]
+
+                with m.If(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
+                    m.next = 'RESP'
+
+            with m.State('RESP'):
+                m.d.comb += self.resp.valid.eq(send_resp)
+
+                with m.If(~send_resp | self.resp.fire):
+                    m.next = 'IDLE'
+
+        m.d.comb += [
+            self.resp.bits.uop.eq(req.uop),
+            self.resp.bits.data.eq(load_gen.data_out),
+        ]
+
+        return m
+
+
 class MSHRFile(HasDCacheParams, Elaboratable):
 
     def __init__(self, params, dbus):
@@ -859,6 +927,11 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                     req.eq(self.req[w].bits),
                 ]
 
+        req_uncacheable = Signal()
+        for origin, size in self.io_regions.items():
+            with m.If((req.addr >= origin) & (req.addr < (origin + size))):
+                m.d.comb += req_uncacheable.eq(1)
+
         #
         # Store data queue
         #
@@ -874,6 +947,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
             sdq_write.data.eq(req.data),
             sdq_write.en.eq((Cat(self.req[w].fire
                                  for w in range(self.mem_width)) != 0)
+                            & ~req_uncacheable
                             & MemoryCommand.is_write(req.uop.mem_cmd)),
         ]
 
@@ -924,8 +998,8 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                                                        self.params)
         wb_arb = m.submodules.wb_arb = Arbiter(self.n_mshrs, WritebackReq,
                                                self.params)
-        resp_arb = m.submodules.resp_arb = Arbiter(self.n_mshrs, DCacheResp,
-                                                   self.params)
+        resp_arb = m.submodules.resp_arb = Arbiter(
+            self.n_mshrs + self.n_iomshrs, DCacheResp, self.params)
 
         idx_matches = Array(
             Signal(self.n_mshrs, name=f'idx_matches{i}')
@@ -956,7 +1030,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         mshr_alloc_idx = Signal(range(self.n_mshrs))
         pri_valid = (Cat(self.req[w].valid for w in range(self.mem_width)) !=
-                     0) & sdq_ready & ~idx_match[req_idx]
+                     0) & sdq_ready & ~req_uncacheable & ~idx_match[req_idx]
         pri_ready = Signal()
         sec_ready = 0
 
@@ -988,10 +1062,11 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                 mshr.req.eq(req),
                 mshr.req.sdq_id.eq(sdq_alloc_idx),
                 mshr.req_pri_valid.eq(pri_valid & (i == mshr_alloc_idx)),
-                mshr.req_sec_valid.eq((Cat(
-                    self.req[w].valid for w in range(self.mem_width)) != 0)
-                                      & sdq_ready & tag_match[req_idx]
-                                      & idx_matches[req_idx][i]),
+                mshr.req_sec_valid.eq(
+                    (Cat(self.req[w].valid
+                         for w in range(self.mem_width)) != 0)
+                    & sdq_ready & tag_match[req_idx]
+                    & idx_matches[req_idx][i] & ~req_uncacheable),
             ]
             with m.If(mshr_alloc_idx == i):
                 m.d.comb += pri_ready.eq(mshr.req_pri_ready)
@@ -1027,6 +1102,40 @@ class MSHRFile(HasDCacheParams, Elaboratable):
             with m.If(mshrs[i].req_pri_ready):
                 m.d.comb += mshr_alloc_idx.eq(i)
 
+        iomshr_alloc_arb = m.submodules.iomshr_alloc_arb = Arbiter(
+            self.n_iomshrs, Signal)
+
+        mmio_ready = 0
+
+        io_mshrs = []
+        for i in range(self.n_iomshrs):
+            mshr_dbus = wishbone.Interface(addr_width=self.dbus.addr_width,
+                                           data_width=self.dbus.data_width,
+                                           granularity=self.dbus.granularity,
+                                           name=f'iomshr_dbus{i}')
+            dbus_arbiter.add(mshr_dbus)
+
+            mshr = IOMSHR(self.n_mshrs + i, self.params, mshr_dbus)
+            setattr(m.submodules, f'iomshr{i}', mshr)
+
+            mmio_ready |= mshr.req.ready
+
+            m.d.comb += [
+                iomshr_alloc_arb.inp[i].valid.eq(mshr.req.ready),
+                mshr.req.valid.eq(iomshr_alloc_arb.inp[i].ready),
+                mshr.req.bits.uop.eq(req.uop),
+                mshr.req.bits.addr.eq(req.addr),
+                mshr.req.bits.data.eq(req.data),
+            ]
+
+            m.d.comb += mshr.resp.connect(resp_arb.inp[self.n_mshrs + i])
+
+            io_mshrs.append(mshr)
+
+        m.d.comb += iomshr_alloc_arb.out.ready.eq((Cat(
+            self.req[w].valid
+            for w in range(self.mem_width)) != 0) & req_uncacheable)
+
         m.d.comb += dbus_arbiter.bus.connect(self.dbus)
 
         m.d.comb += [
@@ -1059,10 +1168,17 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         for w in range(self.mem_width):
             m.d.comb += [
-                self.req[w].ready.eq((w == req_idx)
-                                     & sdq_ready
-                                     & Mux(idx_match[w], tag_match[w]
-                                           & sec_ready, pri_ready)),
+                self.req[w].ready.eq((w == req_idx) & Mux(
+                    req_uncacheable,
+                    mmio_ready,
+                    sdq_ready
+                    & Mux(
+                        idx_match[w],
+                        tag_match[w]
+                        & sec_ready,
+                        pri_ready,
+                    ),
+                )),
                 self.secondary_miss[w].eq(idx_match[w] & way_match[w]
                                           & ~tag_match[w]),
                 self.block_hit[w].eq(idx_match[w] & tag_match[w]),
