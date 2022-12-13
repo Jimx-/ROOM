@@ -89,7 +89,7 @@ class Top(Elaboratable):
         self.core_params = core_params
         self.sim_debug = sim_debug
 
-        self.axil_master = axi.AXILiteInterface(data_width=32,
+        self.axil_master = axi.AXILiteInterface(data_width=64,
                                                 addr_width=32,
                                                 name='axil_master')
 
@@ -108,7 +108,7 @@ class Top(Elaboratable):
             self.jtag.tck.eq(ClockSignal('debug')),
         ]
 
-        soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
+        soc = m.submodules.soc = SoC(bus_data_width=64, bus_addr_width=32)
 
         core = Core(self.core_params, sim_debug=self.sim_debug)
         soc.add_cpu(core)
@@ -170,11 +170,11 @@ if __name__ == "__main__":
                         default=1e6)
     args = parser.parse_args()
 
-    rom = read_mem_image(args.rom)
+    rom = read_mem_image(args.rom, word_len=64)
     debug_rom = read_mem_image(args.debug_rom)
 
     if args.ram is not None:
-        ram = read_mem_image(args.ram)
+        ram = read_mem_image(args.ram, word_len=64)
     else:
         ram = [0x6f]  # j 0
 

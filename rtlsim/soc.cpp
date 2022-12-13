@@ -134,7 +134,7 @@ public:
             case 2:
                 *data = *(uint32_t*)ptr;
                 break;
-            case 4:
+            case 3:
                 *data = *(uint64_t*)ptr;
                 break;
             default:

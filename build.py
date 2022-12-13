@@ -21,7 +21,7 @@ import os
 from jinja2 import FileSystemLoader, Environment
 
 
-def read_mem_image(filename):
+def read_mem_image(filename, word_len=32):
     image = []
 
     with open(filename, 'rb') as f:
@@ -30,6 +30,11 @@ def read_mem_image(filename):
             if not w:
                 break
             image.append(struct.unpack('I', w)[0])
+
+    if word_len == 64:
+        if len(image) & 1:
+            image.append(0)
+        image = [((hi << 32) | lo) for lo, hi in zip(*(iter(image), ) * 2)]
 
     return image
 
@@ -193,8 +198,8 @@ class Top(Elaboratable):
         self.clk_freq = clk_freq
         self.sim = sim
 
-        self.axil_master = axi.AXILiteInterface(data_width=32,
-                                                addr_width=30,
+        self.axil_master = axi.AXILiteInterface(data_width=64,
+                                                addr_width=29,
                                                 name='axil_master')
 
         self.jtag = JTAGInterface()
@@ -206,7 +211,7 @@ class Top(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        soc = m.submodules.soc = SoC(bus_data_width=32, bus_addr_width=32)
+        soc = m.submodules.soc = SoC(bus_data_width=64, bus_addr_width=32)
 
         core = Core(core_params, sim_debug=self.sim)
         soc.add_cpu(core)
@@ -233,8 +238,8 @@ class Top(Elaboratable):
         soc.add_peripheral('dm', debug_module)
 
         if self.sim:
-            sram = DromajoRAM(addr_width=26,
-                              data_width=32,
+            sram = DromajoRAM(addr_width=25,
+                              data_width=64,
                               ram_base=self.mem_map['sram'])
             soc.add_peripheral('sram',
                                sram,
@@ -281,11 +286,11 @@ if __name__ == "__main__":
     parser.add_argument('--sim', action='store_true')
     args = parser.parse_args()
 
-    rom = read_mem_image(args.rom)
+    rom = read_mem_image(args.rom, word_len=64)
     debug_rom = read_mem_image(args.debug_rom)
 
     if args.ram is not None:
-        ram = read_mem_image(args.ram)
+        ram = read_mem_image(args.ram, word_len=64)
     else:
         ram = [0x6f]
 

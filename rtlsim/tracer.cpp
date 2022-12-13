@@ -222,6 +222,7 @@ void Tracer::commit(const Instruction& inst)
                                        inst.rd_data, 0, true);
     if (exit_code != 0) {
         spdlog::error("Mismatch with ref model");
+        throw std::runtime_error("Mismatch with ref model");
     }
 #endif
 }
