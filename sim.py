@@ -13,6 +13,8 @@ from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 import argparse
 import struct
 
+from room.dcache import MSHRReq
+
 
 def read_mem_image(filename, word_len=32):
     image = []
@@ -60,6 +62,17 @@ core_params = dict(
         n_sets=64,
         n_ways=4,
         block_bytes=64,
+    ),
+    dcache_params=dict(
+        n_sets=64,
+        n_ways=4,
+        block_bytes=64,
+        row_bits=64,
+        n_mshrs=1,
+        n_iomshrs=1,
+        sdq_size=17,
+        rpq_size=16,
+        n_data_banks=1,
     ),
     use_fpu=True,
     flen=64,

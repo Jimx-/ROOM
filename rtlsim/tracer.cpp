@@ -58,6 +58,7 @@ static void dromajo_error_log(int hartid, const char* fmt, ...)
 
 Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
                std::string_view bootrom)
+    : should_stop_(false), cycle_(0), last_commit_cycle_(0)
 {
 #ifdef DROMAJO
     char tempname[] = "/tmp/rtlsim-XXXXXX";
@@ -83,11 +84,11 @@ Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
 
     char* argv[] = {(char*)"rtlsim", tempname};
 
-    dromajo_state = dromajo_cosim_init(2, argv);
+    dromajo_state_ = dromajo_cosim_init(2, argv);
 
     ::unlink(tempname);
 
-    dromajo_install_new_loggers(dromajo_state, dromajo_debug_log,
+    dromajo_install_new_loggers(dromajo_state_, dromajo_debug_log,
                                 dromajo_error_log);
 #endif
 }
@@ -95,7 +96,7 @@ Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
 Tracer::~Tracer()
 {
 #ifdef DROMAJO
-    dromajo_cosim_fini(dromajo_state);
+    dromajo_cosim_fini(dromajo_state_);
 #endif
 }
 
@@ -210,19 +211,31 @@ void Tracer::trace_branch_resolve(int resolve_mask)
 
 void Tracer::trace_flush() { insts_.clear(); }
 
-void Tracer::tick() {}
+void Tracer::tick()
+{
+    cycle_++;
+
+    if (cycle_ - last_commit_cycle_ > 10000) {
+        spdlog::error("No committed instruction in the last 10000 cycles, last "
+                      "cycle = {}",
+                      last_commit_cycle_);
+        should_stop_ = true;
+    }
+}
 
 void Tracer::commit(const Instruction& inst)
 {
     spdlog::trace("Commit instruction pc={:#x} inst={:#x} wdata={:#x}", inst.pc,
                   inst.inst, inst.rd_data);
 
+    last_commit_cycle_ = cycle_;
+
 #ifdef DROMAJO
-    int exit_code = dromajo_cosim_step(dromajo_state, 0, inst.pc, inst.inst,
+    int exit_code = dromajo_cosim_step(dromajo_state_, 0, inst.pc, inst.inst,
                                        inst.rd_data, 0, true);
     if (exit_code != 0) {
         spdlog::error("Mismatch with ref model");
-        throw std::runtime_error("Mismatch with ref model");
+        should_stop_ = true;
     }
 #endif
 }

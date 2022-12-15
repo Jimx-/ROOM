@@ -9,6 +9,7 @@ from room.branch import BranchUpdate
 from room.rob import CommitReq, Exception
 from room.exc import Cause
 from room.utils import Valid, Decoupled, wrap_incr
+from room.dcache import LoadGen, StoreGen, DCache, SimpleDCache
 
 from roomsoc.interconnect import wishbone
 
@@ -62,235 +63,6 @@ class RRPriorityEncoder(Elaboratable):
                     m.d.comb += self.o.eq(j)
 
         m.d.comb += self.n.eq(self.i == 0)
-        return m
-
-
-class DCacheReq(HasCoreParams):
-
-    def __init__(self, params, name=None, src_loc_at=0):
-        super().__init__(params)
-
-        if name is None:
-            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
-
-        self.uop = MicroOp(params, name=f'{name}_uop')
-        self.kill = Signal(name=f'{name}_kill')
-
-        self.addr = Signal(32, name=f'{name}_addr')
-        self.data = Signal(self.xlen, name=f'{name}_data')
-
-
-class DCacheResp(HasCoreParams):
-
-    def __init__(self, params, name=None, src_loc_at=0):
-        super().__init__(params)
-
-        if name is None:
-            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
-
-        self.uop = MicroOp(params, name=f'{name}_uop')
-        self.data = Signal(self.xlen, name=f'{name}_data')
-
-
-class StoreGen(Elaboratable):
-
-    def __init__(self, max_size):
-        self.log_max_size = log2_int(max_size)
-
-        self.typ = Signal(2)
-        self.addr = Signal(self.log_max_size)
-        self.data_in = Signal(max_size * 8)
-
-        self.mask = Signal(max_size)
-        self.data_out = Signal(max_size * 8)
-
-    def elaborate(self, platform):
-        m = Module()
-
-        for i in range(self.log_max_size + 1):
-            with m.If(self.typ == i):
-                m.d.comb += self.data_out.eq(
-                    Repl(self.data_in[:(8 << i)], 1 <<
-                         (self.log_max_size - i)))
-
-        mask = 1
-        for i in range(self.log_max_size):
-            upper = Mux(self.addr[i], mask, 0) | Mux(self.typ >= (i + 1),
-                                                     (1 << (1 << i)) - 1, 0)
-            lower = Mux(self.addr[i], 0, mask)
-            mask = Cat(lower, upper)
-        m.d.comb += self.mask.eq(mask)
-
-        return m
-
-
-class LoadGen(Elaboratable):
-
-    def __init__(self, max_size):
-        self.log_max_size = log2_int(max_size)
-
-        self.typ = Signal(2)
-        self.signed = Signal()
-        self.addr = Signal(self.log_max_size)
-        self.data_in = Signal(max_size * 8)
-
-        self.data_out = Signal(max_size * 8)
-
-    def elaborate(self, platform):
-        m = Module()
-
-        res = Signal.like(self.data_in)
-        m.d.comb += res.eq(self.data_in)
-
-        for i in range(self.log_max_size - 1, -1, -1):
-            next_res = Signal.like(res)
-
-            pos = 8 << i
-
-            shifted = Signal(pos)
-            m.d.comb += shifted.eq(
-                Mux(self.addr[i], res[pos:pos * 2], res[:pos]))
-
-            m.d.comb += next_res.eq(
-                Cat(
-                    shifted,
-                    Mux(
-                        self.typ == i,
-                        Repl(self.signed & shifted[pos - 1],
-                             (2**self.log_max_size) * 8 - pos), res[pos:])))
-
-            res = next_res
-
-        m.d.comb += self.data_out.eq(res)
-
-        return m
-
-
-class DataCache(HasCoreParams, Elaboratable):
-
-    def __init__(self, params):
-        super().__init__(params)
-
-        self.dbus = wishbone.Interface(data_width=self.xlen,
-                                       addr_width=30,
-                                       granularity=8)
-
-        self.reqs = Array(
-            Decoupled(DCacheReq, params, name=f'req{i}')
-            for i in range(self.mem_width))
-        self.resps = Array(
-            Valid(DCacheResp, params, name=f'resp{i}')
-            for i in range(self.mem_width))
-
-        self.br_update = BranchUpdate(params)
-        self.exception = Signal()
-
-    def elaborate(self, platform):
-        m = Module()
-
-        granularity_bits = log2_int(self.xlen // 8)
-
-        last_grant = Signal(range(self.mem_width))
-        choice = Signal.like(last_grant)
-        chosen = Signal.like(last_grant)
-
-        for w in reversed(range(self.mem_width)):
-            with m.If(self.reqs[w].valid):
-                m.d.comb += choice.eq(w)
-        for w in reversed(range(self.mem_width)):
-            with m.If(self.reqs[w].valid & (w > last_grant)):
-                m.d.comb += choice.eq(w)
-
-        uop = MicroOp(self.params)
-
-        req_addr = Signal(32)
-        dat_w = Signal.like(self.dbus.dat_w)
-        sel = Signal.like(self.dbus.sel)
-        we = Signal.like(self.dbus.we)
-
-        req_chosen = self.reqs[chosen]
-
-        load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
-        m.d.comb += [
-            load_gen.typ.eq(uop.mem_size),
-            load_gen.signed.eq(uop.mem_signed),
-            load_gen.addr.eq(req_addr),
-            load_gen.data_in.eq(self.dbus.dat_r),
-        ]
-
-        store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
-        m.d.comb += [
-            store_gen.typ.eq(req_chosen.bits.uop.mem_size),
-            store_gen.addr.eq(req_chosen.bits.addr),
-            store_gen.data_in.eq(req_chosen.bits.data),
-        ]
-
-        with m.FSM():
-            with m.State('IDLE'):
-                m.d.comb += chosen.eq(choice),
-
-                with m.If(req_chosen.valid
-                          & ~self.br_update.uop_killed(req_chosen.bits.uop)
-                          & ~(self.exception & req_chosen.bits.uop.uses_ldq)):
-                    m.d.comb += [
-                        self.dbus.adr.eq(
-                            req_chosen.bits.addr[granularity_bits:]),
-                        self.dbus.stb.eq(1),
-                        self.dbus.dat_w.eq(store_gen.data_out),
-                        self.dbus.cyc.eq(1),
-                        self.dbus.sel.eq(Mux(self.dbus.we, store_gen.mask,
-                                             ~0)),
-                        self.dbus.we.eq(req_chosen.bits.uop.mem_cmd ==
-                                        MemoryCommand.WRITE),
-                        req_chosen.ready.eq(1),
-                    ]
-
-                    m.d.sync += [
-                        uop.eq(req_chosen.bits.uop),
-                        uop.br_mask.eq(
-                            self.br_update.get_new_br_mask(
-                                req_chosen.bits.uop.br_mask)),
-                        req_addr.eq(req_chosen.bits.addr),
-                        dat_w.eq(self.dbus.dat_w),
-                        sel.eq(self.dbus.sel),
-                        we.eq(self.dbus.we),
-                        last_grant.eq(choice),
-                    ]
-
-                    m.next = 'WAIT_ACK'
-
-            with m.State('WAIT_ACK'):
-                req_killed = req_chosen.bits.kill | self.br_update.uop_killed(
-                    uop) | (self.exception & uop.uses_ldq)
-
-                m.d.comb += [
-                    chosen.eq(last_grant),
-                    self.dbus.adr.eq(req_addr[granularity_bits:]),
-                    self.dbus.stb.eq(self.dbus.cyc),
-                    self.dbus.dat_w.eq(dat_w),
-                    self.dbus.cyc.eq(~req_killed),
-                    self.dbus.sel.eq(sel),
-                    self.dbus.we.eq(we),
-                ]
-
-                m.d.sync += [
-                    uop.br_mask.eq(self.br_update.get_new_br_mask(
-                        uop.br_mask)),
-                ]
-
-                with m.If(req_killed):
-                    m.next = 'IDLE'
-                with m.Elif(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
-                    m.d.comb += [
-                        self.resps[chosen].valid.eq(1),
-                        self.resps[chosen].bits.data.eq(load_gen.data_out),
-                        self.resps[chosen].bits.uop.eq(uop),
-                        self.resps[chosen].bits.uop.br_mask.eq(
-                            self.br_update.get_new_br_mask(uop.br_mask)),
-                    ]
-
-                    m.next = 'IDLE'
-
         return m
 
 
@@ -380,6 +152,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         super().__init__(params)
 
         self.sim_debug = sim_debug
+        self.enable_dcache = params.get('dcache_params') is not None
 
         self.dbus = dbus
 
@@ -448,11 +221,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             exception_d2.eq(exception_d1),
         ]
 
-        dcache = m.submodules.dcache = DataCache(self.params)
-        m.d.comb += [
-            dcache.dbus.connect(self.dbus),
-            dcache.br_update.eq(self.br_update),
-        ]
+        dcache_cls = DCache if self.enable_dcache else SimpleDCache
+        dcache = m.submodules.dcache = dcache_cls(self.dbus, self.params)
 
         ldq = Array(
             LDQEntry(self.params, name=f'ldq{i}')
@@ -620,14 +390,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                    & ~ldq_retry_e.order_fail
                    & ~s1_block_load_mask[ldq_retry_idx]
                    & ~s2_block_load_mask[ldq_retry_idx]
-                   & (w == 0)
+                   & (w == self.mem_width - 1)
                    & (~ldq_retry_e.addr_uncacheable
                       | (self.commit_load_at_head & (ldq_head == ldq_retry_idx)
                          & (ldq_retry_e.st_dep_mask == 0)))),
                 can_fire_store_commit[w].eq(stq_commit_e.valid
                                             & ~stq_commit_e.uop.exception
                                             & ~stq_commit_e.uop.is_fence
-                                            & (w == self.mem_width - 1)
+                                            & (w == 0)
                                             & stq_commit_e.committed),
             ]
 
@@ -724,10 +494,20 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         # Memory access
         #
 
-        m.d.comb += dcache.exception.eq(self.exception)
+        store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
+        m.d.comb += [
+            store_gen.typ.eq(stq_commit_e.uop.mem_size),
+            store_gen.addr.eq(0),
+            store_gen.data_in.eq(stq_commit_e.data),
+        ]
+
+        m.d.comb += [
+            dcache.br_update.eq(self.br_update),
+            dcache.exception.eq(self.exception),
+        ]
 
         for w in range(self.mem_width):
-            dmem_req = dcache.reqs[w]
+            dmem_req = dcache.req[w]
 
             with m.If(will_fire_load_incoming[w]):
                 m.d.comb += [
@@ -735,21 +515,21 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     dmem_req.bits.uop.eq(self.exec_reqs[w].bits.uop),
                     dmem_req.bits.addr.eq(self.exec_reqs[w].bits.addr),
                     s0_executing_loads[self.exec_reqs[w].bits.uop.ldq_idx].eq(
-                        dmem_req.ready),
+                        dmem_req.fire),
                 ]
             with m.Elif(will_fire_load_retry[w]):
                 m.d.comb += [
                     dmem_req.valid.eq(1),
                     dmem_req.bits.uop.eq(ldq_retry_e.uop),
                     dmem_req.bits.addr.eq(ldq_retry_e.addr),
-                    s0_executing_loads[ldq_retry_idx].eq(dmem_req.ready),
+                    s0_executing_loads[ldq_retry_idx].eq(dmem_req.fire),
                 ]
             with m.Elif(will_fire_store_commit[w]):
                 m.d.comb += [
                     dmem_req.valid.eq(1),
                     dmem_req.bits.uop.eq(stq_commit_e.uop),
                     dmem_req.bits.addr.eq(stq_commit_e.addr),
-                    dmem_req.bits.data.eq(stq_commit_e.data),
+                    dmem_req.bits.data.eq(store_gen.data_out),
                 ]
 
                 m.d.sync += [
@@ -773,69 +553,67 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         fired_stdf_incoming = Signal()
         fired_stad_incoming = Signal(self.mem_width)
 
-        fired_incoming_uop = [
-            MicroOp(self.params, name=f'fired_incoming_uop{i}')
+        s1_incoming_uop = [
+            MicroOp(self.params, name=f's1_incoming_uop{i}')
             for i in range(self.mem_width)
         ]
 
-        fired_ldq_incoming_e = [
-            LDQEntry(self.params, name=f'fired_ldq_incoming_e{i}')
+        s1_ldq_incoming_e = [
+            LDQEntry(self.params, name=f's1_ldq_incoming_e{i}')
             for i in range(self.mem_width)
         ]
-        fired_ldq_retry_e = [
-            LDQEntry(self.params, name=f'fired_ldq_retry_e{i}')
-            for i in range(self.mem_width)
-        ]
-
-        fired_stq_incoming_e = [
-            STQEntry(self.params, name=f'fired_stq_incoming_e{i}')
+        s1_ldq_retry_e = [
+            LDQEntry(self.params, name=f's1_ldq_retry_e{i}')
             for i in range(self.mem_width)
         ]
 
-        fired_ldq_e = [
-            LDQEntry(self.params, name=f'fired_ldq_e{i}')
+        s1_stq_incoming_e = [
+            STQEntry(self.params, name=f's1_stq_incoming_e{i}')
             for i in range(self.mem_width)
         ]
 
-        fired_stq_e = [
-            STQEntry(self.params, name=f'fired_stq_e{i}')
+        s1_ldq_e = [
+            LDQEntry(self.params, name=f's1_ldq_e{i}')
             for i in range(self.mem_width)
         ]
 
-        fired_mem_addr = [
-            Signal(32, name=f'fired_mem_addr{i}')
+        s1_stq_e = [
+            STQEntry(self.params, name=f's1_stq_e{i}')
             for i in range(self.mem_width)
         ]
 
-        fired_req_addr = [
-            Signal(32, name=f'fired_req_addr{i}')
-            for i in range(self.mem_width)
+        s1_mem_addr = [
+            Signal(32, name=f's1_mem_addr{i}') for i in range(self.mem_width)
         ]
 
-        fired_tlb_uncacheable = Signal.like(s0_tlb_uncacheable)
+        s1_req_addr = [
+            Signal(32, name=f's1_req_addr{i}') for i in range(self.mem_width)
+        ]
+
+        s1_tlb_uncacheable = Signal.like(s0_tlb_uncacheable)
 
         for w in range(self.mem_width):
             req_killed = self.br_update.uop_killed(self.exec_reqs[w].bits.uop)
 
             with m.If(fired_load_incoming[w]):
-                m.d.comb += fired_ldq_e[w].eq(fired_ldq_incoming_e[w])
+                m.d.comb += s1_ldq_e[w].eq(s1_ldq_incoming_e[w])
             with m.Elif(fired_load_retry[w]):
-                m.d.comb += fired_ldq_e[w].eq(fired_ldq_retry_e[w])
+                m.d.comb += s1_ldq_e[w].eq(s1_ldq_retry_e[w])
 
             with m.If(fired_sta_incoming[w] | fired_stad_incoming[w]):
-                m.d.comb += fired_stq_e[w].eq(fired_stq_incoming_e[w])
+                m.d.comb += s1_stq_e[w].eq(s1_stq_incoming_e[w])
 
             m.d.sync += [
-                dmem_req_fired[w].eq(dcache.reqs[w].fire),
-                fired_incoming_uop[w].eq(self.exec_reqs[w].bits.uop),
-                fired_incoming_uop[w].br_mask.eq(
+                dmem_req_fired[w].eq(dcache.req[w].fire),
+                s1_incoming_uop[w].eq(self.exec_reqs[w].bits.uop),
+                s1_incoming_uop[w].br_mask.eq(
                     self.br_update.get_new_br_mask(
                         self.exec_reqs[w].bits.uop.br_mask)),
                 fired_load_incoming[w].eq(will_fire_load_incoming[w]
                                           & ~req_killed),
                 fired_load_retry[w].eq(
                     will_fire_load_retry[w]
-                    & dcache.reqs[w].fire
+                    & dcache.req[w].fire
                     & ~self.br_update.uop_killed(ldq_retry_e.uop)),
                 fired_sta_incoming[w].eq(will_fire_sta_incoming[w]
                                          & ~req_killed),
@@ -843,25 +621,25 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                                          & ~req_killed),
                 fired_stad_incoming[w].eq(will_fire_stad_incoming[w]
                                           & ~req_killed),
-                fired_ldq_incoming_e[w].eq(
+                s1_ldq_incoming_e[w].eq(
                     ldq[self.exec_reqs[w].bits.uop.ldq_idx]),
-                fired_ldq_incoming_e[w].uop.br_mask.eq(
+                s1_ldq_incoming_e[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(
                         ldq[self.exec_reqs[w].bits.uop.ldq_idx].uop.br_mask)),
-                fired_ldq_retry_e[w].eq(ldq_retry_e),
-                fired_ldq_retry_e[w].uop.br_mask.eq(
+                s1_ldq_retry_e[w].eq(ldq_retry_e),
+                s1_ldq_retry_e[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(ldq_retry_e.uop.br_mask)),
-                fired_stq_incoming_e[w].eq(
+                s1_stq_incoming_e[w].eq(
                     stq[self.exec_reqs[w].bits.uop.stq_idx]),
-                fired_stq_incoming_e[w].uop.br_mask.eq(
+                s1_stq_incoming_e[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(
                         stq[self.exec_reqs[w].bits.uop.stq_idx].uop.br_mask)),
-                fired_mem_addr[w].eq(dcache.reqs[w].bits.addr),
-                fired_req_addr[w].eq(self.exec_reqs[w].bits.addr),
-                fired_tlb_uncacheable[w].eq(s0_tlb_uncacheable[w]),
+                s1_mem_addr[w].eq(dcache.req[w].bits.addr),
+                s1_req_addr[w].eq(self.exec_reqs[w].bits.addr),
+                s1_tlb_uncacheable[w].eq(s0_tlb_uncacheable[w]),
             ]
 
-            with m.If(will_fire_load_retry[w] & dcache.reqs[w].fire):
+            with m.If(will_fire_load_retry[w] & dcache.req[w].fire):
                 m.d.comb += s0_block_load_mask[ldq_retry_idx].eq(1)
             with m.Elif(will_fire_load_incoming[w]):
                 m.d.comb += s0_block_load_mask[
@@ -901,35 +679,35 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
             with m.If(fired_stad_incoming[w]):
                 m.d.sync += [
-                    clr_bsy_valids[w].eq(fired_stq_incoming_e[w].valid
-                                         & ~self.br_update.uop_killed(
-                                             fired_stq_incoming_e[w].uop)),
-                    clr_bsy_rob_idx[w].eq(fired_stq_incoming_e[w].uop.rob_idx),
+                    clr_bsy_valids[w].
+                    eq(s1_stq_incoming_e[w].valid
+                       & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
+                    clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
                         self.br_update.get_new_br_mask(
-                            fired_stq_incoming_e[w].uop.br_mask)),
+                            s1_stq_incoming_e[w].uop.br_mask)),
                 ]
             with m.Elif(fired_sta_incoming[w]):
                 m.d.sync += [
-                    clr_bsy_valids[w].eq(fired_stq_incoming_e[w].valid
-                                         & fired_stq_incoming_e[w].data_valid
-                                         & ~self.br_update.uop_killed(
-                                             fired_stq_incoming_e[w].uop)),
-                    clr_bsy_rob_idx[w].eq(fired_stq_incoming_e[w].uop.rob_idx),
+                    clr_bsy_valids[w].
+                    eq(s1_stq_incoming_e[w].valid
+                       & s1_stq_incoming_e[w].data_valid
+                       & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
+                    clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
                         self.br_update.get_new_br_mask(
-                            fired_stq_incoming_e[w].uop.br_mask)),
+                            s1_stq_incoming_e[w].uop.br_mask)),
                 ]
             with m.Elif(fired_std_incoming[w]):
                 m.d.sync += [
-                    clr_bsy_valids[w].eq(fired_stq_incoming_e[w].valid
-                                         & fired_stq_incoming_e[w].addr_valid
-                                         & ~self.br_update.uop_killed(
-                                             fired_stq_incoming_e[w].uop)),
-                    clr_bsy_rob_idx[w].eq(fired_stq_incoming_e[w].uop.rob_idx),
+                    clr_bsy_valids[w].
+                    eq(s1_stq_incoming_e[w].valid
+                       & s1_stq_incoming_e[w].addr_valid
+                       & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
+                    clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
                         self.br_update.get_new_br_mask(
-                            fired_stq_incoming_e[w].uop.br_mask)),
+                            s1_stq_incoming_e[w].uop.br_mask)),
                 ]
 
             m.d.comb += [
@@ -1007,20 +785,20 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             m.d.comb += [
                 cam_addr[w].eq(
                     Mux(fired_sta_incoming[w] | fired_stad_incoming[w],
-                        fired_req_addr[w], fired_mem_addr[w])),
+                        s1_req_addr[w], s1_mem_addr[w])),
                 cam_uop[w].eq(
-                    Mux(do_st_search[w], fired_stq_e[w].uop,
-                        Mux(do_ld_search[w], fired_ldq_e[w].uop, 0))),
+                    Mux(do_st_search[w], s1_stq_e[w].uop,
+                        Mux(do_ld_search[w], s1_ldq_e[w].uop, 0))),
                 cam_mask[w].eq(gen_byte_mask(cam_addr[w],
                                              cam_uop[w].mem_size)),
                 cam_ldq_idx[w].eq(
-                    Mux(fired_load_incoming[w], fired_incoming_uop[w].ldq_idx,
+                    Mux(fired_load_incoming[w], s1_incoming_uop[w].ldq_idx,
                         Mux(fired_load_retry[w], s1_ldq_retry_idx, 0))),
                 cam_stq_idx[w].eq(
                     Mux(fired_sta_incoming[w] | fired_stad_incoming[w],
-                        fired_incoming_uop[w].stq_idx, 0)),
+                        s1_incoming_uop[w].stq_idx, 0)),
                 can_forward[w].eq(
-                    Mux(fired_load_incoming[w], ~fired_tlb_uncacheable[w],
+                    Mux(fired_load_incoming[w], ~s1_tlb_uncacheable[w],
                         ~ldq[cam_ldq_idx[w]].addr_uncacheable)),
             ]
 
@@ -1035,19 +813,19 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         failed_loads = Signal(self.ldq_size)
 
-        mem_forward_valid = Signal(self.mem_width)
-        mem_forward_stq_idx = [
-            Signal(range(self.stq_size), name=f'mem_forward_stq_idx{i}')
+        s1_forward_valid = Signal(self.mem_width)
+        s1_forward_stq_idx = [
+            Signal(range(self.stq_size), name=f's1_forward_stq_idx{i}')
             for i in range(self.mem_width)
         ]
 
-        wb_forward_valid = Signal(self.mem_width)
-        wb_forward_ldq_idx = [
-            Signal(range(self.ldq_size), name=f'wb_forward_ldq_idx{i}')
+        s2_forward_valid = Signal(self.mem_width)
+        s2_forward_ldq_idx = [
+            Signal(range(self.ldq_size), name=f's2_forward_ldq_idx{i}')
             for i in range(self.mem_width)
         ]
-        wb_forward_stq_idx = [
-            Signal(range(self.stq_size), name=f'wb_forward_stq_idx{i}')
+        s2_forward_stq_idx = [
+            Signal(range(self.stq_size), name=f's2_forward_stq_idx{i}')
             for i in range(self.mem_width)
         ]
 
@@ -1057,8 +835,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
             load_mask = gen_byte_mask(ldq[i].addr, ldq[i].uop.mem_size)
 
-            load_forwarders = Cat(wb_forward_valid[w]
-                                  & (wb_forward_ldq_idx[w] == i)
+            load_forwarders = Cat(s2_forward_valid[w]
+                                  & (s2_forward_ldq_idx[w] == i)
                                   for w in range(self.mem_width))
             load_forward_stq_idx = Signal(range(self.stq_size))
 
@@ -1090,27 +868,27 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
             for w in range(self.mem_width):
                 with m.If(do_ld_search[w] & stq[i].valid
-                          & fired_ldq_e[w].st_dep_mask[i]):
+                          & s1_ldq_e[w].st_dep_mask[i]):
                     with m.If(((cam_mask[w] & write_mask) == cam_mask[w])
                               & addr_matches[w] & ~stq[i].uop.is_fence
                               & can_forward[w]):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
                             ldst_forward_matches[w][i].eq(1),
-                            dcache.reqs[w].bits.kill.eq(dmem_req_fired[w]),
+                            dcache.s1_kill[w].eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
                     with m.Elif(((cam_mask[w] & write_mask) != 0)
                                 & addr_matches[w]):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
-                            dcache.reqs[w].bits.kill.eq(dmem_req_fired[w]),
+                            dcache.s1_kill[w].eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
                     with m.Elif(stq[i].uop.is_fence):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
-                            dcache.reqs[w].bits.kill.eq(dmem_req_fired[w]),
+                            dcache.s1_kill[w].eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
 
@@ -1120,18 +898,17 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             m.d.comb += [
                 enc.i.eq(ldst_addr_matches[w]),
                 enc.head_or_tail.eq(cam_uop[w].stq_idx),
-                mem_forward_stq_idx[w].eq(enc.o),
-                mem_forward_valid[w].eq(
-                    ((ldst_forward_matches[w] &
-                      (1 << mem_forward_stq_idx[w])) != 0)
-                    & ~self.br_update.uop_killed(cam_uop[w])
-                    & ~self.exception & ~exception_d1),
+                s1_forward_stq_idx[w].eq(enc.o),
+                s1_forward_valid[w].eq(((ldst_forward_matches[w] &
+                                         (1 << s1_forward_stq_idx[w])) != 0)
+                                       & ~self.br_update.uop_killed(cam_uop[w])
+                                       & ~self.exception & ~exception_d1),
             ]
 
             m.d.sync += [
-                wb_forward_valid[w].eq(mem_forward_valid[w]),
-                wb_forward_ldq_idx[w].eq(cam_ldq_idx[w]),
-                wb_forward_stq_idx[w].eq(mem_forward_stq_idx[w]),
+                s2_forward_valid[w].eq(s1_forward_valid[w]),
+                s2_forward_ldq_idx[w].eq(cam_ldq_idx[w]),
+                s2_forward_stq_idx[w].eq(s1_forward_stq_idx[w]),
             ]
 
         ld_fail_enc = RRPriorityEncoder(self.ldq_size)
@@ -1170,9 +947,20 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         dmem_resp_fire = Signal(self.mem_width)
 
         for w in range(self.mem_width):
-            with m.If(dcache.resps[w].valid):
-                with m.If(dcache.resps[w].bits.uop.uses_ldq):
-                    ldq_idx = dcache.resps[w].bits.uop.ldq_idx
+            with m.If(dcache.nack[w].valid):
+                with m.If(dcache.nack[w].bits.uop.uses_ldq):
+                    m.d.sync += ldq[
+                        dcache.nack[w].bits.uop.ldq_idx].executed.eq(0)
+                with m.Elif((
+                        dcache.nack[w].bits.uop.stq_idx < stq_execute_head)
+                            ^ (dcache.nack[w].bits.uop.stq_idx < stq_head)
+                            ^ (stq_execute_head < stq_head)):
+                    m.d.sync += stq_execute_head.eq(
+                        dcache.nack[w].bits.uop.stq_idx)
+
+            with m.If(dcache.resp[w].valid):
+                with m.If(dcache.resp[w].bits.uop.uses_ldq):
+                    ldq_idx = dcache.resp[w].bits.uop.ldq_idx
                     iresp = self.exec_iresps[w]
                     fresp = self.exec_fresps[w]
 
@@ -1183,21 +971,21 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                             ldq[ldq_idx].uop.dst_rtype == RegisterType.FIX),
                         fresp.valid.eq(
                             ldq[ldq_idx].uop.dst_rtype == RegisterType.FLT),
-                        iresp.bits.data.eq(dcache.resps[w].bits.data),
-                        fresp.bits.data.eq(dcache.resps[w].bits.data),
+                        iresp.bits.data.eq(dcache.resp[w].bits.data),
+                        fresp.bits.data.eq(dcache.resp[w].bits.data),
                         dmem_resp_fire[w].eq(1),
                     ]
 
                     m.d.sync += ldq[ldq_idx].succeeded.eq(iresp.valid
                                                           | fresp.valid)
-                with m.If(dcache.resps[w].bits.uop.uses_stq):
-                    stq_idx = dcache.resps[w].bits.uop.stq_idx
+                with m.If(dcache.resp[w].bits.uop.uses_stq):
+                    stq_idx = dcache.resp[w].bits.uop.stq_idx
                     m.d.comb += dmem_resp_fire[w].eq(1)
                     m.d.sync += stq[stq_idx].succeeded.eq(1)
 
-            with m.If(~dmem_resp_fire[w] & wb_forward_valid[w]):
-                ldq_e = ldq[wb_forward_ldq_idx[w]]
-                stq_e = stq[wb_forward_stq_idx[w]]
+            with m.If(~dmem_resp_fire[w] & s2_forward_valid[w]):
+                ldq_e = ldq[s2_forward_ldq_idx[w]]
+                stq_e = stq[s2_forward_stq_idx[w]]
 
                 data_valid = stq_e.data_valid
                 live = ~self.br_update.uop_killed(ldq_e.uop)
@@ -1227,7 +1015,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     m.d.sync += [
                         ldq_e.succeeded.eq(1),
                         ldq_e.forwarded.eq(1),
-                        ldq_e.forward_stq_idx.eq(wb_forward_stq_idx[w]),
+                        ldq_e.forward_stq_idx.eq(s2_forward_stq_idx[w]),
                     ]
 
         #

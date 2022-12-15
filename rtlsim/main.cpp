@@ -60,7 +60,11 @@ int main(int argc, char* argv[])
     room::SoC soc(sd_image, memory_addr, (size_t)memory_size_mb << 20UL,
                   bootrom);
 
-    soc.run();
+    try {
+        soc.run();
+    } catch (std::runtime_error& e) {
+        spdlog::error("Exiting simulation due to runtime error: {}", e.what());
+    }
 
     return 0;
 }

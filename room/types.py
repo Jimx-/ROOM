@@ -5,7 +5,7 @@ from room.consts import *
 
 class HasCoreParams:
 
-    def __init__(self, params):
+    def __init__(self, params, *args, **kwargs):
         self.params = params
 
         self.xlen = params['xlen']

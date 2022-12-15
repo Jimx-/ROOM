@@ -102,6 +102,7 @@ public:
     int run()
     {
         int N = 2000000;
+        // int N = 90000;
         this->reset();
 
         for (int i = 0; i < N; i++) {
@@ -110,6 +111,10 @@ public:
             }
 
             this->tick();
+
+#ifdef ITRACE
+            if (Tracer::get_singleton().should_stop()) break;
+#endif
         }
 
         return 0;

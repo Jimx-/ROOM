@@ -33,7 +33,7 @@ int Uart::tick(int i_tx)
             rx_state_ = RxState::IDLE;
 
             c = (rx_data_ >> (32 - nbits_)) & 0xff;
-            std::cout << c;
+            std::cout << std::unitbuf << c;
         } else {
             rx_busy_ = (rx_busy_ << 1) | 1;
             rx_data_ = ((i_tx & 1) << 31) | (rx_data_ >> 1);

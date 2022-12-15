@@ -121,6 +121,8 @@ class BranchKillableFIFO(HasCoreParams, Elaboratable):
         self.r_en = Signal()
         self.r_rdy = Signal()
 
+        self.empty = Signal()
+
         self.br_update = BranchUpdate(params)
         self.flush = Signal()
 
@@ -140,7 +142,7 @@ class BranchKillableFIFO(HasCoreParams, Elaboratable):
         r_ptr = Signal(range(self.entries))
         maybe_full = Signal()
 
-        empty = (r_ptr == w_ptr) & ~maybe_full
+        m.d.comb += self.empty.eq((r_ptr == w_ptr) & ~maybe_full)
         full = (r_ptr == w_ptr) & maybe_full
 
         do_enq = Signal()
@@ -149,7 +151,7 @@ class BranchKillableFIFO(HasCoreParams, Elaboratable):
         m.d.comb += [
             do_enq.eq(self.w_en & self.w_rdy),
             do_deq.eq((self.r_en | ~valids[r_ptr])
-                      & self.r_rdy),
+                      & ~self.empty),
         ]
 
         for i in range(self.entries):
@@ -185,7 +187,7 @@ class BranchKillableFIFO(HasCoreParams, Elaboratable):
         m.d.comb += self.w_rdy.eq(~full)
 
         m.d.comb += [
-            self.r_rdy.eq(~empty & valids[r_ptr]
+            self.r_rdy.eq(~self.empty & valids[r_ptr]
                           & ~self.br_update.br_mask_killed(br_masks[r_ptr])
                           & ~self.flush),
             self.r_br_mask.eq(self.br_update.get_new_br_mask(br_masks[r_ptr])),
@@ -196,7 +198,7 @@ class BranchKillableFIFO(HasCoreParams, Elaboratable):
                 m.d.comb += self.r_data.eq(mem[i])
 
         if self.flow:
-            with m.If(empty):
+            with m.If(self.empty):
                 m.d.comb += [
                     self.r_rdy.eq(self.w_en),
                     self.r_data.eq(self.w_data),

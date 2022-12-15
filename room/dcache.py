@@ -8,15 +8,88 @@ from room.consts import *
 from room.alu import AMODataGen
 from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
-from room.lsu import LoadGen, StoreGen
 from room.utils import Valid, Decoupled, Arbiter, BranchKillableFIFO
 
 from roomsoc.interconnect import wishbone
 
 
+class StoreGen(Elaboratable):
+
+    def __init__(self, max_size):
+        self.log_max_size = log2_int(max_size)
+
+        self.typ = Signal(2)
+        self.addr = Signal(self.log_max_size)
+        self.data_in = Signal(max_size * 8)
+
+        self.mask = Signal(max_size)
+        self.data_out = Signal(max_size * 8)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        for i in range(self.log_max_size + 1):
+            with m.If(self.typ == i):
+                m.d.comb += self.data_out.eq(
+                    Repl(self.data_in[:(8 << i)], 1 <<
+                         (self.log_max_size - i)))
+
+        mask = 1
+        for i in range(self.log_max_size):
+            upper = Mux(self.addr[i], mask, 0) | Mux(self.typ >= (i + 1),
+                                                     (1 << (1 << i)) - 1, 0)
+            lower = Mux(self.addr[i], 0, mask)
+            mask = Cat(lower, upper)
+        m.d.comb += self.mask.eq(mask)
+
+        return m
+
+
+class LoadGen(Elaboratable):
+
+    def __init__(self, max_size):
+        self.log_max_size = log2_int(max_size)
+
+        self.typ = Signal(2)
+        self.signed = Signal()
+        self.addr = Signal(self.log_max_size)
+        self.data_in = Signal(max_size * 8)
+
+        self.data_out = Signal(max_size * 8)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        res = Signal.like(self.data_in)
+        m.d.comb += res.eq(self.data_in)
+
+        for i in range(self.log_max_size - 1, -1, -1):
+            next_res = Signal.like(res)
+
+            pos = 8 << i
+
+            shifted = Signal(pos)
+            m.d.comb += shifted.eq(
+                Mux(self.addr[i], res[pos:pos * 2], res[:pos]))
+
+            m.d.comb += next_res.eq(
+                Cat(
+                    shifted,
+                    Mux(
+                        self.typ == i,
+                        Repl(self.signed & shifted[pos - 1],
+                             (2**self.log_max_size) * 8 - pos), res[pos:])))
+
+            res = next_res
+
+        m.d.comb += self.data_out.eq(res)
+
+        return m
+
+
 class HasDCacheParams(HasCoreParams):
 
-    def __init__(self, params):
+    def __init__(self, params, *args, **kwargs):
         super().__init__(params)
 
         dcache_params = params['dcache_params']
@@ -59,7 +132,7 @@ class DCacheReqType(IntEnum):
     REPLAY = 4
 
 
-class DCacheReq(HasDCacheParams):
+class DCacheReq(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
         super().__init__(params)
@@ -78,7 +151,7 @@ class DCacheReq(HasDCacheParams):
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
-class DCacheResp(HasDCacheParams):
+class DCacheResp(HasCoreParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
         super().__init__(params)
@@ -455,10 +528,10 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
 #
 
 
-class MSHRReq(DCacheReq):
+class MSHRReq(HasDCacheParams, DCacheReq):
 
     def __init__(self, params, name=None, src_loc_at=0):
-        super().__init__(params, name=name, src_loc_at=src_loc_at + 1)
+        super().__init__(params=params, name=name, src_loc_at=src_loc_at + 1)
 
         self.tag_match = Signal(name=f'{self.name}_tag_match')
         self.old_meta = Metadata(params, name=f'{self.name}_old_meta')
@@ -469,7 +542,7 @@ class MSHRReq(DCacheReq):
     def eq(self, rhs):
         return super().eq(rhs) + [
             getattr(self, a).eq(getattr(rhs, a))
-            for a in ['tag_match', 'old_meta', 'way_en']
+            for a in ['tag_match', 'old_meta', 'way_en', 'sdq_id']
         ]
 
 
@@ -710,9 +783,10 @@ class MSHR(HasDCacheParams, Elaboratable):
 
                 with m.If(rpq.r_en & rpq.r_rdy):
                     m.d.sync += commit_line.eq(1)
-                with m.Elif(~rpq.r_rdy & ~commit_line):
-                    pass
-                with m.Elif(~rpq.r_rdy | (rpq.r_rdy & ~drain_load)):
+                with m.Elif(rpq.empty & ~commit_line):
+                    with m.If(~(rpq.w_en & rpq.w_rdy)):
+                        m.next = 'MEM_FINISH'
+                with m.Elif(rpq.empty | (rpq.r_rdy & ~drain_load)):
                     m.next = 'META_READ'
 
             with m.State('META_READ'):
@@ -792,7 +866,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                         m, new_state, rpq.r_data.uop.mem_cmd)
                     m.d.sync += new_state.eq(next_state)
 
-                with m.If(~rpq.r_rdy & ~rpq.w_en):
+                with m.If(rpq.empty & ~rpq.w_en):
                     m.next = 'META_WRITE'
 
             with m.State('META_WRITE'):
@@ -833,12 +907,14 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
         req = DCacheReq(self.params)
 
+        resp_data = Signal.like(self.resp.bits.data)
+
         load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
         m.d.comb += [
             load_gen.typ.eq(req.uop.mem_size),
             load_gen.signed.eq(req.uop.mem_signed),
             load_gen.addr.eq(req.addr),
-            load_gen.data_in.eq(self.dbus.dat_r),
+            load_gen.data_in.eq(resp_data),
         ]
 
         store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
@@ -869,6 +945,9 @@ class IOMSHR(HasDCacheParams, Elaboratable):
                 ]
 
                 with m.If(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
+                    with m.If(send_resp):
+                        m.d.sync += resp_data.eq(self.dbus.dat_r)
+
                     m.next = 'RESP'
 
             with m.State('RESP'):
@@ -919,12 +998,14 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         req_idx = Signal(range(self.mem_width))
         req = MSHRReq(self.params)
+        req_valid = Signal()
 
         for w in reversed(range(self.mem_width)):
             with m.If(self.req[w].valid):
                 m.d.comb += [
                     req_idx.eq(w),
                     req.eq(self.req[w].bits),
+                    req_valid.eq(1),
                 ]
 
         req_uncacheable = Signal()
@@ -938,7 +1019,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         sdq_valid = Signal(self.sdq_size)
         sdq_alloc_idx = Signal(range(self.sdq_size))
-        sdq_ready = sdq_valid != Repl(1, len(sdq_valid))
+        sdq_ready = Signal()
         sdq = Memory(width=self.word_bits, depth=self.sdq_size)
 
         sdq_write = m.submodules.sdq_write = sdq.write_port()
@@ -953,7 +1034,10 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         for i in reversed(range(self.sdq_size)):
             with m.If(~sdq_valid[i]):
-                m.d.comb += sdq_alloc_idx.eq(i)
+                m.d.comb += [
+                    sdq_alloc_idx.eq(i),
+                    sdq_ready.eq(1),
+                ]
 
         #
         # Line buffer
@@ -1029,8 +1113,8 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                     ]
 
         mshr_alloc_idx = Signal(range(self.n_mshrs))
-        pri_valid = (Cat(self.req[w].valid for w in range(self.mem_width)) !=
-                     0) & sdq_ready & ~req_uncacheable & ~idx_match[req_idx]
+        pri_valid = req_valid & sdq_ready & ~req_uncacheable & ~idx_match[
+            req_idx]
         pri_ready = Signal()
         sec_ready = 0
 
@@ -1062,11 +1146,10 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                 mshr.req.eq(req),
                 mshr.req.sdq_id.eq(sdq_alloc_idx),
                 mshr.req_pri_valid.eq(pri_valid & (i == mshr_alloc_idx)),
-                mshr.req_sec_valid.eq(
-                    (Cat(self.req[w].valid
-                         for w in range(self.mem_width)) != 0)
-                    & sdq_ready & tag_match[req_idx]
-                    & idx_matches[req_idx][i] & ~req_uncacheable),
+                mshr.req_sec_valid.eq(req_valid
+                                      & sdq_ready & tag_match[req_idx]
+                                      & idx_matches[req_idx][i]
+                                      & ~req_uncacheable),
             ]
             with m.If(mshr_alloc_idx == i):
                 m.d.comb += pri_ready.eq(mshr.req_pri_ready)
@@ -1132,9 +1215,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
             io_mshrs.append(mshr)
 
-        m.d.comb += iomshr_alloc_arb.out.ready.eq((Cat(
-            self.req[w].valid
-            for w in range(self.mem_width)) != 0) & req_uncacheable)
+        m.d.comb += iomshr_alloc_arb.out.ready.eq(req_valid & req_uncacheable)
 
         m.d.comb += dbus_arbiter.bus.connect(self.dbus)
 
@@ -1868,5 +1949,138 @@ class DCache(HasDCacheParams, Elaboratable):
                     s3_bypass[w], s3_req.data,
                     Mux(s4_bypass[w], s4_req.data,
                         Mux(s5_bypass[w], s5_req.data, s2_data_muxed[w]))))
+
+        return m
+
+
+class SimpleDCache(HasCoreParams, Elaboratable):
+
+    def __init__(self, dbus, params):
+        super().__init__(params)
+
+        self.dbus = dbus
+
+        self.req = Array(
+            Decoupled(DCacheReq, params, name=f'req{i}')
+            for i in range(self.mem_width))
+        self.resp = Array(
+            Valid(DCacheResp, params, name=f'resp{i}')
+            for i in range(self.mem_width))
+
+        self.nack = [
+            Valid(DCacheReq, self.params, name=f'nack{i}')
+            for i in range(self.mem_width)
+        ]
+
+        self.s1_kill = Array(
+            Signal(name='s1_kill{i}') for i in range(self.mem_width))
+
+        self.br_update = BranchUpdate(params)
+        self.exception = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        granularity_bits = log2_int(self.xlen // 8)
+
+        last_grant = Signal(range(self.mem_width))
+        choice = Signal.like(last_grant)
+        chosen = Signal.like(last_grant)
+
+        for w in reversed(range(self.mem_width)):
+            with m.If(self.req[w].valid):
+                m.d.comb += choice.eq(w)
+        for w in reversed(range(self.mem_width)):
+            with m.If(self.req[w].valid & (w > last_grant)):
+                m.d.comb += choice.eq(w)
+
+        uop = MicroOp(self.params)
+
+        req_addr = Signal(32)
+        dat_w = Signal.like(self.dbus.dat_w)
+        sel = Signal.like(self.dbus.sel)
+        we = Signal.like(self.dbus.we)
+
+        req_chosen = self.req[chosen]
+
+        load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
+        m.d.comb += [
+            load_gen.typ.eq(uop.mem_size),
+            load_gen.signed.eq(uop.mem_signed),
+            load_gen.addr.eq(req_addr),
+            load_gen.data_in.eq(self.dbus.dat_r),
+        ]
+
+        store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
+        m.d.comb += [
+            store_gen.typ.eq(req_chosen.bits.uop.mem_size),
+            store_gen.addr.eq(req_chosen.bits.addr),
+            store_gen.data_in.eq(req_chosen.bits.data),
+        ]
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.comb += chosen.eq(choice),
+
+                with m.If(req_chosen.valid
+                          & ~self.br_update.uop_killed(req_chosen.bits.uop)
+                          & ~(self.exception & req_chosen.bits.uop.uses_ldq)):
+                    m.d.comb += [
+                        self.dbus.adr.eq(
+                            req_chosen.bits.addr[granularity_bits:]),
+                        self.dbus.stb.eq(1),
+                        self.dbus.dat_w.eq(store_gen.data_out),
+                        self.dbus.cyc.eq(1),
+                        self.dbus.sel.eq(store_gen.mask),
+                        self.dbus.we.eq(req_chosen.bits.uop.mem_cmd ==
+                                        MemoryCommand.WRITE),
+                        req_chosen.ready.eq(1),
+                    ]
+
+                    m.d.sync += [
+                        uop.eq(req_chosen.bits.uop),
+                        uop.br_mask.eq(
+                            self.br_update.get_new_br_mask(
+                                req_chosen.bits.uop.br_mask)),
+                        req_addr.eq(req_chosen.bits.addr),
+                        dat_w.eq(self.dbus.dat_w),
+                        sel.eq(self.dbus.sel),
+                        we.eq(self.dbus.we),
+                        last_grant.eq(choice),
+                    ]
+
+                    m.next = 'WAIT_ACK'
+
+            with m.State('WAIT_ACK'):
+                req_killed = self.s1_kill[chosen] | self.br_update.uop_killed(
+                    uop) | (self.exception & uop.uses_ldq)
+
+                m.d.comb += [
+                    chosen.eq(last_grant),
+                    self.dbus.adr.eq(req_addr[granularity_bits:]),
+                    self.dbus.stb.eq(self.dbus.cyc),
+                    self.dbus.dat_w.eq(dat_w),
+                    self.dbus.cyc.eq(~req_killed),
+                    self.dbus.sel.eq(sel),
+                    self.dbus.we.eq(we),
+                ]
+
+                m.d.sync += [
+                    uop.br_mask.eq(self.br_update.get_new_br_mask(
+                        uop.br_mask)),
+                ]
+
+                with m.If(req_killed):
+                    m.next = 'IDLE'
+                with m.Elif(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
+                    m.d.comb += [
+                        self.resp[chosen].valid.eq(1),
+                        self.resp[chosen].bits.data.eq(load_gen.data_out),
+                        self.resp[chosen].bits.uop.eq(uop),
+                        self.resp[chosen].bits.uop.br_mask.eq(
+                            self.br_update.get_new_br_mask(uop.br_mask)),
+                    ]
+
+                    m.next = 'IDLE'
 
         return m

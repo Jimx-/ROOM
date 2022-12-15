@@ -32,6 +32,8 @@ public:
 
     void tick();
 
+    bool should_stop() const { return should_stop_; }
+
 private:
     struct Instruction {
         int uop_id;
@@ -56,9 +58,12 @@ private:
     };
 
     std::unordered_map<int, Instruction> insts_;
+    bool should_stop_;
+
+    uint64_t cycle_, last_commit_cycle_;
 
 #ifdef DROMAJO
-    dromajo_cosim_state_t* dromajo_state;
+    dromajo_cosim_state_t* dromajo_state_;
 #endif
 
     void commit(const Instruction& inst);
