@@ -159,8 +159,16 @@ class JTAGTap(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        m.domains += ClockDomain('sync_inv', clk_edge='neg')
+        m.d.comb += [
+            ClockSignal('sync_inv').eq(ClockSignal()),
+            ResetSignal('sync_inv').eq(ResetSignal()),
+        ]
+
         tms = self.port.tms
         tdi = self.port.tdi
+
+        tdo_reg = Signal()
 
         with m.FSM():
             with m.State("TEST-LOGIC-RESET"):
@@ -193,7 +201,8 @@ class JTAGTap(Elaboratable):
                     m.next = "SHIFT-DR"
 
             with m.State("SHIFT-DR"):
-                m.d.sync += self.port.tdo.eq(self.dr[0])
+                m.d.comb += self.port.tdo.eq(tdo_reg)
+                m.d.sync_inv += tdo_reg.eq(self.dr[0])
                 with m.Switch(self.ir):
                     for addr, port in self.regs.items():
                         with m.Case(addr):
@@ -203,7 +212,8 @@ class JTAGTap(Elaboratable):
                     m.next = "EXIT1-DR"
 
             with m.State("EXIT1-DR"):
-                m.d.sync += self.port.tdo.eq(0)
+                m.d.comb += self.port.tdo.eq(tdo_reg)
+                m.d.sync_inv += tdo_reg.eq(0)
                 with m.If(tms):
                     m.next = "UPDATE-DR"
                 with m.Else():
@@ -245,13 +255,15 @@ class JTAGTap(Elaboratable):
                     m.next = "SHIFT-IR"
 
             with m.State("SHIFT-IR"):
-                m.d.sync += self.port.tdo.eq(self.ir[0])
+                m.d.comb += self.port.tdo.eq(tdo_reg)
+                m.d.sync_inv += tdo_reg.eq(self.ir[0])
                 m.d.sync += self.ir.eq(Cat(self.ir[1:], tdi))
                 with m.If(tms):
                     m.next = "EXIT1-IR"
 
             with m.State("EXIT1-IR"):
-                m.d.sync += self.port.tdo.eq(0)
+                m.d.comb += self.port.tdo.eq(tdo_reg)
+                m.d.sync_inv += tdo_reg.eq(0)
                 with m.If(tms):
                     m.next = "UPDATE-IR"
                 with m.Else():

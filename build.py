@@ -190,6 +190,36 @@ class DromajoRAM(Elaboratable):
         return m
 
 
+class JTAGDPI(Elaboratable):
+
+    def __init__(self):
+        self.jtag = JTAGInterface()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        jtag_trst_n = Signal()
+        jtag_srst_n = Signal()
+
+        m.submodules.jtag_dpi = Instance(
+            'jtagdpi',
+            #
+            i_clk_i=ClockSignal(),
+            i_rst_ni=ResetSignal(),
+            i_jtag_tdo=self.jtag.tdo,
+            #
+            o_jtag_tms=self.jtag.tms,
+            o_jtag_tck=self.jtag.tck,
+            o_jtag_tdi=self.jtag.tdi,
+            o_jtag_trst_n=jtag_trst_n,
+            o_jtag_srst_n=jtag_srst_n,
+        )
+
+        m.d.comb += self.jtag.trst.eq(~jtag_trst_n)
+
+        return m
+
+
 class Top(Elaboratable):
 
     mem_map = {
@@ -232,10 +262,13 @@ class Top(Elaboratable):
             generate_trace_if(m, core, '/tmp')
 
         debug_module = DebugModule(self.debug_rom_image)
-        m.d.comb += [
-            debug_module.jtag.connect(self.jtag),
-            core.interrupts.debug.eq(debug_module.debug_int),
-        ]
+        m.d.comb += core.interrupts.debug.eq(debug_module.debug_int)
+
+        if self.sim:
+            jtag_dpi = m.submodules.jtag_dpi = JTAGDPI()
+            m.d.comb += debug_module.jtag.connect(jtag_dpi.jtag)
+        else:
+            m.d.comb += debug_module.jtag.connect(self.jtag)
 
         soc.bus.add_master(name='axil_master', master=self.axil_master)
         soc.bus.add_master(name='dm_master', master=debug_module.dbus)

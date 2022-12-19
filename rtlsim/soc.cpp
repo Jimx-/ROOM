@@ -102,12 +102,15 @@ public:
     int run()
     {
         int N = 2000000;
-        // int N = 90000;
+
         this->reset();
 
         for (int i = 0; i < N; i++) {
             if (i && (i % 10000 == 0)) {
                 spdlog::trace("Cycle {}/{}", i, N);
+#if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
+                trace_->flush();
+#endif
             }
 
             this->tick();

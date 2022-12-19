@@ -16,7 +16,9 @@ set(SOURCE_FILES main.cpp
                  soc.cpp
                  uart.cpp
                  sdcard.cpp
-                 tracer.cpp)
+                 tracer.cpp
+                 jtagdpi/tcp_server.c
+                 jtagdpi/jtagdpi.c)
 
 set(TOP_MODULE soc_wrapper)
 
