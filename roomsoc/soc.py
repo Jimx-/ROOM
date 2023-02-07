@@ -3,7 +3,7 @@ from amaranth.utils import log2_int
 from amaranth_soc.memory import MemoryMap
 
 from roomsoc.peripheral import Peripheral
-from roomsoc.interconnect import wishbone, axi
+from roomsoc.interconnect import wishbone, axi, ahb
 
 
 class SoCRegion:
@@ -127,6 +127,7 @@ class BusHelper(Elaboratable):
             main_bus_cls = {
                 'wishbone': wishbone.Interface,
                 'axi-lite': axi.AXILiteInterface,
+                'ahb': ahb.Interface,
             }[self.standard]
 
             if isinstance(interface, main_bus_cls):
@@ -145,6 +146,7 @@ class BusHelper(Elaboratable):
             bridge_cls = {
                 (axi.AXILiteInterface, wishbone.Interface):
                 axi.AXILite2Wishbone,
+                (ahb.Interface, wishbone.Interface): ahb.AHB2Wishbone,
             }[type(master), type(slave)]
             self.converters[f'{name}_bridge'] = bridge_cls(master, slave)
 
@@ -184,6 +186,7 @@ class BusHelper(Elaboratable):
         bus_names = {
             wishbone.Interface: "Wishbone",
             axi.AXILiteInterface: "AXI-Lite",
+            ahb.Interface: 'AHB',
         }
         print(
             f'Bus {name} adapted from {bus_names[type(interface)]} {interface.data_width}-bit to {bus_names[type(adapted_interface)]} {self.data_width}-bit.'
@@ -372,10 +375,10 @@ class SoC(Elaboratable):
             slave = self.bus.decoder.bus
 
             timeout = m.submodules.timeout = wishbone.Timeout(master, 128)
-            m.d.comb += [
-                timeout.bus.connect(slave),
-                self.ctrl.bus_error_addr.eq(timeout.error_addr),
-            ]
+            m.d.comb += timeout.bus.connect(slave)
+
+            if hasattr(self, 'ctrl'):
+                m.d.comb += self.ctrl.bus_error_addr.eq(timeout.error_addr)
 
         return m
 
