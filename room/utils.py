@@ -80,7 +80,7 @@ class Decoupled:
         if getattr(self.bits, 'connect', None) is not None:
             stmts += self.bits.connect(subord.bits)
         else:
-            stmts += subord.bits.eq(self.bits)
+            stmts += [subord.bits.eq(self.bits)]
 
         stmts.append(subord.valid.eq(self.valid))
         stmts.append(self.ready.eq(subord.ready))

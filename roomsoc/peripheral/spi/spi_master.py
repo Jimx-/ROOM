@@ -30,15 +30,22 @@ class SPIMaster(Peripheral, Elaboratable):
             self._cs = bank.csr(cs_bits, 'rw')
             self._clk_divider = bank.csr(16, 'rw')
 
-        self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
-        self.bus = self._bridge.bus
+            self._bridge = self.bridge(data_width=32,
+                                       granularity=8,
+                                       alignment=2)
+            self.bus = self._bridge.bus
 
         self.enabled = Signal()
         self.loopback = Signal()
         self.rx_reset = Signal()
         self.tx_reset = Signal()
+        self.done = Signal()
         self.cs = Signal(cs_bits, reset=1)
         self.clk_divider = Signal(16)
+
+        self.w_data = Signal(self.data_width)
+        self.w_en = Signal()
+        self.w_rdy = Signal()
 
         self.sclk = Signal()
         self.mosi = Signal()
@@ -47,7 +54,9 @@ class SPIMaster(Peripheral, Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
-        m.submodules.bridge = self._bridge
+
+        if self.with_csr:
+            m.submodules.bridge = self._bridge
 
         self._rx_fifo = ResetInserter(self.rx_reset)(self._rx_fifo)
         self._tx_fifo = ResetInserter(self.tx_reset)(self._tx_fifo)
@@ -82,8 +91,12 @@ class SPIMaster(Peripheral, Elaboratable):
         # Control state machine
         with m.FSM():
             with m.State('IDLE'):
+                m.d.comb += self.done.eq(1)
                 with m.If(self.enabled & self._tx_fifo.r_rdy):
-                    m.d.comb += mosi_latch.eq(1)
+                    m.d.comb += [
+                        self.done.eq(0),
+                        mosi_latch.eq(1),
+                    ]
                     m.next = 'START'
 
             with m.State('START'):
@@ -157,17 +170,24 @@ class SPIMaster(Peripheral, Elaboratable):
                 ]
 
             m.d.comb += self._status.r_data.eq(
-                Cat(~self._rx_fifo.r_rdy, ~self._rx_fifo.w_rdy,
+                Cat(self.done, ~self._rx_fifo.r_rdy, ~self._rx_fifo.w_rdy,
                     ~self._tx_fifo.r_rdy, ~self._tx_fifo.w_rdy))
 
             m.d.comb += [
                 self._data.r_data.eq(self._rx_fifo.r_data),
                 self._rx_fifo.r_en.eq(self._data.r_stb),
-                self._rx_fifo.w_data.eq(miso_data),
-                self._rx_fifo.w_en.eq(miso_latch),
-                self._tx_fifo.w_en.eq(self._data.w_stb),
-                self._tx_fifo.w_data.eq(self._data.w_data),
-                self._tx_fifo.r_en.eq(mosi_latch),
+                self.w_en.eq(self._data.w_stb),
+                self.w_data.eq(self._data.w_data),
             ]
+
+        # FIFO interface
+        m.d.comb += [
+            self._rx_fifo.w_data.eq(miso_data),
+            self._rx_fifo.w_en.eq(miso_latch),
+            self._tx_fifo.w_en.eq(self.w_en),
+            self._tx_fifo.w_data.eq(self.w_data),
+            self._tx_fifo.r_en.eq(mosi_latch),
+            self.w_rdy.eq(self._tx_fifo.w_rdy),
+        ]
 
         return m

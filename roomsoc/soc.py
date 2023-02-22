@@ -90,7 +90,8 @@ class BusHelper(Elaboratable):
                             '0': allocated,
                             '1': candidate
                     }) is not None:
-                        origin += size
+                        origin = max(allocated.origin + allocated.size,
+                                     origin + size)
                         overlap = True
                         break
                 if not overlap:
