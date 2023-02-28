@@ -3,7 +3,7 @@ from amaranth.utils import log2_int
 from amaranth_soc.memory import MemoryMap
 
 from roomsoc.peripheral import Peripheral
-from roomsoc.interconnect import wishbone, axi, ahb
+from roomsoc.interconnect import wishbone, axi, ahb, tilelink
 
 
 class SoCRegion:
@@ -129,6 +129,7 @@ class BusHelper(Elaboratable):
                 'wishbone': wishbone.Interface,
                 'axi-lite': axi.AXILiteInterface,
                 'ahb': ahb.Interface,
+                'tilelink': tilelink.Interface,
             }[self.standard]
 
             if isinstance(interface, main_bus_cls):
@@ -147,7 +148,10 @@ class BusHelper(Elaboratable):
             bridge_cls = {
                 (axi.AXILiteInterface, wishbone.Interface):
                 axi.AXILite2Wishbone,
-                (ahb.Interface, wishbone.Interface): ahb.AHB2Wishbone,
+                (ahb.Interface, wishbone.Interface):
+                ahb.AHB2Wishbone,
+                (tilelink.Interface, wishbone.Interface):
+                tilelink.TileLink2Wishbone,
             }[type(master), type(slave)]
             self.converters[f'{name}_bridge'] = bridge_cls(master, slave)
 
@@ -188,6 +192,7 @@ class BusHelper(Elaboratable):
             wishbone.Interface: "Wishbone",
             axi.AXILiteInterface: "AXI-Lite",
             ahb.Interface: 'AHB',
+            tilelink.Interface: 'TileLink',
         }
         print(
             f'Bus {name} adapted from {bus_names[type(interface)]} {interface.data_width}-bit to {bus_names[type(adapted_interface)]} {self.data_width}-bit.'

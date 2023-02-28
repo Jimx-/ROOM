@@ -21,7 +21,7 @@ from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
 from room.utils import Arbiter, Valid
 
-from roomsoc.interconnect import wishbone
+from roomsoc.interconnect import wishbone, tilelink
 
 
 class WritebackDebug(HasCoreParams, Record):
@@ -131,11 +131,18 @@ class Core(HasCoreParams, Elaboratable):
         self.interrupts = CoreInterrupts()
         self.debug_entry = Signal(32)
 
-        ibus_addr_shift = Shape.cast(range(self.fetch_bytes)).width
-        self.ibus = wishbone.Interface(data_width=self.fetch_width * 16,
-                                       addr_width=32 - ibus_addr_shift,
-                                       granularity=8,
-                                       name='ibus')
+        if params.get('icache_params') is None:
+            ibus_addr_shift = Shape.cast(range(self.fetch_bytes)).width
+            self.ibus = wishbone.Interface(data_width=self.fetch_width * 16,
+                                           addr_width=32 - ibus_addr_shift,
+                                           granularity=8,
+                                           name='ibus')
+        else:
+            self.ibus = tilelink.Interface(data_width=self.fetch_width * 16,
+                                           addr_width=32,
+                                           size_width=3,
+                                           name='ibus')
+
         self.dbus = wishbone.Interface(data_width=self.xlen,
                                        addr_width=32 -
                                        log2_int(self.xlen // 8),

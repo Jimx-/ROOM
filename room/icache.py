@@ -4,6 +4,8 @@ from amaranth.utils import log2_int
 from room.types import HasCoreParams
 from room.utils import Valid, Decoupled
 
+from roomsoc.interconnect import tilelink
+
 
 class HasICacheParams(HasCoreParams):
 
@@ -14,6 +16,7 @@ class HasICacheParams(HasCoreParams):
         self.n_sets = icache_params['n_sets']
         self.n_ways = icache_params['n_ways']
         self.block_bytes = icache_params['block_bytes']
+        self.lg_block_bytes = log2_int(self.block_bytes)
 
 
 class ICacheReq(HasCoreParams, Record):
@@ -92,10 +95,12 @@ class ICache(HasICacheParams, Elaboratable):
         refill_tag = refill_paddr[untag_bits:untag_bits + tag_bits]
         refill_done = Signal()
         refill_counter = Signal(range(refill_cycles))
+        refill_one_beat = self.ibus.d.fire & (
+            self.ibus.d.bits.opcode == tilelink.ChannelDOpcode.AccessAckData)
         with m.If(s1_valid & ~(s2_miss | refill_valid)):
             m.d.sync += refill_paddr.eq(self.s1_paddr)
 
-        m.d.comb += self.req.ready.eq(~(refill_valid & self.ibus.ack))
+        m.d.comb += self.req.ready.eq(~refill_one_beat)
 
         #
         # Tag array
@@ -126,7 +131,7 @@ class ICache(HasICacheParams, Elaboratable):
             Signal(name=f'slot_valid{i}')
             for i in range(self.n_sets * self.n_ways))
 
-        with m.If(refill_valid & self.ibus.ack):
+        with m.If(refill_one_beat):
             m.d.sync += slot_valids[Cat(
                 refill_index, refill_way)].eq(refill_done & ~invalidated)
 
@@ -179,8 +184,9 @@ class ICache(HasICacheParams, Elaboratable):
             m.d.comb += [
                 wport.addr.eq((refill_index << len(refill_counter))
                               | refill_counter),
-                wport.data.eq(self.ibus.dat_r),
-                wport.en.eq((i == refill_way) & self.ibus.ack & ~invalidated),
+                wport.data.eq(self.ibus.d.bits.data),
+                wport.en.eq((i == refill_way) & refill_one_beat
+                            & ~invalidated),
             ]
 
         s2_tag_hit = Signal.like(s1_tag_hit)
@@ -206,21 +212,26 @@ class ICache(HasICacheParams, Elaboratable):
                 m.d.sync += refill_counter.eq(0)
 
                 with m.If(s2_miss & ~self.s2_kill):
-                    m.d.sync += refill_way.eq(refill_way + 1)
-                    m.next = 'REFILL'
+                    m.d.comb += [
+                        self.ibus.tilelink_get(address=Cat(
+                            Const(0, block_off_bits),
+                            refill_paddr[block_off_bits:]),
+                                               size=self.lg_block_bytes,
+                                               mask=~0),
+                        self.ibus.a.valid.eq(1),
+                    ]
+
+                    with m.If(self.ibus.a.fire):
+                        m.d.sync += refill_way.eq(refill_way + 1)
+                        m.next = 'REFILL'
 
             with m.State('REFILL'):
-                m.d.comb += refill_valid.eq(1)
-
                 m.d.comb += [
-                    self.ibus.adr.eq(
-                        Cat(refill_counter, refill_paddr[block_off_bits:])),
-                    self.ibus.cyc.eq(1),
-                    self.ibus.stb.eq(1),
-                    self.ibus.sel.eq(~0),
+                    refill_valid.eq(1),
+                    self.ibus.d.ready.eq(1),
                 ]
 
-                with m.If(self.ibus.ack):
+                with m.If(refill_one_beat):
                     m.d.sync += refill_counter.eq(refill_counter + 1)
 
                     with m.If(refill_counter == (refill_cycles - 1)):
