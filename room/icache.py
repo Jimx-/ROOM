@@ -95,8 +95,8 @@ class ICache(HasICacheParams, Elaboratable):
         refill_tag = refill_paddr[untag_bits:untag_bits + tag_bits]
         refill_done = Signal()
         refill_counter = Signal(range(refill_cycles))
-        refill_one_beat = self.ibus.d.fire & (
-            self.ibus.d.bits.opcode == tilelink.ChannelDOpcode.AccessAckData)
+        refill_one_beat = self.ibus.d.fire & self.ibus.has_data(
+            self.ibus.d.bits)
         with m.If(s1_valid & ~(s2_miss | refill_valid)):
             m.d.sync += refill_paddr.eq(self.s1_paddr)
 

@@ -219,6 +219,16 @@ class Interface:
             self.e.connect(subord.e)
         ] if self.has_bce and subord.has_bce else []
 
+    @staticmethod
+    def has_data(bits):
+        if isinstance(bits, ChannelA):
+            return (bits.opcode == ChannelAOpcode.PutFullData) | (
+                bits.opcode == ChannelAOpcode.PutPartialData)
+        elif isinstance(bits, ChannelD):
+            return bits.opcode == ChannelDOpcode.AccessAckData
+
+        return False
+
     @property
     def memory_map(self):
         if self._map is None:
@@ -320,9 +330,7 @@ class TileLink2Wishbone(Elaboratable):
         with m.FSM():
             with m.State('IDLE'):
                 with m.If(tl.a.valid):
-                    is_write = (tl.a.bits.opcode == ChannelAOpcode.PutFullData
-                                ) | (tl.a.bits.opcode
-                                     == ChannelAOpcode.PutPartialData)
+                    is_write = Interface.has_data(tl.a.bits)
 
                     m.d.sync += [
                         wb_addr.eq((tl.a.bits.address -
@@ -409,5 +417,78 @@ class TileLink2Wishbone(Elaboratable):
 
                 with m.If(tl.d.ready):
                     m.next = 'IDLE'
+
+        return m
+
+
+class Arbiter(Elaboratable):
+
+    def __init__(self, cls, *args, data_width, size_width, **kwargs):
+        self.data_width = data_width
+        self.size_width = size_width
+
+        self.bus = Decoupled(cls,
+                             data_width=data_width,
+                             size_width=size_width,
+                             *args,
+                             **kwargs)
+        self._intrs = []
+
+    def add(self, intr_bus):
+        self._intrs.append(intr_bus)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        requests = Signal(len(self._intrs))
+        grant = Signal(range(len(self._intrs)))
+        m.d.comb += requests.eq(Cat(intr_bus.valid
+                                    for intr_bus in self._intrs))
+
+        beats_left = Signal(2**self.size_width + 1)
+        beat_bytes = log2_int(self.data_width // 8)
+
+        bus_busy = beats_left != 0
+
+        def num_beats(bits):
+            if isinstance(bits, ChannelE):
+                return 1
+            return Mux(Interface.has_data(bits),
+                       (1 << bits.size) >> beat_bytes, 1)
+
+        with m.If(~bus_busy):
+            with m.Switch(grant):
+                for i in range(len(requests)):
+                    with m.Case(i):
+                        for pred in reversed(range(i)):
+                            with m.If(requests[pred]):
+                                m.d.sync += [
+                                    grant.eq(pred),
+                                    beats_left.eq(
+                                        num_beats(self._intrs[pred].bits)),
+                                ]
+                        for succ in reversed(range(i + 1, len(requests))):
+                            with m.If(requests[succ]):
+                                m.d.sync += [
+                                    grant.eq(succ),
+                                    beats_left.eq(
+                                        num_beats(self._intrs[succ].bits)),
+                                ]
+
+                        with m.If(requests[i]):
+                            m.d.sync += beats_left.eq(
+                                num_beats(self._intrs[i].bits))
+
+        with m.If(bus_busy):
+            m.d.sync += beats_left.eq(beats_left - self.bus.fire)
+
+            with m.Switch(grant):
+                for i, intr_bus in enumerate(self._intrs):
+                    with m.Case(i):
+                        m.d.comb += [
+                            self.bus.bits.eq(intr_bus.bits),
+                            self.bus.valid.eq(intr_bus.valid),
+                            intr_bus.ready.eq(self.bus.ready),
+                        ]
 
         return m
