@@ -1,7 +1,7 @@
 from amaranth import *
 from amaranth import tracer
 from amaranth.hdl.rec import *
-from amaranth.utils import log2_int
+from amaranth.utils import log2_int, bits_for
 from enum import IntEnum
 
 from room.consts import *
@@ -10,7 +10,7 @@ from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.utils import Valid, Decoupled, Arbiter, BranchKillableFIFO
 
-from roomsoc.interconnect import wishbone
+from roomsoc.interconnect import tilelink
 
 
 class StoreGen(Elaboratable):
@@ -90,12 +90,13 @@ class LoadGen(Elaboratable):
 class HasDCacheParams(HasCoreParams):
 
     def __init__(self, params, *args, **kwargs):
-        super().__init__(params)
+        super().__init__(params, *args, **kwargs)
 
         dcache_params = params['dcache_params']
         self.n_sets = dcache_params['n_sets']
         self.n_ways = dcache_params['n_ways']
         self.block_bytes = dcache_params['block_bytes']
+        self.lg_block_bytes = log2_int(self.block_bytes)
 
         self.block_off_bits = log2_int(self.block_bytes)
         self.index_bits = log2_int(self.n_sets)
@@ -431,10 +432,16 @@ class WritebackReq(HasDCacheParams, Record):
 
 class WritebackUnit(HasDCacheParams, Elaboratable):
 
-    def __init__(self, params, dbus):
+    def __init__(self, params):
         super().__init__(params)
 
-        self.dbus = dbus
+        self.mem_acquire = Decoupled(
+            tilelink.ChannelA,
+            addr_width=32,
+            data_width=self.xlen,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+        self.mem_grant = Signal()
 
         self.req = Decoupled(WritebackReq, params)
         self.resp = Signal()
@@ -506,19 +513,28 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
 
             with m.State('WRITE_BACK'):
                 m.d.comb += [
-                    self.dbus.adr.eq(Cat(wb_counter, req.idx, req.tag)),
-                    self.dbus.cyc.eq(1),
-                    self.dbus.stb.eq(1),
-                    self.dbus.sel.eq(~0),
-                    self.dbus.dat_w.eq(wb_buffer[wb_counter]),
-                    self.dbus.we.eq(1),
+                    self.mem_acquire.bits.opcode.eq(
+                        tilelink.ChannelAOpcode.PutFullData),
+                    self.mem_acquire.bits.param.eq(0),
+                    self.mem_acquire.bits.size.eq(self.lg_block_bytes),
+                    self.mem_acquire.bits.source.eq(self.n_mshrs +
+                                                    self.n_iomshrs),
+                    self.mem_acquire.bits.address.eq(
+                        Cat(Const(0, self.block_off_bits), req.idx, req.tag)),
+                    self.mem_acquire.bits.mask.eq(~0),
+                    self.mem_acquire.bits.data.eq(wb_buffer[wb_counter]),
+                    self.mem_acquire.valid.eq(1),
                 ]
 
-                with m.If(self.dbus.ack):
+                with m.If(self.mem_acquire.fire):
                     m.d.sync += wb_counter.eq(wb_counter + 1)
 
                     with m.If(wb_counter == (self.refill_cycles - 1)):
-                        m.next = 'INVALID'
+                        m.next = 'WAIT_ACK'
+
+            with m.State('WAIT_ACK'):
+                with m.If(self.mem_grant):
+                    m.next = 'INVALID'
 
         return m
 
@@ -531,7 +547,7 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
 class MSHRReq(HasDCacheParams, DCacheReq):
 
     def __init__(self, params, name=None, src_loc_at=0):
-        super().__init__(params=params, name=name, src_loc_at=src_loc_at + 1)
+        super().__init__(params=params, name=name, src_loc_at=src_loc_at + 2)
 
         self.tag_match = Signal(name=f'{self.name}_tag_match')
         self.old_meta = Metadata(params, name=f'{self.name}_old_meta')
@@ -581,12 +597,21 @@ class LineBufferWriteReq(HasDCacheParams, Record):
 
 class MSHR(HasDCacheParams, Elaboratable):
 
-    def __init__(self, id, params, dbus):
+    def __init__(self, id, params):
         super().__init__(params)
 
         self.id = id
 
-        self.dbus = dbus
+        self.mem_acquire = Decoupled(
+            tilelink.ChannelA,
+            addr_width=32,
+            data_width=self.xlen,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+
+        self.mem_grant = Decoupled(tilelink.ChannelD,
+                                   data_width=self.xlen,
+                                   size_width=bits_for(self.lg_block_bytes))
 
         self.req = MSHRReq(params)
         self.req_pri_valid = Signal()
@@ -606,7 +631,7 @@ class MSHR(HasDCacheParams, Elaboratable):
         self.replay = Decoupled(MSHRReq, self.params)
 
         self.lb_read = Decoupled(LineBufferReadReq, self.params)
-        self.lb_resp = Signal(self.dbus.data_width)
+        self.lb_resp = Signal(len(self.mem_acquire.bits.data))
         self.lb_write = Decoupled(LineBufferWriteReq, self.params)
 
         self.wb_req = Decoupled(WritebackReq, self.params)
@@ -655,10 +680,7 @@ class MSHR(HasDCacheParams, Elaboratable):
         refill_done = Signal()
         refill_counter = Signal(range(self.refill_cycles))
 
-        lb_write_data = Signal(self.dbus.data_width)
-
-        load_gen = m.submodules.load_gen = LoadGen(
-            max_size=self.dbus.data_width // 8)
+        load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
 
         commit_line = Signal()
         with m.If(refill_done):
@@ -699,47 +721,38 @@ class MSHR(HasDCacheParams, Elaboratable):
 
                     with m.Else():
                         m.d.sync += new_state.eq(CacheState.CLEAN)
-                        m.next = 'REFILL'
+                        m.next = 'REFILL_REQ'
 
-            with m.State('REFILL'):
+            with m.State('REFILL_REQ'):
                 m.d.comb += [
-                    self.dbus.adr.eq(Cat(refill_counter, req_idx, req_tag)),
-                    self.dbus.cyc.eq(1),
-                    self.dbus.stb.eq(1),
-                    self.dbus.sel.eq(~0),
+                    self.mem_acquire.bits.opcode.eq(
+                        tilelink.ChannelAOpcode.Get),
+                    self.mem_acquire.bits.param.eq(0),
+                    self.mem_acquire.bits.size.eq(self.lg_block_bytes),
+                    self.mem_acquire.bits.source.eq(self.id),
+                    self.mem_acquire.bits.address.eq(
+                        Cat(Const(0, self.block_off_bits), req_idx, req_tag)),
+                    self.mem_acquire.bits.mask.eq(~0),
+                    self.mem_acquire.valid.eq(1),
                 ]
 
-                with m.If(self.dbus.ack):
+                with m.If(self.mem_acquire.fire):
+                    m.next = 'REFILL_RESP'
+
+            with m.State('REFILL_RESP'):
+                with m.If(tilelink.Interface.has_data(self.mem_acquire.bits)):
 
                     m.d.comb += [
-                        self.lb_write.valid.eq(1),
+                        self.lb_write.valid.eq(self.mem_grant.valid),
                         self.lb_write.bits.id.eq(self.id),
                         self.lb_write.bits.offset.eq(refill_counter),
-                        self.lb_write.bits.data.eq(self.dbus.dat_r),
+                        self.lb_write.bits.data.eq(self.mem_grant.bits.data),
+                        self.mem_grant.ready.eq(self.lb_write.ready),
                     ]
+                with m.Else():
+                    m.d.comb += self.mem_grant.ready.eq(1)
 
-                    with m.If(~self.lb_write.ready):
-                        m.d.sync += lb_write_data.eq(self.dbus.dat_r)
-
-                        m.next = 'WRITE_LB'
-
-                    with m.Elif(refill_counter == (self.refill_cycles - 1)):
-                        m.d.sync += refill_counter.eq(0)
-                        m.d.comb += refill_done.eq(1)
-                        m.next = 'DRAIN_LOAD'
-
-                    with m.Else():
-                        m.d.sync += refill_counter.eq(refill_counter + 1)
-
-            with m.State('WRITE_LB'):
-                m.d.comb += [
-                    self.lb_write.valid.eq(1),
-                    self.lb_write.bits.id.eq(self.id),
-                    self.lb_write.bits.offset.eq(refill_counter),
-                    self.lb_write.bits.data.eq(lb_write_data),
-                ]
-
-                with m.If(self.lb_write.ready):
+                with m.If(self.mem_grant.fire):
                     with m.If(refill_counter == (self.refill_cycles - 1)):
                         m.d.sync += refill_counter.eq(0)
                         m.d.comb += refill_done.eq(1)
@@ -747,7 +760,6 @@ class MSHR(HasDCacheParams, Elaboratable):
 
                     with m.Else():
                         m.d.sync += refill_counter.eq(refill_counter + 1)
-                        m.next = 'REFILL'
 
             with m.State('DRAIN_LOAD'):
                 drain_load = MemoryCommand.is_read(
@@ -891,11 +903,21 @@ class MSHR(HasDCacheParams, Elaboratable):
 
 class IOMSHR(HasDCacheParams, Elaboratable):
 
-    def __init__(self, id, params, dbus):
+    def __init__(self, id, params):
         super().__init__(params)
 
         self.id = id
-        self.dbus = dbus
+
+        self.mem_acquire = Decoupled(
+            tilelink.ChannelA,
+            addr_width=32,
+            data_width=self.xlen,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+
+        self.mem_grant = Decoupled(tilelink.ChannelD,
+                                   data_width=self.xlen,
+                                   size_width=bits_for(self.lg_block_bytes))
 
         self.req = Decoupled(DCacheReq, params)
         self.resp = Decoupled(DCacheResp, params)
@@ -936,17 +958,25 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
             with m.State('MEM_ACCESS'):
                 m.d.comb += [
-                    self.dbus.adr.eq(req.addr[granularity_bits:]),
-                    self.dbus.stb.eq(1),
-                    self.dbus.dat_w.eq(store_gen.data_out),
-                    self.dbus.cyc.eq(1),
-                    self.dbus.sel.eq(store_gen.mask),
-                    self.dbus.we.eq(req.uop.mem_cmd == MemoryCommand.WRITE),
+                    self.mem_acquire.bits.opcode.eq(
+                        Mux(req.uop.mem_cmd == MemoryCommand.WRITE,
+                            tilelink.ChannelAOpcode.PutPartialData,
+                            tilelink.ChannelAOpcode.Get)),
+                    self.mem_acquire.bits.size.eq(req.uop.mem_cmd),
+                    self.mem_acquire.bits.source.eq(self.id),
+                    self.mem_acquire.bits.address.eq(req.addr),
+                    self.mem_acquire.bits.mask.eq(store_gen.mask),
+                    self.mem_acquire.bits.data.eq(store_gen.data_out),
+                    self.mem_acquire.valid.eq(1),
                 ]
 
-                with m.If(self.dbus.cyc & self.dbus.stb & self.dbus.ack):
+                with m.If(self.mem_acquire.fire):
+                    m.next = 'MEM_ACK'
+
+            with m.State('MEM_ACK'):
+                with m.If(self.mem_grant.valid):
                     with m.If(send_resp):
-                        m.d.sync += resp_data.eq(self.dbus.dat_r)
+                        m.d.sync += resp_data.eq(self.mem_grant.bits.data)
 
                     m.next = 'RESP'
 
@@ -966,10 +996,19 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
 class MSHRFile(HasDCacheParams, Elaboratable):
 
-    def __init__(self, params, dbus):
+    def __init__(self, params):
         super().__init__(params)
 
-        self.dbus = dbus
+        self.mem_acquire = Decoupled(
+            tilelink.ChannelA,
+            addr_width=32,
+            data_width=self.xlen,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+
+        self.mem_grant = Decoupled(tilelink.ChannelD,
+                                   data_width=self.xlen,
+                                   size_width=bits_for(self.lg_block_bytes))
 
         self.req = [
             Decoupled(MSHRReq, params, name=f'req{i}')
@@ -1048,7 +1087,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
         lb_write_arb = m.submodules.lb_write_arb = Arbiter(
             self.n_mshrs, LineBufferWriteReq, self.params)
 
-        lb_mem = Memory(width=self.dbus.data_width,
+        lb_mem = Memory(width=len(self.mem_acquire.bits.data),
                         depth=self.n_mshrs * self.refill_cycles)
 
         lb_read = m.submodules.lb_read = lb_mem.read_port(domain='comb',
@@ -1066,10 +1105,12 @@ class MSHRFile(HasDCacheParams, Elaboratable):
             lb_write_arb.out.ready.eq(1),
         ]
 
-        dbus_arbiter = m.submodules.dbus_arbiter = wishbone.Arbiter(
-            data_width=self.dbus.data_width,
-            addr_width=self.dbus.addr_width,
-            granularity=self.dbus.granularity)
+        mem_acquire_arbiter = m.submodules.mem_acquire_arbiter = tilelink.Arbiter(
+            tilelink.ChannelA,
+            addr_width=32,
+            data_width=self.xlen,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
         meta_read_arb = m.submodules.meta_read_arb = Arbiter(
             self.n_mshrs, MetaReadReq, self.params)
@@ -1120,14 +1161,10 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         mshrs = []
         for i in range(self.n_mshrs):
-            mshr_dbus = wishbone.Interface(addr_width=self.dbus.addr_width,
-                                           data_width=self.dbus.data_width,
-                                           granularity=self.dbus.granularity,
-                                           name=f'mshr_dbus{i}')
-            dbus_arbiter.add(mshr_dbus)
-
-            mshr = MSHR(i, self.params, mshr_dbus)
+            mshr = MSHR(i, self.params)
             setattr(m.submodules, f'mshr{i}', mshr)
+
+            mem_acquire_arbiter.add(mshr.mem_acquire)
 
             for w in range(self.mem_width):
                 m.d.comb += [
@@ -1177,6 +1214,9 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                 mshr.wb_resp.eq(self.wb_resp),
             ]
 
+            with m.If(self.mem_grant.bits.source == i):
+                m.d.comb += self.mem_grant.connect(mshr.mem_grant)
+
             m.d.comb += mshr.resp.connect(resp_arb.inp[i])
 
             mshrs.append(mshr)
@@ -1192,14 +1232,11 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         io_mshrs = []
         for i in range(self.n_iomshrs):
-            mshr_dbus = wishbone.Interface(addr_width=self.dbus.addr_width,
-                                           data_width=self.dbus.data_width,
-                                           granularity=self.dbus.granularity,
-                                           name=f'iomshr_dbus{i}')
-            dbus_arbiter.add(mshr_dbus)
-
-            mshr = IOMSHR(self.n_mshrs + i, self.params, mshr_dbus)
+            mshr_id = self.n_mshrs + i
+            mshr = IOMSHR(mshr_id, self.params)
             setattr(m.submodules, f'iomshr{i}', mshr)
+
+            mem_acquire_arbiter.add(mshr.mem_acquire)
 
             mmio_ready |= mshr.req.ready
 
@@ -1211,13 +1248,22 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                 mshr.req.bits.data.eq(req.data),
             ]
 
+            m.d.comb += [
+                mshr.mem_grant.bits.eq(self.mem_grant.bits),
+                mshr.mem_grant.valid.eq(
+                    self.mem_grant.valid
+                    & (self.mem_grant.bits.source == mshr_id)),
+            ]
+            with m.If(self.mem_grant.bits.source == mshr_id):
+                m.d.comb += self.mem_grant.ready.eq(1)
+
             m.d.comb += mshr.resp.connect(resp_arb.inp[self.n_mshrs + i])
 
             io_mshrs.append(mshr)
 
         m.d.comb += iomshr_alloc_arb.out.ready.eq(req_valid & req_uncacheable)
 
-        m.d.comb += dbus_arbiter.bus.connect(self.dbus)
+        m.d.comb += mem_acquire_arbiter.bus.connect(self.mem_acquire)
 
         m.d.comb += [
             meta_read_arb.out.connect(self.meta_read),
@@ -1326,32 +1372,35 @@ class DCache(HasDCacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        wb_dbus = wishbone.Interface(addr_width=self.dbus.addr_width,
-                                     data_width=self.dbus.data_width,
-                                     granularity=self.dbus.granularity,
-                                     name='wb_dbus')
-        wb = m.submodules.wb = WritebackUnit(self.params, wb_dbus)
+        wb = m.submodules.wb = WritebackUnit(self.params)
 
-        mshrs_dbus = wishbone.Interface(addr_width=self.dbus.addr_width,
-                                        data_width=self.dbus.data_width,
-                                        granularity=self.dbus.granularity,
-                                        name='mshrs_dbus')
-        mshrs = m.submodules.mshrs = MSHRFile(self.params, mshrs_dbus)
+        mshrs = m.submodules.mshrs = MSHRFile(self.params)
 
         m.d.comb += [
             mshrs.br_update.eq(self.br_update),
             mshrs.exception.eq(self.exception),
         ]
 
-        dbus_arbiter = m.submodules.dbus_arbiter = wishbone.Arbiter(
-            data_width=self.dbus.data_width,
-            addr_width=self.dbus.addr_width,
-            granularity=self.dbus.granularity)
+        mem_acquire_arbiter = m.submodules.mem_acquire_arbiter = tilelink.Arbiter(
+            tilelink.ChannelA,
+            addr_width=32,
+            data_width=self.xlen,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+        mem_acquire_arbiter.add(mshrs.mem_acquire)
+        mem_acquire_arbiter.add(wb.mem_acquire)
+        m.d.comb += mem_acquire_arbiter.bus.connect(self.dbus.a)
 
-        dbus_arbiter.add(wb_dbus)
-        dbus_arbiter.add(mshrs_dbus)
+        with m.If(self.dbus.d.bits.source == self.n_mshrs + self.n_iomshrs):
+            m.d.comb += [
+                self.dbus.d.ready.eq(1),
+                mshrs.mem_grant.valid.eq(0),
+            ]
+        with m.Else():
+            m.d.comb += self.dbus.d.connect(mshrs.mem_grant)
 
-        m.d.comb += dbus_arbiter.bus.connect(self.dbus)
+        m.d.comb += wb.mem_grant.eq(self.dbus.d.fire & (
+            self.dbus.d.bits.source == self.n_mshrs + self.n_iomshrs))
 
         #
         # Tag & data access

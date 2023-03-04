@@ -54,7 +54,7 @@ class ChannelA(Record):
                  addr_width,
                  data_width,
                  size_width,
-                 source_id_width,
+                 source_id_width=1,
                  name=None):
 
         layout = [
@@ -78,17 +78,17 @@ class ChannelB(Record):
                  addr_width,
                  data_width,
                  size_width,
-                 source_id_width,
+                 source_id_width=1,
                  name=None):
 
         layout = [
-            ('opcode', ChannelBOpcode, Direction.FANIN),
-            ('param', 3, Direction.FANIN),
-            ('size', size_width, Direction.FANIN),
-            ('source', source_id_width, Direction.FANIN),
-            ('address', addr_width, Direction.FANIN),
-            ('mask', data_width // 8, Direction.FANIN),
-            ('data', data_width, Direction.FANIN),
+            ('opcode', ChannelBOpcode, Direction.FANOUT),
+            ('param', 3, Direction.FANOUT),
+            ('size', size_width, Direction.FANOUT),
+            ('source', source_id_width, Direction.FANOUT),
+            ('address', addr_width, Direction.FANOUT),
+            ('mask', data_width // 8, Direction.FANOUT),
+            ('data', data_width, Direction.FANOUT),
         ]
 
         super().__init__(layout, name=name, src_loc_at=1)
@@ -101,7 +101,7 @@ class ChannelC(Record):
                  addr_width,
                  data_width,
                  size_width,
-                 source_id_width,
+                 source_id_width=1,
                  name=None):
 
         layout = [
@@ -123,19 +123,19 @@ class ChannelD(Record):
                  *,
                  data_width,
                  size_width,
-                 source_id_width,
-                 sink_id_width,
+                 source_id_width=1,
+                 sink_id_width=1,
                  name=None):
 
         layout = [
-            ('opcode', ChannelDOpcode, Direction.FANIN),
-            ('param', 2, Direction.FANIN),
-            ('size', size_width, Direction.FANIN),
-            ('source', source_id_width, Direction.FANIN),
-            ('sink', sink_id_width, Direction.FANIN),
-            ('denied', 1, Direction.FANIN),
-            ('corrupt', 1, Direction.FANIN),
-            ('data', data_width, Direction.FANIN),
+            ('opcode', ChannelDOpcode, Direction.FANOUT),
+            ('param', 2, Direction.FANOUT),
+            ('size', size_width, Direction.FANOUT),
+            ('source', source_id_width, Direction.FANOUT),
+            ('sink', sink_id_width, Direction.FANOUT),
+            ('denied', 1, Direction.FANOUT),
+            ('corrupt', 1, Direction.FANOUT),
+            ('data', data_width, Direction.FANOUT),
         ]
 
         super().__init__(layout, name=name, src_loc_at=1)
@@ -143,7 +143,7 @@ class ChannelD(Record):
 
 class ChannelE(Record):
 
-    def __init__(self, *, sink_id_width, name=None):
+    def __init__(self, *, sink_id_width=1, name=None):
 
         layout = [
             ('sink', sink_id_width, Direction.FANOUT),
@@ -212,12 +212,12 @@ class Interface:
     def connect(self, subord):
         return [
             self.a.connect(subord.a),
-            self.d.connect(subord.d),
-        ] + [
-            self.b.connect(subord.b),
+            subord.d.connect(self.d),
+        ] + ([
+            subord.b.connect(self.b),
             self.c.connect(subord.c),
             self.e.connect(subord.e)
-        ] if self.has_bce and subord.has_bce else []
+        ] if self.has_bce and subord.has_bce else [])
 
     @staticmethod
     def has_data(bits):
@@ -324,6 +324,7 @@ class TileLink2Wishbone(Elaboratable):
 
         wb_addr = Signal(wb.addr_width)
         burst_len = Signal(2**tl.size_bits + 1)
+        mask = Signal.like(tl.a.bits.mask)
         wen = Signal()
         rdata = Signal.like(wb.dat_r)
 
@@ -336,6 +337,7 @@ class TileLink2Wishbone(Elaboratable):
                         wb_addr.eq((tl.a.bits.address -
                                     self.base_addr)[wb_adr_shift:]),
                         burst_len.eq(1 << tl.a.bits.size),
+                        mask.eq(tl.a.bits.mask),
                         wen.eq(is_write),
                         tl.d.bits.size.eq(tl.a.bits.size),
                         tl.d.bits.source.eq(tl.a.bits.source),
@@ -351,7 +353,7 @@ class TileLink2Wishbone(Elaboratable):
                     wb.cyc.eq(~wen | tl.a.valid),
                     wb.adr.eq(wb_addr),
                     wb.we.eq(wen),
-                    wb.sel.eq(2**len(wb.sel) - 1),
+                    wb.sel.eq(mask),
                 ]
 
                 with m.If(wb.we):
@@ -446,7 +448,7 @@ class Arbiter(Elaboratable):
                                     for intr_bus in self._intrs))
 
         beats_left = Signal(2**self.size_width + 1)
-        beat_bytes = log2_int(self.data_width // 8)
+        lg_beat_bytes = log2_int(self.data_width // 8)
 
         bus_busy = beats_left != 0
 
@@ -454,7 +456,8 @@ class Arbiter(Elaboratable):
             if isinstance(bits, ChannelE):
                 return 1
             return Mux(Interface.has_data(bits),
-                       (1 << bits.size) >> beat_bytes, 1)
+                       ((1 << bits.size) >> lg_beat_bytes) |
+                       (bits.size < lg_beat_bytes), 1)
 
         with m.If(~bus_busy):
             with m.Switch(grant):

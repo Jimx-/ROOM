@@ -143,11 +143,18 @@ class Core(HasCoreParams, Elaboratable):
                                            size_width=3,
                                            name='ibus')
 
-        self.dbus = wishbone.Interface(data_width=self.xlen,
-                                       addr_width=32 -
-                                       log2_int(self.xlen // 8),
-                                       granularity=8,
-                                       name='dbus')
+        if params.get('dcache_params') is None:
+            self.dbus = wishbone.Interface(data_width=self.xlen,
+                                           addr_width=32 -
+                                           log2_int(self.xlen // 8),
+                                           granularity=8,
+                                           name='dbus')
+        else:
+            self.dbus = tilelink.Interface(data_width=self.xlen,
+                                           addr_width=32,
+                                           size_width=3,
+                                           source_id_width=8,
+                                           name='dbus')
 
         self.periph_buses = [self.ibus, self.dbus]
 
