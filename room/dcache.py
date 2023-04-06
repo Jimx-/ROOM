@@ -193,15 +193,27 @@ class CacheState(IntEnum):
 
         with m.Switch(state):
             with m.Case(CacheState.NOTHING):
-                pass
+                with m.If(cmd_is_write):
+                    m.d.comb += next_state.eq(tilelink.GrowParam.NtoT)
+                with m.Else():
+                    m.d.comb += next_state.eq(tilelink.GrowParam.NtoB)
 
             with m.Case(CacheState.BRANCH):
+                with m.If(cmd_is_write):
+                    m.d.comb += next_state.eq(tilelink.GrowParam.BtoT)
+                with m.Else():
+                    m.d.comb += [
+                        is_hit.eq(1),
+                        next_state.eq(CacheState.BRANCH),
+                    ]
+
+            with m.Case(CacheState.TRUNK):
                 m.d.comb += [
                     is_hit.eq(1),
                     next_state.eq(
-                        Mux(cmd_is_write, CacheState.DIRTY,
-                            CacheState.BRANCH)),
+                        Mux(cmd_is_write, CacheState.DIRTY, CacheState.TRUNK)),
                 ]
+
             with m.Case(CacheState.DIRTY):
                 m.d.comb += [
                     is_hit.eq(1),
@@ -209,6 +221,25 @@ class CacheState(IntEnum):
                 ]
 
         return is_hit, next_state
+
+    @staticmethod
+    def on_grant(m, cmd, param):
+        cmd_is_write = MemoryCommand.is_write(cmd)
+
+        grant_state = Signal(CacheState, reset=CacheState.NOTHING)
+
+        with m.Switch(param):
+            with m.Case(tilelink.CapParam.toB):
+                with m.If(~cmd_is_write):
+                    m.d.comb += grant_state.eq(CacheState.BRANCH)
+
+            with m.Case(tilelink.CapParam.toT):
+                with m.If(cmd_is_write):
+                    m.d.comb += grant_state.eq(CacheState.DIRTY)
+                with m.Else():
+                    m.d.comb += grant_state.eq(CacheState.TRUNK)
+
+        return grant_state
 
     @staticmethod
     def on_sec_access(m, state, cmd_pri, cmd_sec):
@@ -684,11 +715,14 @@ class MSHR(HasDCacheParams, Elaboratable):
 
         load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
 
+        grant_had_data = Signal()
         commit_line = Signal()
-        with m.If(refill_done):
-            m.d.sync += commit_line.eq(0)
 
         new_state = Signal(CacheState)
+
+        _, grow_param = CacheState.on_access(m, new_state, req.uop.mem_cmd)
+        grant_state = CacheState.on_grant(m, req.uop.mem_cmd,
+                                          self.mem_grant.bits.param)
 
         is_hit_again, dirtier_state, dirtier_cmd = CacheState.on_sec_access(
             m, new_state, req.uop.mem_cmd, self.req.uop.mem_cmd)
@@ -709,6 +743,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     block_sec_req.eq(1),
                     self.req_pri_ready.eq(1),
                 ]
+                m.d.sync += grant_had_data.eq(0)
 
                 with m.If(self.req_pri_valid & self.req_pri_ready):
                     m.d.sync += req.eq(self.req)
@@ -721,15 +756,19 @@ class MSHR(HasDCacheParams, Elaboratable):
                             m.d.sync += new_state.eq(next_state)
                             m.next = 'DRAIN_REPLAY'
 
+                        with m.Else():
+                            m.d.sync += new_state.eq(self.req.old_meta.state)
+                            m.next = 'REFILL_REQ'
+
                     with m.Else():
-                        m.d.sync += new_state.eq(CacheState.BRANCH)
+                        m.d.sync += new_state.eq(CacheState.NOTHING)
                         m.next = 'REFILL_REQ'
 
             with m.State('REFILL_REQ'):
                 m.d.comb += [
                     self.mem_acquire.bits.opcode.eq(
                         tilelink.ChannelAOpcode.AcquireBlock),
-                    self.mem_acquire.bits.param.eq(0),
+                    self.mem_acquire.bits.param.eq(grow_param),
                     self.mem_acquire.bits.size.eq(self.lg_block_bytes),
                     self.mem_acquire.bits.source.eq(self.id),
                     self.mem_acquire.bits.address.eq(
@@ -742,7 +781,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     m.next = 'REFILL_RESP'
 
             with m.State('REFILL_RESP'):
-                with m.If(tilelink.Interface.has_data(self.mem_acquire.bits)):
+                with m.If(tilelink.Interface.has_data(self.mem_grant.bits)):
 
                     m.d.comb += [
                         self.lb_write.valid.eq(self.mem_grant.valid),
@@ -755,10 +794,20 @@ class MSHR(HasDCacheParams, Elaboratable):
                     m.d.comb += self.mem_grant.ready.eq(1)
 
                 with m.If(self.mem_grant.fire):
-                    with m.If(refill_counter == (self.refill_cycles - 1)):
-                        m.d.sync += refill_counter.eq(0)
+                    m.d.sync += grant_had_data.eq(tilelink.Interface.has_data(self.mem_grant.bits))
+
+                    with m.If((refill_counter == (self.refill_cycles - 1)) | (self.mem_grant.bits.opcode == tilelink.ChannelDOpcode.Grant)):
+                        m.d.sync += [
+                            refill_counter.eq(0),
+                            new_state.eq(grant_state),
+                            commit_line.eq(0),
+                        ]
                         m.d.comb += refill_done.eq(1)
-                        m.next = 'DRAIN_LOAD'
+
+                        with m.If(grant_had_data):
+                            m.next = 'DRAIN_LOAD'
+                        with m.Else():
+                            m.next = 'DRAIN_REPLAY'
 
                     with m.Else():
                         m.d.sync += refill_counter.eq(refill_counter + 1)

@@ -55,7 +55,7 @@ class HasL2CacheParams:
         return ~opcode[2] | (
             ((opcode == tilelink.ChannelAOpcode.AcquireBlock) |
              (opcode == tilelink.ChannelAOpcode.AcquirePerm)) &
-            (param != tilelink.ChannelAPerm.NtoB))
+            (param != tilelink.GrowParam.NtoB))
 
 
 class CacheState(IntEnum):
@@ -565,7 +565,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
                     tilelink.ChannelDOpcode.AccessAckData)
             with m.Case(tilelink.ChannelAOpcode.AcquireBlock):
                 m.d.comb += resp_opcode.eq(
-                    Mux(s3_req.param == tilelink.ChannelAPerm.BtoT,
+                    Mux(s3_req.param == tilelink.GrowParam.BtoT,
                         tilelink.ChannelDOpcode.Grant,
                         tilelink.ChannelDOpcode.GrantData))
             with m.Case(tilelink.ChannelAOpcode.AcquirePerm):
@@ -866,7 +866,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
             # Channel A
             self.schedule.bits.a.bits.tag.eq(request.tag),
             self.schedule.bits.a.bits.set.eq(request.set),
-            self.schedule.bits.a.bits.param.eq(tilelink.ChannelAPerm.NtoB),
+            self.schedule.bits.a.bits.param.eq(tilelink.GrowParam.NtoB),
             self.schedule.bits.a.bits.block.eq(1),
             self.schedule.bits.a.bits.source.eq(0),
             # Channel D
@@ -888,8 +888,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
                     w_grantfirst.eq(1),
                     w_grantlast.eq(self.sinkd.bits.last),
                     w_grant.eq(self.sinkd.bits.last),
-                    got_t.eq(
-                        self.sinkd.bits.param == tilelink.ChannelDPerm.toT),
+                    got_t.eq(self.sinkd.bits.param == tilelink.CapParam.toT),
                 ]
 
         with m.If(self.directory.valid):

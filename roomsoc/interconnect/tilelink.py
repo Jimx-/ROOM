@@ -19,7 +19,13 @@ class ChannelAOpcode(Enum):
     AcquirePerm = 7
 
 
-class ChannelAPerm(Enum):
+class CapParam(Enum):
+    toT = 0
+    toB = 1
+    toN = 2
+
+
+class GrowParam(Enum):
     NtoB = 0
     NtoT = 1
     BtoT = 2
@@ -52,12 +58,6 @@ class ChannelDOpcode(Enum):
     Grant = 4
     GrantData = 5
     ReleaseAck = 6
-
-
-class ChannelDPerm(Enum):
-    toT = 0
-    toB = 1
-    toN = 2
 
 
 class ChannelA(Record):
@@ -339,7 +339,7 @@ class TileLink2Wishbone(Elaboratable):
         wb_addr = Signal(wb.addr_width)
         burst_len = Signal(2**tl.size_bits + 1)
         req_opcode = Signal(ChannelAOpcode)
-        req_param = Signal(ChannelAPerm)
+        req_param = Signal(GrowParam)
         mask = Signal.like(tl.a.bits.mask)
         wen = Signal()
         rdata = Signal.like(wb.dat_r)
@@ -354,7 +354,7 @@ class TileLink2Wishbone(Elaboratable):
                 m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAckData)
             with m.Case(ChannelAOpcode.AcquireBlock):
                 m.d.comb += resp_opcode.eq(
-                    Mux(req_param == ChannelAPerm.BtoT, ChannelDOpcode.Grant,
+                    Mux(req_param == GrowParam.BtoT, ChannelDOpcode.Grant,
                         ChannelDOpcode.GrantData))
             with m.Case(ChannelAOpcode.AcquirePerm):
                 m.d.comb += resp_opcode.eq(ChannelDOpcode.Grant)
@@ -380,7 +380,13 @@ class TileLink2Wishbone(Elaboratable):
 
                     m.d.comb += tl.a.ready.eq(~is_write)
 
-                    m.next = 'ACT'
+                    with m.If((
+                        (tl.a.bits.opcode == ChannelAOpcode.AcquireBlock)
+                            | (tl.a.bits.opcode == ChannelAOpcode.AcquirePerm))
+                              & (tl.a.bits.param == GrowParam.BtoT)):
+                        m.next = 'WRITE_ACK'
+                    with m.Else():
+                        m.next = 'ACT'
 
             with m.State('ACT'):
                 m.d.comb += [
@@ -404,7 +410,7 @@ class TileLink2Wishbone(Elaboratable):
                         m.d.comb += [
                             tl.d.bits.opcode.eq(resp_opcode),
                             tl.d.bits.data.eq(wb.dat_r),
-                            tl.d.bits.param.eq(ChannelDPerm.toT),
+                            tl.d.bits.param.eq(CapParam.toT),
                             tl.d.valid.eq(1),
                         ]
 
@@ -434,7 +440,7 @@ class TileLink2Wishbone(Elaboratable):
                 m.d.comb += [
                     tl.d.bits.opcode.eq(resp_opcode),
                     tl.d.bits.data.eq(rdata),
-                    tl.d.bits.param.eq(ChannelDPerm.toT),
+                    tl.d.bits.param.eq(CapParam.toT),
                     tl.d.valid.eq(1),
                 ]
 
