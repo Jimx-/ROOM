@@ -15,7 +15,14 @@ class ChannelAOpcode(Enum):
     LogicalData = 3
     Get = 4
     Intent = 5
-    Acquire = 6
+    AcquireBlock = 6
+    AcquirePerm = 7
+
+
+class ChannelAPerm(Enum):
+    NtoB = 0
+    NtoT = 1
+    BtoT = 2
 
 
 class ChannelBOpcode(Enum):
@@ -45,6 +52,12 @@ class ChannelDOpcode(Enum):
     Grant = 4
     GrantData = 5
     ReleaseAck = 6
+
+
+class ChannelDPerm(Enum):
+    toT = 0
+    toB = 1
+    toN = 2
 
 
 class ChannelA(Record):
@@ -225,7 +238,8 @@ class Interface:
             return (bits.opcode == ChannelAOpcode.PutFullData) | (
                 bits.opcode == ChannelAOpcode.PutPartialData)
         elif isinstance(bits, ChannelD):
-            return bits.opcode == ChannelDOpcode.AccessAckData
+            return (bits.opcode == ChannelDOpcode.AccessAckData) | (
+                bits.opcode == ChannelDOpcode.GrantData)
 
         return False
 
@@ -324,12 +338,31 @@ class TileLink2Wishbone(Elaboratable):
 
         wb_addr = Signal(wb.addr_width)
         burst_len = Signal(2**tl.size_bits + 1)
+        req_opcode = Signal(ChannelAOpcode)
+        req_param = Signal(ChannelAPerm)
         mask = Signal.like(tl.a.bits.mask)
         wen = Signal()
         rdata = Signal.like(wb.dat_r)
 
+        resp_opcode = Signal(ChannelDOpcode)
+        with m.Switch(req_opcode):
+            with m.Case(ChannelAOpcode.PutFullData):
+                m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAck)
+            with m.Case(ChannelAOpcode.PutPartialData):
+                m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAck)
+            with m.Case(ChannelAOpcode.Get):
+                m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAckData)
+            with m.Case(ChannelAOpcode.AcquireBlock):
+                m.d.comb += resp_opcode.eq(
+                    Mux(req_param == ChannelAPerm.BtoT, ChannelDOpcode.Grant,
+                        ChannelDOpcode.GrantData))
+            with m.Case(ChannelAOpcode.AcquirePerm):
+                m.d.comb += resp_opcode.eq(ChannelDOpcode.Grant)
+
         with m.FSM():
             with m.State('IDLE'):
+                m.d.comb += tl.a.ready.eq(1)
+
                 with m.If(tl.a.valid):
                     is_write = Interface.has_data(tl.a.bits)
 
@@ -337,6 +370,8 @@ class TileLink2Wishbone(Elaboratable):
                         wb_addr.eq((tl.a.bits.address -
                                     self.base_addr)[wb_adr_shift:]),
                         burst_len.eq(1 << tl.a.bits.size),
+                        req_opcode.eq(tl.a.bits.opcode),
+                        req_param.eq(tl.a.bits.param),
                         mask.eq(tl.a.bits.mask),
                         wen.eq(is_write),
                         tl.d.bits.size.eq(tl.a.bits.size),
@@ -367,8 +402,9 @@ class TileLink2Wishbone(Elaboratable):
 
                     with m.If(~wb.we):
                         m.d.comb += [
-                            tl.d.bits.opcode.eq(ChannelDOpcode.AccessAckData),
+                            tl.d.bits.opcode.eq(resp_opcode),
                             tl.d.bits.data.eq(wb.dat_r),
+                            tl.d.bits.param.eq(ChannelDPerm.toT),
                             tl.d.valid.eq(1),
                         ]
 
@@ -396,8 +432,9 @@ class TileLink2Wishbone(Elaboratable):
 
             with m.State('WAIT_ACK'):
                 m.d.comb += [
-                    tl.d.bits.opcode.eq(ChannelDOpcode.AccessAckData),
+                    tl.d.bits.opcode.eq(resp_opcode),
                     tl.d.bits.data.eq(rdata),
+                    tl.d.bits.param.eq(ChannelDPerm.toT),
                     tl.d.valid.eq(1),
                 ]
 
@@ -412,8 +449,7 @@ class TileLink2Wishbone(Elaboratable):
 
             with m.State('WRITE_ACK'):
                 m.d.comb += [
-                    tl.d.bits.opcode.eq(ChannelDOpcode.AccessAck),
-                    tl.d.bits.data.eq(rdata),
+                    tl.d.bits.opcode.eq(resp_opcode),
                     tl.d.valid.eq(1),
                 ]
 

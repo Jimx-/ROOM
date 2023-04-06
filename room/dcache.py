@@ -176,7 +176,8 @@ class DCacheResp(HasCoreParams):
 
 class CacheState(IntEnum):
     NOTHING = 0
-    CLEAN = 1
+    BRANCH = 1
+    TRUNK = 2
     DIRTY = 3
 
     @staticmethod
@@ -194,11 +195,12 @@ class CacheState(IntEnum):
             with m.Case(CacheState.NOTHING):
                 pass
 
-            with m.Case(CacheState.CLEAN):
+            with m.Case(CacheState.BRANCH):
                 m.d.comb += [
                     is_hit.eq(1),
                     next_state.eq(
-                        Mux(cmd_is_write, CacheState.DIRTY, CacheState.CLEAN)),
+                        Mux(cmd_is_write, CacheState.DIRTY,
+                            CacheState.BRANCH)),
                 ]
             with m.Case(CacheState.DIRTY):
                 m.d.comb += [
@@ -720,13 +722,13 @@ class MSHR(HasDCacheParams, Elaboratable):
                             m.next = 'DRAIN_REPLAY'
 
                     with m.Else():
-                        m.d.sync += new_state.eq(CacheState.CLEAN)
+                        m.d.sync += new_state.eq(CacheState.BRANCH)
                         m.next = 'REFILL_REQ'
 
             with m.State('REFILL_REQ'):
                 m.d.comb += [
                     self.mem_acquire.bits.opcode.eq(
-                        tilelink.ChannelAOpcode.Get),
+                        tilelink.ChannelAOpcode.AcquireBlock),
                     self.mem_acquire.bits.param.eq(0),
                     self.mem_acquire.bits.size.eq(self.lg_block_bytes),
                     self.mem_acquire.bits.source.eq(self.id),
