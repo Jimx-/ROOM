@@ -343,6 +343,7 @@ class TileLink2Wishbone(Elaboratable):
         mask = Signal.like(tl.a.bits.mask)
         wen = Signal()
         rdata = Signal.like(wb.dat_r)
+        req_from_c = Signal()
 
         resp_opcode = Signal(ChannelDOpcode)
         with m.Switch(req_opcode):
@@ -359,9 +360,15 @@ class TileLink2Wishbone(Elaboratable):
             with m.Case(ChannelAOpcode.AcquirePerm):
                 m.d.comb += resp_opcode.eq(ChannelDOpcode.Grant)
 
+        with m.If(req_from_c):
+            m.d.comb += resp_opcode.eq(ChannelDOpcode.ReleaseAck)
+
         with m.FSM():
             with m.State('IDLE'):
                 m.d.comb += tl.a.ready.eq(1)
+
+                if tl.has_bce:
+                    m.d.comb += tl.c.ready.eq(1)
 
                 with m.If(tl.a.valid):
                     is_write = Interface.has_data(tl.a.bits)
@@ -376,6 +383,7 @@ class TileLink2Wishbone(Elaboratable):
                         wen.eq(is_write),
                         tl.d.bits.size.eq(tl.a.bits.size),
                         tl.d.bits.source.eq(tl.a.bits.source),
+                        req_from_c.eq(0),
                     ]
 
                     m.d.comb += tl.a.ready.eq(~is_write)
@@ -388,20 +396,52 @@ class TileLink2Wishbone(Elaboratable):
                     with m.Else():
                         m.next = 'ACT'
 
+                if tl.has_bce:
+                    with m.If(tl.c.valid):
+                        m.d.sync += [
+                            wb_addr.eq((tl.c.bits.address -
+                                        self.base_addr)[wb_adr_shift:]),
+                            burst_len.eq(1 << tl.c.bits.size),
+                            req_opcode.eq(tl.c.bits.opcode),
+                            req_param.eq(tl.c.bits.param),
+                            mask.eq(~0),
+                            wen.eq(1),
+                            tl.d.bits.size.eq(tl.c.bits.size),
+                            tl.d.bits.source.eq(tl.c.bits.source),
+                            req_from_c.eq(1),
+                        ]
+
+                        m.d.comb += tl.c.ready.eq(0)
+
+                        m.next = 'ACT'
+
             with m.State('ACT'):
                 m.d.comb += [
-                    wb.stb.eq(~wen | tl.a.valid),
-                    wb.cyc.eq(~wen | tl.a.valid),
+                    wb.stb.eq(wb.cyc),
                     wb.adr.eq(wb_addr),
                     wb.we.eq(wen),
                     wb.sel.eq(mask),
                 ]
 
+                if tl.has_bce:
+                    m.d.comb += wb.cyc.eq(
+                        ~wen | Mux(req_from_c, tl.c.valid, tl.a.valid))
+                else:
+                    m.d.comb += wb.cyc.eq(~wen | tl.a.valid)
+
                 with m.If(wb.we):
-                    m.d.comb += [
-                        wb.dat_w.eq(tl.a.bits.data),
-                        tl.a.ready.eq(wb.ack),
-                    ]
+                    with m.If(~req_from_c):
+                        m.d.comb += [
+                            wb.dat_w.eq(tl.a.bits.data),
+                            tl.a.ready.eq(wb.ack),
+                        ]
+
+                    if tl.has_bce:
+                        with m.If(req_from_c):
+                            m.d.comb += [
+                                wb.dat_w.eq(tl.c.bits.data),
+                                tl.c.ready.eq(wb.ack),
+                            ]
 
                 with m.If(wb.ack):
                     m.d.sync += wb_addr.eq(wb_addr + 1)

@@ -458,6 +458,8 @@ class WritebackReq(HasDCacheParams, Record):
             ('tag', self.tag_bits, DIR_FANOUT),
             ('idx', self.index_bits, DIR_FANOUT),
             ('way_en', self.n_ways, DIR_FANOUT),
+            ('param', 3, DIR_FANOUT),
+            ('voluntary', 1, DIR_FANOUT),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
@@ -468,8 +470,8 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
     def __init__(self, params):
         super().__init__(params)
 
-        self.mem_acquire = Decoupled(
-            tilelink.ChannelA,
+        self.mem_release = Decoupled(
+            tilelink.ChannelC,
             addr_width=32,
             data_width=self.xlen,
             size_width=bits_for(self.lg_block_bytes),
@@ -546,20 +548,19 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
 
             with m.State('WRITE_BACK'):
                 m.d.comb += [
-                    self.mem_acquire.bits.opcode.eq(
-                        tilelink.ChannelAOpcode.PutFullData),
-                    self.mem_acquire.bits.param.eq(0),
-                    self.mem_acquire.bits.size.eq(self.lg_block_bytes),
-                    self.mem_acquire.bits.source.eq(self.n_mshrs +
+                    self.mem_release.bits.opcode.eq(
+                        tilelink.ChannelCOpcode.ReleaseData),
+                    self.mem_release.bits.param.eq(req.param),
+                    self.mem_release.bits.size.eq(self.lg_block_bytes),
+                    self.mem_release.bits.source.eq(self.n_mshrs +
                                                     self.n_iomshrs),
-                    self.mem_acquire.bits.address.eq(
+                    self.mem_release.bits.address.eq(
                         Cat(Const(0, self.block_off_bits), req.idx, req.tag)),
-                    self.mem_acquire.bits.mask.eq(~0),
-                    self.mem_acquire.bits.data.eq(wb_buffer[wb_counter]),
-                    self.mem_acquire.valid.eq(1),
+                    self.mem_release.bits.data.eq(wb_buffer[wb_counter]),
+                    self.mem_release.valid.eq(1),
                 ]
 
-                with m.If(self.mem_acquire.fire):
+                with m.If(self.mem_release.fire):
                     m.d.sync += wb_counter.eq(wb_counter + 1)
 
                     with m.If(wb_counter == (self.refill_cycles - 1)):
@@ -794,9 +795,12 @@ class MSHR(HasDCacheParams, Elaboratable):
                     m.d.comb += self.mem_grant.ready.eq(1)
 
                 with m.If(self.mem_grant.fire):
-                    m.d.sync += grant_had_data.eq(tilelink.Interface.has_data(self.mem_grant.bits))
+                    m.d.sync += grant_had_data.eq(
+                        tilelink.Interface.has_data(self.mem_grant.bits))
 
-                    with m.If((refill_counter == (self.refill_cycles - 1)) | (self.mem_grant.bits.opcode == tilelink.ChannelDOpcode.Grant)):
+                    with m.If((refill_counter == (self.refill_cycles - 1))
+                              | (self.mem_grant.bits.opcode ==
+                                 tilelink.ChannelDOpcode.Grant)):
                         m.d.sync += [
                             refill_counter.eq(0),
                             new_state.eq(grant_state),
@@ -857,6 +861,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     self.meta_read.valid.eq(1),
                     self.meta_read.bits.idx.eq(req_idx),
                     self.meta_read.bits.tag.eq(req_tag),
+
                     self.meta_read.bits.way_en.eq(req.way_en),
                 ]
 
@@ -883,6 +888,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     self.wb_req.bits.tag.eq(req.old_meta.tag),
                     self.wb_req.bits.idx.eq(req_idx),
                     self.wb_req.bits.way_en.eq(req.way_en),
+                    self.wb_req.bits.voluntary.eq(1),
                 ]
 
                 with m.If(self.wb_req.fire):
@@ -1398,6 +1404,9 @@ class DCache(HasDCacheParams, Elaboratable):
     def __init__(self, dbus, params):
         super().__init__(params)
 
+        if not dbus.has_bce:
+            raise ValueError('Data bus must have BCE channels')
+
         self.dbus = dbus
 
         self.req = [
@@ -1432,15 +1441,9 @@ class DCache(HasDCacheParams, Elaboratable):
             mshrs.exception.eq(self.exception),
         ]
 
-        mem_acquire_arbiter = m.submodules.mem_acquire_arbiter = tilelink.Arbiter(
-            tilelink.ChannelA,
-            addr_width=32,
-            data_width=self.xlen,
-            size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
-        mem_acquire_arbiter.add(mshrs.mem_acquire)
-        mem_acquire_arbiter.add(wb.mem_acquire)
-        m.d.comb += mem_acquire_arbiter.bus.connect(self.dbus.a)
+        m.d.comb += mshrs.mem_acquire.connect(self.dbus.a)
+
+        m.d.comb += wb.mem_release.connect(self.dbus.c)
 
         with m.If(self.dbus.d.bits.source == self.n_mshrs + self.n_iomshrs):
             m.d.comb += [

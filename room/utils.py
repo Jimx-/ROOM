@@ -186,10 +186,15 @@ class BranchKillableFIFO(HasCoreParams, Elaboratable):
 
         m.d.comb += self.w_rdy.eq(~full)
 
+        flush_r_ptr = Signal()
+        for i in range(self.entries):
+            with m.If(r_ptr == i):
+                m.d.comb += flush_r_ptr.eq(self.flush_fn(mem[i]))
+
         m.d.comb += [
             self.r_rdy.eq(~self.empty & valids[r_ptr]
                           & ~self.br_update.br_mask_killed(br_masks[r_ptr])
-                          & ~self.flush),
+                          & ~(self.flush & flush_r_ptr)),
             self.r_br_mask.eq(self.br_update.get_new_br_mask(br_masks[r_ptr])),
         ]
 

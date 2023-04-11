@@ -154,6 +154,7 @@ class Core(HasCoreParams, Elaboratable):
                                            addr_width=32,
                                            size_width=3,
                                            source_id_width=8,
+                                           has_bce=True,
                                            name='dbus')
 
         self.periph_buses = [self.ibus, self.dbus]
