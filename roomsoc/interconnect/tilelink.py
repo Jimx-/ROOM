@@ -31,6 +31,15 @@ class GrowParam(Enum):
     BtoT = 2
 
 
+class ShrinkReportParam(Enum):
+    TtoB = 0
+    TtoN = 1
+    BtoN = 2
+    TtoT = 3
+    BtoB = 4
+    NtoN = 5
+
+
 class ChannelBOpcode(Enum):
     PutFullData = 0
     PutPartialData = 1
@@ -124,7 +133,7 @@ class ChannelC(Record):
             ('source', source_id_width, Direction.FANOUT),
             ('address', addr_width, Direction.FANOUT),
             ('data', data_width, Direction.FANOUT),
-            ('error', 1, Direction.FANOUT),
+            ('corrupt', 1, Direction.FANOUT),
         ]
 
         super().__init__(layout, name=name, src_loc_at=1)
@@ -237,11 +246,58 @@ class Interface:
         if isinstance(bits, ChannelA):
             return (bits.opcode == ChannelAOpcode.PutFullData) | (
                 bits.opcode == ChannelAOpcode.PutPartialData)
+        elif isinstance(bits, ChannelC):
+            return (bits.opcode == ChannelCOpcode.ReleaseData)
         elif isinstance(bits, ChannelD):
             return (bits.opcode == ChannelDOpcode.AccessAckData) | (
                 bits.opcode == ChannelDOpcode.GrantData)
 
         return False
+
+    @staticmethod
+    def num_beats0(bits):
+        data_width = len(bits.data) if hasattr(bits, 'data') else 0
+        beat_bytes = data_width // 8
+
+        if isinstance(bits, ChannelE):
+            return 0
+        elif not hasattr(bits, 'size') or len(bits.size) == 0:
+            return 0
+        else:
+            return Mux(Interface.has_data(bits),
+                       ((1 << bits.size) >> log2_int(beat_bytes)) - 1, 0)
+
+    @staticmethod
+    def count(m, bits, fire, name=None):
+        if name is None:
+            prefix = ''
+        else:
+            prefix = f'{name}_'
+
+        data_width = len(bits.data) if hasattr(bits, 'data') else 0
+        beat_bytes = data_width // 8
+
+        beats = Interface.num_beats0(bits)
+        counter = Signal(range(4**len(bits.size) //
+                               beat_bytes) if hasattr(bits, 'size') else 1,
+                         name=f'{prefix}counter')
+        counter_next = counter - 1
+        first = Signal(name=f'{prefix}first')
+        last = Signal(name=f'{prefix}last')
+        done = Signal(name=f'{prefix}done')
+        count = Signal.like(counter, name=f'{prefix}count')
+
+        m.d.comb += [
+            first.eq(counter == 0),
+            last.eq((counter == 1) | (beats == 0)),
+            done.eq(last & fire),
+            count.eq(beats & ~counter_next),
+        ]
+
+        with m.If(fire):
+            m.d.sync += counter.eq(Mux(first, beats, counter_next))
+
+        return first, last, done, count
 
     @property
     def memory_map(self):

@@ -8,7 +8,7 @@ from amaranth.lib.fifo import SyncFIFO
 
 from .peripheral import Peripheral
 
-from roomsoc.interconnect import tilelink
+from roomsoc.interconnect import tilelink as tl
 
 from room.utils import Valid, Decoupled
 
@@ -34,6 +34,9 @@ class HasL2CacheParams:
 
         self.client_bits = 1
 
+        self.n_rel_lists = 1
+        self.n_rel_entries = self.block_bytes // self.beat_bytes
+
         in_bus_params = params['in_bus']
         self.in_source_id_width = in_bus_params['source_id_width']
         self.in_size_width = in_bus_params['size_width']
@@ -52,10 +55,9 @@ class HasL2CacheParams:
         return 1
 
     def need_t(self, opcode, param):
-        return ~opcode[2] | (
-            ((opcode == tilelink.ChannelAOpcode.AcquireBlock) |
-             (opcode == tilelink.ChannelAOpcode.AcquirePerm)) &
-            (param != tilelink.GrowParam.NtoB))
+        return ~opcode[2] | (((opcode == tl.ChannelAOpcode.AcquireBlock) |
+                              (opcode == tl.ChannelAOpcode.AcquirePerm)) &
+                             (param != tl.GrowParam.NtoB))
 
 
 class CacheState(IntEnum):
@@ -140,8 +142,9 @@ class BankedStore(HasL2CacheParams, Elaboratable):
 
         sinkd_req = make_request(self.sinkd_port, True, 'sinkd_req')
         sourced_rreq = make_request(self.sourced_rport, False, 'sourced_rreq')
+        sourced_wreq = make_request(self.sourced_wport, True, 'sourced_wreq')
 
-        reqs = [sinkd_req, sourced_rreq]
+        reqs = [sinkd_req, sourced_wreq, sourced_rreq]
 
         bank_sum = 0
         for r in reqs:
@@ -302,6 +305,8 @@ class Directory(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        m.d.comb += self.ready.eq(1)
+
         dir_mem = Memory(width=self.n_ways * len(Directory.Entry(self.params)),
                          depth=self.n_sets)
 
@@ -363,10 +368,17 @@ class Directory(HasL2CacheParams, Elaboratable):
 
         m.d.comb += [
             self.result.valid.eq(ren1),
-            self.result.bits.eq(Mux(hit, rways[hit_way], 0)),
             self.result.bits.hit.eq(hit),
             self.result.bits.way.eq(hit_way),
         ]
+
+        with m.If(hit):
+            m.d.comb += [
+                self.result.bits.dirty.eq(rways[hit_way].dirty),
+                self.result.bits.state.eq(rways[hit_way].state),
+                self.result.bits.clients.eq(rways[hit_way].clients),
+                self.result.bits.tag.eq(rways[hit_way].tag),
+            ]
 
         return m
 
@@ -391,7 +403,7 @@ class SourceA(HasL2CacheParams, Elaboratable):
     def __init__(self, params):
         super().__init__(params=params)
 
-        self.a = Decoupled(tilelink.ChannelA,
+        self.a = Decoupled(tl.ChannelA,
                            addr_width=32,
                            data_width=self.beat_bytes * 8,
                            size_width=bits_for(self.lg_block_bytes),
@@ -408,8 +420,8 @@ class SourceA(HasL2CacheParams, Elaboratable):
             self.req.ready.eq(a.ready),
             a.valid.eq(self.req.valid),
             a.bits.opcode.eq(
-                Mux(self.req.bits.block, tilelink.ChannelAOpcode.AcquireBlock,
-                    tilelink.ChannelAOpcode.AcquirePerm)),
+                Mux(self.req.bits.block, tl.ChannelAOpcode.AcquireBlock,
+                    tl.ChannelAOpcode.AcquirePerm)),
             a.bits.param.eq(self.req.bits.param),
             a.bits.size.eq(self.offset_bits),
             a.bits.source.eq(self.req.bits.source),
@@ -444,12 +456,16 @@ class SourceD(HasL2CacheParams, Elaboratable):
 
         self.req = Decoupled(SourceD.Request, params)
 
-        self.d = Decoupled(tilelink.ChannelD,
+        self.d = Decoupled(tl.ChannelD,
                            data_width=self.beat_bytes * 8,
                            size_width=bits_for(self.lg_block_bytes),
                            source_id_width=self.out_source_id_width)
 
         self.bs_rport = Decoupled(BankedStore.Port, params, write=False)
+        self.bs_wport = Decoupled(BankedStore.Port, params, write=True)
+
+        self.rel_pop = Decoupled(PutBufferPop, params)
+        self.rel_entry = SinkC.PutBufferEntry(params)
 
     def elaborate(self, platform):
         m = Module()
@@ -467,10 +483,12 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s1_block_r = Signal()
         s1_req = SourceD.Request(self.params)
         s1_req_reg = SourceD.Request(self.params)
-        s1_need_r = 1
+        s1_need_r = s1_req.prio[0]
         s1_valid_r = (busy | self.req.valid) & s1_need_r & ~s1_block_r
+        s1_need_pb = Mux(s1_req.prio[0], ~s1_req.opcode[2], s1_req.opcode[0])
         s1_num_beats = (1 << s1_req.size) >> log2_int(self.beat_bytes)
         s1_last = s1_counter == s1_num_beats - 1
+        s1_first = s1_counter == 0
 
         with m.If(busy):
             m.d.comb += s1_req.eq(s1_req_reg)
@@ -529,22 +547,57 @@ class SourceD(HasL2CacheParams, Elaboratable):
 
         s2_latch = s1_valid & s2_ready
         s2_full = Signal()
+        s2_valid_pb = Signal()
         s2_req = SourceD.Request(self.params)
         s2_need_r = Signal()
-        s2_need_d = 1
+        s2_need_d = Signal()
+        s2_need_pb = Signal()
+        s2_last = Signal()
+        s2_pb_data_reg = Signal(self.beat_bytes * 8)
+        s2_pb_mask_reg = Signal(self.beat_bytes)
+        s2_pb_corrupt_reg = Signal()
+        s2_counter = Signal.like(s1_counter)
 
+        s2_pb_data_raw = Mux(s2_req.prio[0], 0, self.rel_entry.data)
+        s2_pb_mask_raw = Mux(s2_req.prio[0], 0, ~0)
+        s2_pb_corrupt_raw = Mux(s2_req.prio[0], 0, self.rel_entry.corrupt)
+
+        with m.If(s2_valid_pb):
+            m.d.sync += [
+                s2_pb_data_reg.eq(s2_pb_data_raw),
+                s2_pb_mask_reg.eq(s2_pb_mask_raw),
+                s2_pb_corrupt_reg.eq(s2_pb_corrupt_raw),
+            ]
+
+        s2_pb_data = Mux(s2_valid_pb, s2_pb_data_raw, s2_pb_data_reg)
+        s2_pb_mask = Mux(s2_valid_pb, s2_pb_mask_raw, s2_pb_mask_reg)
+        s2_pb_corrupt = Mux(s2_valid_pb, s2_pb_corrupt_raw, s2_pb_corrupt_reg)
+
+        m.d.comb += [
+            self.rel_pop.valid.eq(s2_valid_pb & ~s2_req.prio[0]),
+            self.rel_pop.bits.last.eq(s2_last),
+        ]
+
+        pb_ready = Mux(s2_req.prio[0], 0, self.rel_pop.ready)
+        with m.If(pb_ready):
+            m.d.sync += s2_valid_pb.eq(0)
         with m.If(s2_valid & s3_ready):
             m.d.sync += s2_full.eq(0)
         with m.If(s2_latch):
             m.d.sync += [
                 s2_full.eq(1),
                 s2_req.eq(s1_req),
+                s2_last.eq(s1_last),
+                s2_valid_pb.eq(s1_need_pb),
                 s2_need_r.eq(s1_need_r),
+                s2_need_d.eq(~s1_need_pb | s1_first),
+                s2_need_pb.eq(s1_need_pb),
+                s2_counter.eq(s1_counter),
             ]
 
         m.d.comb += [
-            s2_valid.eq(s2_full),
-            s2_ready.eq(~s2_full | s3_ready),
+            s2_valid.eq(s2_full & (~s2_valid_pb | pb_ready)),
+            s2_ready.eq(~s2_full | (s3_ready & (~s2_valid_pb | pb_ready))),
         ]
 
         s3_latch = s2_valid & s3_ready
@@ -552,24 +605,29 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s3_valid_d = Signal()
         s3_req = SourceD.Request(self.params)
         s3_need_r = Signal()
+        s3_need_pb = Signal()
         s3_rdata = Mux(~bs_rbuf.r_rdy, self.bs_rport.bits.data, bs_rbuf.r_data)
+        s3_pb_data = Signal(self.beat_bytes * 8)
+        s3_pb_mask = Signal(self.beat_bytes)
+        s3_pb_corrupt = Signal()
+        s3_counter = Signal.like(s2_counter)
+        s3_acquire = (s3_req.opcode == tl.ChannelAOpcode.AcquireBlock) | (
+            s3_req.opcode == tl.ChannelAOpcode.AcquirePerm)
 
         resp_opcode = Signal.like(self.d.bits.opcode)
         with m.Switch(s3_req.opcode):
-            with m.Case(tilelink.ChannelAOpcode.PutFullData):
-                m.d.comb += resp_opcode.eq(tilelink.ChannelDOpcode.AccessAck)
-            with m.Case(tilelink.ChannelAOpcode.PutPartialData):
-                m.d.comb += resp_opcode.eq(tilelink.ChannelDOpcode.AccessAck)
-            with m.Case(tilelink.ChannelAOpcode.Get):
+            with m.Case(tl.ChannelAOpcode.PutFullData):
+                m.d.comb += resp_opcode.eq(tl.ChannelDOpcode.AccessAck)
+            with m.Case(tl.ChannelAOpcode.PutPartialData):
+                m.d.comb += resp_opcode.eq(tl.ChannelDOpcode.AccessAck)
+            with m.Case(tl.ChannelAOpcode.Get):
+                m.d.comb += resp_opcode.eq(tl.ChannelDOpcode.AccessAckData)
+            with m.Case(tl.ChannelAOpcode.AcquireBlock):
                 m.d.comb += resp_opcode.eq(
-                    tilelink.ChannelDOpcode.AccessAckData)
-            with m.Case(tilelink.ChannelAOpcode.AcquireBlock):
-                m.d.comb += resp_opcode.eq(
-                    Mux(s3_req.param == tilelink.GrowParam.BtoT,
-                        tilelink.ChannelDOpcode.Grant,
-                        tilelink.ChannelDOpcode.GrantData))
-            with m.Case(tilelink.ChannelAOpcode.AcquirePerm):
-                m.d.comb += resp_opcode.eq(tilelink.ChannelDOpcode.Grant)
+                    Mux(s3_req.param == tl.GrowParam.BtoT,
+                        tl.ChannelDOpcode.Grant, tl.ChannelDOpcode.GrantData))
+            with m.Case(tl.ChannelAOpcode.AcquirePerm):
+                m.d.comb += resp_opcode.eq(tl.ChannelDOpcode.Grant)
 
         d = self.d
 
@@ -577,7 +635,12 @@ class SourceD(HasL2CacheParams, Elaboratable):
             d.valid.eq(s3_valid_d),
             d.bits.opcode.eq(
                 Mux(s3_req.prio[0], resp_opcode,
-                    tilelink.ChannelDOpcode.ReleaseAck)),
+                    tl.ChannelDOpcode.ReleaseAck)),
+            d.bits.param.eq(
+                Mux(
+                    s3_req.prio[0] & s3_acquire,
+                    Mux(s3_req.param != tl.GrowParam.NtoB, tl.CapParam.toT,
+                        tl.CapParam.toB), 0)),
             d.bits.size.eq(s3_req.size),
             d.bits.source.eq(s3_req.source),
             # d.bits.sink.eq(s3_req.sink),
@@ -600,7 +663,12 @@ class SourceD(HasL2CacheParams, Elaboratable):
                 s3_full.eq(1),
                 s3_valid_d.eq(s2_need_d),
                 s3_req.eq(s2_req),
+                s3_need_pb.eq(s2_need_pb),
+                s3_pb_data.eq(s2_pb_data),
+                s3_pb_mask.eq(s2_pb_mask),
+                s3_pb_corrupt.eq(s2_pb_corrupt),
                 s3_need_r.eq(s2_need_r),
+                s3_counter.eq(s2_counter),
             ]
 
         m.d.comb += [
@@ -608,9 +676,52 @@ class SourceD(HasL2CacheParams, Elaboratable):
             s3_ready.eq(~s3_full | (s4_ready & (~s3_valid_d | d.ready))),
         ]
 
-        m.d.comb += s4_ready.eq(1)
+        s4_latch = s3_valid & s4_ready
+        s4_full = Signal()
+        s4_req = SourceD.Request(self.params)
+        s4_need_wb = Signal()
+        s4_pb_data = Signal(self.beat_bytes * 8)
+        s4_pb_mask = Signal(self.beat_bytes)
+        s4_pb_corrupt = Signal()
+        s4_counter = Signal.like(s3_counter)
+
+        m.d.comb += [
+            self.bs_wport.valid.eq(s4_full & s4_need_wb),
+            self.bs_wport.bits.way.eq(s4_req.way),
+            self.bs_wport.bits.set.eq(s4_req.set),
+            self.bs_wport.bits.beat.eq(s4_counter),
+            self.bs_wport.bits.mask.eq(s4_pb_mask),
+            self.bs_wport.bits.data.eq(s4_pb_data),
+        ]
+
+        with m.If(self.bs_wport.ready | ~s4_need_wb):
+            m.d.sync += s4_full.eq(0)
+        with m.If(s4_latch):
+            m.d.sync += [
+                s4_full.eq(1),
+                s4_req.eq(s3_req),
+                s4_need_wb.eq(s3_need_pb),
+                s4_pb_data.eq(s3_pb_data),
+                s4_pb_mask.eq(s3_pb_mask),
+                s4_pb_corrupt.eq(s3_pb_corrupt),
+                s4_counter.eq(s3_counter),
+            ]
+
+        m.d.comb += s4_ready.eq(~s4_full | self.bs_wport.ready | ~s4_need_wb)
 
         return m
+
+
+class PutBufferPop(HasL2CacheParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasL2CacheParams.__init__(self, params=params)
+
+        Record.__init__(self, [
+            ('last', 1, Direction.FANOUT),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
 
 
 class SinkA(HasL2CacheParams, Elaboratable):
@@ -618,7 +729,7 @@ class SinkA(HasL2CacheParams, Elaboratable):
     def __init__(self, params):
         super().__init__(params=params)
 
-        self.a = Decoupled(tilelink.ChannelA,
+        self.a = Decoupled(tl.ChannelA,
                            addr_width=32,
                            data_width=self.beat_bytes * 8,
                            size_width=self.in_size_width,
@@ -631,8 +742,12 @@ class SinkA(HasL2CacheParams, Elaboratable):
 
         a = self.a
 
+        first, _, _, _ = tl.Interface.count(m, a.bits, a.fire)
+
+        req_stall = first & ~self.req.ready
+
         m.d.comb += [
-            a.ready.eq(1),
+            a.ready.eq(~req_stall),
             self.req.valid.eq(a.valid),
         ]
 
@@ -648,6 +763,98 @@ class SinkA(HasL2CacheParams, Elaboratable):
             self.req.bits.set.eq(set),
             self.req.bits.tag.eq(tag),
         ]
+
+        return m
+
+
+class SinkC(HasL2CacheParams, Elaboratable):
+
+    class PutBufferEntry(HasL2CacheParams, Record):
+
+        def __init__(self, params, name=None, src_loc_at=0):
+            HasL2CacheParams.__init__(self, params=params)
+
+            Record.__init__(self, [
+                ('data', self.beat_bytes * 8),
+                ('corrupt', 1),
+            ],
+                            name=name,
+                            src_loc_at=1 + src_loc_at)
+
+    def __init__(self, params):
+        super().__init__(params=params)
+
+        self.c = Decoupled(tl.ChannelC,
+                           addr_width=32,
+                           data_width=self.beat_bytes * 8,
+                           size_width=self.in_size_width,
+                           source_id_width=self.in_source_id_width)
+
+        self.req = Decoupled(FullRequest, params)
+
+        self.rel_pop = Decoupled(PutBufferPop, params)
+        self.rel_entry = SinkC.PutBufferEntry(params)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        c = self.c
+
+        tag, set, offset = self.parse_addr(c.bits.address)
+        first, last, _, beat = tl.Interface.count(m, c.bits, c.fire)
+        has_data = tl.Interface.has_data(c.bits)
+
+        resp = (c.bits.opcode == tl.ChannelCOpcode.ProbeAck) | (
+            c.bits.opcode == tl.ChannelCOpcode.ProbeAckData)
+        resp_reg = Signal()
+        is_resp = Mux(c.valid, resp, resp_reg)
+        with m.If(c.valid):
+            m.d.sync += resp_reg.eq(resp)
+
+        putbuffer = m.submodules.putbuffer = SyncFIFO(width=len(
+            self.rel_entry),
+                                                      depth=self.n_rel_entries)
+        putbuffer_ready = Signal(reset=1)
+
+        req_stall = first & ~self.req.ready & ~(has_data & ~putbuffer_ready)
+        buf_stall = has_data & ~putbuffer.w_rdy
+
+        m.d.comb += c.ready.eq(Mux(resp, ~has_data, ~req_stall & ~buf_stall))
+
+        m.d.comb += [
+            self.req.valid.eq(~is_resp & c.valid & first & ~buf_stall),
+            putbuffer.w_en.eq(~is_resp & c.valid & has_data & ~req_stall),
+        ]
+        with m.If(~is_resp & c.valid & first & has_data & ~req_stall
+                  & ~buf_stall):
+            m.d.sync += putbuffer_ready.eq(0)
+
+        m.d.comb += [
+            self.req.bits.prio.eq(4),
+            self.req.bits.opcode.eq(c.bits.opcode),
+            self.req.bits.param.eq(c.bits.param),
+            self.req.bits.size.eq(c.bits.size),
+            self.req.bits.source.eq(c.bits.source),
+            self.req.bits.set.eq(set),
+            self.req.bits.tag.eq(tag),
+            self.req.bits.offset.eq(offset),
+        ]
+
+        putbuffer_wdata = SinkC.PutBufferEntry(self.params)
+        m.d.comb += [
+            putbuffer_wdata.data.eq(c.bits.data),
+            putbuffer_wdata.corrupt.eq(c.bits.corrupt),
+            putbuffer.w_data.eq(putbuffer_wdata),
+        ]
+
+        m.d.comb += [
+            self.rel_pop.ready.eq(putbuffer.r_rdy),
+            putbuffer.r_en.eq(self.rel_pop.fire),
+            self.rel_entry.eq(putbuffer.r_data),
+        ]
+
+        with m.If(self.rel_pop.fire & self.rel_pop.bits.last):
+            m.d.sync += putbuffer_ready.eq(1)
 
         return m
 
@@ -675,7 +882,7 @@ class SinkD(HasL2CacheParams, Elaboratable):
 
         self.resp = Valid(SinkD.Response, params)
 
-        self.d = Decoupled(tilelink.ChannelD,
+        self.d = Decoupled(tl.ChannelD,
                            data_width=self.beat_bytes * 8,
                            size_width=bits_for(self.lg_block_bytes),
                            source_id_width=self.out_source_id_width)
@@ -707,7 +914,7 @@ class SinkD(HasL2CacheParams, Elaboratable):
         first = beat_counter == 0
         last = beat_counter == (self.block_bytes // self.beat_bytes) - 1
 
-        has_data = tilelink.Interface.has_data(d.bits)
+        has_data = tl.Interface.has_data(d.bits)
 
         m.d.comb += [
             self.resp.valid.eq((first | last) & d.fire),
@@ -797,6 +1004,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
 
         new_meta = self.directory.bits
         new_request = FullRequest(self.params)
+        new_client_bit = self.client_bit(new_request.source)
         m.d.comb += new_request.eq(request)
         with m.If(self.allocate.valid):
             m.d.comb += new_request.eq(self.allocate.bits)
@@ -835,38 +1043,69 @@ class MSHR(HasL2CacheParams, Elaboratable):
             with m.If(w_grant):
                 m.d.sync += s_execute.eq(1)
             with m.If(no_wait):
-                m.d.sync += s_writeback.eq(1)
+                m.d.sync += [
+                    s_writeback.eq(1),
+                    request_valid.eq(0),
+                ]
 
         meta_writeback = Directory.Result(self.params)
         m.d.comb += meta_writeback.eq(meta)
 
         req_need_t = self.need_t(request.opcode, request.param)
-        req_acquire = (request.opcode == tilelink.ChannelAOpcode.AcquireBlock
-                       ) | (request.opcode
-                            == tilelink.ChannelAOpcode.AcquirePerm)
+        req_acquire = (request.opcode == tl.ChannelAOpcode.AcquireBlock) | (
+            request.opcode == tl.ChannelAOpcode.AcquirePerm)
+        req_client_bit = self.client_bit(request.source)
 
-        m.d.comb += [
-            meta_writeback.dirty.eq((meta.hit & meta.dirty)
-                                    | ~request.opcode[2]),
-            meta_writeback.tag.eq(request.tag),
-            meta_writeback.clients.eq(
-                Mux(req_acquire, self.client_bit(request.source), 0)),
-            meta_writeback.hit.eq(1),
-        ]
+        with m.If(request.prio[2]):
+            m.d.comb += [
+                meta_writeback.dirty.eq(meta.dirty | request.opcode[0]),
+                meta_writeback.state.eq(
+                    Mux((request.param != tl.ShrinkReportParam.TtoT) &
+                        (meta.state == CacheState.TRUNK), CacheState.TIP,
+                        meta.state)),
+                meta_writeback.clients.eq(meta.clients & ~Mux(
+                    (request.param == tl.ShrinkReportParam.BtoN) |
+                    (request.param == tl.ShrinkReportParam.TtoN),
+                    req_client_bit, 0)),
+                meta_writeback.hit.eq(1),
+            ]
 
-        with m.If(req_need_t):
-            m.d.comb += meta_writeback.state.eq(
-                Mux(req_acquire, CacheState.TRUNK, CacheState.TIP))
-        with m.Elif(~meta.hit):
-            m.d.comb += meta_writeback.state.eq(
-                Mux(got_t, Mux(req_acquire, CacheState.TRUNK, CacheState.TIP),
-                    CacheState.BRANCH))
+        with m.Else():
+            m.d.comb += [
+                meta_writeback.dirty.eq((meta.hit & meta.dirty)
+                                        | ~request.opcode[2]),
+                meta_writeback.tag.eq(request.tag),
+                meta_writeback.clients.eq(
+                    Mux(req_acquire, self.client_bit(request.source), 0)),
+                meta_writeback.hit.eq(1),
+            ]
+
+            with m.If(req_need_t):
+                m.d.comb += meta_writeback.state.eq(
+                    Mux(req_acquire, CacheState.TRUNK, CacheState.TIP))
+            with m.Elif(~meta.hit):
+                m.d.comb += meta_writeback.state.eq(
+                    Mux(got_t,
+                        Mux(req_acquire, CacheState.TRUNK, CacheState.TIP),
+                        CacheState.BRANCH))
+            with m.Else():
+                with m.Switch(meta.state):
+                    with m.Case(CacheState.INVALID):
+                        m.d.comb += meta_writeback.state.eq(CacheState.BRANCH)
+                    with m.Case(CacheState.BRANCH):
+                        m.d.comb += meta_writeback.state.eq(CacheState.BRANCH)
+                    with m.Case(CacheState.TRUNK):
+                        m.d.comb += meta_writeback.state.eq(CacheState.TIP)
+                    with m.Case(CacheState.TIP):
+                        m.d.comb += meta_writeback.state.eq(
+                            Mux((meta.clients == 0) & req_acquire,
+                                CacheState.TRUNK, CacheState.TIP))
 
         m.d.comb += [
             # Channel A
             self.schedule.bits.a.bits.tag.eq(request.tag),
             self.schedule.bits.a.bits.set.eq(request.set),
-            self.schedule.bits.a.bits.param.eq(tilelink.GrowParam.NtoB),
+            self.schedule.bits.a.bits.param.eq(tl.GrowParam.NtoB),
             self.schedule.bits.a.bits.block.eq(1),
             self.schedule.bits.a.bits.source.eq(0),
             # Channel D
@@ -881,14 +1120,14 @@ class MSHR(HasL2CacheParams, Elaboratable):
         ]
 
         with m.If(self.sinkd.valid):
-            with m.If((self.sinkd.bits.opcode == tilelink.ChannelDOpcode.Grant)
-                      | (self.sinkd.bits.opcode ==
-                         tilelink.ChannelDOpcode.GrantData)):
+            with m.If((self.sinkd.bits.opcode == tl.ChannelDOpcode.Grant)
+                      |
+                      (self.sinkd.bits.opcode == tl.ChannelDOpcode.GrantData)):
                 m.d.sync += [
                     w_grantfirst.eq(1),
                     w_grantlast.eq(self.sinkd.bits.last),
                     w_grant.eq(self.sinkd.bits.last),
-                    got_t.eq(self.sinkd.bits.param == tilelink.CapParam.toT),
+                    got_t.eq(self.sinkd.bits.param == tl.CapParam.toT),
                 ]
 
         with m.If(self.directory.valid):
@@ -905,7 +1144,20 @@ class MSHR(HasL2CacheParams, Elaboratable):
             ]
 
             with m.If(new_request.prio[2]):
-                pass
+                m.d.sync += s_execute.eq(0)
+
+                with m.If(new_request.opcode[0] & ~new_meta.dirty):
+                    m.d.sync += s_writeback.eq(0)
+
+                with m.If((new_request.param == tl.ShrinkReportParam.TtoB)
+                          & (new_meta.state == CacheState.TRUNK)):
+                    m.d.sync += s_writeback.eq(0)
+
+                with m.If(((new_request.param == tl.ShrinkReportParam.TtoN)
+                           | (new_request.param == tl.ShrinkReportParam.BtoN))
+                          & ((new_meta.clients & new_client_bit) != 0)):
+                    m.d.sync += s_writeback.eq(0)
+
             with m.Elif(new_request.control):
                 pass
             with m.Else():
@@ -919,6 +1171,13 @@ class MSHR(HasL2CacheParams, Elaboratable):
                         w_grant.eq(0),
                         s_writeback.eq(0),
                     ]
+                with m.If(
+                    (new_request.opcode == tl.ChannelAOpcode.AcquireBlock) | (
+                        new_request.opcode == tl.ChannelAOpcode.AcquirePerm)):
+                    m.d.sync += s_writeback.eq(0)
+                with m.If(~new_request.opcode[2] & new_meta.hit
+                          & ~new_meta.dirty):
+                    m.d.sync += s_writeback.eq(0)
 
         return m
 
@@ -943,10 +1202,12 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         ]
 
         sink_a = m.submodules.sink_a = SinkA(self.params)
+        sink_c = m.submodules.sink_c = SinkC(self.params)
         sink_d = m.submodules.sink_d = SinkD(self.params)
 
         m.d.comb += [
             self.in_bus.a.connect(sink_a.a),
+            self.in_bus.c.connect(sink_c.c),
             self.out_bus.d.connect(sink_d.d),
         ]
 
@@ -1003,9 +1264,17 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         ]
 
         request = Decoupled(FullRequest, self.params)
+        m.d.comb += request.valid.eq(directory.ready
+                                     & (sink_a.req.valid | sink_c.req.valid))
+        with m.If(sink_c.req.valid):
+            m.d.comb += request.bits.eq(sink_c.req.bits)
+        with m.Elif(sink_a.req.valid):
+            m.d.comb += request.bits.eq(sink_a.req.bits)
+
         m.d.comb += [
-            request.valid.eq(sink_a.req.valid),
-            request.bits.eq(sink_a.req.bits),
+            sink_c.req.ready.eq(directory.ready & request.ready),
+            sink_a.req.ready.eq(directory.ready & request.ready
+                                & ~sink_c.req.valid),
         ]
 
         set_matches = Cat([
@@ -1013,6 +1282,8 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             for m in mshrs
         ])
         alloc_mshr = set_matches == 0
+
+        m.d.comb += request.ready.eq(1)
 
         m.d.comb += [
             directory.read.valid.eq(request.valid),
@@ -1051,8 +1322,14 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                 ]
 
         m.d.comb += [
+            source_d.rel_pop.connect(sink_c.rel_pop),
+            source_d.rel_entry.eq(sink_c.rel_entry),
+        ]
+
+        m.d.comb += [
             sink_d.port.connect(banked_store.sinkd_port),
             source_d.bs_rport.connect(banked_store.sourced_rport),
+            source_d.bs_wport.connect(banked_store.sourced_wport),
         ]
 
         return m
@@ -1063,17 +1340,16 @@ class L2Cache(HasL2CacheParams, Peripheral, Elaboratable):
     def __init__(self, params, *, name=None, **kwargs):
         super().__init__(params=params, name=name)
 
-        self.in_bus = tilelink.Interface(
-            data_width=self.beat_bytes * 8,
-            addr_width=32,
-            size_width=self.in_size_width,
-            source_id_width=self.in_source_id_width)
+        self.in_bus = tl.Interface(data_width=self.beat_bytes * 8,
+                                   addr_width=32,
+                                   size_width=self.in_size_width,
+                                   source_id_width=self.in_source_id_width,
+                                   has_bce=True)
 
-        self.out_bus = tilelink.Interface(
-            data_width=self.beat_bytes * 8,
-            addr_width=32,
-            size_width=bits_for(self.lg_block_bytes),
-            source_id_width=self.out_source_id_width)
+        self.out_bus = tl.Interface(data_width=self.beat_bytes * 8,
+                                    addr_width=32,
+                                    size_width=bits_for(self.lg_block_bytes),
+                                    source_id_width=self.out_source_id_width)
 
     def elaborate(self, platform):
         m = Module()

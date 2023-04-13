@@ -257,10 +257,24 @@ class CacheState(IntEnum):
     @staticmethod
     def on_cache_control(m, state, cmd):
         is_dirty = Signal()
+        param = Signal(3)
 
         m.d.comb += is_dirty.eq(state == CacheState.DIRTY)
 
-        return is_dirty
+        with m.Switch(state):
+            with m.Case(CacheState.DIRTY):
+                m.d.comb += [
+                    is_dirty.eq(1),
+                    param.eq(tilelink.ShrinkReportParam.TtoN),
+                ]
+            with m.Case(CacheState.TRUNK):
+                m.d.comb += param.eq(tilelink.ShrinkReportParam.TtoN)
+            with m.Case(CacheState.BRANCH):
+                m.d.comb += param.eq(tilelink.ShrinkReportParam.BtoN)
+            with m.Case(CacheState.NOTHING):
+                m.d.comb += param.eq(tilelink.ShrinkReportParam.NtoN)
+
+        return is_dirty, param
 
 
 class Metadata(HasDCacheParams, Record):
@@ -502,6 +516,7 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
             Signal(self.row_bits, name=f'wb_buffer{i}')
             for i in range(self.refill_cycles))
         wb_counter = Signal(range(self.refill_cycles))
+        mem_acked = Signal()
 
         with m.FSM():
             with m.State('INVALID'):
@@ -514,6 +529,7 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
                     m.d.sync += [
                         req.eq(self.req.bits),
                         wb_counter.eq(0),
+                        mem_acked.eq(0),
                     ]
 
                     m.next = 'FILL_BUFFER'
@@ -560,6 +576,9 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
                     self.mem_release.valid.eq(1),
                 ]
 
+                with m.If(self.mem_grant):
+                    m.d.sync += mem_acked.eq(1)
+
                 with m.If(self.mem_release.fire):
                     m.d.sync += wb_counter.eq(wb_counter + 1)
 
@@ -567,7 +586,7 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
                         m.next = 'WAIT_ACK'
 
             with m.State('WAIT_ACK'):
-                with m.If(self.mem_grant):
+                with m.If(self.mem_grant | mem_acked):
                     m.next = 'INVALID'
 
         return m
@@ -722,6 +741,8 @@ class MSHR(HasDCacheParams, Elaboratable):
         new_state = Signal(CacheState)
 
         _, grow_param = CacheState.on_access(m, new_state, req.uop.mem_cmd)
+        _, shrink_param = CacheState.on_cache_control(m, req.old_meta.state,
+                                                      MemoryCommand.WRITE)
         grant_state = CacheState.on_grant(m, req.uop.mem_cmd,
                                           self.mem_grant.bits.param)
 
@@ -861,7 +882,6 @@ class MSHR(HasDCacheParams, Elaboratable):
                     self.meta_read.valid.eq(1),
                     self.meta_read.bits.idx.eq(req_idx),
                     self.meta_read.bits.tag.eq(req_tag),
-
                     self.meta_read.bits.way_en.eq(req.way_en),
                 ]
 
@@ -872,7 +892,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                 m.next = 'META_RESP_2'
 
             with m.State('META_RESP_2'):
-                needs_wb = CacheState.on_cache_control(
+                needs_wb, _ = CacheState.on_cache_control(
                     m, self.meta_resp.bits.state, MemoryCommand.WRITE)
 
                 with m.If(~self.meta_resp.valid):
@@ -888,6 +908,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     self.wb_req.bits.tag.eq(req.old_meta.tag),
                     self.wb_req.bits.idx.eq(req_idx),
                     self.wb_req.bits.way_en.eq(req.way_en),
+                    self.wb_req.bits.param.eq(shrink_param),
                     self.wb_req.bits.voluntary.eq(1),
                 ]
 
