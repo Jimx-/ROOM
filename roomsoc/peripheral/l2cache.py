@@ -39,6 +39,7 @@ class HasL2CacheParams:
 
         in_bus_params = params['in_bus']
         self.in_source_id_width = in_bus_params['source_id_width']
+        self.in_sink_id_width = in_bus_params['sink_id_width']
         self.in_size_width = in_bus_params['size_width']
 
         out_bus_params = params['out_bus']
@@ -712,6 +713,40 @@ class SourceD(HasL2CacheParams, Elaboratable):
         return m
 
 
+class SourceE(HasL2CacheParams, Elaboratable):
+
+    class Request(HasL2CacheParams, Record):
+
+        def __init__(self, params, name=None, src_loc_at=0):
+            HasL2CacheParams.__init__(self, params=params)
+
+            Record.__init__(self, [
+                ('sink', 1),
+            ],
+                            name=name,
+                            src_loc_at=1 + src_loc_at)
+
+    def __init__(self, params):
+        super().__init__(params=params)
+
+        self.req = Decoupled(SourceE.Request, params)
+
+        self.e = Decoupled(tl.ChannelE)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        e = self.e
+
+        m.d.comb += [
+            self.req.ready.eq(e.ready),
+            e.valid.eq(self.req.valid),
+            e.bits.sink.eq(self.req.bits.sink),
+        ]
+
+        return m
+
+
 class PutBufferPop(HasL2CacheParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
@@ -943,6 +978,40 @@ class SinkD(HasL2CacheParams, Elaboratable):
         return m
 
 
+class SinkE(HasL2CacheParams, Elaboratable):
+
+    class Response(HasL2CacheParams, Record):
+
+        def __init__(self, params, name=None, src_loc_at=0):
+            HasL2CacheParams.__init__(self, params=params)
+
+            Record.__init__(self, [
+                ('sink', self.in_sink_id_width),
+            ],
+                            name=name,
+                            src_loc_at=1 + src_loc_at)
+
+    def __init__(self, params):
+        super().__init__(params=params)
+
+        self.resp = Valid(SinkE.Response, params)
+
+        self.e = Decoupled(tl.ChannelE, sink_id_width=self.in_sink_id_width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        e = self.e
+
+        m.d.comb += [
+            e.ready.eq(1),
+            self.resp.valid.eq(e.valid),
+            self.resp.bits.sink.eq(e.bits.sink),
+        ]
+
+        return m
+
+
 class ScheduleRequest(HasL2CacheParams):
 
     def __init__(self, params, name=None, src_loc_at=0):
@@ -954,12 +1023,14 @@ class ScheduleRequest(HasL2CacheParams):
 
         self.a = Valid(SourceA.Request, params)
         self.d = Valid(SourceD.Request, params)
+        self.e = Valid(SourceE.Request, params)
         self.dir = Valid(Directory.WriteReq, params)
 
     def eq(self, rhs):
         return [
             self.a.eq(rhs.a),
             self.d.eq(rhs.d),
+            self.e.eq(rhs.e),
             self.dir.eq(rhs.dir),
         ]
 
@@ -987,6 +1058,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
         self.status = Valid(MSHR.Status, params)
         self.schedule = Decoupled(ScheduleRequest, params)
         self.sinkd = Valid(SinkD.Response, params)
+        self.sinke = Valid(SinkE.Response, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -1021,25 +1093,31 @@ class MSHR(HasL2CacheParams, Elaboratable):
         w_grant = Signal(reset=1)
         w_grantfirst = Signal(reset=1)
         w_grantlast = Signal(reset=1)
+        w_grantack = Signal(reset=1)
         s_execute = Signal(reset=1)
+        s_grantack = Signal(reset=1)
         s_writeback = Signal(reset=1)
 
         got_t = Signal()
-        no_wait = w_grantlast
+        no_wait = w_grantlast & w_grantack
 
         m.d.comb += [
             self.schedule.bits.a.valid.eq(~s_acquire & s_release
                                           & s_pprobe),
             self.schedule.bits.d.valid.eq(~s_execute & w_grant),
+            self.schedule.bits.e.valid.eq(~s_grantack & w_grantfirst),
             self.schedule.bits.dir.valid.eq(~s_writeback & no_wait),
             self.schedule.valid.eq(self.schedule.bits.a.valid
                                    | self.schedule.bits.d.valid
+                                   | self.schedule.bits.e.valid
                                    | self.schedule.bits.dir.valid),
         ]
 
         with m.If(self.schedule.ready):
             with m.If(s_release & s_pprobe):
                 m.d.sync += s_acquire.eq(1)
+            with m.If(w_grantfirst):
+                m.d.sync += s_grantack.eq(1)
             with m.If(w_grant):
                 m.d.sync += s_execute.eq(1)
             with m.If(no_wait):
@@ -1129,6 +1207,8 @@ class MSHR(HasL2CacheParams, Elaboratable):
                     w_grant.eq(self.sinkd.bits.last),
                     got_t.eq(self.sinkd.bits.param == tl.CapParam.toT),
                 ]
+        with m.If(self.sinke.valid):
+            m.d.sync += w_grantack.eq(1)
 
         with m.If(self.directory.valid):
             m.d.sync += [
@@ -1141,6 +1221,13 @@ class MSHR(HasL2CacheParams, Elaboratable):
                 s_release.eq(1),
                 s_pprobe.eq(1),
                 s_acquire.eq(1),
+                w_grant.eq(1),
+                w_grantfirst.eq(1),
+                w_grantlast.eq(1),
+                w_grantack.eq(1),
+                s_execute.eq(1),
+                s_grantack.eq(1),
+                s_writeback.eq(1),
             ]
 
             with m.If(new_request.prio[2]):
@@ -1170,11 +1257,15 @@ class MSHR(HasL2CacheParams, Elaboratable):
                         w_grantlast.eq(0),
                         w_grant.eq(0),
                         s_writeback.eq(0),
+                        s_grantack.eq(0),
                     ]
                 with m.If(
                     (new_request.opcode == tl.ChannelAOpcode.AcquireBlock) | (
                         new_request.opcode == tl.ChannelAOpcode.AcquirePerm)):
-                    m.d.sync += s_writeback.eq(0)
+                    m.d.sync += [
+                        s_writeback.eq(0),
+                        w_grantack.eq(0),
+                    ]
                 with m.If(~new_request.opcode[2] & new_meta.hit
                           & ~new_meta.dirty):
                     m.d.sync += s_writeback.eq(0)
@@ -1195,20 +1286,24 @@ class Scheduler(HasL2CacheParams, Elaboratable):
 
         source_a = m.submodules.source_a = SourceA(self.params)
         source_d = m.submodules.source_d = SourceD(self.params)
+        source_e = m.submodules.source_e = SourceE(self.params)
 
         m.d.comb += [
             source_a.a.connect(self.out_bus.a),
             source_d.d.connect(self.in_bus.d),
+            source_e.e.connect(self.out_bus.e),
         ]
 
         sink_a = m.submodules.sink_a = SinkA(self.params)
         sink_c = m.submodules.sink_c = SinkC(self.params)
         sink_d = m.submodules.sink_d = SinkD(self.params)
+        sink_e = m.submodules.sink_e = SinkE(self.params)
 
         m.d.comb += [
             self.in_bus.a.connect(sink_a.a),
             self.in_bus.c.connect(sink_c.c),
             self.out_bus.d.connect(sink_d.d),
+            self.in_bus.e.connect(sink_e.e),
         ]
 
         directory = m.submodules.directory = Directory(self.params)
@@ -1224,6 +1319,8 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                                               | ~mshr.schedule.bits.a.valid)
                                            & (source_d.req.ready
                                               | ~mshr.schedule.bits.d.valid)
+                                           & (source_e.req.ready
+                                              | ~mshr.schedule.bits.e.valid)
                                            & (directory.write.ready
                                               | ~mshr.schedule.bits.dir.valid))
 
@@ -1231,6 +1328,9 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                 mshr.sinkd.valid.eq(sink_d.resp.valid
                                     & (sink_d.resp.bits.source == i)),
                 mshr.sinkd.bits.eq(sink_d.resp.bits),
+                mshr.sinke.valid.eq(sink_e.resp.valid
+                                    & (sink_e.resp.bits.sink == i)),
+                mshr.sinke.bits.eq(sink_e.resp.bits),
             ]
 
         mshr_rr = m.submodules.mshr_rr = RoundRobin(count=self.n_mshrs)
@@ -1259,6 +1359,8 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             source_a.req.bits.eq(schedule.a.bits),
             source_d.req.valid.eq(schedule.d.valid & mshr_rr.valid),
             source_d.req.bits.eq(schedule.d.bits),
+            source_e.req.valid.eq(schedule.e.valid & mshr_rr.valid),
+            source_e.req.bits.eq(schedule.e.bits),
             directory.write.valid.eq(schedule.dir.valid & mshr_rr.valid),
             directory.write.bits.eq(schedule.dir.bits),
         ]
@@ -1349,7 +1451,8 @@ class L2Cache(HasL2CacheParams, Peripheral, Elaboratable):
         self.out_bus = tl.Interface(data_width=self.beat_bytes * 8,
                                     addr_width=32,
                                     size_width=bits_for(self.lg_block_bytes),
-                                    source_id_width=self.out_source_id_width)
+                                    source_id_width=self.out_source_id_width,
+                                    has_bce=True)
 
     def elaborate(self, platform):
         m = Module()

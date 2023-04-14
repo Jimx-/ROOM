@@ -77,7 +77,8 @@ class ChannelA(Record):
                  data_width,
                  size_width,
                  source_id_width=1,
-                 name=None):
+                 name=None,
+                 src_loc_at=1):
 
         layout = [
             ('opcode', ChannelAOpcode, Direction.FANOUT),
@@ -90,7 +91,7 @@ class ChannelA(Record):
             ('corrupt', 1, Direction.FANOUT),
         ]
 
-        super().__init__(layout, name=name, src_loc_at=1)
+        super().__init__(layout, name=name, src_loc_at=src_loc_at)
 
 
 class ChannelB(Record):
@@ -101,7 +102,8 @@ class ChannelB(Record):
                  data_width,
                  size_width,
                  source_id_width=1,
-                 name=None):
+                 name=None,
+                 src_loc_at=1):
 
         layout = [
             ('opcode', ChannelBOpcode, Direction.FANOUT),
@@ -113,7 +115,7 @@ class ChannelB(Record):
             ('data', data_width, Direction.FANOUT),
         ]
 
-        super().__init__(layout, name=name, src_loc_at=1)
+        super().__init__(layout, name=name, src_loc_at=src_loc_at)
 
 
 class ChannelC(Record):
@@ -124,7 +126,8 @@ class ChannelC(Record):
                  data_width,
                  size_width,
                  source_id_width=1,
-                 name=None):
+                 name=None,
+                 src_loc_at=1):
 
         layout = [
             ('opcode', ChannelCOpcode, Direction.FANOUT),
@@ -136,7 +139,7 @@ class ChannelC(Record):
             ('corrupt', 1, Direction.FANOUT),
         ]
 
-        super().__init__(layout, name=name, src_loc_at=1)
+        super().__init__(layout, name=name, src_loc_at=src_loc_at)
 
 
 class ChannelD(Record):
@@ -147,7 +150,8 @@ class ChannelD(Record):
                  size_width,
                  source_id_width=1,
                  sink_id_width=1,
-                 name=None):
+                 name=None,
+                 src_loc_at=1):
 
         layout = [
             ('opcode', ChannelDOpcode, Direction.FANOUT),
@@ -160,18 +164,18 @@ class ChannelD(Record):
             ('data', data_width, Direction.FANOUT),
         ]
 
-        super().__init__(layout, name=name, src_loc_at=1)
+        super().__init__(layout, name=name, src_loc_at=src_loc_at)
 
 
 class ChannelE(Record):
 
-    def __init__(self, *, sink_id_width=1, name=None):
+    def __init__(self, *, sink_id_width=1, name=None, src_loc_at=1):
 
         layout = [
             ('sink', sink_id_width, Direction.FANOUT),
         ]
 
-        super().__init__(layout, name=name, src_loc_at=1)
+        super().__init__(layout, name=name, src_loc_at=src_loc_at)
 
 
 class Interface:
@@ -195,7 +199,7 @@ class Interface:
         self.data_width = data_width
         self.source_id_width = source_id_width
         self.sink_id_width = sink_id_width
-        self.size_bits = size_width
+        self.size_width = size_width
         self.has_bce = has_bce
 
         self.a = Decoupled(ChannelA,
@@ -255,6 +259,19 @@ class Interface:
         return False
 
     @staticmethod
+    def is_request(bits):
+        if isinstance(bits, ChannelA):
+            return True
+        elif isinstance(bits, ChannelB):
+            return True
+        elif isinstance(bits, ChannelC):
+            return bits.opcode[2] & bits.opcode[1]
+        elif isinstance(bits, ChannelD):
+            return bits.opcode[2] & ~bits.opcode[1]
+
+        return False
+
+    @staticmethod
     def num_beats0(bits):
         data_width = len(bits.data) if hasattr(bits, 'data') else 0
         beat_bytes = data_width // 8
@@ -264,8 +281,11 @@ class Interface:
         elif not hasattr(bits, 'size') or len(bits.size) == 0:
             return 0
         else:
-            return Mux(Interface.has_data(bits),
-                       ((1 << bits.size) >> log2_int(beat_bytes)) - 1, 0)
+            raw_size = 1 << bits.size
+            return Mux(
+                Interface.has_data(bits),
+                Mux(raw_size < beat_bytes, 0,
+                    (raw_size >> log2_int(beat_bytes)) - 1), 0)
 
     @staticmethod
     def count(m, bits, fire, name=None):
@@ -390,41 +410,26 @@ class TileLink2Wishbone(Elaboratable):
         tl = self.tl
         wb = self.wishbone
 
+        if tl.has_bce:
+            tl_adapted = Interface(addr_width=tl.addr_width,
+                                   data_width=tl.data_width,
+                                   size_width=tl.size_width,
+                                   source_id_width=tl.source_id_width,
+                                   sink_id_width=tl.sink_id_width)
+            m.submodules.cache_adapter = CacheCork(tl, tl_adapted)
+            tl = tl_adapted
+
         wb_adr_shift = log2_int(tl.data_width // 8)
 
         wb_addr = Signal(wb.addr_width)
-        burst_len = Signal(2**tl.size_bits + 1)
-        req_opcode = Signal(ChannelAOpcode)
-        req_param = Signal(GrowParam)
+        burst_len = Signal(2**tl.size_width + 1)
         mask = Signal.like(tl.a.bits.mask)
         wen = Signal()
         rdata = Signal.like(wb.dat_r)
-        req_from_c = Signal()
-
-        resp_opcode = Signal(ChannelDOpcode)
-        with m.Switch(req_opcode):
-            with m.Case(ChannelAOpcode.PutFullData):
-                m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAck)
-            with m.Case(ChannelAOpcode.PutPartialData):
-                m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAck)
-            with m.Case(ChannelAOpcode.Get):
-                m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAckData)
-            with m.Case(ChannelAOpcode.AcquireBlock):
-                m.d.comb += resp_opcode.eq(
-                    Mux(req_param == GrowParam.BtoT, ChannelDOpcode.Grant,
-                        ChannelDOpcode.GrantData))
-            with m.Case(ChannelAOpcode.AcquirePerm):
-                m.d.comb += resp_opcode.eq(ChannelDOpcode.Grant)
-
-        with m.If(req_from_c):
-            m.d.comb += resp_opcode.eq(ChannelDOpcode.ReleaseAck)
 
         with m.FSM():
             with m.State('IDLE'):
                 m.d.comb += tl.a.ready.eq(1)
-
-                if tl.has_bce:
-                    m.d.comb += tl.c.ready.eq(1)
 
                 with m.If(tl.a.valid):
                     is_write = Interface.has_data(tl.a.bits)
@@ -433,80 +438,38 @@ class TileLink2Wishbone(Elaboratable):
                         wb_addr.eq((tl.a.bits.address -
                                     self.base_addr)[wb_adr_shift:]),
                         burst_len.eq(1 << tl.a.bits.size),
-                        req_opcode.eq(tl.a.bits.opcode),
-                        req_param.eq(tl.a.bits.param),
                         mask.eq(tl.a.bits.mask),
                         wen.eq(is_write),
                         tl.d.bits.size.eq(tl.a.bits.size),
                         tl.d.bits.source.eq(tl.a.bits.source),
-                        req_from_c.eq(0),
                     ]
 
                     m.d.comb += tl.a.ready.eq(~is_write)
 
-                    with m.If((
-                        (tl.a.bits.opcode == ChannelAOpcode.AcquireBlock)
-                            | (tl.a.bits.opcode == ChannelAOpcode.AcquirePerm))
-                              & (tl.a.bits.param == GrowParam.BtoT)):
-                        m.next = 'WRITE_ACK'
-                    with m.Else():
-                        m.next = 'ACT'
-
-                if tl.has_bce:
-                    with m.If(tl.c.valid):
-                        m.d.sync += [
-                            wb_addr.eq((tl.c.bits.address -
-                                        self.base_addr)[wb_adr_shift:]),
-                            burst_len.eq(1 << tl.c.bits.size),
-                            req_opcode.eq(tl.c.bits.opcode),
-                            req_param.eq(tl.c.bits.param),
-                            mask.eq(~0),
-                            wen.eq(1),
-                            tl.d.bits.size.eq(tl.c.bits.size),
-                            tl.d.bits.source.eq(tl.c.bits.source),
-                            req_from_c.eq(1),
-                        ]
-
-                        m.d.comb += tl.c.ready.eq(0)
-
-                        m.next = 'ACT'
+                    m.next = 'ACT'
 
             with m.State('ACT'):
                 m.d.comb += [
+                    wb.cyc.eq(~wen | tl.a.valid),
                     wb.stb.eq(wb.cyc),
                     wb.adr.eq(wb_addr),
                     wb.we.eq(wen),
                     wb.sel.eq(mask),
                 ]
 
-                if tl.has_bce:
-                    m.d.comb += wb.cyc.eq(
-                        ~wen | Mux(req_from_c, tl.c.valid, tl.a.valid))
-                else:
-                    m.d.comb += wb.cyc.eq(~wen | tl.a.valid)
-
                 with m.If(wb.we):
-                    with m.If(~req_from_c):
-                        m.d.comb += [
-                            wb.dat_w.eq(tl.a.bits.data),
-                            tl.a.ready.eq(wb.ack),
-                        ]
-
-                    if tl.has_bce:
-                        with m.If(req_from_c):
-                            m.d.comb += [
-                                wb.dat_w.eq(tl.c.bits.data),
-                                tl.c.ready.eq(wb.ack),
-                            ]
+                    m.d.comb += [
+                        wb.dat_w.eq(tl.a.bits.data),
+                        tl.a.ready.eq(wb.ack),
+                    ]
 
                 with m.If(wb.ack):
                     m.d.sync += wb_addr.eq(wb_addr + 1)
 
                     with m.If(~wb.we):
                         m.d.comb += [
-                            tl.d.bits.opcode.eq(resp_opcode),
+                            tl.d.bits.opcode.eq(ChannelDOpcode.AccessAckData),
                             tl.d.bits.data.eq(wb.dat_r),
-                            tl.d.bits.param.eq(CapParam.toT),
                             tl.d.valid.eq(1),
                         ]
 
@@ -534,7 +497,7 @@ class TileLink2Wishbone(Elaboratable):
 
             with m.State('WAIT_ACK'):
                 m.d.comb += [
-                    tl.d.bits.opcode.eq(resp_opcode),
+                    tl.d.bits.opcode.eq(ChannelDOpcode.AccessAckData),
                     tl.d.bits.data.eq(rdata),
                     tl.d.bits.param.eq(CapParam.toT),
                     tl.d.valid.eq(1),
@@ -551,7 +514,7 @@ class TileLink2Wishbone(Elaboratable):
 
             with m.State('WRITE_ACK'):
                 m.d.comb += [
-                    tl.d.bits.opcode.eq(resp_opcode),
+                    tl.d.bits.opcode.eq(ChannelDOpcode.AccessAck),
                     tl.d.valid.eq(1),
                 ]
 
@@ -561,17 +524,145 @@ class TileLink2Wishbone(Elaboratable):
         return m
 
 
+class CacheCork(Elaboratable):
+
+    def __init__(self, in_bus, out_bus):
+        self.in_bus = in_bus
+        self.out_bus = out_bus
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_bus = self.in_bus
+        out_bus = self.out_bus
+
+        if not self.in_bus.has_bce:
+            m.d.comb += in_bus.connect(out_bus)
+        else:
+            is_release = Signal()
+
+            req_opcode = Signal(ChannelAOpcode)
+            req_param = Signal(GrowParam)
+
+            resp_opcode = Signal(ChannelDOpcode)
+            with m.Switch(req_opcode):
+                with m.Case(ChannelAOpcode.PutFullData):
+                    m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAck)
+                with m.Case(ChannelAOpcode.PutPartialData):
+                    m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAck)
+                with m.Case(ChannelAOpcode.Get):
+                    m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAckData)
+                with m.Case(ChannelAOpcode.AcquireBlock):
+                    m.d.comb += resp_opcode.eq(
+                        Mux(req_param == GrowParam.BtoT, ChannelDOpcode.Grant,
+                            ChannelDOpcode.GrantData))
+                with m.Case(ChannelAOpcode.AcquirePerm):
+                    m.d.comb += resp_opcode.eq(ChannelDOpcode.Grant)
+
+            with m.If(is_release):
+                m.d.comb += resp_opcode.eq(ChannelDOpcode.ReleaseAck)
+
+            with m.If(is_release | in_bus.c.valid):
+                m.d.comb += [
+                    out_bus.a.bits.opcode.eq(ChannelAOpcode.PutFullData),
+                    out_bus.a.bits.param.eq(0),
+                    out_bus.a.bits.size.eq(in_bus.c.bits.size),
+                    out_bus.a.bits.source.eq(in_bus.c.bits.source),
+                    out_bus.a.bits.address.eq(in_bus.c.bits.address),
+                    out_bus.a.bits.mask.eq(~0),
+                    out_bus.a.bits.data.eq(in_bus.c.bits.data),
+                    out_bus.a.bits.corrupt.eq(in_bus.c.bits.corrupt),
+                    out_bus.a.valid.eq(in_bus.c.valid),
+                    in_bus.c.ready.eq(out_bus.a.ready),
+                ]
+
+            with m.Else():
+                m.d.comb += in_bus.a.connect(out_bus.a)
+
+                with m.If(in_bus.a.bits.opcode == ChannelAOpcode.AcquireBlock):
+                    m.d.comb += out_bus.a.bits.opcode.eq(ChannelAOpcode.Get)
+
+            with m.FSM():
+                with m.State('IDLE'):
+                    m.d.comb += [
+                        in_bus.a.ready.eq(1),
+                        in_bus.c.ready.eq(1),
+                    ]
+
+                    m.d.sync += is_release.eq(0)
+
+                    with m.If(in_bus.a.valid):
+                        to_d = ((in_bus.a.bits.opcode
+                                 == ChannelAOpcode.AcquireBlock)
+                                & (in_bus.a.bits.param == GrowParam.BtoT)) | (
+                                    in_bus.a.bits.opcode
+                                    == ChannelAOpcode.AcquirePerm)
+
+                        m.d.comb += in_bus.a.ready.eq(out_bus.a.ready)
+
+                        m.d.sync += [
+                            req_opcode.eq(in_bus.a.bits.opcode),
+                            req_param.eq(in_bus.a.bits.param),
+                        ]
+
+                        with m.If(to_d):
+                            m.next = 'ACK'
+                        with m.Else():
+                            m.next = 'ACT'
+
+                    with m.If(in_bus.c.valid):
+                        m.d.comb += [
+                            in_bus.a.ready.eq(0),
+                            in_bus.c.ready.eq(out_bus.a.ready),
+                        ]
+
+                        m.d.sync += is_release.eq(1)
+
+                        m.next = 'ACT'
+
+                with m.State('ACT'):
+                    _, _, done, _ = Interface.count(m, out_bus.d.bits,
+                                                    out_bus.d.fire)
+
+                    m.d.comb += [
+                        out_bus.d.connect(in_bus.d),
+                        in_bus.d.bits.opcode.eq(resp_opcode),
+                        in_bus.d.bits.param.eq(CapParam.toT),
+                    ]
+
+                    with m.If(done):
+                        m.d.sync += is_release.eq(0)
+                        m.next = 'IDLE'
+
+                with m.State('ACK'):
+                    m.d.comb += [
+                        in_bus.d.valid.eq(1),
+                        in_bus.d.bits.opcode.eq(resp_opcode),
+                    ]
+
+                    with m.If(in_bus.d.ready):
+                        m.next = 'IDLE'
+
+            m.d.comb += in_bus.e.ready.eq(1)
+
+        return m
+
+
 class Arbiter(Elaboratable):
 
-    def __init__(self, cls, *args, data_width, size_width, **kwargs):
+    def __init__(self, cls, *args, data_width=None, size_width=None, **kwargs):
         self.data_width = data_width
         self.size_width = size_width
 
-        self.bus = Decoupled(cls,
-                             data_width=data_width,
-                             size_width=size_width,
-                             *args,
-                             **kwargs)
+        if data_width is not None:
+            self.bus = Decoupled(cls,
+                                 data_width=data_width,
+                                 size_width=size_width,
+                                 *args,
+                                 **kwargs)
+        else:
+            self.bus = Decoupled(cls, *args, **kwargs)
+
         self._intrs = []
 
     def add(self, intr_bus):
@@ -585,8 +676,12 @@ class Arbiter(Elaboratable):
         m.d.comb += requests.eq(Cat(intr_bus.valid
                                     for intr_bus in self._intrs))
 
-        beats_left = Signal(2**self.size_width + 1)
-        lg_beat_bytes = log2_int(self.data_width // 8)
+        if self.data_width is not None:
+            beats_left = Signal(2**self.size_width + 1)
+            lg_beat_bytes = log2_int(self.data_width // 8)
+        else:
+            beats_left = Signal()
+            lg_beat_bytes = 0
 
         bus_busy = beats_left != 0
 

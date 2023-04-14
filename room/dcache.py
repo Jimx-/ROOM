@@ -10,7 +10,7 @@ from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.utils import Valid, Decoupled, Arbiter, BranchKillableFIFO
 
-from roomsoc.interconnect import tilelink
+from roomsoc.interconnect import tilelink as tl
 
 
 class StoreGen(Elaboratable):
@@ -194,13 +194,13 @@ class CacheState(IntEnum):
         with m.Switch(state):
             with m.Case(CacheState.NOTHING):
                 with m.If(cmd_is_write):
-                    m.d.comb += next_state.eq(tilelink.GrowParam.NtoT)
+                    m.d.comb += next_state.eq(tl.GrowParam.NtoT)
                 with m.Else():
-                    m.d.comb += next_state.eq(tilelink.GrowParam.NtoB)
+                    m.d.comb += next_state.eq(tl.GrowParam.NtoB)
 
             with m.Case(CacheState.BRANCH):
                 with m.If(cmd_is_write):
-                    m.d.comb += next_state.eq(tilelink.GrowParam.BtoT)
+                    m.d.comb += next_state.eq(tl.GrowParam.BtoT)
                 with m.Else():
                     m.d.comb += [
                         is_hit.eq(1),
@@ -229,11 +229,11 @@ class CacheState(IntEnum):
         grant_state = Signal(CacheState, reset=CacheState.NOTHING)
 
         with m.Switch(param):
-            with m.Case(tilelink.CapParam.toB):
+            with m.Case(tl.CapParam.toB):
                 with m.If(~cmd_is_write):
                     m.d.comb += grant_state.eq(CacheState.BRANCH)
 
-            with m.Case(tilelink.CapParam.toT):
+            with m.Case(tl.CapParam.toT):
                 with m.If(cmd_is_write):
                     m.d.comb += grant_state.eq(CacheState.DIRTY)
                 with m.Else():
@@ -265,14 +265,14 @@ class CacheState(IntEnum):
             with m.Case(CacheState.DIRTY):
                 m.d.comb += [
                     is_dirty.eq(1),
-                    param.eq(tilelink.ShrinkReportParam.TtoN),
+                    param.eq(tl.ShrinkReportParam.TtoN),
                 ]
             with m.Case(CacheState.TRUNK):
-                m.d.comb += param.eq(tilelink.ShrinkReportParam.TtoN)
+                m.d.comb += param.eq(tl.ShrinkReportParam.TtoN)
             with m.Case(CacheState.BRANCH):
-                m.d.comb += param.eq(tilelink.ShrinkReportParam.BtoN)
+                m.d.comb += param.eq(tl.ShrinkReportParam.BtoN)
             with m.Case(CacheState.NOTHING):
-                m.d.comb += param.eq(tilelink.ShrinkReportParam.NtoN)
+                m.d.comb += param.eq(tl.ShrinkReportParam.NtoN)
 
         return is_dirty, param
 
@@ -485,7 +485,7 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
         super().__init__(params)
 
         self.mem_release = Decoupled(
-            tilelink.ChannelC,
+            tl.ChannelC,
             addr_width=32,
             data_width=self.xlen,
             size_width=bits_for(self.lg_block_bytes),
@@ -565,7 +565,7 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
             with m.State('WRITE_BACK'):
                 m.d.comb += [
                     self.mem_release.bits.opcode.eq(
-                        tilelink.ChannelCOpcode.ReleaseData),
+                        tl.ChannelCOpcode.ReleaseData),
                     self.mem_release.bits.param.eq(req.param),
                     self.mem_release.bits.size.eq(self.lg_block_bytes),
                     self.mem_release.bits.source.eq(self.n_mshrs +
@@ -656,15 +656,17 @@ class MSHR(HasDCacheParams, Elaboratable):
         self.id = id
 
         self.mem_acquire = Decoupled(
-            tilelink.ChannelA,
+            tl.ChannelA,
             addr_width=32,
             data_width=self.xlen,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
-        self.mem_grant = Decoupled(tilelink.ChannelD,
+        self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.xlen,
                                    size_width=bits_for(self.lg_block_bytes))
+
+        self.mem_finish = Decoupled(tl.ChannelE)
 
         self.req = MSHRReq(params)
         self.req_pri_valid = Signal()
@@ -735,6 +737,7 @@ class MSHR(HasDCacheParams, Elaboratable):
 
         load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
 
+        grantack = Valid(tl.ChannelE)
         grant_had_data = Signal()
         commit_line = Signal()
 
@@ -765,7 +768,10 @@ class MSHR(HasDCacheParams, Elaboratable):
                     block_sec_req.eq(1),
                     self.req_pri_ready.eq(1),
                 ]
-                m.d.sync += grant_had_data.eq(0)
+                m.d.sync += [
+                    grant_had_data.eq(0),
+                    grantack.valid.eq(0),
+                ]
 
                 with m.If(self.req_pri_valid & self.req_pri_ready):
                     m.d.sync += req.eq(self.req)
@@ -789,7 +795,7 @@ class MSHR(HasDCacheParams, Elaboratable):
             with m.State('REFILL_REQ'):
                 m.d.comb += [
                     self.mem_acquire.bits.opcode.eq(
-                        tilelink.ChannelAOpcode.AcquireBlock),
+                        tl.ChannelAOpcode.AcquireBlock),
                     self.mem_acquire.bits.param.eq(grow_param),
                     self.mem_acquire.bits.size.eq(self.lg_block_bytes),
                     self.mem_acquire.bits.source.eq(self.id),
@@ -803,7 +809,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     m.next = 'REFILL_RESP'
 
             with m.State('REFILL_RESP'):
-                with m.If(tilelink.Interface.has_data(self.mem_grant.bits)):
+                with m.If(tl.Interface.has_data(self.mem_grant.bits)):
 
                     m.d.comb += [
                         self.lb_write.valid.eq(self.mem_grant.valid),
@@ -817,12 +823,15 @@ class MSHR(HasDCacheParams, Elaboratable):
 
                 with m.If(self.mem_grant.fire):
                     m.d.sync += grant_had_data.eq(
-                        tilelink.Interface.has_data(self.mem_grant.bits))
+                        tl.Interface.has_data(self.mem_grant.bits))
 
                     with m.If((refill_counter == (self.refill_cycles - 1))
                               | (self.mem_grant.bits.opcode ==
-                                 tilelink.ChannelDOpcode.Grant)):
+                                 tl.ChannelDOpcode.Grant)):
                         m.d.sync += [
+                            grantack.valid.eq(
+                                tl.Interface.is_request(self.mem_grant.bits)),
+                            grantack.bits.sink.eq(self.mem_grant.bits.sink),
                             refill_counter.eq(0),
                             new_state.eq(grant_state),
                             commit_line.eq(0),
@@ -873,7 +882,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     m.d.sync += commit_line.eq(1)
                 with m.Elif(rpq.empty & ~commit_line):
                     with m.If(~(rpq.w_en & rpq.w_rdy)):
-                        m.next = 'MEM_FINISH'
+                        m.next = 'MEM_FINISH_1'
                 with m.Elif(rpq.empty | (rpq.r_rdy & ~drain_load)):
                     m.next = 'META_READ'
 
@@ -970,9 +979,20 @@ class MSHR(HasDCacheParams, Elaboratable):
                 ]
 
                 with m.If(self.meta_write.fire):
-                    m.next = 'MEM_FINISH'
+                    m.next = 'MEM_FINISH_1'
 
-            with m.State('MEM_FINISH'):
+            with m.State('MEM_FINISH_1'):
+                m.d.comb += [
+                    block_sec_req.eq(1),
+                    self.mem_finish.valid.eq(grantack.valid),
+                    self.mem_finish.bits.eq(grantack.bits),
+                ]
+
+                with m.If(self.mem_finish.fire | ~grantack.valid):
+                    m.d.sync += grantack.valid.eq(0)
+                    m.next = 'MEM_FINISH_2'
+
+            with m.State('MEM_FINISH_2'):
                 m.d.comb += block_sec_req.eq(1)
                 m.next = 'INVALID'
 
@@ -987,13 +1007,13 @@ class IOMSHR(HasDCacheParams, Elaboratable):
         self.id = id
 
         self.mem_acquire = Decoupled(
-            tilelink.ChannelA,
+            tl.ChannelA,
             addr_width=32,
             data_width=self.xlen,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
-        self.mem_grant = Decoupled(tilelink.ChannelD,
+        self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.xlen,
                                    size_width=bits_for(self.lg_block_bytes))
 
@@ -1002,8 +1022,6 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
-
-        granularity_bits = log2_int(self.xlen // 8)
 
         req = DCacheReq(self.params)
 
@@ -1038,9 +1056,9 @@ class IOMSHR(HasDCacheParams, Elaboratable):
                 m.d.comb += [
                     self.mem_acquire.bits.opcode.eq(
                         Mux(req.uop.mem_cmd == MemoryCommand.WRITE,
-                            tilelink.ChannelAOpcode.PutPartialData,
-                            tilelink.ChannelAOpcode.Get)),
-                    self.mem_acquire.bits.size.eq(req.uop.mem_cmd),
+                            tl.ChannelAOpcode.PutPartialData,
+                            tl.ChannelAOpcode.Get)),
+                    self.mem_acquire.bits.size.eq(req.uop.mem_size),
                     self.mem_acquire.bits.source.eq(self.id),
                     self.mem_acquire.bits.address.eq(req.addr),
                     self.mem_acquire.bits.mask.eq(store_gen.mask),
@@ -1078,15 +1096,17 @@ class MSHRFile(HasDCacheParams, Elaboratable):
         super().__init__(params)
 
         self.mem_acquire = Decoupled(
-            tilelink.ChannelA,
+            tl.ChannelA,
             addr_width=32,
             data_width=self.xlen,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
-        self.mem_grant = Decoupled(tilelink.ChannelD,
+        self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.xlen,
                                    size_width=bits_for(self.lg_block_bytes))
+
+        self.mem_finish = Decoupled(tl.ChannelE)
 
         self.req = [
             Decoupled(MSHRReq, params, name=f'req{i}')
@@ -1183,12 +1203,15 @@ class MSHRFile(HasDCacheParams, Elaboratable):
             lb_write_arb.out.ready.eq(1),
         ]
 
-        mem_acquire_arbiter = m.submodules.mem_acquire_arbiter = tilelink.Arbiter(
-            tilelink.ChannelA,
+        mem_acquire_arbiter = m.submodules.mem_acquire_arbiter = tl.Arbiter(
+            tl.ChannelA,
             addr_width=32,
             data_width=self.xlen,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+
+        mem_finish_arbiter = m.submodules.mem_finish_arbiter = tl.Arbiter(
+            tl.ChannelE)
 
         meta_read_arb = m.submodules.meta_read_arb = Arbiter(
             self.n_mshrs, MetaReadReq, self.params)
@@ -1243,6 +1266,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
             setattr(m.submodules, f'mshr{i}', mshr)
 
             mem_acquire_arbiter.add(mshr.mem_acquire)
+            mem_finish_arbiter.add(mshr.mem_finish)
 
             for w in range(self.mem_width):
                 m.d.comb += [
@@ -1341,7 +1365,10 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         m.d.comb += iomshr_alloc_arb.out.ready.eq(req_valid & req_uncacheable)
 
-        m.d.comb += mem_acquire_arbiter.bus.connect(self.mem_acquire)
+        m.d.comb += [
+            mem_acquire_arbiter.bus.connect(self.mem_acquire),
+            mem_finish_arbiter.bus.connect(self.mem_finish),
+        ]
 
         m.d.comb += [
             meta_read_arb.out.connect(self.meta_read),
@@ -1476,6 +1503,8 @@ class DCache(HasDCacheParams, Elaboratable):
 
         m.d.comb += wb.mem_grant.eq(self.dbus.d.fire & (
             self.dbus.d.bits.source == self.n_mshrs + self.n_iomshrs))
+
+        m.d.comb += mshrs.mem_finish.connect(self.dbus.e)
 
         #
         # Tag & data access
