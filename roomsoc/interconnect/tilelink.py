@@ -251,7 +251,8 @@ class Interface:
             return (bits.opcode == ChannelAOpcode.PutFullData) | (
                 bits.opcode == ChannelAOpcode.PutPartialData)
         elif isinstance(bits, ChannelC):
-            return (bits.opcode == ChannelCOpcode.ReleaseData)
+            return (bits.opcode == ChannelCOpcode.ReleaseData) | (
+                bits.opcode == ChannelCOpcode.ProbeAckData)
         elif isinstance(bits, ChannelD):
             return (bits.opcode == ChannelDOpcode.AccessAckData) | (
                 bits.opcode == ChannelDOpcode.GrantData)
@@ -507,9 +508,9 @@ class TileLink2Wishbone(Elaboratable):
                     with m.If(burst_len > tl.data_width // 8):
                         m.d.sync += burst_len.eq(burst_len -
                                                  tl.data_width // 8)
+                        m.next = 'ACT'
                     with m.Else():
                         m.d.sync += burst_len.eq(0)
-
                         m.next = 'IDLE'
 
             with m.State('WRITE_ACK'):
@@ -613,12 +614,18 @@ class CacheCork(Elaboratable):
                     with m.If(in_bus.c.valid):
                         m.d.comb += [
                             in_bus.a.ready.eq(0),
-                            in_bus.c.ready.eq(out_bus.a.ready),
+                            in_bus.c.ready.eq((
+                                in_bus.c.bits.opcode == ChannelCOpcode.Release)
+                                              | out_bus.a.ready),
                         ]
 
                         m.d.sync += is_release.eq(1)
 
-                        m.next = 'ACT'
+                        with m.If(in_bus.c.bits.opcode ==
+                                  ChannelCOpcode.Release):
+                            m.next = 'ACK'
+                        with m.Else():
+                            m.next = 'ACT'
 
                 with m.State('ACT'):
                     _, _, done, _ = Interface.count(m, out_bus.d.bits,
@@ -641,6 +648,7 @@ class CacheCork(Elaboratable):
                     ]
 
                     with m.If(in_bus.d.ready):
+                        m.d.sync += is_release.eq(0)
                         m.next = 'IDLE'
 
             m.d.comb += in_bus.e.ready.eq(1)
