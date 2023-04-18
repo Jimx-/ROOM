@@ -9,6 +9,7 @@ from room import Core
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi, wishbone
+from roomsoc.peripheral.l2cache import L2Cache
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 from roomsoc.peripheral.sdc import SDController
@@ -83,6 +84,18 @@ core_params = dict(
     flen=64,
     fma_latency=4,
     io_regions={0xC0000000: 0x40000000},
+)
+
+l2cache_params = dict(
+    capacity_kb=64,
+    n_ways=8,
+    block_bytes=64,
+    in_bus=dict(
+        source_id_width=4,
+        sink_id_width=2,
+        size_width=3,
+    ),
+    out_bus=dict(source_id_width=4, ),
 )
 
 
@@ -280,6 +293,14 @@ class Top(Elaboratable):
                     mode='rw')
 
         soc.add_peripheral('dm', debug_module)
+
+        if l2cache_params is not None:
+            l2cache = L2Cache(l2cache_params)
+            m.d.comb += core.dbus.connect(l2cache.in_bus)
+            soc.bus.add_master(name='l2c_dbus', master=l2cache.out_bus)
+            soc.add_peripheral('l2cache', l2cache)
+        else:
+            soc.bus.add_master(name='cpu_dbus', master=core.dbus)
 
         if self.sim:
             sram = DromajoRAM(addr_width=25,

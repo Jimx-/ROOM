@@ -721,10 +721,16 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s1_block_r = Signal()
         s1_req = SourceD.Request(self.params)
         s1_req_reg = SourceD.Request(self.params)
-        s1_need_r = s1_req.prio[0]
+        s1_grant = ((s1_req.opcode == tl.ChannelAOpcode.AcquireBlock) &
+                    (s1_req.param == tl.GrowParam.BtoT)) | (
+                        s1_req.opcode == tl.ChannelAOpcode.AcquirePerm)
+        s1_need_r = s1_req.prio[0] & ~s1_grant
         s1_valid_r = (busy | self.req.valid) & s1_need_r & ~s1_block_r
         s1_need_pb = Mux(s1_req.prio[0], ~s1_req.opcode[2], s1_req.opcode[0])
-        s1_num_beats = (1 << s1_req.size) >> log2_int(self.beat_bytes)
+        s1_single = Mux(s1_req.prio[0], s1_grant,
+                        s1_req.opcode == tl.ChannelCOpcode.Release)
+        s1_num_beats = Mux(s1_single, 1,
+                           (1 << s1_req.size) >> log2_int(self.beat_bytes))
         s1_last = s1_counter == s1_num_beats - 1
         s1_first = s1_counter == 0
 
@@ -1830,7 +1836,17 @@ class Scheduler(HasL2CacheParams, Elaboratable):
 class L2Cache(HasL2CacheParams, Peripheral, Elaboratable):
 
     def __init__(self, params, *, name=None, **kwargs):
-        super().__init__(params=params, name=name)
+        Peripheral.__init__(self, name=name, src_loc_at=1)
+        HasL2CacheParams.__init__(self, params)
+
+        bank = self.csr_bank()
+        self._banks = bank.csr(8, 'r')
+        self._ways = bank.csr(8, 'r')
+        self._lg_sets = bank.csr(8, 'r')
+        self._lg_block_bytes = bank.csr(8, 'r')
+
+        self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
+        self.bus = self._bridge.bus
 
         self.in_bus = tl.Interface(data_width=self.beat_bytes * 8,
                                    addr_width=32,
@@ -1846,6 +1862,14 @@ class L2Cache(HasL2CacheParams, Peripheral, Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
+        m.submodules.bridge = self._bridge
+
+        m.d.comb += [
+            self._banks.r_data.eq(self.n_ways),
+            self._ways.r_data.eq(self.n_ways),
+            self._lg_sets.r_data.eq(log2_int(self.n_sets)),
+            self._lg_block_bytes.r_data.eq(log2_int(self.block_bytes)),
+        ]
 
         scheduler = m.submodules.scheduler = Scheduler(self.params,
                                                        self.in_bus,

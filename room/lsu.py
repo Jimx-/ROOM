@@ -148,13 +148,14 @@ def gen_byte_mask(addr, size):
 
 class LoadStoreUnit(HasCoreParams, Elaboratable):
 
-    def __init__(self, dbus, params, sim_debug=False):
+    def __init__(self, dbus, dbus_mmio, params, sim_debug=False):
         super().__init__(params)
 
         self.sim_debug = sim_debug
         self.enable_dcache = params.get('dcache_params') is not None
 
         self.dbus = dbus
+        self.dbus_mmio = dbus_mmio
 
         self.dis_uops = [
             MicroOp(params, name=f'dis_uop{i}') for i in range(self.core_width)
@@ -222,7 +223,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         ]
 
         dcache_cls = DCache if self.enable_dcache else SimpleDCache
-        dcache = m.submodules.dcache = dcache_cls(self.dbus, self.params)
+        dcache = m.submodules.dcache = dcache_cls(self.dbus, self.dbus_mmio,
+                                                  self.params)
 
         ldq = Array(
             LDQEntry(self.params, name=f'ldq{i}')

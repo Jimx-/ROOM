@@ -143,12 +143,17 @@ class Core(HasCoreParams, Elaboratable):
                                            size_width=3,
                                            name='ibus')
 
+        self.periph_buses = [self.ibus]
+        self.dbus_mmio = None
+
         if params.get('dcache_params') is None:
             self.dbus = wishbone.Interface(data_width=self.xlen,
                                            addr_width=32 -
                                            log2_int(self.xlen // 8),
                                            granularity=8,
                                            name='dbus')
+
+            self.periph_buses.append(self.dbus)
         else:
             self.dbus = tilelink.Interface(data_width=self.xlen,
                                            addr_width=32,
@@ -157,7 +162,13 @@ class Core(HasCoreParams, Elaboratable):
                                            has_bce=True,
                                            name='dbus')
 
-        self.periph_buses = [self.ibus, self.dbus]
+            self.dbus_mmio = tilelink.Interface(data_width=self.xlen,
+                                                addr_width=32,
+                                                size_width=3,
+                                                source_id_width=8,
+                                                name='dbus_mmio')
+
+            self.periph_buses.append(self.dbus_mmio)
 
         if sim_debug:
             self.core_debug = CoreDebug(params)
@@ -292,6 +303,7 @@ class Core(HasCoreParams, Elaboratable):
         #
 
         lsu = m.submodules.lsu = LoadStoreUnit(self.dbus,
+                                               self.dbus_mmio,
                                                self.params,
                                                sim_debug=self.sim_debug)
 

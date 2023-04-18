@@ -116,7 +116,10 @@ public:
             this->tick();
 
 #ifdef ITRACE
-            if (Tracer::get_singleton().should_stop()) break;
+            if (Tracer::get_singleton().should_stop()) {
+                spdlog::info("Tracer stopped at cycle {}", i);
+                break;
+            }
 #endif
         }
 

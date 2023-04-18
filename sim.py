@@ -6,6 +6,7 @@ from room.core import Core, CoreDebug
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi
+from roomsoc.peripheral.l2cache import L2Cache
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.sdc import MockSDController
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
@@ -80,6 +81,18 @@ core_params = dict(
     io_regions={0xC0000000: 0x40000000},
 )
 
+l2cache_params = dict(
+    capacity_kb=64,
+    n_ways=8,
+    block_bytes=64,
+    in_bus=dict(
+        source_id_width=4,
+        sink_id_width=2,
+        size_width=3,
+    ),
+    out_bus=dict(source_id_width=4, ),
+)
+
 
 class Top(Elaboratable):
 
@@ -145,6 +158,14 @@ class Top(Elaboratable):
                     init=self.rom_image)
 
         soc.add_peripheral('dm', debug_module)
+
+        if l2cache_params is not None:
+            l2cache = L2Cache(l2cache_params)
+            m.d.comb += core.dbus.connect(l2cache.in_bus)
+            soc.bus.add_master(name='l2c_dbus', master=l2cache.out_bus)
+            soc.add_peripheral('l2cache', l2cache)
+        else:
+            soc.bus.add_master(name='cpu_dbus', master=core.dbus)
 
         soc.add_ram(name='sram',
                     origin=self.mem_map['sram'],
