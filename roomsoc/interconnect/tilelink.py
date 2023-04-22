@@ -540,10 +540,12 @@ class CacheCork(Elaboratable):
         if not self.in_bus.has_bce:
             m.d.comb += in_bus.connect(out_bus)
         else:
+            busy = Signal(reset=1)
             is_release = Signal()
 
             req_opcode = Signal(ChannelAOpcode)
             req_param = Signal(GrowParam)
+            req_source = Signal.like(in_bus.a.bits.source)
 
             resp_opcode = Signal(ChannelDOpcode)
             with m.Switch(req_opcode):
@@ -563,7 +565,7 @@ class CacheCork(Elaboratable):
             with m.If(is_release):
                 m.d.comb += resp_opcode.eq(ChannelDOpcode.ReleaseAck)
 
-            with m.If(is_release | in_bus.c.valid):
+            with m.If(is_release | (in_bus.c.valid & ~busy)):
                 m.d.comb += [
                     out_bus.a.bits.opcode.eq(ChannelAOpcode.PutFullData),
                     out_bus.a.bits.param.eq(0),
@@ -573,7 +575,8 @@ class CacheCork(Elaboratable):
                     out_bus.a.bits.mask.eq(~0),
                     out_bus.a.bits.data.eq(in_bus.c.bits.data),
                     out_bus.a.bits.corrupt.eq(in_bus.c.bits.corrupt),
-                    out_bus.a.valid.eq(in_bus.c.valid),
+                    out_bus.a.valid.eq(in_bus.c.valid & (
+                        in_bus.c.bits.opcode != ChannelCOpcode.Release)),
                     in_bus.c.ready.eq(out_bus.a.ready),
                 ]
 
@@ -586,6 +589,7 @@ class CacheCork(Elaboratable):
             with m.FSM():
                 with m.State('IDLE'):
                     m.d.comb += [
+                        busy.eq(0),
                         in_bus.a.ready.eq(1),
                         in_bus.c.ready.eq(1),
                     ]
@@ -604,12 +608,14 @@ class CacheCork(Elaboratable):
                         m.d.sync += [
                             req_opcode.eq(in_bus.a.bits.opcode),
                             req_param.eq(in_bus.a.bits.param),
+                            req_source.eq(in_bus.a.bits.source),
                         ]
 
-                        with m.If(to_d):
-                            m.next = 'ACK'
-                        with m.Else():
-                            m.next = 'ACT'
+                        with m.If(in_bus.a.fire):
+                            with m.If(to_d):
+                                m.next = 'ACK'
+                            with m.Else():
+                                m.next = 'ACT'
 
                     with m.If(in_bus.c.valid):
                         m.d.comb += [
@@ -619,13 +625,17 @@ class CacheCork(Elaboratable):
                                               | out_bus.a.ready),
                         ]
 
-                        m.d.sync += is_release.eq(1)
+                        m.d.sync += [
+                            is_release.eq(1),
+                            req_source.eq(in_bus.c.bits.source),
+                        ]
 
-                        with m.If(in_bus.c.bits.opcode ==
-                                  ChannelCOpcode.Release):
-                            m.next = 'ACK'
-                        with m.Else():
-                            m.next = 'ACT'
+                        with m.If(in_bus.c.fire):
+                            with m.If(in_bus.c.bits.opcode ==
+                                      ChannelCOpcode.Release):
+                                m.next = 'ACK'
+                            with m.Else():
+                                m.next = 'ACT'
 
                 with m.State('ACT'):
                     _, _, done, _ = Interface.count(m, out_bus.d.bits,
@@ -645,6 +655,7 @@ class CacheCork(Elaboratable):
                     m.d.comb += [
                         in_bus.d.valid.eq(1),
                         in_bus.d.bits.opcode.eq(resp_opcode),
+                        in_bus.d.bits.source.eq(req_source),
                     ]
 
                     with m.If(in_bus.d.ready):

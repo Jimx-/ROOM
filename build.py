@@ -92,7 +92,7 @@ l2cache_params = dict(
     block_bytes=64,
     in_bus=dict(
         source_id_width=4,
-        sink_id_width=2,
+        sink_id_width=4,
         size_width=3,
     ),
     out_bus=dict(source_id_width=4, ),
@@ -296,10 +296,11 @@ class Top(Elaboratable):
 
         if l2cache_params is not None:
             l2cache = L2Cache(l2cache_params)
-            m.d.comb += core.dbus.connect(l2cache.in_bus)
+            m.d.comb += core.core_bus.connect(l2cache.in_bus)
             soc.bus.add_master(name='l2c_dbus', master=l2cache.out_bus)
             soc.add_peripheral('l2cache', l2cache)
         else:
+            soc.bus.add_master(name='cpu_ibus', master=core.dbus)
             soc.bus.add_master(name='cpu_dbus', master=core.dbus)
 
         if self.sim:

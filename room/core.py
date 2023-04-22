@@ -21,7 +21,7 @@ from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
 from room.utils import Arbiter, Valid
 
-from roomsoc.interconnect import wishbone, tilelink
+from roomsoc.interconnect import wishbone, tilelink as tl
 
 
 class WritebackDebug(HasCoreParams, Record):
@@ -131,20 +131,26 @@ class Core(HasCoreParams, Elaboratable):
         self.interrupts = CoreInterrupts()
         self.debug_entry = Signal(32)
 
+        self.periph_buses = []
+
         if params.get('icache_params') is None:
             ibus_addr_shift = Shape.cast(range(self.fetch_bytes)).width
             self.ibus = wishbone.Interface(data_width=self.fetch_width * 16,
                                            addr_width=32 - ibus_addr_shift,
                                            granularity=8,
                                            name='ibus')
-        else:
-            self.ibus = tilelink.Interface(data_width=self.fetch_width * 16,
-                                           addr_width=32,
-                                           size_width=3,
-                                           name='ibus')
 
-        self.periph_buses = [self.ibus]
+            self.periph_buses.append(self.ibus)
+        else:
+            self.ibus = tl.Interface(data_width=self.fetch_width * 16,
+                                     addr_width=32,
+                                     size_width=3,
+                                     source_id_width=4,
+                                     sink_id_width=4,
+                                     name='ibus')
+
         self.dbus_mmio = None
+        self.core_bus = None
 
         if params.get('dcache_params') is None:
             self.dbus = wishbone.Interface(data_width=self.xlen,
@@ -155,20 +161,30 @@ class Core(HasCoreParams, Elaboratable):
 
             self.periph_buses.append(self.dbus)
         else:
-            self.dbus = tilelink.Interface(data_width=self.xlen,
-                                           addr_width=32,
-                                           size_width=3,
-                                           source_id_width=8,
-                                           has_bce=True,
-                                           name='dbus')
+            self.dbus = tl.Interface(data_width=self.xlen,
+                                     addr_width=32,
+                                     size_width=3,
+                                     source_id_width=4,
+                                     sink_id_width=4,
+                                     has_bce=True,
+                                     name='dbus')
 
-            self.dbus_mmio = tilelink.Interface(data_width=self.xlen,
-                                                addr_width=32,
-                                                size_width=3,
-                                                source_id_width=8,
-                                                name='dbus_mmio')
+            self.dbus_mmio = tl.Interface(data_width=self.xlen,
+                                          addr_width=32,
+                                          size_width=3,
+                                          source_id_width=8,
+                                          name='dbus_mmio')
 
             self.periph_buses.append(self.dbus_mmio)
+
+        if params.get('icache_params') is not None and params.get(
+                'dcache_params') is not None:
+            self.core_bus = tl.Interface(data_width=self.xlen,
+                                         addr_width=32,
+                                         size_width=3,
+                                         source_id_width=4,
+                                         sink_id_width=4,
+                                         has_bce=True)
 
         if sim_debug:
             self.core_debug = CoreDebug(params)
@@ -1002,5 +1018,41 @@ class Core(HasCoreParams, Elaboratable):
             exc_unit.exception.eq(rob.commit_exc.valid),
             exc_unit.cause.eq(rob.commit_exc.cause),
         ]
+
+        #
+        # I-D bus
+        #
+
+        if self.core_bus is not None:
+            a_arbiter = m.submodules.a_arbiter = tl.Arbiter(
+                tl.ChannelA,
+                data_width=self.dbus.data_width,
+                addr_width=self.dbus.addr_width,
+                size_width=self.dbus.size_width,
+                source_id_width=self.dbus.source_id_width)
+
+            a_arbiter.add(self.ibus.a)
+            a_arbiter.add(self.dbus.a)
+
+            m.d.comb += [
+                a_arbiter.bus.connect(self.core_bus.a),
+                self.dbus.c.connect(self.core_bus.c),
+                self.core_bus.b.connect(self.dbus.b),
+                self.dbus.e.connect(self.core_bus.e),
+            ]
+
+            m.d.comb += [
+                self.ibus.d.valid.eq(self.core_bus.d.valid
+                                     & self.core_bus.d.bits.source[-1]),
+                self.ibus.d.bits.eq(self.core_bus.d.bits),
+                self.dbus.d.valid.eq(self.core_bus.d.valid
+                                     & ~self.core_bus.d.bits.source[-1]),
+                self.dbus.d.bits.eq(self.core_bus.d.bits),
+            ]
+
+            with m.If(~self.core_bus.d.bits.source[-1]):
+                m.d.comb += self.core_bus.d.ready.eq(self.dbus.d.ready)
+            with m.Else():
+                m.d.comb += self.core_bus.d.ready.eq(self.ibus.d.ready)
 
         return m

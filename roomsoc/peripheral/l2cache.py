@@ -60,6 +60,11 @@ class HasL2CacheParams:
                               (opcode == tl.ChannelAOpcode.AcquirePerm)) &
                              (param != tl.GrowParam.NtoB))
 
+    def skip_probe_n(self, opcode):
+        return (opcode == tl.ChannelAOpcode.AcquireBlock) | (
+            opcode == tl.ChannelAOpcode.AcquirePerm) | (
+                opcode == tl.ChannelAOpcode.Get)
+
 
 class CacheState(IntEnum):
     INVALID = 0
@@ -421,7 +426,7 @@ class SourceA(HasL2CacheParams, Elaboratable):
                 ('set', self.index_bits),
                 ('tag', self.tag_bits),
                 ('param', 3),
-                ('source', 1),
+                ('source', self.out_source_id_width),
                 ('block', 1),
             ],
                             name=name,
@@ -681,13 +686,18 @@ class SourceD(HasL2CacheParams, Elaboratable):
                              name=name,
                              src_loc_at=src_loc_at + 1)
 
+            self.sink = Signal(self.in_sink_id_width, name=f'{self.name}_sink')
             self.way = Signal(self.n_ways, name=f'{self.name}_way')
             self.bad = Signal(name=f'{self.name}_bad')
 
         def eq(self, rhs):
-            return super().eq(rhs) + ([self.way.eq(rhs.way)] if hasattr(
-                rhs, 'way') else []) + ([self.bad.eq(rhs.bad)] if hasattr(
-                    rhs, 'bad') else [])
+            return [
+                x for x in super().eq(rhs) + [
+                    self.sink.eq(rhs.sink) if hasattr(rhs, 'sink') else None,
+                    self.way.eq(rhs.way) if hasattr(rhs, 'way') else None,
+                    self.bad.eq(rhs.bad) if hasattr(rhs, 'bad') else None,
+                ] if x is not None
+            ]
 
     def __init__(self, params):
         super().__init__(params=params)
@@ -697,7 +707,8 @@ class SourceD(HasL2CacheParams, Elaboratable):
         self.d = Decoupled(tl.ChannelD,
                            data_width=self.beat_bytes * 8,
                            size_width=bits_for(self.lg_block_bytes),
-                           source_id_width=self.out_source_id_width)
+                           source_id_width=self.in_source_id_width,
+                           sink_id_width=self.in_sink_id_width)
 
         self.bs_rport = Decoupled(BankedStore.Port, params, write=False)
         self.bs_wport = Decoupled(BankedStore.Port, params, write=True)
@@ -887,7 +898,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
                         tl.CapParam.toB), 0)),
             d.bits.size.eq(s3_req.size),
             d.bits.source.eq(s3_req.source),
-            # d.bits.sink.eq(s3_req.sink),
+            d.bits.sink.eq(s3_req.sink),
             d.bits.denied.eq(s3_req.bad),
             d.bits.data.eq(s3_rdata),
             d.bits.corrupt.eq(s3_req.bad & d.bits.opcode[0]),
@@ -1364,15 +1375,25 @@ class MSHR(HasL2CacheParams, Elaboratable):
 
         new_meta = self.directory.bits
         new_request = FullRequest(self.params)
-        new_client_bit = self.client_bit(new_request.source)
+        new_client_bit = Signal(self.client_bits)
+        new_need_t = self.need_t(new_request.opcode, new_request.param)
+        new_skip_probe = Mux(self.skip_probe_n(new_request.opcode),
+                             new_client_bit, 0)
         m.d.comb += new_request.eq(request)
         with m.If(self.allocate.valid):
             m.d.comb += new_request.eq(self.allocate.bits)
+
+        with m.If(new_request.prio[0]
+                  & (new_request.opcode == tl.ChannelAOpcode.Get)):
+            m.d.comb += new_client_bit.eq(0)
+        with m.Else():
+            m.d.comb += new_client_bit.eq(self.client_bit(new_request.source))
 
         m.d.comb += [
             self.status.valid.eq(request_valid),
             self.status.bits.set.eq(request.set),
             self.status.bits.tag.eq(request.tag),
+            self.status.bits.way.eq(meta.way),
             self.status.bits.block_c.eq(0),
             self.status.bits.nest_c.eq(0),
         ]
@@ -1383,6 +1404,9 @@ class MSHR(HasL2CacheParams, Elaboratable):
         s_release = Signal(reset=1)
         w_releaseack = Signal(reset=1)
         s_pprobe = Signal(reset=1)
+        w_pprobeackfirst = Signal(reset=1)
+        w_pprobeacklast = Signal(reset=1)
+        w_pprobeack = Signal(reset=1)
         s_acquire = Signal(reset=1)
         w_grant = Signal(reset=1)
         w_grantfirst = Signal(reset=1)
@@ -1393,16 +1417,17 @@ class MSHR(HasL2CacheParams, Elaboratable):
         s_writeback = Signal(reset=1)
 
         got_t = Signal()
-        no_wait = w_rprobeacklast & w_releaseack & w_grantlast & w_grantack
+        no_wait = w_rprobeacklast & w_releaseack & w_grantlast & w_pprobeacklast & w_grantack
 
         m.d.comb += [
             self.schedule.bits.a.valid.eq(~s_acquire & s_release
                                           & s_pprobe),
             self.schedule.bits.b.valid.eq(~s_rprobe | ~s_pprobe),
             self.schedule.bits.c.valid.eq(~s_release & w_rprobeackfirst),
-            self.schedule.bits.d.valid.eq(~s_execute & w_grant),
+            self.schedule.bits.d.valid.eq(~s_execute & w_pprobeack & w_grant),
             self.schedule.bits.e.valid.eq(~s_grantack & w_grantfirst),
-            self.schedule.bits.dir.valid.eq(~s_writeback & no_wait),
+            self.schedule.bits.dir.valid.eq((~s_writeback & no_wait)
+                                            | (~s_release & w_rprobeackfirst)),
             self.schedule.valid.eq(self.schedule.bits.a.valid
                                    | self.schedule.bits.b.valid
                                    | self.schedule.bits.c.valid
@@ -1415,12 +1440,15 @@ class MSHR(HasL2CacheParams, Elaboratable):
             m.d.sync += s_rprobe.eq(1)
 
             with m.If(w_rprobeackfirst):
-                m.d.sync += s_release.eq(1)
+                m.d.sync += [
+                    s_release.eq(1),
+                    s_pprobe.eq(1),
+                ]
             with m.If(s_release & s_pprobe):
                 m.d.sync += s_acquire.eq(1)
             with m.If(w_grantfirst):
                 m.d.sync += s_grantack.eq(1)
-            with m.If(w_grant):
+            with m.If(w_pprobeack & w_grant):
                 m.d.sync += s_execute.eq(1)
             with m.If(no_wait):
                 m.d.sync += [
@@ -1435,7 +1463,17 @@ class MSHR(HasL2CacheParams, Elaboratable):
         req_need_t = self.need_t(request.opcode, request.param)
         req_acquire = (request.opcode == tl.ChannelAOpcode.AcquireBlock) | (
             request.opcode == tl.ChannelAOpcode.AcquirePerm)
-        req_client_bit = self.client_bit(request.source)
+        req_promote_t = req_acquire & Mux(
+            meta.hit,
+            (meta.clients == 0) & (meta.state == CacheState.TIP), got_t)
+
+        req_client_bit = Signal(self.client_bits)
+        with m.If(request.prio[0] & (request.opcode == tl.ChannelAOpcode.Get)):
+            m.d.comb += req_client_bit.eq(0)
+        with m.Else():
+            m.d.comb += req_client_bit.eq(self.client_bit(request.source))
+
+        honor_b_to_t = meta.hit & ((meta.clients & req_client_bit) != 0)
 
         with m.If(request.prio[2]):
             m.d.comb += [
@@ -1482,6 +1520,10 @@ class MSHR(HasL2CacheParams, Elaboratable):
                             Mux((meta.clients == 0) & req_acquire,
                                 CacheState.TRUNK, CacheState.TIP))
 
+        excluded_clients = Mux(
+            meta.hit & request.prio[0] & self.skip_probe_n(request.opcode),
+            req_client_bit, 0)
+
         m.d.comb += [
             # Channel A
             self.schedule.bits.a.bits.tag.eq(request.tag),
@@ -1491,11 +1533,15 @@ class MSHR(HasL2CacheParams, Elaboratable):
             self.schedule.bits.a.bits.source.eq(0),
             # Channel B
             self.schedule.bits.b.bits.param.eq(
-                Mux(~s_rprobe, tl.CapParam.toN, 0)),
+                Mux(
+                    ~s_rprobe, tl.CapParam.toN,
+                    Mux(request.prio[1], request.param,
+                        Mux(req_need_t, tl.CapParam.toN, tl.CapParam.toB)))),
             self.schedule.bits.b.bits.tag.eq(
                 Mux(~s_rprobe, meta.tag, request.tag)),
             self.schedule.bits.b.bits.set.eq(request.set),
-            self.schedule.bits.b.bits.clients.eq(meta.clients),
+            self.schedule.bits.b.bits.clients.eq(meta.clients
+                                                 & ~excluded_clients),
             # Channel C
             self.schedule.bits.c.bits.opcode.eq(
                 Mux(meta.dirty, tl.ChannelCOpcode.ReleaseData,
@@ -1509,22 +1555,47 @@ class MSHR(HasL2CacheParams, Elaboratable):
             self.schedule.bits.c.bits.dirty.eq(meta.dirty),
             # Channel D
             self.schedule.bits.d.bits.eq(request),
+            self.schedule.bits.d.bits.param.eq(
+                Mux(
+                    ~req_acquire, request.param,
+                    Mux(
+                        request.param == tl.GrowParam.NtoB,
+                        Mux(req_promote_t, tl.GrowParam.NtoT,
+                            tl.GrowParam.NtoB),
+                        Mux(
+                            request.param == tl.GrowParam.BtoT,
+                            Mux(honor_b_to_t, tl.GrowParam.BtoT,
+                                tl.GrowParam.NtoT),
+                            Mux(request.param == tl.GrowParam.NtoT,
+                                tl.GrowParam.NtoT, request.param))))),
+            self.schedule.bits.d.bits.way.eq(meta.way),
             # Directory writeback
             self.schedule.bits.dir.bits.set.eq(request.set),
             self.schedule.bits.dir.bits.way.eq(meta.way),
-            self.schedule.bits.dir.bits.dirty.eq(meta_writeback.dirty),
-            self.schedule.bits.dir.bits.state.eq(meta_writeback.state),
-            self.schedule.bits.dir.bits.clients.eq(meta_writeback.clients),
-            self.schedule.bits.dir.bits.tag.eq(meta_writeback.tag),
+            self.schedule.bits.dir.bits.dirty.eq(
+                Mux(~s_release, 0, meta_writeback.dirty)),
+            self.schedule.bits.dir.bits.state.eq(
+                Mux(~s_release, CacheState.INVALID, meta_writeback.state)),
+            self.schedule.bits.dir.bits.clients.eq(
+                Mux(~s_release, 0, meta_writeback.clients)),
+            self.schedule.bits.dir.bits.tag.eq(
+                Mux(~s_release, 0, meta_writeback.tag)),
         ]
 
         with m.If(self.sinkc.valid):
             last_probe = 1
             m.d.sync += [
                 w_rprobeackfirst.eq(w_rprobeackfirst | last_probe),
-                w_rprobeacklast.eq(w_rprobeackfirst
+                w_rprobeacklast.eq(w_rprobeacklast
                                    | (last_probe
                                       & self.sinkc.bits.last)),
+                w_pprobeackfirst.eq(w_pprobeackfirst | last_probe),
+                w_pprobeacklast.eq(w_pprobeacklast
+                                   | (last_probe
+                                      & self.sinkc.bits.last)),
+                w_pprobeack.eq(w_pprobeack
+                               | (last_probe & (self.sinkc.bits.last |
+                                                (request.offset == 0)))),
             ]
 
             with m.If((meta.state != CacheState.INVALID)
@@ -1562,6 +1633,9 @@ class MSHR(HasL2CacheParams, Elaboratable):
                 s_release.eq(1),
                 w_releaseack.eq(1),
                 s_pprobe.eq(1),
+                w_pprobeackfirst.eq(1),
+                w_pprobeacklast.eq(1),
+                w_pprobeack.eq(1),
                 s_acquire.eq(1),
                 w_grant.eq(1),
                 w_grantfirst.eq(1),
@@ -1605,7 +1679,8 @@ class MSHR(HasL2CacheParams, Elaboratable):
                             w_rprobeackfirst.eq(0),
                             w_rprobeacklast.eq(0),
                         ]
-                with m.If(~new_meta.hit):
+                with m.If(~new_meta.hit | (
+                    (new_meta.state == CacheState.BRANCH) & new_need_t)):
                     m.d.sync += [
                         s_acquire.eq(0),
                         w_grantfirst.eq(0),
@@ -1613,6 +1688,16 @@ class MSHR(HasL2CacheParams, Elaboratable):
                         w_grant.eq(0),
                         s_writeback.eq(0),
                         s_grantack.eq(0),
+                    ]
+                with m.If(new_meta.hit
+                          & (new_need_t | (new_meta.state == CacheState.TRUNK))
+                          & ((new_meta.clients & ~new_skip_probe) != 0)):
+                    m.d.sync += [
+                        s_pprobe.eq(0),
+                        w_pprobeackfirst.eq(0),
+                        w_pprobeacklast.eq(0),
+                        w_pprobeack.eq(0),
+                        s_writeback.eq(0),
                     ]
                 with m.If(
                     (new_request.opcode == tl.ChannelAOpcode.AcquireBlock) | (
@@ -1727,6 +1812,9 @@ class Scheduler(HasL2CacheParams, Elaboratable):
 
         m.d.comb += [
             schedule.a.bits.source.eq(mshr_rr.grant),
+            schedule.c.bits.source.eq(
+                Mux(schedule.c.bits.opcode[1], mshr_rr.grant, 0)),
+            schedule.d.bits.sink.eq(mshr_rr.grant),
         ]
 
         m.d.comb += [
@@ -1775,28 +1863,35 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                       & request.bits.prio[2]):
                 m.d.comb += nest_c.eq(1)
 
-        m.d.comb += request.ready.eq(alloc_mshr)
+        mshr_free = Signal()
+        request_will_alloc = (alloc_mshr & mshr_free)
+
+        m.d.comb += request.ready.eq(request_will_alloc)
 
         m.d.comb += [
-            directory.read.valid.eq(request.valid & alloc_mshr),
+            directory.read.valid.eq(request.valid & request_will_alloc),
             directory.read.bits.set.eq(request.bits.set),
             directory.read.bits.tag.eq(request.bits.tag),
         ]
 
         mshr_write_index = Signal(range(self.n_mshrs))
         for i in reversed(range(self.n_mshrs)):
-            with m.If(~mshrs[i].status.valid):
-                m.d.comb += mshr_write_index.eq(i)
+            with m.If(~mshrs[i].status.valid & prio_filter[i]):
+                m.d.comb += [
+                    mshr_write_index.eq(i),
+                    mshr_free.eq(1),
+                ]
 
         with m.If(request.valid & alloc_mshr):
             with m.Switch(mshr_write_index):
                 for i, mshr in enumerate(mshrs):
                     with m.Case(i):
-                        m.d.comb += [
-                            mshr.allocate.valid.eq(1),
-                            mshr.allocate.bits.eq(request.bits),
-                            mshr.allocate.bits.repeat.eq(0),
-                        ]
+                        with m.If(~mshrs[i].status.valid):
+                            m.d.comb += [
+                                mshr.allocate.valid.eq(1),
+                                mshr.allocate.bits.eq(request.bits),
+                                mshr.allocate.bits.repeat.eq(0),
+                            ]
 
         dir_target = Signal(range(self.n_mshrs))
         m.d.sync += dir_target.eq(mshr_write_index)
@@ -1852,6 +1947,7 @@ class L2Cache(HasL2CacheParams, Peripheral, Elaboratable):
                                    addr_width=32,
                                    size_width=self.in_size_width,
                                    source_id_width=self.in_source_id_width,
+                                   sink_id_width=self.in_sink_id_width,
                                    has_bce=True)
 
         self.out_bus = tl.Interface(data_width=self.beat_bytes * 8,

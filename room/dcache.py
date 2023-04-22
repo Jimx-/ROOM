@@ -875,10 +875,11 @@ class LineBufferWriteReq(HasDCacheParams, Record):
 
 class MSHR(HasDCacheParams, Elaboratable):
 
-    def __init__(self, id, params):
+    def __init__(self, id, params, sink_id_width=1):
         super().__init__(params)
 
         self.id = id
+        self.sink_id_width = sink_id_width
 
         self.mem_acquire = Decoupled(
             tl.ChannelA,
@@ -889,9 +890,10 @@ class MSHR(HasDCacheParams, Elaboratable):
 
         self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.xlen,
-                                   size_width=bits_for(self.lg_block_bytes))
+                                   size_width=bits_for(self.lg_block_bytes),
+                                   sink_id_width=sink_id_width)
 
-        self.mem_finish = Decoupled(tl.ChannelE)
+        self.mem_finish = Decoupled(tl.ChannelE, sink_id_width=sink_id_width)
 
         self.req = MSHRReq(params)
         self.req_is_probe = Signal()
@@ -966,7 +968,7 @@ class MSHR(HasDCacheParams, Elaboratable):
 
         load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
 
-        grantack = Valid(tl.ChannelE)
+        grantack = Valid(tl.ChannelE, sink_id_width=self.sink_id_width)
         grant_had_data = Signal()
         commit_line = Signal()
 
@@ -1352,8 +1354,10 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
 class MSHRFile(HasDCacheParams, Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sink_id_width=1):
         super().__init__(params)
+
+        self.sink_id_width = sink_id_width
 
         self.mem_acquire = Decoupled(
             tl.ChannelA,
@@ -1364,7 +1368,8 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.xlen,
-                                   size_width=bits_for(self.lg_block_bytes))
+                                   size_width=bits_for(self.lg_block_bytes),
+                                   sink_id_width=sink_id_width)
 
         self.mem_access = Decoupled(
             tl.ChannelA,
@@ -1377,7 +1382,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                                  data_width=self.xlen,
                                  size_width=bits_for(self.lg_block_bytes))
 
-        self.mem_finish = Decoupled(tl.ChannelE)
+        self.mem_finish = Decoupled(tl.ChannelE, sink_id_width=sink_id_width)
 
         self.req = [
             Decoupled(MSHRReq, params, name=f'req{i}')
@@ -1496,7 +1501,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
         mem_finish_arbiter = m.submodules.mem_finish_arbiter = tl.Arbiter(
-            tl.ChannelE)
+            tl.ChannelE, sink_id_width=self.sink_id_width)
 
         meta_read_arb = m.submodules.meta_read_arb = Arbiter(
             self.n_mshrs, MetaReadReq, self.params)
@@ -1547,7 +1552,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         mshrs = []
         for i in range(self.n_mshrs):
-            mshr = MSHR(i, self.params)
+            mshr = MSHR(i, self.params, sink_id_width=self.sink_id_width)
             setattr(m.submodules, f'mshr{i}', mshr)
 
             mem_acquire_arbiter.add(mshr.mem_acquire)
@@ -1775,7 +1780,8 @@ class DCache(HasDCacheParams, Elaboratable):
 
         wb = m.submodules.wb = WritebackUnit(self.params)
         prober = m.submodules.prober = ProbeUnit(self.params)
-        mshrs = m.submodules.mshrs = MSHRFile(self.params)
+        mshrs = m.submodules.mshrs = MSHRFile(self.params,
+                                              self.dbus.sink_id_width)
 
         m.d.comb += [
             mshrs.br_update.eq(self.br_update),
@@ -2163,7 +2169,8 @@ class DCache(HasDCacheParams, Elaboratable):
 
         m.d.comb += s2_hit.eq(
             Cat((s2_tag_match[w] & s2_state_is_hit[w]
-                 & (s2_new_hit_state[w] == s2_hit_state[w]))
+                 & (s2_new_hit_state[w] == s2_hit_state[w])
+                 & ~mshrs.block_hit[w])
                 | (s2_type == DCacheReqType.REPLAY)
                 | (s2_type == DCacheReqType.WRITEBACK)
                 for w in range(self.mem_width)))
