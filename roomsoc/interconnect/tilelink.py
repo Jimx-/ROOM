@@ -669,18 +669,8 @@ class CacheCork(Elaboratable):
 
 class Arbiter(Elaboratable):
 
-    def __init__(self, cls, *args, data_width=None, size_width=None, **kwargs):
-        self.data_width = data_width
-        self.size_width = size_width
-
-        if data_width is not None:
-            self.bus = Decoupled(cls,
-                                 data_width=data_width,
-                                 size_width=size_width,
-                                 *args,
-                                 **kwargs)
-        else:
-            self.bus = Decoupled(cls, *args, **kwargs)
+    def __init__(self, cls, *args, **kwargs):
+        self.bus = Decoupled(cls, *args, **kwargs)
 
         self._intrs = []
 
@@ -692,24 +682,18 @@ class Arbiter(Elaboratable):
 
         requests = Signal(len(self._intrs))
         grant = Signal(range(len(self._intrs)))
-        m.d.comb += requests.eq(Cat(intr_bus.valid
-                                    for intr_bus in self._intrs))
+        early_grant = Signal.like(grant)
+        m.d.comb += [
+            requests.eq(Cat(intr_bus.valid for intr_bus in self._intrs)),
+            early_grant.eq(grant),
+        ]
 
-        if self.data_width is not None:
-            beats_left = Signal(2**self.size_width + 1)
-            lg_beat_bytes = log2_int(self.data_width // 8)
+        if hasattr(self.bus.bits, 'size'):
+            beats_left = Signal(2**len(self.bus.bits.size) + 1)
         else:
             beats_left = Signal()
-            lg_beat_bytes = 0
 
         bus_busy = beats_left != 0
-
-        def num_beats(bits):
-            if isinstance(bits, ChannelE):
-                return 1
-            return Mux(Interface.has_data(bits),
-                       ((1 << bits.size) >> lg_beat_bytes) |
-                       (bits.size < lg_beat_bytes), 1)
 
         with m.If(~bus_busy):
             with m.Switch(grant):
@@ -717,33 +701,44 @@ class Arbiter(Elaboratable):
                     with m.Case(i):
                         for pred in reversed(range(i)):
                             with m.If(requests[pred]):
-                                m.d.sync += [
-                                    grant.eq(pred),
-                                    beats_left.eq(
-                                        num_beats(self._intrs[pred].bits)),
-                                ]
+                                m.d.comb += early_grant.eq(pred)
+
+                                with m.If(self.bus.fire):
+                                    m.d.sync += [
+                                        grant.eq(pred),
+                                        beats_left.eq(
+                                            Interface.num_beats0(
+                                                self._intrs[pred].bits)),
+                                    ]
                         for succ in reversed(range(i + 1, len(requests))):
                             with m.If(requests[succ]):
-                                m.d.sync += [
-                                    grant.eq(succ),
-                                    beats_left.eq(
-                                        num_beats(self._intrs[succ].bits)),
-                                ]
+                                m.d.comb += early_grant.eq(succ)
+
+                                with m.If(self.bus.fire):
+                                    m.d.sync += [
+                                        grant.eq(succ),
+                                        beats_left.eq(
+                                            Interface.num_beats0(
+                                                self._intrs[succ].bits)),
+                                    ]
 
                         with m.If(requests[i]):
-                            m.d.sync += beats_left.eq(
-                                num_beats(self._intrs[i].bits))
+                            m.d.comb += early_grant.eq(i)
+
+                            with m.If(self.bus.fire):
+                                m.d.sync += beats_left.eq(
+                                    Interface.num_beats0(self._intrs[i].bits))
 
         with m.If(bus_busy):
             m.d.sync += beats_left.eq(beats_left - self.bus.fire)
 
-            with m.Switch(grant):
-                for i, intr_bus in enumerate(self._intrs):
-                    with m.Case(i):
-                        m.d.comb += [
-                            self.bus.bits.eq(intr_bus.bits),
-                            self.bus.valid.eq(intr_bus.valid),
-                            intr_bus.ready.eq(self.bus.ready),
-                        ]
+        with m.Switch(early_grant):
+            for i, intr_bus in enumerate(self._intrs):
+                with m.Case(i):
+                    m.d.comb += [
+                        self.bus.bits.eq(intr_bus.bits),
+                        self.bus.valid.eq(intr_bus.valid),
+                        intr_bus.ready.eq(self.bus.ready),
+                    ]
 
         return m
