@@ -1797,6 +1797,7 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         m.d.comb += mshr_rr.requests.eq(mshr_request)
 
         schedule = ScheduleRequest(self.params)
+        schedule_req = Signal()
         schedule_tag = Signal(self.tag_bits)
         schedule_set = Signal(self.index_bits)
         with m.Switch(mshr_rr.grant):
@@ -1804,6 +1805,7 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                 with m.Case(i):
                     m.d.comb += [
                         schedule.eq(mshr.schedule.bits),
+                        schedule_req.eq(mshr_request[i]),
                         mshr.schedule.ready.eq(mshr_rr.valid
                                                & mshr_request[i]),
                         schedule_tag.eq(mshr.status.bits.tag),
@@ -1818,17 +1820,23 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         ]
 
         m.d.comb += [
-            source_a.req.valid.eq(schedule.a.valid & mshr_rr.valid),
+            source_a.req.valid.eq(schedule.a.valid & mshr_rr.valid
+                                  & schedule_req),
             source_a.req.bits.eq(schedule.a.bits),
-            source_b.req.valid.eq(schedule.b.valid & mshr_rr.valid),
+            source_b.req.valid.eq(schedule.b.valid & mshr_rr.valid
+                                  & schedule_req),
             source_b.req.bits.eq(schedule.b.bits),
-            source_c.req.valid.eq(schedule.c.valid & mshr_rr.valid),
+            source_c.req.valid.eq(schedule.c.valid & mshr_rr.valid
+                                  & schedule_req),
             source_c.req.bits.eq(schedule.c.bits),
-            source_d.req.valid.eq(schedule.d.valid & mshr_rr.valid),
+            source_d.req.valid.eq(schedule.d.valid & mshr_rr.valid
+                                  & schedule_req),
             source_d.req.bits.eq(schedule.d.bits),
-            source_e.req.valid.eq(schedule.e.valid & mshr_rr.valid),
+            source_e.req.valid.eq(schedule.e.valid & mshr_rr.valid
+                                  & schedule_req),
             source_e.req.bits.eq(schedule.e.bits),
-            directory.write.valid.eq(schedule.dir.valid & mshr_rr.valid),
+            directory.write.valid.eq(schedule.dir.valid & mshr_rr.valid
+                                     & schedule_req),
             directory.write.bits.eq(schedule.dir.bits),
         ]
 
