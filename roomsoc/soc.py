@@ -3,7 +3,7 @@ from amaranth.utils import log2_int
 from amaranth_soc.memory import MemoryMap
 
 from roomsoc.peripheral import Peripheral
-from roomsoc.interconnect import wishbone, axi, ahb, tilelink
+from roomsoc.interconnect import wishbone, axi, ahb, apb, tilelink
 
 
 class SoCRegion:
@@ -130,6 +130,7 @@ class BusHelper(Elaboratable):
                 'axi-lite': axi.AXILiteInterface,
                 'ahb': ahb.Interface,
                 'tilelink': tilelink.Interface,
+                'apb': apb.Interface,
             }[self.standard]
 
             if isinstance(interface, main_bus_cls):
@@ -150,6 +151,8 @@ class BusHelper(Elaboratable):
                 axi.AXILite2Wishbone,
                 (ahb.Interface, wishbone.Interface):
                 ahb.AHB2Wishbone,
+                (apb.Interface, wishbone.Interface):
+                apb.APB2Wishbone,
                 (tilelink.Interface, wishbone.Interface):
                 tilelink.TileLink2Wishbone,
             }[type(master), type(slave)]
@@ -192,6 +195,7 @@ class BusHelper(Elaboratable):
             wishbone.Interface: "Wishbone",
             axi.AXILiteInterface: "AXI-Lite",
             ahb.Interface: 'AHB',
+            apb.Interface: 'APB',
             tilelink.Interface: 'TileLink',
         }
         print(
