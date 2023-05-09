@@ -56,12 +56,13 @@ def make_axi_lite_layout(data_width=32, addr_width=32):
 
 class AXILiteInterface(Record):
 
-    def __init__(self, data_width=32, addr_width=32, name=None):
+    def __init__(self, data_width=32, addr_width=32, name=None, src_loc_at=1):
         self.addr_width = addr_width
         self.data_width = data_width
         super().__init__(make_axi_lite_layout(data_width=data_width,
                                               addr_width=addr_width),
-                         name=name)
+                         name=name,
+                         src_loc_at=src_loc_at)
 
     def write(self, addr, data, strb=None):
         if strb is None:
@@ -192,5 +193,94 @@ class AXILite2Wishbone(Elaboratable):
 
                 with m.If(axil.b.ready):
                     m.next = 'IDLE'
+
+        return m
+
+
+class Wishbone2AXILite(Elaboratable):
+
+    def __init__(self, wishbone, axi_lite, base_addr=0x00000000):
+        self.base_addr = base_addr
+
+        self.wishbone = wishbone
+        self.axi_lite = axi_lite
+
+    def elaborate(self, platform):
+        m = Module()
+
+        wb = self.wishbone
+        axil = self.axi_lite
+
+        wb_adr_shift = log2_int(axil.data_width // 8)
+
+        cmd_done = Signal()
+        data_done = Signal()
+
+        addr = Signal(axil.addr_width)
+        m.d.comb += addr.eq((wb.adr << wb_adr_shift) - self.base_addr)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.sync += [
+                    cmd_done.eq(0),
+                    data_done.eq(0),
+                ]
+
+                with m.If(wb.stb & wb.cyc):
+                    with m.If(wb.we):
+                        m.next = 'WRITE'
+                    with m.Else():
+                        m.next = 'READ'
+
+            with m.State('WRITE'):
+                m.d.comb += [
+                    axil.aw.valid.eq(~cmd_done),
+                    axil.aw.addr.eq(addr),
+                ]
+                with m.If(axil.aw.valid & axil.aw.ready):
+                    m.d.sync += cmd_done.eq(1)
+
+                m.d.comb += [
+                    axil.w.valid.eq(~data_done),
+                    axil.w.data.eq(wb.dat_w),
+                    axil.w.strb.eq(wb.sel),
+                ]
+                with m.If(axil.w.valid & axil.w.ready):
+                    m.d.sync += data_done.eq(1)
+
+                m.d.comb += axil.b.ready.eq(cmd_done & data_done)
+                with m.If(axil.b.valid & axil.b.ready):
+                    with m.If(axil.b.resp == 0):
+                        m.d.comb += wb.ack.eq(1)
+                        m.next = 'IDLE'
+                    with m.Else():
+                        m.next = 'ERROR'
+
+            with m.State('READ'):
+                m.d.comb += [
+                    axil.ar.valid.eq(~cmd_done),
+                    axil.ar.addr.eq(addr),
+                ]
+                with m.If(axil.ar.valid & axil.ar.ready):
+                    m.d.sync += cmd_done.eq(1)
+
+                m.d.comb += axil.r.ready.eq(cmd_done)
+                with m.If(axil.r.valid & axil.r.ready):
+                    with m.If(axil.r.resp == 0):
+                        m.d.comb += [
+                            wb.dat_r.eq(axil.r.data),
+                            wb.ack.eq(1),
+                        ]
+                        m.next = 'IDLE'
+                    with m.Else():
+                        m.next = 'ERROR'
+
+            with m.State('ERROR'):
+                m.d.comb += wb.ack.eq(1)
+
+                if hasattr(wb, 'err'):
+                    m.d.comb += wb.err.eq(1)
+
+                m.next = 'IDLE'
 
         return m
