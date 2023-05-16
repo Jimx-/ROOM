@@ -4,7 +4,7 @@
 #include "spdlog/cfg/env.h"
 #include "spdlog/spdlog.h"
 
-using cxxopts::OptionException;
+#include <iostream>
 
 cxxopts::ParseResult parse_arguments(int argc, char* argv[])
 {
@@ -30,7 +30,7 @@ cxxopts::ParseResult parse_arguments(int argc, char* argv[])
         }
 
         return result;
-    } catch (const OptionException& e) {
+    } catch (const cxxopts::exceptions::exception& e) {
         spdlog::error("Failed to parse arguments: {}", e.what());
         exit(EXIT_FAILURE);
     }
@@ -52,7 +52,7 @@ int main(int argc, char* argv[])
         memory_addr = options["memory-addr"].as<uint64_t>();
         memory_size_mb = options["memory-size"].as<unsigned int>();
         bootrom = options["bootrom"].as<std::string>();
-    } catch (const OptionException& e) {
+    } catch (const cxxopts::exceptions::exception& e) {
         spdlog::error("Failed to parse options: {}", e.what());
         exit(EXIT_FAILURE);
     }

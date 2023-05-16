@@ -31,8 +31,8 @@ set(VL_FLAGS -O2 --language 1800-2009 --assert -Wall -Wpedantic
              -Wno-CMPCONST -Wno-UNOPTFLAT -Wno-UNSIGNED
              --x-initial unique --x-assign unique)
 
-set(LIBRARIES CONAN_PKG::spdlog
-              CONAN_PKG::cxxopts)
+set(LIBRARIES spdlog::spdlog
+              cxxopts::cxxopts)
 
 if (USE_TRACE)
    add_definitions(-DVCD_OUTPUT)

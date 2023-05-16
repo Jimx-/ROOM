@@ -3,5 +3,6 @@ spdlog/[>=1.4.1]
 cxxopts/[>=2.2.0]
 
 [generators]
-cmake
+CMakeDeps
+CMakeToolchain
 

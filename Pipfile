@@ -4,7 +4,7 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-amaranth = "*"
+amaranth = {git = "https://github.com/amaranth-lang/amaranth.git"}
 riscv-model = "*"
 amaranth-soc = {editable = true, git = "https://github.com/amaranth-lang/amaranth-soc"}
 amaranth-stdio = {editable = true, git = "https://github.com/amaranth-lang/amaranth-stdio"}
@@ -16,4 +16,4 @@ pytest = "*"
 rich = "*"
 
 [requires]
-python_version = "3.10"
+python_version = "3.11"

@@ -12,6 +12,7 @@ sim_build
 # Generated files
 build
 include/generated/
+CMakeUserPresets.json
 
 # Object files
 *.o

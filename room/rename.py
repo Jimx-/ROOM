@@ -164,7 +164,7 @@ class Freelist(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        free_list = Signal(self.num_pregs, reset=~1)
+        free_list = Signal(self.num_pregs, reset=2**self.num_pregs - 2)
 
         br_alloc_lists = Array(
             Signal(self.num_pregs, name=f'br_alloc_list{i}')
