@@ -1,0 +1,549 @@
+from amaranth import *
+from amaranth.hdl.rec import *
+from amaranth.lib.cdc import FFSynchronizer
+
+from room.utils import Decoupled
+
+from .peripheral import Peripheral
+
+H_BITS = 12
+V_BITS = 12
+
+video_timings = {
+    "1024x600@60Hz": {
+        "pix_clk": 49e6,
+        "h_active": 1024,
+        "h_blanking": 288,
+        "h_sync_offset": 40,
+        "h_sync_width": 104,
+        "v_active": 600,
+        "v_blanking": 24,
+        "v_sync_offset": 3,
+        "v_sync_width": 10,
+    },
+    "1920x1080@60Hz": {
+        "pix_clk": 148.5e6,
+        "h_active": 1920,
+        "h_blanking": 280,
+        "h_sync_offset": 88,
+        "h_sync_width": 44,
+        "v_active": 1080,
+        "v_blanking": 45,
+        "v_sync_offset": 4,
+        "v_sync_width": 5,
+    },
+}
+
+video_timing_layout = [
+    ("hsync", 1, DIR_FANOUT),
+    ("vsync", 1, DIR_FANOUT),
+    ("de", 1, DIR_FANOUT),
+    ("hres", H_BITS, DIR_FANOUT),
+    ("vres", V_BITS, DIR_FANOUT),
+    ("hcount", H_BITS, DIR_FANOUT),
+    ("vcount", V_BITS, DIR_FANOUT),
+]
+
+video_data_layout = [
+    ("hsync", 1, DIR_FANOUT),
+    ("vsync", 1, DIR_FANOUT),
+    ("de", 1, DIR_FANOUT),
+    ("r", 8, DIR_FANOUT),
+    ("g", 8, DIR_FANOUT),
+    ("b", 8, DIR_FANOUT),
+]
+
+_dvi_c2d = {'r': 2, 'g': 1, 'b': 0}
+
+
+class TMDSEncoder(Elaboratable):
+
+    CONTROL_TOKENS = [0b1101010100, 0b0010101011, 0b0101010100, 0b1010101011]
+
+    def __init__(self):
+        self.d = Signal(8)
+        self.c = Signal(2)
+        self.de = Signal()
+
+        self.out = Signal(10)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        def sum_bits(d):
+            acc = 0
+            for i in range(len(d)):
+                acc += d[i]
+            return acc
+
+        d = Signal(8)
+        n1d = Signal(range(9))
+        m.d.sync += [
+            n1d.eq(sum_bits(self.d)),
+            d.eq(self.d),
+        ]
+
+        q_m = Signal(9)
+        q_m8_n = Signal()
+        m.d.comb += q_m8_n.eq((n1d > 4) | ((n1d == 4) & ~d[0]))
+
+        for i in range(8):
+            if i:
+                curval = curval ^ d[i] ^ q_m8_n
+            else:
+                curval = d[0]
+            m.d.sync += q_m[i].eq(curval)
+
+        m.d.sync += q_m[8].eq(~q_m8_n)
+
+        q_m_r = Signal(9)
+        n0q_m = Signal(range(9))
+        n1q_m = Signal(range(9))
+        m.d.sync += [
+            n0q_m.eq(sum_bits(~q_m[:8])),
+            n1q_m.eq(sum_bits(q_m[:8])),
+            q_m_r.eq(q_m),
+        ]
+
+        cnt = Signal(signed(6))
+
+        s_c = self.c
+        s_de = self.de
+        for _ in range(3):
+            new_c = Signal(2)
+            new_de = Signal()
+            m.d.sync += [
+                new_c.eq(s_c),
+                new_de.eq(s_de),
+            ]
+            s_c, s_de = new_c, new_de
+
+        with m.If(s_de):
+            with m.If((cnt == 0) | (n1q_m == n0q_m)):
+                m.d.sync += [
+                    self.out[9].eq(~q_m_r[8]),
+                    self.out[8].eq(q_m_r[8]),
+                ]
+
+                with m.If(q_m_r[8]):
+                    m.d.sync += [
+                        self.out[:8].eq(q_m_r[:8]),
+                        cnt.eq(cnt + n1q_m - n0q_m),
+                    ]
+                with m.Else():
+                    m.d.sync += [
+                        self.out[:8].eq(~q_m_r[:8]),
+                        cnt.eq(cnt + n0q_m - n1q_m),
+                    ]
+            with m.Else():
+                with m.If((~cnt[5] & (n1q_m > n0q_m))
+                          | (cnt[5] & (n0q_m > n1q_m))):
+                    m.d.sync += [
+                        self.out[9].eq(1),
+                        self.out[8].eq(q_m_r[8]),
+                        self.out[:8].eq(~q_m_r[:8]),
+                        cnt.eq(cnt + Cat(0, q_m_r[8]) + n0q_m - n1q_m),
+                    ]
+                with m.Else():
+                    m.d.sync += [
+                        self.out[9].eq(0),
+                        self.out[8].eq(q_m_r[8]),
+                        self.out[:8].eq(q_m_r[:8]),
+                        cnt.eq(cnt - Cat(0, ~q_m_r[8]) + n1q_m - n0q_m),
+                    ]
+        with m.Else():
+            with m.Switch(s_c):
+                for i, token in enumerate(self.CONTROL_TOKENS):
+                    with m.Case(i):
+                        m.d.sync += [
+                            self.out.eq(token),
+                            cnt.eq(0),
+                        ]
+
+        return m
+
+
+class VideoTimingGenerator(Peripheral, Elaboratable):
+
+    def __init__(self,
+                 *,
+                 name=None,
+                 clock_domain="sync",
+                 default_video_timings="1920x1080@60Hz"):
+        super().__init__(name=name)
+
+        self.clock_domain = clock_domain
+
+        if isinstance(default_video_timings, str):
+            try:
+                self.video_timings = video_timings[default_video_timings]
+            except KeyError:
+                msg = [
+                    f"Video Timings {default_video_timings} not supported, availables:"
+                ]
+                for video_timing in video_timings.keys():
+                    msg.append(
+                        f" - {video_timing} / {video_timings[video_timing]['pix_clk']/1e6:3.2f}MHz."
+                    )
+                raise ValueError("\n".join(msg))
+        else:
+            self.video_timings = default_video_timings
+
+        bank = self.csr_bank()
+        self._enable = bank.csr(1, 'rw')
+
+        self._hres = bank.csr(H_BITS, 'rw')
+        self._hsync_start = bank.csr(H_BITS, 'rw')
+        self._hsync_end = bank.csr(H_BITS, 'rw')
+        self._hscan = bank.csr(H_BITS, 'rw')
+
+        self._vres = bank.csr(V_BITS, 'rw')
+        self._vsync_start = bank.csr(V_BITS, 'rw')
+        self._vsync_end = bank.csr(V_BITS, 'rw')
+        self._vscan = bank.csr(V_BITS, 'rw')
+
+        self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
+        self.bus = self._bridge.bus
+
+        self.source = Decoupled(Record, video_timing_layout)
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.bridge = self._bridge
+
+        _enable = Signal(reset=1)
+
+        _hres = Signal(H_BITS, reset=self.video_timings["h_active"])
+        _hsync_start = Signal(H_BITS,
+                              reset=self.video_timings["h_active"] +
+                              self.video_timings["h_sync_offset"])
+        _hsync_end = Signal(H_BITS,
+                            reset=self.video_timings["h_active"] +
+                            self.video_timings["h_sync_offset"] +
+                            self.video_timings["h_sync_width"])
+        _hscan = Signal(H_BITS,
+                        reset=self.video_timings["h_active"] +
+                        self.video_timings["h_blanking"] - 1)
+
+        _vres = Signal(V_BITS, reset=self.video_timings["v_active"])
+        _vsync_start = Signal(V_BITS,
+                              reset=self.video_timings["v_active"] +
+                              self.video_timings["v_sync_offset"])
+        _vsync_end = Signal(V_BITS,
+                            reset=self.video_timings["v_active"] +
+                            self.video_timings["v_sync_offset"] +
+                            self.video_timings["v_sync_width"])
+        _vscan = Signal(V_BITS,
+                        reset=self.video_timings["v_active"] +
+                        self.video_timings["v_blanking"] - 1)
+
+        m.d.comb += [
+            self._enable.r_data.eq(_enable),
+            self._hres.r_data.eq(_hres),
+            self._hsync_start.r_data.eq(_hsync_start),
+            self._hsync_end.r_data.eq(_hsync_end),
+            self._hscan.r_data.eq(_hscan),
+            self._vres.r_data.eq(_vres),
+            self._vsync_start.r_data.eq(_vsync_start),
+            self._vsync_end.r_data.eq(_vsync_end),
+            self._vscan.r_data.eq(_vscan),
+        ]
+
+        with m.If(self._enable.w_stb):
+            m.d.sync += _enable.eq(self._enable.w_data)
+
+        with m.If(self._hres.w_stb):
+            m.d.sync += _hres.eq(self._hres.w_data)
+        with m.If(self._hsync_start.w_stb):
+            m.d.sync += _hsync_start.eq(self._hsync_start.w_data)
+        with m.If(self._hsync_end.w_stb):
+            m.d.sync += _hsync_end.eq(self._hsync_end.w_data)
+        with m.If(self._hscan.w_stb):
+            m.d.sync += _hscan.eq(self._hscan.w_data)
+
+        with m.If(self._vres.w_stb):
+            m.d.sync += _vres.eq(self._vres.w_data)
+        with m.If(self._vsync_start.w_stb):
+            m.d.sync += _vsync_start.eq(self._vsync_start.w_data)
+        with m.If(self._vsync_end.w_stb):
+            m.d.sync += _vsync_end.eq(self._vsync_end.w_data)
+        with m.If(self._vscan.w_stb):
+            m.d.sync += _vscan.eq(self._vscan.w_data)
+
+        if self.clock_domain == 'sync':
+            enable = _enable
+            hres = _hres
+            hsync_start = _hsync_start
+            hsync_end = _hsync_end
+            hscan = _hscan
+            vres = _vres
+            vsync_start = _vsync_start
+            vsync_end = _vsync_end
+            vscan = _vscan
+        else:
+            enable = Signal()
+
+            hres = Signal.like(_hres)
+            hsync_start = Signal.like(_hsync_start)
+            hsync_end = Signal.like(_hsync_end)
+            hscan = Signal.like(_hscan)
+
+            vres = Signal.like(_vres)
+            vsync_start = Signal.like(_vsync_start)
+            vsync_end = Signal.like(_vsync_end)
+            vscan = Signal.like(_vscan)
+
+            m.submodules += FFSynchronizer(_enable,
+                                           enable,
+                                           o_domain=self.clock_domain)
+
+            m.submodules += FFSynchronizer(_hres,
+                                           hres,
+                                           o_domain=self.clock_domain)
+            m.submodules += FFSynchronizer(_hsync_start,
+                                           hsync_start,
+                                           o_domain=self.clock_domain)
+            m.submodules += FFSynchronizer(_hsync_end,
+                                           hsync_end,
+                                           o_domain=self.clock_domain)
+            m.submodules += FFSynchronizer(_hscan,
+                                           hscan,
+                                           o_domain=self.clock_domain)
+
+            m.submodules += FFSynchronizer(_vres,
+                                           vres,
+                                           o_domain=self.clock_domain)
+            m.submodules += FFSynchronizer(_vsync_start,
+                                           vsync_start,
+                                           o_domain=self.clock_domain)
+            m.submodules += FFSynchronizer(_vsync_end,
+                                           vsync_end,
+                                           o_domain=self.clock_domain)
+            m.submodules += FFSynchronizer(_vscan,
+                                           vscan,
+                                           o_domain=self.clock_domain)
+
+        hactive = Signal()
+        vactive = Signal()
+        m.d.comb += self.source.bits.de.eq(hactive & vactive)
+
+        with m.FSM(domain=self.clock_domain):
+            with m.State('IDLE'):
+                m.d.sync += [
+                    hactive.eq(0),
+                    vactive.eq(0),
+                    self.source.bits.hres.eq(hres),
+                    self.source.bits.vres.eq(vres),
+                    self.source.bits.hcount.eq(0),
+                    self.source.bits.vcount.eq(0),
+                ]
+
+                with m.If(enable):
+                    m.next = 'RUN'
+
+            with m.State('RUN'):
+                with m.If(~enable):
+                    m.next = 'IDLE'
+                with m.Else():
+                    m.d.comb += self.source.valid.eq(1)
+
+                    with m.If(self.source.ready):
+                        m.d.sync += self.source.bits.hcount.eq(
+                            self.source.bits.hcount + 1)
+
+                        with m.If(self.source.bits.hcount == 0):
+                            m.d.sync += hactive.eq(1)
+                        with m.If(self.source.bits.hcount == hres):
+                            m.d.sync += hactive.eq(0)
+                        with m.If(self.source.bits.hcount == hsync_start):
+                            m.d.sync += self.source.bits.hsync.eq(1)
+                        with m.If(self.source.bits.hcount == hsync_end):
+                            m.d.sync += self.source.bits.hsync.eq(0)
+                        with m.If(self.source.bits.hcount == hscan):
+                            m.d.sync += self.source.bits.hcount.eq(0)
+
+                        with m.If(self.source.bits.hcount == hsync_start):
+                            m.d.sync += self.source.bits.vcount.eq(
+                                self.source.bits.vcount + 1)
+
+                            with m.If(self.source.bits.vcount == 0):
+                                m.d.sync += vactive.eq(1)
+                            with m.If(self.source.bits.vcount == vres):
+                                m.d.sync += vactive.eq(0)
+                            with m.If(self.source.bits.vcount == vsync_start):
+                                m.d.sync += self.source.bits.vsync.eq(1)
+                            with m.If(self.source.bits.vcount == vsync_end):
+                                m.d.sync += self.source.bits.vsync.eq(0)
+                            with m.If(self.source.bits.vcount == vscan):
+                                m.d.sync += self.source.bits.vcount.eq(0)
+
+        return m
+
+
+class ColorBarsPattern(Elaboratable):
+
+    def __init__(self):
+        self.vtg = Decoupled(Record, video_timing_layout)
+        self.source = Decoupled(Record, video_data_layout)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        pix = Signal(H_BITS)
+        bar = Signal(3)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.comb += self.vtg.ready.eq(1)
+
+                m.d.sync += [
+                    pix.eq(0),
+                    bar.eq(0),
+                ]
+
+                with m.If(self.vtg.valid & (self.vtg.bits.hcount == 0)
+                          & (self.vtg.bits.vcount == 0)):
+                    m.d.comb += self.vtg.ready.eq(0)
+                    m.next = 'RUN'
+
+            with m.State('RUN'):
+                m.d.comb += [
+                    self.source.bits.de.eq(self.vtg.bits.de),
+                    self.source.bits.hsync.eq(self.vtg.bits.hsync),
+                    self.source.bits.vsync.eq(self.vtg.bits.vsync),
+                    self.source.valid.eq(self.vtg.valid),
+                    self.vtg.ready.eq(self.source.ready),
+                ]
+
+                with m.If(self.source.fire & self.source.bits.de):
+                    m.d.sync += pix.eq(pix + 1)
+                    with m.If(pix == (self.vtg.bits.hres[3:] - 1)):
+                        m.d.sync += [
+                            pix.eq(0),
+                            bar.eq(bar + 1),
+                        ]
+                with m.Else():
+                    m.d.sync += [
+                        pix.eq(0),
+                        bar.eq(0),
+                    ]
+
+        color_bar = [
+            [0xff, 0xff, 0xff],
+            [0xff, 0xff, 0x00],
+            [0x00, 0xff, 0xff],
+            [0x00, 0xff, 0x00],
+            [0xff, 0x00, 0xff],
+            [0xff, 0x00, 0x00],
+            [0x00, 0x00, 0xff],
+            [0x00, 0x00, 0x00],
+        ]
+
+        with m.Switch(bar):
+            for i, (r, g, b) in enumerate(color_bar):
+                with m.Case(i):
+                    m.d.comb += [
+                        self.source.bits.r.eq(r),
+                        self.source.bits.g.eq(g),
+                        self.source.bits.b.eq(b),
+                    ]
+
+        return m
+
+
+class VideoS7HDMI10to1Serializer(Elaboratable):
+
+    def __init__(self, clock_domain):
+        self.clock_domain = clock_domain
+
+        self.i = Signal(10)
+        self.o = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        data_m = Signal(8)
+        data_s = Signal(8)
+        m.d.comb += data_m[0:8].eq(self.i[:8])
+        m.d.comb += data_s[2:4].eq(self.i[8:])
+
+        shift = Signal(2)
+        for data, serdes in zip([data_m, data_s], ["master", "slave"]):
+            param_dict = dict(
+                p_DATA_WIDTH=10,
+                p_TRISTATE_WIDTH=1,
+                p_DATA_RATE_OQ="DDR",
+                p_DATA_RATE_TQ="DDR",
+                p_SERDES_MODE=serdes.upper(),
+                i_OCE=1,
+                i_TCE=0,
+                i_RST=ResetSignal(self.clock_domain),
+                i_CLK=ClockSignal(self.clock_domain + "5x"),
+                i_CLKDIV=ClockSignal(self.clock_domain),
+                **{f"i_D{n+1}": data[n]
+                   for n in range(8)},
+                i_SHIFTIN1=shift[0] if serdes == "master" else 0,
+                i_SHIFTIN2=shift[1] if serdes == "master" else 0,
+            )
+
+            if serdes == "master":
+                param_dict['o_OQ'] = self.o
+            else:
+                param_dict['o_SHIFTOUT1'] = shift[0]
+                param_dict['o_SHIFTOUT2'] = shift[1]
+
+            m.submodules += Instance(
+                "OSERDESE2",
+                **param_dict,
+            )
+
+        return m
+
+
+class VideoS7HDMIPHY(Elaboratable):
+
+    def __init__(self, clock_domain='sync'):
+        self.clock_domain = clock_domain
+
+        self.sink = Decoupled(Record, video_data_layout)
+
+        self.tmds_clk_p = Signal()
+        self.tmds_clk_n = Signal()
+        self.tmds_data_p = Signal(3)
+        self.tmds_data_n = Signal(3)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += self.sink.ready.eq(1)
+
+        clk_serializer = m.submodules.clk_serializer = VideoS7HDMI10to1Serializer(
+            self.clock_domain)
+        m.d.comb += clk_serializer.i.eq(0b0000011111)
+        m.submodules += Instance("OBUFDS",
+                                 i_I=clk_serializer.o,
+                                 o_O=self.tmds_clk_p,
+                                 o_OB=self.tmds_clk_n)
+
+        for color, channel in _dvi_c2d.items():
+            enc = DomainRenamer(self.clock_domain)(TMDSEncoder())
+            setattr(m.submodules, f'encoder_{color}', enc)
+
+            m.d.comb += [
+                enc.d.eq(getattr(self.sink.bits, color)),
+                enc.c.eq(
+                    Cat(self.sink.bits.hsync, self.sink.bits.vsync
+                        ) if channel == 0 else 0),
+                enc.de.eq(self.sink.bits.de),
+            ]
+
+            serializer = VideoS7HDMI10to1Serializer(self.clock_domain)
+            setattr(m.submodules, f'serializer_{color}', serializer)
+
+            m.d.comb += serializer.i.eq(enc.out)
+            m.submodules += Instance("OBUFDS",
+                                     i_I=serializer.o,
+                                     o_O=self.tmds_data_p[channel],
+                                     o_OB=self.tmds_data_n[channel])
+
+        return m
