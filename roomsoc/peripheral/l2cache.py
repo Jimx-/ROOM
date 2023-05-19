@@ -446,22 +446,43 @@ class SourceA(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        a = self.a
+        a = tl.ChannelA(addr_width=32,
+                        data_width=self.beat_bytes * 8,
+                        size_width=bits_for(self.lg_block_bytes),
+                        source_id_width=self.out_source_id_width)
 
         m.d.comb += [
-            self.req.ready.eq(a.ready),
-            a.valid.eq(self.req.valid),
-            a.bits.opcode.eq(
+            a.opcode.eq(
                 Mux(self.req.bits.block, tl.ChannelAOpcode.AcquireBlock,
                     tl.ChannelAOpcode.AcquirePerm)),
-            a.bits.param.eq(self.req.bits.param),
-            a.bits.size.eq(self.offset_bits),
-            a.bits.source.eq(self.req.bits.source),
-            a.bits.address.eq(
+            a.param.eq(self.req.bits.param),
+            a.size.eq(self.offset_bits),
+            a.source.eq(self.req.bits.source),
+            a.address.eq(
                 self.make_addr(self.req.bits.tag, self.req.bits.set,
                                Const(0, self.offset_bits))),
-            a.bits.mask.eq(~0),
+            a.mask.eq(~0),
         ]
+
+        queue = m.submodules.queue = SyncFIFO(depth=1, width=len(a))
+        m.d.comb += [
+            queue.w_data.eq(a),
+            queue.w_en.eq(self.req.valid),
+            self.req.ready.eq(queue.w_rdy),
+            self.a.bits.eq(queue.r_data),
+            self.a.valid.eq(queue.r_rdy),
+            queue.r_en.eq(self.a.ready),
+        ]
+
+        with m.If(self.req.valid):
+            m.d.comb += self.a.valid.eq(1)
+        with m.If(queue.w_rdy):
+            m.d.comb += [
+                self.a.bits.eq(a),
+                queue.r_en.eq(0),
+            ]
+            with m.If(self.a.ready):
+                m.d.comb += queue.w_en.eq(0)
 
         return m
 
@@ -990,13 +1011,31 @@ class SourceE(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        e = self.e
+        e = tl.ChannelE()
 
         m.d.comb += [
-            self.req.ready.eq(e.ready),
-            e.valid.eq(self.req.valid),
-            e.bits.sink.eq(self.req.bits.sink),
+            e.sink.eq(self.req.bits.sink),
         ]
+
+        queue = m.submodules.queue = SyncFIFO(depth=1, width=len(e))
+        m.d.comb += [
+            queue.w_data.eq(e),
+            queue.w_en.eq(self.req.valid),
+            self.req.ready.eq(queue.w_rdy),
+            self.e.bits.eq(queue.r_data),
+            self.e.valid.eq(queue.r_rdy),
+            queue.r_en.eq(self.e.ready),
+        ]
+
+        with m.If(self.req.valid):
+            m.d.comb += self.e.valid.eq(1)
+        with m.If(queue.w_rdy):
+            m.d.comb += [
+                self.e.bits.eq(e),
+                queue.r_en.eq(0),
+            ]
+            with m.If(self.e.ready):
+                m.d.comb += queue.w_en.eq(0)
 
         return m
 
