@@ -5,7 +5,7 @@ from room.consts import *
 from room.core import Core, CoreDebug
 
 from roomsoc.soc import SoC
-from roomsoc.interconnect import axi
+from roomsoc.interconnect import axi, tilelink as tl
 from roomsoc.peripheral.l2cache import L2Cache
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.sdc import MockSDController
@@ -160,9 +160,51 @@ class Top(Elaboratable):
         soc.add_peripheral('dm', debug_module)
 
         if l2cache_params is not None:
+            l2c_in_bus = tl.Interface(data_width=core.xlen,
+                                      addr_width=32,
+                                      size_width=3,
+                                      source_id_width=4,
+                                      sink_id_width=4,
+                                      has_bce=True)
+
+            mmio_bus = tl.Interface(data_width=core.xlen,
+                                    addr_width=32,
+                                    size_width=3,
+                                    source_id_width=4,
+                                    sink_id_width=4,
+                                    has_bce=True)
+
+            mmio_valid = Signal()
+            for origin, size in core.io_regions.items():
+                with m.If((core.core_bus.a.bits.address >= origin)
+                          & (core.core_bus.a.bits.address < (origin + size))):
+                    m.d.comb += mmio_valid.eq(1)
+
+            m.d.comb += [
+                core.core_bus.connect(mmio_bus),
+                core.core_bus.connect(l2c_in_bus),
+                l2c_in_bus.a.valid.eq(core.core_bus.a.valid & ~mmio_valid),
+                mmio_bus.a.valid.eq(core.core_bus.a.valid & mmio_valid),
+                core.core_bus.a.ready.eq(
+                    Mux(mmio_valid, mmio_bus.a.ready, l2c_in_bus.a.ready)),
+                core.core_bus.d.valid.eq(l2c_in_bus.d.valid
+                                         | mmio_bus.d.valid),
+                mmio_bus.d.ready.eq(core.core_bus.d.ready),
+                l2c_in_bus.d.ready.eq(core.core_bus.d.ready
+                                      & ~mmio_bus.d.valid),
+                mmio_bus.c.valid.eq(0),
+                mmio_bus.e.valid.eq(0),
+            ]
+
+            with m.If(mmio_bus.d.valid):
+                m.d.comb += core.core_bus.d.bits.eq(mmio_bus.d.bits)
+            with m.Else():
+                m.d.comb += core.core_bus.d.bits.eq(l2c_in_bus.d.bits)
+
             l2cache = L2Cache(l2cache_params)
-            m.d.comb += core.core_bus.connect(l2cache.in_bus)
+            m.d.comb += l2c_in_bus.connect(l2cache.in_bus)
             soc.bus.add_master(name='l2c_dbus', master=l2cache.out_bus)
+            soc.bus.add_master(name='cpu_mmio_bus', master=mmio_bus)
             soc.add_peripheral('l2cache', l2cache)
         else:
             soc.bus.add_master(name='cpu_ibus', master=core.ibus)
