@@ -95,6 +95,7 @@ class HasDCacheParams(HasCoreParams):
         dcache_params = params['dcache_params']
         self.n_sets = dcache_params['n_sets']
         self.n_ways = dcache_params['n_ways']
+        self.n_banks = dcache_params['n_banks']
         self.block_bytes = dcache_params['block_bytes']
         self.lg_block_bytes = log2_int(self.block_bytes)
 
@@ -114,7 +115,6 @@ class HasDCacheParams(HasCoreParams):
         self.n_iomshrs = dcache_params['n_iomshrs']
         self.sdq_size = dcache_params['sdq_size']
         self.rpq_size = dcache_params['rpq_size']
-        self.n_data_banks = dcache_params['n_data_banks']
 
     def addr_block_offset(self, addr):
         return addr[:self.block_off_bits]
@@ -384,6 +384,23 @@ class MetaWriteReq(HasDCacheParams, Record):
                         src_loc_at=1 + src_loc_at)
 
 
+class L1MetaReadReq(HasDCacheParams):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.req = [
+            MetaReadReq(self.params, name=f'{name}_req{i}')
+            for i in range(self.mem_width)
+        ]
+
+    def eq(self, rhs):
+        return [a.eq(b) for a, b in zip(self.req, rhs.req)]
+
+
 class MetadataArray(HasDCacheParams, Elaboratable):
 
     def __init__(self, params):
@@ -464,6 +481,44 @@ class DataWriteReq(HasDCacheParams, Record):
                         src_loc_at=1 + src_loc_at)
 
 
+class L1DataReadReq(HasDCacheParams):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.req = [
+            DataReadReq(self.params, name=f'{name}_req{i}')
+            for i in range(self.mem_width)
+        ]
+        self.valid = Signal(self.mem_width, name=f'{name}_valid')
+
+    def eq(self, rhs):
+        return [a.eq(b) for a, b in zip(self.req, rhs.req)
+                ] + [self.valid.eq(rhs.valid)]
+
+
+class L1DataWriteReq(HasDCacheParams):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.req = [
+            DataWriteReq(self.params, name=f'{name}_req{i}')
+            for i in range(self.mem_width)
+        ]
+        self.valid = Signal(self.mem_width, name=f'{name}_valid')
+
+    def eq(self, rhs):
+        return [a.eq(b) for a, b in zip(self.req, rhs.req)
+                ] + [self.valid.eq(rhs.valid)]
+
+
 class BaseDataArray(HasDCacheParams, Elaboratable):
 
     def __init__(self, params):
@@ -473,7 +528,10 @@ class BaseDataArray(HasDCacheParams, Elaboratable):
             Valid(DataReadReq, self.params, name=f'read{i}')
             for i in range(self.mem_width)
         ]
-        self.write = Valid(DataWriteReq, self.params)
+        self.write = [
+            Valid(DataWriteReq, self.params, name=f'write{i}')
+            for i in range(self.mem_width)
+        ]
 
         self.resp = [[
             Signal(self.row_bits, name=f'resp{i}_way{w}')
@@ -510,13 +568,14 @@ class DuplicatedDataArray(BaseDataArray):
                 mem_write = mem.write_port()
                 setattr(m.submodules, f'mem_write{i}_{w}', mem_write)
 
-                m.d.comb += [
-                    mem_write.addr.eq(
-                        self.write.bits.addr >> self.row_off_bits),
-                    mem_write.data.eq(self.write.bits.data),
-                    mem_write.en.eq(self.write.bits.way_en[w]
-                                    & self.write.valid),
-                ]
+                for j in reversed(range(self.mem_width)):
+                    with m.If(self.write[j].valid):
+                        m.d.comb += [
+                            mem_write.addr.eq(
+                                self.write[j].bits.addr >> self.row_off_bits),
+                            mem_write.data.eq(self.write[j].bits.data),
+                            mem_write.en.eq(self.write[j].bits.way_en[w]),
+                        ]
 
                 m.d.sync += self.resp[i][w].eq(mem_read.data)
 
@@ -1825,53 +1884,50 @@ class DCache(HasDCacheParams, Elaboratable):
         # 0 - MSHR refill, 1 - Prober
         meta_write_arb = m.submodules.meta_write_arb = Arbiter(
             2, MetaWriteReq, self.params)
+        # 0 - MSHR replay, 1 - Prober, 2 - WB, 3 - MSHR meta read, 4 - LSU
+        meta_read_arb = m.submodules.meta_read_arb = Arbiter(
+            5, L1MetaReadReq, self.params)
 
-        meta_read_arb = []
         meta = []
         for w in range(self.mem_width):
-            # 0 - MSHR replay, 1 - Prober, 2 - WB, 3 - MSHR meta read, 4 - LSU
-            read_arb = Arbiter(5, MetaReadReq, self.params)
-            setattr(m.submodules, f'meta_read_arb{w}', read_arb)
-
             array = MetadataArray(self.params)
             setattr(m.submodules, f'meta{w}', array)
 
             m.d.comb += [
                 array.write.valid.eq(meta_write_arb.out.fire),
                 array.write.bits.eq(meta_write_arb.out.bits),
-                array.read.valid.eq(read_arb.out.fire),
-                array.read.bits.eq(read_arb.out.bits),
-                read_arb.out.ready.eq(array.read.ready),
+                array.read.valid.eq(meta_read_arb.out.valid),
+                array.read.bits.eq(meta_read_arb.out.bits.req[w]),
             ]
             meta.append(array)
-            meta_read_arb.append(read_arb)
 
-        m.d.comb += meta_write_arb.out.ready.eq(
-            Cat(m.write.ready for m in meta) != 0)
+        m.d.comb += [
+            meta_read_arb.out.ready.eq(Cat(m.read.ready for m in meta) != 0),
+            meta_write_arb.out.ready.eq(Cat(m.write.ready for m in meta) != 0),
+        ]
 
-        data = DuplicatedDataArray(
-            self.params) if self.n_data_banks == 1 else None
+        data = DuplicatedDataArray(self.params) if self.n_banks == 1 else None
         m.submodules.data = data
 
         # 0 - LSU, 1 - MSHR refill
         data_write_arb = m.submodules.data_write_arb = Arbiter(
-            2, DataWriteReq, self.params)
+            2, L1DataWriteReq, self.params)
 
-        data_read_arb = []
+        # 0 - MSHR replay, 1 - WB, 2 - LSU
+        data_read_arb = m.submodules.data_read_arb = Arbiter(
+            3, L1DataReadReq, self.params)
+
         for w in range(self.mem_width):
-            # 0 - MSHR replay, 1 - WB, 2 - LSU
-            read_arb = Arbiter(3, DataReadReq, self.params)
-            setattr(m.submodules, f'data_read_arb{w}', read_arb)
-
             m.d.comb += [
-                data.read[w].valid.eq(read_arb.out.fire),
-                data.read[w].bits.eq(read_arb.out.bits),
-                read_arb.out.ready.eq(1),
+                data.read[w].valid.eq(data_read_arb.out.bits.valid[w]
+                                      & data_read_arb.out.valid),
+                data.read[w].bits.eq(data_read_arb.out.bits.req[w]),
+                data.write[w].valid.eq(data_write_arb.out.bits.valid[w]
+                                       & data_write_arb.out.valid),
+                data.write[w].bits.eq(data_write_arb.out.bits.req[w]),
             ]
-            data_read_arb.append(read_arb)
-
         m.d.comb += [
-            data.write.eq(data_write_arb.out),
+            data_read_arb.out.ready.eq(1),
             data_write_arb.out.ready.eq(1),
         ]
 
@@ -1879,20 +1935,21 @@ class DCache(HasDCacheParams, Elaboratable):
         # Incoming requests
         #
 
-        req_ready = Cat(meta_read_arb[w].inp[4].ready
-                        & data_read_arb[w].inp[2].ready
-                        for w in range(self.mem_width)) == Repl(
-                            1, self.mem_width)
-
+        req_ready = meta_read_arb.inp[4].ready & data_read_arb.inp[2].ready
+        m.d.comb += [
+            meta_read_arb.inp[4].valid.eq(Cat(r.valid for r in self.req) != 0),
+            data_read_arb.inp[2].valid.eq(Cat(r.valid for r in self.req) != 0),
+        ]
         for w in range(self.mem_width):
             m.d.comb += [
                 self.req[w].ready.eq(req_ready),
-                meta_read_arb[w].inp[4].valid.eq(self.req[w].valid),
-                meta_read_arb[w].inp[4].bits.idx.eq(
+                meta_read_arb.inp[4].bits.req[w].idx.eq(
                     self.addr_index(self.req[w].bits.addr)),
-                data_read_arb[w].inp[2].valid.eq(self.req[w].valid),
-                data_read_arb[w].inp[2].bits.addr.eq(self.req[w].bits.addr),
-                data_read_arb[w].inp[2].bits.way_en.eq(Repl(1, self.n_ways)),
+                data_read_arb.inp[2].bits.valid[w].eq(self.req[w].valid),
+                data_read_arb.inp[2].bits.req[w].addr.eq(
+                    self.req[w].bits.addr),
+                data_read_arb.inp[2].bits.req[w].way_en.eq(Repl(
+                    1, self.n_ways)),
             ]
 
         #
@@ -1907,14 +1964,16 @@ class DCache(HasDCacheParams, Elaboratable):
             mshr_replay_req[0].uop.eq(mshrs.replay.bits.uop),
             mshr_replay_req[0].addr.eq(mshrs.replay.bits.addr),
             mshr_replay_req[0].data.eq(mshrs.replay.bits.data),
-            mshrs.replay.ready.eq(meta_read_arb[0].inp[0].ready
-                                  & data_read_arb[0].inp[0].ready),
-            meta_read_arb[0].inp[0].valid.eq(mshrs.replay.valid),
-            meta_read_arb[0].inp[0].bits.idx.eq(
+            mshrs.replay.ready.eq(meta_read_arb.inp[0].ready
+                                  & data_read_arb.inp[0].ready),
+            meta_read_arb.inp[0].valid.eq(mshrs.replay.valid),
+            meta_read_arb.inp[0].bits.req[0].idx.eq(
                 self.addr_index(mshrs.replay.bits.addr)),
-            data_read_arb[0].inp[0].valid.eq(mshrs.replay.valid),
-            data_read_arb[0].inp[0].bits.addr.eq(mshrs.replay.bits.addr),
-            data_read_arb[0].inp[0].bits.way_en.eq(mshrs.replay.bits.way_en),
+            data_read_arb.inp[0].valid.eq(mshrs.replay.valid),
+            data_read_arb.inp[0].bits.req[0].addr.eq(mshrs.replay.bits.addr),
+            data_read_arb.inp[0].bits.req[0].way_en.eq(
+                mshrs.replay.bits.way_en),
+            data_read_arb.inp[0].bits.valid[0].eq(1),
         ]
 
         #
@@ -1929,9 +1988,9 @@ class DCache(HasDCacheParams, Elaboratable):
             mshr_read_req[0].addr.eq(
                 Cat(Repl(0, self.block_off_bits), mshrs.meta_read.bits.idx,
                     mshrs.meta_read.bits.tag)),
-            mshrs.meta_read.ready.eq(meta_read_arb[0].inp[3].ready),
-            meta_read_arb[0].inp[3].valid.eq(mshrs.meta_read.valid),
-            meta_read_arb[0].inp[3].bits.eq(mshrs.meta_read.bits),
+            mshrs.meta_read.ready.eq(meta_read_arb.inp[3].ready),
+            meta_read_arb.inp[3].valid.eq(mshrs.meta_read.valid),
+            meta_read_arb.inp[3].bits.req[0].eq(mshrs.meta_read.bits),
         ]
 
         #
@@ -1946,14 +2005,15 @@ class DCache(HasDCacheParams, Elaboratable):
         m.d.comb += [
             wb_req[0].addr.eq(
                 Cat(wb.data_read.bits.addr, wb.meta_read.bits.tag)),
-            meta_read_arb[0].inp[2].valid.eq(wb.meta_read.valid),
-            meta_read_arb[0].inp[2].bits.eq(wb.meta_read.bits),
-            data_read_arb[0].inp[1].valid.eq(wb.data_read.valid),
-            data_read_arb[0].inp[1].bits.eq(wb.data_read.bits),
-            wb.meta_read.ready.eq(meta_read_arb[0].inp[2].ready
-                                  & data_read_arb[0].inp[1].ready),
-            wb.data_read.ready.eq(meta_read_arb[0].inp[2].ready
-                                  & data_read_arb[0].inp[1].ready),
+            meta_read_arb.inp[2].valid.eq(wb.meta_read.valid),
+            meta_read_arb.inp[2].bits.req[0].eq(wb.meta_read.bits),
+            data_read_arb.inp[1].valid.eq(wb.data_read.valid),
+            data_read_arb.inp[1].bits.req[0].eq(wb.data_read.bits),
+            data_read_arb.inp[1].bits.valid[0].eq(1),
+            wb.meta_read.ready.eq(meta_read_arb.inp[2].ready
+                                  & data_read_arb.inp[1].ready),
+            wb.data_read.ready.eq(meta_read_arb.inp[2].ready
+                                  & data_read_arb.inp[1].ready),
         ]
 
         #
@@ -1968,9 +2028,9 @@ class DCache(HasDCacheParams, Elaboratable):
             prober_req[0].addr.eq(
                 Cat(prober.meta_read.bits.idx, prober.meta_read.bits.tag) <<
                 self.block_off_bits),
-            meta_read_arb[0].inp[1].valid.eq(prober.meta_read.valid),
-            meta_read_arb[0].inp[1].bits.eq(prober.meta_read.bits),
-            prober.meta_read.ready.eq(meta_read_arb[0].inp[1].ready),
+            meta_read_arb.inp[1].valid.eq(prober.meta_read.valid),
+            meta_read_arb.inp[1].bits.req[0].eq(prober.meta_read.bits),
+            prober.meta_read.ready.eq(meta_read_arb.inp[1].ready),
         ]
 
         #
@@ -2294,7 +2354,10 @@ class DCache(HasDCacheParams, Elaboratable):
 
         m.d.comb += [
             mshrs.meta_write.connect(meta_write_arb.inp[0]),
-            mshrs.refill.connect(data_write_arb.inp[1]),
+            data_write_arb.inp[1].valid.eq(mshrs.refill.valid),
+            data_write_arb.inp[1].bits.req[0].eq(mshrs.refill.bits),
+            data_write_arb.inp[1].bits.valid[0].eq(1),
+            mshrs.refill.ready.eq(data_write_arb.inp[1].ready),
         ]
 
         #
@@ -2405,70 +2468,96 @@ class DCache(HasDCacheParams, Elaboratable):
         # Store hit
         #
 
-        s3_req = DCacheReq(self.params, name=f's3_req')
-        s3_valid = Signal()
-        s3_way = Signal.like(s2_tag_match_way[0])
-
-        amo_gen = m.submodules.amo_gen = AMODataGen(self.xlen)
-        store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
-
-        m.d.comb += [
-            store_gen.typ.eq(s2_req[0].uop.mem_size),
-            store_gen.addr.eq(s2_req[0].addr),
-            amo_gen.mask.eq(store_gen.mask),
-            amo_gen.cmd.eq(s2_req[0].uop.mem_cmd),
-            amo_gen.lhs.eq(s2_data_word[0]),
-            amo_gen.rhs.eq(s2_req[0].data),
+        s3_req = [
+            DCacheReq(self.params, name=f's3_req{i}')
+            for i in range(self.mem_width)
+        ]
+        s3_valid = Signal(self.mem_width)
+        s3_way = [
+            Signal.like(s2_tag_match_way[0], name=f's3_way{i}')
+            for i in range(self.mem_width)
         ]
 
-        m.d.sync += [
-            s3_req.eq(s2_req[0]),
-            s3_req.data.eq(amo_gen.out),
-            s3_valid.eq(s2_valid[0] & s2_hit[0]
-                        & MemoryCommand.is_write(s2_req[0].uop.mem_cmd)
-                        & ~(s2_send_nack[0] & s2_nack[0])),
-            s3_way.eq(s2_tag_match_way[0]),
-        ]
+        for w in range(self.mem_width):
+            amo_gen = AMODataGen(self.xlen)
+            store_gen = StoreGen(max_size=self.xlen // 8)
+            setattr(m.submodules, f'amo_gen{w}', amo_gen)
+            setattr(m.submodules, f'store_gen{w}', store_gen)
 
-        m.d.comb += [
-            data_write_arb.inp[0].valid.eq(s3_valid),
-            data_write_arb.inp[0].bits.addr.eq(s3_req.addr),
-            data_write_arb.inp[0].bits.data.eq(s3_req.data),
-            data_write_arb.inp[0].bits.way_en.eq(s3_way),
-        ]
+            m.d.comb += [
+                store_gen.typ.eq(s2_req[w].uop.mem_size),
+                store_gen.addr.eq(s2_req[w].addr),
+                amo_gen.mask.eq(store_gen.mask),
+                amo_gen.cmd.eq(s2_req[w].uop.mem_cmd),
+                amo_gen.lhs.eq(s2_data_word[w]),
+                amo_gen.rhs.eq(s2_req[w].data),
+            ]
+
+            m.d.sync += [
+                s3_req[w].eq(s2_req[w]),
+                s3_req[w].data.eq(amo_gen.out),
+                s3_valid[w].eq(s2_valid[w] & s2_hit[w]
+                               & MemoryCommand.is_write(s2_req[w].uop.mem_cmd)
+                               & ~(s2_send_nack[w] & s2_nack[w])),
+                s3_way[w].eq(s2_tag_match_way[w]),
+            ]
+
+            m.d.comb += [
+                data_write_arb.inp[0].bits.req[w].addr.eq(s3_req[w].addr),
+                data_write_arb.inp[0].bits.req[w].data.eq(s3_req[w].data),
+                data_write_arb.inp[0].bits.req[w].way_en.eq(s3_way[w]),
+                data_write_arb.inp[0].bits.valid[w].eq(1),
+            ]
+        m.d.comb += data_write_arb.inp[0].valid.eq(s3_valid != 0)
 
         #
         # Load bypassing
         #
 
-        s4_req = DCacheReq(self.params, name=f's4_req')
-        s4_valid = Signal()
-        s5_req = DCacheReq(self.params, name=f's5_req')
-        s5_valid = Signal()
+        s4_req = [
+            DCacheReq(self.params, name=f's4_req{i}')
+            for i in range(self.mem_width)
+        ]
+        s4_valid = Signal.like(s3_valid)
+        s5_req = [
+            DCacheReq(self.params, name=f's5_req{i}')
+            for i in range(self.mem_width)
+        ]
+        s5_valid = Signal.like(s4_valid)
 
         m.d.sync += [
-            s4_req.eq(s3_req),
             s4_valid.eq(s3_valid),
-            s5_req.eq(s4_req),
             s5_valid.eq(s4_valid),
         ]
-
-        s3_bypass = Cat(s3_valid & (s2_req[w].addr[self.word_off_bits:] ==
-                                    s3_req.addr[self.word_off_bits:])
-                        for w in range(self.mem_width))
-        s4_bypass = Cat(s4_valid & (s2_req[w].addr[self.word_off_bits:] ==
-                                    s4_req.addr[self.word_off_bits:])
-                        for w in range(self.mem_width))
-        s5_bypass = Cat(s5_valid & (s2_req[w].addr[self.word_off_bits:] ==
-                                    s5_req.addr[self.word_off_bits:])
-                        for w in range(self.mem_width))
-
         for w in range(self.mem_width):
-            m.d.comb += s2_data_word[w].eq(
-                Mux(
-                    s3_bypass[w], s3_req.data,
-                    Mux(s4_bypass[w], s4_req.data,
-                        Mux(s5_bypass[w], s5_req.data, s2_data_muxed[w]))))
+            m.d.sync += [
+                s4_req[w].eq(s3_req[w]),
+                s5_req[w].eq(s4_req[w]),
+            ]
+
+            m.d.comb += s2_data_word[w].eq(s2_data_muxed[w])
+
+        for i in reversed(range(self.mem_width)):
+            s3_bypass = Cat(s3_valid[i]
+                            & (s2_req[w].addr[self.word_off_bits:] ==
+                               s3_req[i].addr[self.word_off_bits:])
+                            for w in range(self.mem_width))
+            s4_bypass = Cat(s4_valid[i]
+                            & (s2_req[w].addr[self.word_off_bits:] ==
+                               s4_req[i].addr[self.word_off_bits:])
+                            for w in range(self.mem_width))
+            s5_bypass = Cat(s5_valid[i]
+                            & (s2_req[w].addr[self.word_off_bits:] ==
+                               s5_req[i].addr[self.word_off_bits:])
+                            for w in range(self.mem_width))
+
+            for w in range(self.mem_width):
+                with m.If(s3_bypass[w]):
+                    m.d.comb += s2_data_word[w].eq(s3_req[i].data)
+                with m.Elif(s4_bypass[w]):
+                    m.d.comb += s2_data_word[w].eq(s4_req[i].data)
+                with m.Elif(s5_bypass[w]):
+                    m.d.comb += s2_data_word[w].eq(s5_req[i].data)
 
         return m
 

@@ -73,7 +73,7 @@ core_params = dict(
         n_iomshrs=1,
         sdq_size=17,
         rpq_size=16,
-        n_data_banks=1,
+        n_banks=1,
     ),
     use_fpu=True,
     flen=64,
