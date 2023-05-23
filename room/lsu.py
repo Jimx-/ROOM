@@ -901,8 +901,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 enc.i.eq(ldst_addr_matches[w]),
                 enc.head_or_tail.eq(cam_uop[w].stq_idx),
                 s1_forward_stq_idx[w].eq(enc.o),
-                s1_forward_valid[w].eq(((ldst_forward_matches[w] &
-                                         (1 << s1_forward_stq_idx[w])) != 0)
+                s1_forward_valid[w].eq(((ldst_forward_matches[w]
+                                         & (1 << s1_forward_stq_idx[w])) != 0)
                                        & ~self.br_update.uop_killed(cam_uop[w])
                                        & ~self.exception & ~exception_d1),
             ]

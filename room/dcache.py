@@ -582,6 +582,173 @@ class DuplicatedDataArray(BaseDataArray):
         return m
 
 
+class BankedDataArray(BaseDataArray):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        bank_size = self.n_sets * self.refill_cycles // self.n_banks
+
+        bank_bits = log2_int(self.n_banks)
+        bank_off_bits = self.row_off_bits
+        bidx_bits = log2_int(bank_size)
+        bidx_off_bits = bank_off_bits + bank_bits
+
+        #
+        # S0
+        #
+
+        s0_rbanks = [
+            Signal(bank_bits, name=f's0_rbank{i}')
+            for i in range(self.mem_width)
+        ]
+        s0_wbanks = [
+            Signal(bank_bits, name=f's0_wbank{i}')
+            for i in range(self.mem_width)
+        ]
+        s0_ridxs = [
+            Signal(bidx_bits, name=f's0_ridx{i}')
+            for i in range(self.mem_width)
+        ]
+        s0_widxs = [
+            Signal(bidx_bits, name=f's0_widx{i}')
+            for i in range(self.mem_width)
+        ]
+        s0_read_valids = Cat(r.valid for r in self.read)
+        s0_bank_conflicts = Signal(self.mem_width)
+        s0_do_read = s0_read_valids & ~s0_bank_conflicts
+        s0_bank_read_gnts = [
+            Signal(self.mem_width, name=f's0_bank_read_gnt{i}')
+            for i in range(self.n_banks)
+        ]
+
+        for w in range(self.mem_width):
+            m.d.comb += [
+                s0_rbanks[w].eq(
+                    (self.read[w].bits.addr >> bank_off_bits)[:bank_bits]),
+                s0_ridxs[w].eq(
+                    (self.read[w].bits.addr >> bidx_off_bits)[:bidx_bits]),
+                s0_wbanks[w].eq(
+                    (self.write[w].bits.addr >> bank_off_bits)[:bank_bits]),
+                s0_widxs[w].eq(
+                    (self.write[w].bits.addr >> bidx_off_bits)[:bidx_bits]),
+            ]
+
+            c = Const(0)
+            for i in range(w):
+                c |= self.read[i].valid & (s0_rbanks[i] == s0_rbanks[w])
+            m.d.comb += s0_bank_conflicts[w].eq(c)
+
+        for b in range(self.n_banks):
+            for w in range(self.mem_width):
+                with m.If((s0_rbanks[w] == b) & s0_do_read[w]):
+                    m.d.comb += s0_bank_read_gnts[b][w].eq(1)
+
+        #
+        # S1
+        #
+
+        s1_rbanks = [
+            Signal(bank_bits, name=f's1_rbank{i}')
+            for i in range(self.mem_width)
+        ]
+        s1_ridxs = [
+            Signal(bidx_bits, name=f's1_ridx{i}')
+            for i in range(self.mem_width)
+        ]
+        s1_read_valids = Signal(self.mem_width)
+        s1_pipe_selection = [
+            Signal(self.mem_width, name=f's1_pipe_selection{i}')
+            for i in range(self.mem_width)
+        ]
+        s1_ridx_match = [
+            Signal(self.mem_width, name=f's1_ridx_match{i}')
+            for i in range(self.mem_width)
+        ]
+        s1_bank_selection = [
+            Signal(range(self.n_banks), name=f's1_bank_selection{i}')
+            for i in range(self.mem_width)
+        ]
+        s1_nacks = Signal(self.mem_width)
+
+        m.d.sync += s1_read_valids.eq(s0_read_valids)
+        for w in range(self.mem_width):
+            m.d.sync += [
+                s1_rbanks[w].eq(s0_rbanks[w]),
+                s1_ridxs[w].eq(s0_ridxs[w]),
+            ]
+
+            m.d.comb += [
+                s1_pipe_selection[w].eq(1 << w),
+                s1_ridx_match[w][w].eq(1),
+            ]
+            for i in reversed(range(w)):
+                with m.If(s1_read_valids[i] & (s1_rbanks[i] == s1_rbanks[w])):
+                    m.d.comb += s1_pipe_selection[w].eq(1 << i)
+                m.d.comb += s1_ridx_match[w][i].eq(s1_ridxs[i] == s1_ridxs[w])
+
+            m.d.comb += s1_nacks[w].eq(s1_read_valids[w] & (
+                (s1_pipe_selection[w] & ~s1_ridx_match[w]) != 0))
+
+            for i in reversed(range(self.mem_width)):
+                with m.If(s1_pipe_selection[w][i]):
+                    m.d.comb += s1_bank_selection[w].eq(s1_rbanks[i])
+
+        #
+        # S2
+        #
+
+        s2_bank_selection = [
+            Signal(range(self.n_banks), name=f's2_bank_selection{i}')
+            for i in range(self.mem_width)
+        ]
+        s2_nacks = Signal(self.mem_width)
+
+        m.d.sync += s2_nacks.eq(s1_nacks)
+        for w in range(self.mem_width):
+            m.d.sync += s2_bank_selection[w].eq(s1_bank_selection[w])
+
+        for w in range(self.n_ways):
+            s2_bank_reads = Array(
+                Signal(self.row_bits, name=f's2_bank_read{w}_b{b}')
+                for b in range(self.n_banks))
+
+            for b in range(self.n_banks):
+                mem = Memory(width=self.row_bits, depth=bank_size)
+
+                mem_read = mem.read_port(transparent=False)
+                setattr(m.submodules, f'mem_read{b}_{w}', mem_read)
+
+                for i in range(self.mem_width):
+                    with m.If(s0_bank_read_gnts[b][i]):
+                        m.d.comb += mem_read.addr.eq(s0_ridxs[i])
+                m.d.sync += s2_bank_reads[b].eq(mem_read.data)
+
+                mem_write = mem.write_port()
+                setattr(m.submodules, f'mem_write{b}_{w}', mem_write)
+
+                for j in reversed(range(self.mem_width)):
+                    with m.If(self.write[j].valid
+                              & self.write[j].bits.way_en[w]
+                              & (s0_wbanks[j] == b)):
+                        m.d.comb += [
+                            mem_write.addr.eq(s0_widxs[j]),
+                            mem_write.data.eq(self.write[j].bits.data),
+                            mem_write.en.eq(1),
+                        ]
+
+            for i in range(self.mem_width):
+                m.d.comb += self.resp[i][w].eq(
+                    s2_bank_reads[s2_bank_selection[i]])
+
+        m.d.comb += self.nack.eq(s2_nacks)
+
+        return m
+
+
 #
 # Writeback unit
 #
@@ -1906,7 +2073,8 @@ class DCache(HasDCacheParams, Elaboratable):
             meta_write_arb.out.ready.eq(Cat(m.write.ready for m in meta) != 0),
         ]
 
-        data = DuplicatedDataArray(self.params) if self.n_banks == 1 else None
+        data = DuplicatedDataArray(
+            self.params) if self.n_banks == 1 else BankedDataArray(self.params)
         m.submodules.data = data
 
         # 0 - LSU, 1 - MSHR refill
@@ -2506,7 +2674,7 @@ class DCache(HasDCacheParams, Elaboratable):
                 data_write_arb.inp[0].bits.req[w].addr.eq(s3_req[w].addr),
                 data_write_arb.inp[0].bits.req[w].data.eq(s3_req[w].data),
                 data_write_arb.inp[0].bits.req[w].way_en.eq(s3_way[w]),
-                data_write_arb.inp[0].bits.valid[w].eq(1),
+                data_write_arb.inp[0].bits.valid[w].eq(s3_valid[w]),
             ]
         m.d.comb += data_write_arb.inp[0].valid.eq(s3_valid != 0)
 
