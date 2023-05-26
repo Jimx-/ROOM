@@ -1,6 +1,7 @@
 from amaranth import *
 from amaranth.hdl.rec import *
 from amaranth.lib.cdc import FFSynchronizer
+from amaranth.lib.fifo import AsyncFIFO
 
 from room.utils import Decoupled
 
@@ -10,6 +11,17 @@ H_BITS = 12
 V_BITS = 12
 
 video_timings = {
+    "640x480@60Hz": {
+        "pix_clk": 25.175e6,
+        "h_active": 640,
+        "h_blanking": 160,
+        "h_sync_offset": 16,
+        "h_sync_width": 96,
+        "v_active": 480,
+        "v_blanking": 45,
+        "v_sync_offset": 10,
+        "v_sync_width": 2,
+    },
     "1024x600@60Hz": {
         "pix_clk": 49e6,
         "h_active": 1024,
@@ -329,7 +341,7 @@ class VideoTimingGenerator(Peripheral, Elaboratable):
 
         with m.FSM(domain=self.clock_domain):
             with m.State('IDLE'):
-                m.d.sync += [
+                m.d[self.clock_domain] += [
                     hactive.eq(0),
                     vactive.eq(0),
                     self.source.bits.hres.eq(hres),
@@ -348,34 +360,44 @@ class VideoTimingGenerator(Peripheral, Elaboratable):
                     m.d.comb += self.source.valid.eq(1)
 
                     with m.If(self.source.ready):
-                        m.d.sync += self.source.bits.hcount.eq(
+                        m.d[self.clock_domain] += self.source.bits.hcount.eq(
                             self.source.bits.hcount + 1)
 
                         with m.If(self.source.bits.hcount == 0):
-                            m.d.sync += hactive.eq(1)
+                            m.d[self.clock_domain] += hactive.eq(1)
                         with m.If(self.source.bits.hcount == hres):
-                            m.d.sync += hactive.eq(0)
+                            m.d[self.clock_domain] += hactive.eq(0)
                         with m.If(self.source.bits.hcount == hsync_start):
-                            m.d.sync += self.source.bits.hsync.eq(1)
+                            m.d[self.
+                                clock_domain] += self.source.bits.hsync.eq(1)
                         with m.If(self.source.bits.hcount == hsync_end):
-                            m.d.sync += self.source.bits.hsync.eq(0)
+                            m.d[self.
+                                clock_domain] += self.source.bits.hsync.eq(0)
                         with m.If(self.source.bits.hcount == hscan):
-                            m.d.sync += self.source.bits.hcount.eq(0)
+                            m.d[self.
+                                clock_domain] += self.source.bits.hcount.eq(0)
 
                         with m.If(self.source.bits.hcount == hsync_start):
-                            m.d.sync += self.source.bits.vcount.eq(
-                                self.source.bits.vcount + 1)
+                            m.d[self.
+                                clock_domain] += self.source.bits.vcount.eq(
+                                    self.source.bits.vcount + 1)
 
                             with m.If(self.source.bits.vcount == 0):
-                                m.d.sync += vactive.eq(1)
+                                m.d[self.clock_domain] += vactive.eq(1)
                             with m.If(self.source.bits.vcount == vres):
-                                m.d.sync += vactive.eq(0)
+                                m.d[self.clock_domain] += vactive.eq(0)
                             with m.If(self.source.bits.vcount == vsync_start):
-                                m.d.sync += self.source.bits.vsync.eq(1)
+                                m.d[self.
+                                    clock_domain] += self.source.bits.vsync.eq(
+                                        1)
                             with m.If(self.source.bits.vcount == vsync_end):
-                                m.d.sync += self.source.bits.vsync.eq(0)
+                                m.d[self.
+                                    clock_domain] += self.source.bits.vsync.eq(
+                                        0)
                             with m.If(self.source.bits.vcount == vscan):
-                                m.d.sync += self.source.bits.vcount.eq(0)
+                                m.d[self.
+                                    clock_domain] += self.source.bits.vcount.eq(
+                                        0)
 
         return m
 
@@ -447,6 +469,99 @@ class ColorBarsPattern(Elaboratable):
                         self.source.bits.g.eq(g),
                         self.source.bits.b.eq(b),
                     ]
+
+        return m
+
+
+class VideoFrameBuffer(Elaboratable):
+
+    def __init__(self,
+                 bus,
+                 *,
+                 hres=800,
+                 vres=600,
+                 base=0x00000000,
+                 fifo_depth=65536,
+                 clock_domain="sync",
+                 format="rgb888"):
+        self.bus = bus
+        self.hres = hres
+        self.vres = vres
+        self.base = base
+        self.fifo_depth = fifo_depth
+        self.clock_domain = clock_domain
+
+        self.vtg = Decoupled(Record, video_timing_layout)
+        self.source = Decoupled(Record, video_data_layout)
+        self.underflow = Signal()
+
+        self.depth = {"rgb888": 32, "rgb565": 16}[format]
+
+    def elaborate(self, platform):
+        m = Module()
+
+        from .dma import WishboneDMAReader
+        dma = m.submodules.dma = WishboneDMAReader(
+            bus=self.bus,
+            with_csr=True,
+            fifo_depth=self.fifo_depth // (self.bus.data_width // 8),
+            default_base=self.base,
+            default_length=self.hres * self.vres * self.depth // 8,
+            default_loop=1,
+            default_enable=1)
+
+        video_data = Decoupled(Signal, self.depth)
+
+        cdc_param = dict(width=self.depth,
+                         depth=8,
+                         r_domain=self.clock_domain,
+                         w_domain='sync')
+
+        if platform is None or getattr(
+                platform, 'get_async_fifo', None) is None or not callable(
+                    getattr(platform, 'get_async_fifo')):
+            cdc = m.submodules.cdc = AsyncFIFO(**cdc_param)
+        else:
+            cdc = m.submodules.cdc = platform.get_async_fifo(**cdc_param)
+
+        m.d.comb += [
+            cdc.w_data.eq(dma.source.bits),
+            cdc.w_en.eq(dma.source.valid),
+            dma.source.ready.eq(cdc.w_rdy),
+            video_data.bits.eq(cdc.r_data),
+            video_data.valid.eq(cdc.r_rdy),
+            cdc.r_en.eq(video_data.ready),
+        ]
+
+        m.d.comb += [
+            self.vtg.ready.eq(1),
+            self.source.bits.de.eq(self.vtg.bits.de),
+            self.source.bits.hsync.eq(self.vtg.bits.hsync),
+            self.source.bits.vsync.eq(self.vtg.bits.vsync),
+        ]
+
+        with m.If(self.vtg.valid & self.vtg.bits.de):
+            m.d.comb += [
+                self.source.valid.eq(video_data.valid),
+                video_data.ready.eq(self.source.ready),
+                self.vtg.ready.eq(self.source.fire),
+            ]
+
+        if self.depth == 32:
+            m.d.comb += [
+                self.source.bits.r.eq(video_data.bits[0:8]),
+                self.source.bits.g.eq(video_data.bits[8:16]),
+                self.source.bits.b.eq(video_data.bits[16:24]),
+            ]
+        elif self.depth == 16:
+            m.d.comb += [
+                self.source.bits.r.eq(Cat(Const(0, 3),
+                                          video_data.bits[11:16])),
+                self.source.bits.g.eq(Cat(Const(0, 2), video_data.bits[5:11])),
+                self.source.bits.b.eq(Cat(Const(0, 3), video_data.bits[0:5])),
+            ]
+
+        m.d.comb += self.underflow.eq(~self.source.valid)
 
         return m
 

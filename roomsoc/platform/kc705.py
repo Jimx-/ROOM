@@ -86,3 +86,40 @@ class KC705Platform(XilinxPlatform):
                                        depth=depth,
                                        r_domain=r_domain,
                                        w_domain=w_domain)
+
+    def get_ff_sync(self, ff):
+        m = Module()
+
+        if len(ff.i) == 1:
+            m.submodules.ff_sync = Instance(
+                'xpm_cdc_single',
+                ###
+                p_SRC_INPUT_REG=0,
+                p_DEST_SYNC_FF=ff._stages,
+                p_INIT_SYNC_FF=0,
+                p_SIM_ASSERT_CHK=0,
+                ###
+                i_dest_clk=ClockSignal(ff._o_domain),
+                i_src_in=ff.i,
+                i_src_clk=0,
+                ###
+                o_dest_out=ff.o,
+            )
+        else:
+            m.submodules.ff_sync = Instance(
+                'xpm_cdc_array_single',
+                ###
+                p_WIDTH=len(ff.i),
+                p_SRC_INPUT_REG=0,
+                p_DEST_SYNC_FF=ff._stages,
+                p_INIT_SYNC_FF=0,
+                p_SIM_ASSERT_CHK=0,
+                ###
+                i_dest_clk=ClockSignal(ff._o_domain),
+                i_src_in=ff.i,
+                i_src_clk=0,
+                ###
+                o_dest_out=ff.o,
+            )
+
+        return m
