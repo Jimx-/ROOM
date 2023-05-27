@@ -2,7 +2,8 @@ from amaranth import *
 from amaranth import tracer
 
 from room.consts import *
-from room.utils import Valid, Decoupled
+
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class ALU(Elaboratable):

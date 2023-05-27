@@ -6,7 +6,8 @@ from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.rob import CommitReq
 from room.fu import ExecResp
-from room.utils import Valid
+
+from roomsoc.interconnect.stream import Valid
 
 
 class MapReq(Record):

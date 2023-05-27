@@ -2,9 +2,8 @@ from amaranth import *
 from amaranth.utils import log2_int
 
 from room.types import HasCoreParams
-from room.utils import Valid, Decoupled
 
-from roomsoc.interconnect import tilelink
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class HasICacheParams(HasCoreParams):

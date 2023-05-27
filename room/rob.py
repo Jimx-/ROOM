@@ -8,7 +8,9 @@ from room.fu import ExecResp
 from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.exc import Cause
-from room.utils import Valid, wrap_incr, wrap_decr
+from room.utils import wrap_incr, wrap_decr
+
+from roomsoc.interconnect.stream import Valid
 
 
 class FlushType(IntEnum):

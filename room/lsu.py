@@ -8,10 +8,10 @@ from room.fu import ExecResp
 from room.branch import BranchUpdate
 from room.rob import CommitReq, Exception
 from room.exc import Cause
-from room.utils import Valid, Decoupled, wrap_incr
+from room.utils import wrap_incr
 from room.dcache import LoadGen, StoreGen, DCache, SimpleDCache
 
-from roomsoc.interconnect import wishbone
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class LSUDebug(HasCoreParams, Record):

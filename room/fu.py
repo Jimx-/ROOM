@@ -7,7 +7,9 @@ from room.if_stage import GetPCResp
 from room.branch import BranchResolution, BranchUpdate
 from room.alu import ALU, Multiplier, IntDiv
 from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
-from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe, Decoupled
+from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe
+
+from roomsoc.interconnect.stream import Decoupled
 
 
 class ExecReq:

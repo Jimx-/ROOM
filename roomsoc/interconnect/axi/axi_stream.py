@@ -1,7 +1,7 @@
 from amaranth import *
 from amaranth.hdl.rec import Direction
 
-from room.utils import Decoupled
+from roomsoc.interconnect.stream import Decoupled
 
 
 class _AXIStreamLayout(Record):

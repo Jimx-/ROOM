@@ -19,8 +19,9 @@ from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts
 from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
-from room.utils import Arbiter, Valid
+from room.utils import Arbiter
 
+from roomsoc.interconnect.stream import Valid
 from roomsoc.interconnect import wishbone, tilelink as tl
 
 

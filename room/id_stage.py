@@ -6,7 +6,8 @@ from room.types import HasCoreParams, MicroOp
 from room.branch import BranchMaskAllocator, BranchUpdate
 from room.exc import Cause
 from room.fpu import FPFormat
-from room.utils import Valid
+
+from roomsoc.interconnect.stream import Valid
 
 
 class IDDebug(HasCoreParams, Record):

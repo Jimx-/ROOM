@@ -2,7 +2,9 @@ from amaranth import *
 from enum import IntEnum
 
 from room.consts import *
-from room.utils import Pipe, Valid, Decoupled
+from room.utils import Pipe
+
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class FPUOperator(IntEnum):

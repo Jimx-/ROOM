@@ -3,7 +3,7 @@ from amaranth.hdl.rec import *
 from amaranth.lib.cdc import FFSynchronizer
 from amaranth.lib.fifo import AsyncFIFO
 
-from room.utils import Decoupled
+from roomsoc.interconnect.stream import Decoupled
 
 from .peripheral import Peripheral
 

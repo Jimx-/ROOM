@@ -5,7 +5,8 @@ from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.fu import ExecReq
 from room.branch import BranchUpdate
-from room.utils import Decoupled
+
+from roomsoc.interconnect.stream import Decoupled
 
 
 class RFReadPort(Record):

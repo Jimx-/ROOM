@@ -3,7 +3,7 @@ from amaranth.lib.fifo import SyncFIFO
 from amaranth.utils import log2_int
 
 from .peripheral import Peripheral
-from room.utils import Decoupled
+from roomsoc.interconnect.stream import Decoupled
 
 
 class WishboneDMAReader(Peripheral, Elaboratable):

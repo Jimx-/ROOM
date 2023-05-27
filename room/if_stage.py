@@ -8,7 +8,9 @@ from room.id_stage import BranchDecoder
 from room.types import HasCoreParams, MicroOp
 from room.breakpoint import Breakpoint, BreakpointMatcher
 from room.icache import ICache
-from room.utils import wrap_incr, Valid
+from room.utils import wrap_incr
+
+from roomsoc.interconnect.stream import Valid
 
 
 class GetPCResp(Record):

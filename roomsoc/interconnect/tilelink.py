@@ -5,7 +5,7 @@ from amaranth.hdl.rec import Direction
 from amaranth.utils import log2_int
 from amaranth_soc.memory import MemoryMap
 
-from room.utils import Decoupled
+from roomsoc.interconnect.stream import Decoupled
 
 
 class ChannelAOpcode(Enum):

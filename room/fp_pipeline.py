@@ -7,7 +7,9 @@ from room.regfile import RegisterFile, RegisterRead
 from room.branch import BranchUpdate
 from room.issue import IssueUnit
 from room.ex_stage import ExecUnits
-from room.utils import Valid, Decoupled, Arbiter
+from room.utils import Arbiter
+
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class FPPipeline(HasCoreParams, Elaboratable):

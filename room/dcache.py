@@ -8,8 +8,9 @@ from room.consts import *
 from room.alu import AMODataGen
 from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
-from room.utils import Valid, Decoupled, Arbiter, BranchKillableFIFO
+from room.utils import Arbiter, BranchKillableFIFO
 
+from roomsoc.interconnect.stream import Valid, Decoupled
 from roomsoc.interconnect import tilelink as tl
 
 

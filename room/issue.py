@@ -5,7 +5,8 @@ from enum import IntEnum
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
-from room.utils import Valid
+
+from roomsoc.interconnect.stream import Valid
 
 
 class IssueQueueWakeup(Record):

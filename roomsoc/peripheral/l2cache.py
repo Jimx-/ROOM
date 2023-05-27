@@ -9,8 +9,7 @@ from amaranth.lib.fifo import SyncFIFO
 from .peripheral import Peripheral
 
 from roomsoc.interconnect import tilelink as tl
-
-from room.utils import Valid, Decoupled
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class HasL2CacheParams:
