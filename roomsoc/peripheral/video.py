@@ -1,9 +1,8 @@
 from amaranth import *
 from amaranth.hdl.rec import *
 from amaranth.lib.cdc import FFSynchronizer
-from amaranth.lib.fifo import AsyncFIFO
 
-from roomsoc.interconnect.stream import Decoupled
+from roomsoc.interconnect.stream import Decoupled, ClockDomainCrossing, Gearbox
 
 from .peripheral import Peripheral
 
@@ -510,28 +509,11 @@ class VideoFrameBuffer(Elaboratable):
             default_loop=1,
             default_enable=1)
 
-        video_data = Decoupled(Signal, self.depth)
+        cdc = m.submodules.cdc = ClockDomainCrossing(
+            Signal, self.depth, to_domain=self.clock_domain)
+        m.d.comb += dma.source.connect(cdc.sink)
 
-        cdc_param = dict(width=self.depth,
-                         depth=8,
-                         r_domain=self.clock_domain,
-                         w_domain='sync')
-
-        if platform is None or getattr(
-                platform, 'get_async_fifo', None) is None or not callable(
-                    getattr(platform, 'get_async_fifo')):
-            cdc = m.submodules.cdc = AsyncFIFO(**cdc_param)
-        else:
-            cdc = m.submodules.cdc = platform.get_async_fifo(**cdc_param)
-
-        m.d.comb += [
-            cdc.w_data.eq(dma.source.bits),
-            cdc.w_en.eq(dma.source.valid),
-            dma.source.ready.eq(cdc.w_rdy),
-            video_data.bits.eq(cdc.r_data),
-            video_data.valid.eq(cdc.r_rdy),
-            cdc.r_en.eq(video_data.ready),
-        ]
+        video_data = cdc.source
 
         m.d.comb += [
             self.vtg.ready.eq(1),
@@ -615,6 +597,60 @@ class VideoS7HDMI10to1Serializer(Elaboratable):
         return m
 
 
+class VideoUSHDMI10to1Serializer(Elaboratable):
+
+    def __init__(self, clock_domain, sim_device):
+        self.clock_domain = clock_domain
+        self.sim_device = sim_device
+
+        self.i = Signal(10)
+        self.o = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        cdc = m.submodules.cdc = ClockDomainCrossing(
+            Signal,
+            10,
+            from_domain=self.clock_domain,
+            to_domain=self.clock_domain + "1_25x")
+        m.d.comb += [
+            cdc.sink.valid.eq(1),
+            cdc.sink.bits.eq(self.i),
+        ]
+
+        gearbox = m.submodules.gearbox = DomainRenamer(self.clock_domain +
+                                                       "1_25x")(Gearbox(
+                                                           i_dw=10,
+                                                           o_dw=8,
+                                                           msb_first=False))
+        m.d.comb += [
+            cdc.source.connect(gearbox.sink),
+            gearbox.source.ready.eq(1),
+        ]
+
+        m.submodules += Instance(
+            "OSERDESE3",
+            ###
+            p_DATA_WIDTH=8,
+            p_INIT=0,
+            p_IS_CLKDIV_INVERTED=0,
+            p_IS_CLK_INVERTED=0,
+            p_IS_RST_INVERTED=0,
+            p_SIM_DEVICE=self.sim_device,
+            ###
+            i_CLK=ClockSignal(self.clock_domain + "5x"),
+            i_CLKDIV=ClockSignal(self.clock_domain + "1_25x"),
+            i_D=gearbox.source.bits,
+            i_RST=ResetSignal(self.clock_domain),
+            i_T=0,
+            ###
+            o_OQ=self.o,
+        )
+
+        return m
+
+
 class VideoS7HDMIPHY(Elaboratable):
 
     def __init__(self, clock_domain='sync'):
@@ -653,6 +689,57 @@ class VideoS7HDMIPHY(Elaboratable):
             ]
 
             serializer = VideoS7HDMI10to1Serializer(self.clock_domain)
+            setattr(m.submodules, f'serializer_{color}', serializer)
+
+            m.d.comb += serializer.i.eq(enc.out)
+            m.submodules += Instance("OBUFDS",
+                                     i_I=serializer.o,
+                                     o_O=self.tmds_data_p[channel],
+                                     o_OB=self.tmds_data_n[channel])
+
+        return m
+
+
+class VideoUSHDMIPHY(Elaboratable):
+
+    def __init__(self, clock_domain='sync', sim_device='ULTRASCALE'):
+        self.clock_domain = clock_domain
+        self.sim_device = sim_device
+
+        self.sink = Decoupled(Record, video_data_layout)
+
+        self.tmds_clk_p = Signal()
+        self.tmds_clk_n = Signal()
+        self.tmds_data_p = Signal(3)
+        self.tmds_data_n = Signal(3)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += self.sink.ready.eq(1)
+
+        clk_serializer = m.submodules.clk_serializer = VideoUSHDMI10to1Serializer(
+            self.clock_domain, sim_device=self.sim_device)
+        m.d.comb += clk_serializer.i.eq(0b0000011111)
+        m.submodules += Instance("OBUFDS",
+                                 i_I=clk_serializer.o,
+                                 o_O=self.tmds_clk_p,
+                                 o_OB=self.tmds_clk_n)
+
+        for color, channel in _dvi_c2d.items():
+            enc = DomainRenamer(self.clock_domain)(TMDSEncoder())
+            setattr(m.submodules, f'encoder_{color}', enc)
+
+            m.d.comb += [
+                enc.d.eq(getattr(self.sink.bits, color)),
+                enc.c.eq(
+                    Cat(self.sink.bits.hsync, self.sink.bits.vsync
+                        ) if channel == 0 else 0),
+                enc.de.eq(self.sink.bits.de),
+            ]
+
+            serializer = VideoUSHDMI10to1Serializer(self.clock_domain,
+                                                    sim_device=self.sim_device)
             setattr(m.submodules, f'serializer_{color}', serializer)
 
             m.d.comb += serializer.i.eq(enc.out)
