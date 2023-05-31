@@ -88,8 +88,9 @@ class ExecUnit(HasCoreParams, Elaboratable):
 
         self.br_update = BranchUpdate(params)
 
-        self.br_res = has_alu and BranchResolution(params,
-                                                   name='br_res') or None
+        self.br_res = BranchResolution(params,
+                                       name='br_res') if has_alu else None
+
         self.get_pc = None
         if has_jmp_unit:
             self.get_pc = GetPCResp(name='get_pc')

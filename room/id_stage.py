@@ -530,6 +530,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
 
                 with m.Case(0b1010011):
                     m.d.comb += [
+                        uop.fp_valid.eq(1),
                         uop.iq_type.eq(IssueQueueType.FP),
                         uop.fu_type.eq(FUType.FPU),
                         uop.dst_rtype.eq(RegisterType.FLT),
@@ -669,6 +670,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                 # Floating point fused arithmetic
                 with m.Case(0b1000011, 0b1000111, 0b1001011, 0b1001111):
                     m.d.comb += [
+                        uop.fp_valid.eq(1),
                         uop.iq_type.eq(IssueQueueType.FP),
                         uop.fu_type.eq(FUType.FPU),
                         uop.dst_rtype.eq(RegisterType.FLT),

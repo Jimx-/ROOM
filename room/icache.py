@@ -66,9 +66,12 @@ class ICache(HasICacheParams, Elaboratable):
         untag_bits = block_off_bits + index_bits
         tag_bits = 32 - untag_bits
 
-        refill_cycles = (self.block_bytes * 8) // self.ibus.data_width
-
         word_bits = self.fetch_bytes * 8
+
+        row_bits = self.ibus.data_width
+        refill_cycles = (self.block_bytes * 8) // row_bits
+
+        row_words = row_bits // word_bits
 
         s0_valid = self.req.fire
         s0_vaddr = self.req.bits.addr
@@ -77,12 +80,14 @@ class ICache(HasICacheParams, Elaboratable):
         s1_tag_hit = Signal(self.n_ways)
         s1_hit = s1_tag_hit != 0
         s2_valid = Signal()
+        s2_paddr = Signal.like(self.s1_paddr)
         s2_hit = Signal()
         s2_miss = s2_valid & ~s2_hit
 
         m.d.sync += [
             s1_valid.eq(s0_valid),
             s2_valid.eq(s1_valid & ~self.s1_kill),
+            s2_paddr.eq(self.s1_paddr),
             s2_hit.eq(s1_hit),
         ]
 
@@ -159,13 +164,13 @@ class ICache(HasICacheParams, Elaboratable):
         #
 
         data_ways = [
-            Memory(width=word_bits,
+            Memory(width=row_bits,
                    depth=self.n_sets * refill_cycles,
                    name=f'data_mem{i}') for i in range(self.n_ways)
         ]
 
         s2_dout = [
-            Signal(word_bits, name=f's2_dout{i}') for i in range(self.n_ways)
+            Signal(row_bits, name=f's2_dout{i}') for i in range(self.n_ways)
         ]
 
         for i in range(self.n_ways):
@@ -192,10 +197,17 @@ class ICache(HasICacheParams, Elaboratable):
         m.d.sync += s2_tag_hit.eq(s1_tag_hit)
 
         s2_data = Signal.like(self.resp.bits.data)
+        s2_word_idx = Signal(range(row_words))
+
+        if row_words > 1:
+            m.d.comb += s2_word_idx.eq(
+                s2_paddr[log2_int(self.fetch_bytes):log2_int(self.fetch_bytes *
+                                                             row_words)])
 
         for i in range(self.n_ways):
             with m.If(s2_tag_hit[i]):
-                m.d.comb += s2_data.eq(s2_dout[i])
+                m.d.comb += s2_data.eq(s2_dout[i] >>
+                                       (s2_word_idx << log2_int(word_bits)))
 
         m.d.comb += [
             self.resp.bits.data.eq(s2_data),

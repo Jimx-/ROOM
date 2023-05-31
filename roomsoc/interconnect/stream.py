@@ -53,6 +53,158 @@ class Decoupled:
         return stmts
 
 
+def _wrap_incr(signal, modulo):
+    if modulo == 2**len(signal):
+        return (signal + 1)[:len(signal)]
+    else:
+        return Mux(signal == modulo - 1, 0, signal + 1)
+
+
+class SkidBuffer(Elaboratable):
+
+    def __init__(self, cls, *args, pipe=False, **kwargs):
+        self.cls = cls
+        self.args = args
+        self.kwargs = kwargs
+        self.pipe = pipe
+
+        self.enq = Decoupled(cls, *args, **kwargs)
+
+        self.deq = Decoupled(cls, *args, **kwargs)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        valid = Signal()
+        data = self.cls(*self.args, **self.kwargs)
+
+        with m.If(self.enq.fire & (self.deq.valid & ~self.deq.ready)):
+            m.d.sync += valid.eq(1)
+        with m.Else():
+            m.d.sync += valid.eq(0)
+
+        with m.If(self.enq.ready):
+            m.d.sync += data.eq(self.enq.bits)
+
+        m.d.comb += self.enq.ready.eq(~valid)
+
+        if self.pipe:
+            m.d.comb += self.deq.valid.eq(self.enq.valid | valid)
+            with m.If(valid):
+                m.d.comb += self.deq.bits.eq(data)
+            with m.Else():
+                m.d.comb += self.deq.bits.eq(self.enq.bits)
+
+        else:
+            with m.If(~self.deq.valid | self.deq.ready):
+                m.d.sync += self.deq.valid.eq(self.enq.valid | valid)
+
+                with m.If(valid):
+                    m.d.sync += self.deq.bits.eq(data)
+                with m.Else():
+                    m.d.sync += self.deq.bits.eq(self.enq.bits)
+
+        return m
+
+
+class Queue(Elaboratable):
+
+    def __init__(self,
+                 depth,
+                 cls,
+                 *args,
+                 flow=True,
+                 has_flush=False,
+                 **kwargs):
+        self.depth = depth
+        self.flow = flow
+        self.has_flush = has_flush
+
+        self.enq = Decoupled(cls, *args, **kwargs)
+
+        self.deq = Decoupled(cls, *args, **kwargs)
+
+        self.count = Signal(range(depth + 1))
+
+        if has_flush:
+            self.flush = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        mem = Memory(width=len(self.enq.bits), depth=self.depth)
+        rport = m.submodules.rport = mem.read_port(domain='comb')
+        wport = m.submodules.wport = mem.write_port()
+
+        enq_ptr = Signal(range(self.depth))
+        deq_ptr = Signal(range(self.depth))
+        maybe_full = Signal()
+
+        empty = (enq_ptr == deq_ptr) & ~maybe_full
+        full = (enq_ptr == deq_ptr) & maybe_full
+
+        do_enq = Signal()
+        do_deq = Signal()
+        m.d.comb += [
+            do_enq.eq(self.enq.fire),
+            do_deq.eq(self.deq.fire),
+        ]
+
+        with m.If(do_enq):
+            m.d.comb += [
+                wport.addr.eq(enq_ptr),
+                wport.data.eq(self.enq.bits),
+                wport.en.eq(1),
+            ]
+            m.d.sync += enq_ptr.eq(_wrap_incr(enq_ptr, self.depth))
+
+        with m.If(do_deq):
+            m.d.sync += deq_ptr.eq(_wrap_incr(deq_ptr, self.depth))
+
+        with m.If(do_enq ^ do_deq):
+            m.d.sync += maybe_full.eq(do_enq)
+
+        if self.has_flush:
+            with m.If(self.flush):
+                m.d.sync += [
+                    enq_ptr.eq(0),
+                    deq_ptr.eq(0),
+                    maybe_full.eq(0),
+                ]
+
+        m.d.comb += [
+            self.enq.ready.eq(~full),
+            self.deq.valid.eq(~empty),
+        ]
+
+        m.d.comb += [
+            rport.addr.eq(deq_ptr),
+            self.deq.bits.eq(rport.data),
+        ]
+
+        if self.flow:
+            with m.If(self.enq.valid):
+                m.d.comb += self.deq.valid.eq(1)
+            with m.If(empty):
+                m.d.comb += [
+                    self.deq.bits.eq(self.enq.bits),
+                    do_deq.eq(0),
+                ]
+                with m.If(self.deq.ready):
+                    m.d.comb += do_enq.eq(0)
+
+        ptr_diff = (enq_ptr - deq_ptr)[:len(enq_ptr)]
+
+        if self.depth & (self.depth - 1) == 0:
+            m.d.comb += self.count.eq(Mux(full, self.depth, 0) | ptr_diff)
+        else:
+            m.d.comb += self.count.eq(
+                Mux(enq_ptr == deq_ptr, Mux(maybe_full, self.depth, 0),
+                    Mux(deq_ptr > enq_ptr, ptr_diff + self.depth, ptr_diff)))
+
+        return m
+
+
 class ClockDomainCrossing(Elaboratable):
 
     def __init__(self,
@@ -99,13 +251,6 @@ class ClockDomainCrossing(Elaboratable):
         return m
 
 
-def wrap_incr(signal, modulo):
-    if modulo == 2**len(signal):
-        return (signal + 1)[:len(signal)]
-    else:
-        return Mux(signal == modulo - 1, 0, signal + 1)
-
-
 class Gearbox(Elaboratable):
 
     def __init__(self, i_dw, o_dw, msb_first=True):
@@ -140,9 +285,9 @@ class Gearbox(Elaboratable):
         ]
 
         with m.If(enq):
-            m.d.sync += w_count.eq(wrap_incr(w_count, io_lcm // self.i_dw))
+            m.d.sync += w_count.eq(_wrap_incr(w_count, io_lcm // self.i_dw))
         with m.If(deq):
-            m.d.sync += r_count.eq(wrap_incr(r_count, io_lcm // self.o_dw))
+            m.d.sync += r_count.eq(_wrap_incr(r_count, io_lcm // self.o_dw))
 
         with m.If(enq & ~deq):
             m.d.sync += level.eq(level + self.i_dw)

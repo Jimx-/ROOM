@@ -61,8 +61,8 @@ class FunctionalUnit(HasCoreParams, Elaboratable):
 
         self.br_update = BranchUpdate(params)
 
-        self.br_res = is_alu and BranchResolution(params,
-                                                  name='br_res') or None
+        self.br_res = BranchResolution(params,
+                                       name='br_res') if is_alu else None
         self.get_pc = None
         if is_jmp:
             self.get_pc = GetPCResp(name='get_pc')
