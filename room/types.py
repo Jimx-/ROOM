@@ -158,6 +158,7 @@ class MicroOp(HasCoreParams, Record):
             groom_layout = [
                 ('pc', 32),
                 ('tmask', self.n_threads),
+                ('stall_warp', 1),
             ]
 
             layout = common_layout + groom_layout

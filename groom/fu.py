@@ -1,12 +1,12 @@
 from amaranth import *
 from amaranth import tracer
 
-from groom.if_stage import BranchResolution
+from groom.if_stage import BranchResolution, WarpControlReq
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.alu import ALU
-from room.utils import generate_imm
+from room.utils import generate_imm, Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -72,7 +72,7 @@ class ExecResp(HasCoreParams):
 
 class FunctionalUnit(HasCoreParams, Elaboratable):
 
-    def __init__(self, data_width, params, is_alu=False):
+    def __init__(self, data_width, params, is_alu=False, is_gpu=False):
         super().__init__(params)
 
         self.req = Decoupled(ExecReq, data_width, params)
@@ -81,14 +81,22 @@ class FunctionalUnit(HasCoreParams, Elaboratable):
         if is_alu:
             self.br_res = Valid(BranchResolution, params)
 
+        if is_gpu:
+            self.warp_ctrl = Valid(WarpControlReq, params)
+
 
 class PipelinedFunctionalUnit(FunctionalUnit):
 
-    def __init__(self, num_stages, data_width, params, is_alu=False):
+    def __init__(self,
+                 num_stages,
+                 data_width,
+                 params,
+                 is_alu=False,
+                 is_gpu=False):
         self.params = params
         self.num_stages = num_stages
 
-        super().__init__(data_width, params, is_alu=is_alu)
+        super().__init__(data_width, params, is_alu=is_alu, is_gpu=is_gpu)
 
     def elaborate(self, platform):
         m = Module()
@@ -294,5 +302,46 @@ class ALUUnit(PipelinedFunctionalUnit):
                 self.resp.bits.data[w].eq(data[self.num_stages - 1][w]),
                 self.br_res.eq(br_res_stages[self.num_stages - 1]),
             ]
+
+        return m
+
+
+class GPUControlUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(1, params['xlen'], params, is_gpu=True)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        uop = self.req.bits.uop
+
+        warp_ctrl = Valid(WarpControlReq, self.params)
+        m.d.comb += warp_ctrl.bits.wid.eq(self.req.bits.wid)
+
+        with m.If(self.req.valid):
+            with m.Switch(uop.opcode):
+                with m.Case(UOpCode.GPU_TMC):
+                    m.d.comb += [
+                        warp_ctrl.valid.eq(1),
+                        warp_ctrl.bits.tmc_valid.eq(1),
+                    ]
+
+                    for w in reversed(range(self.n_threads)):
+                        with m.If(uop.tmask[w]):
+                            m.d.comb += warp_ctrl.bits.tmc_mask.eq(
+                                self.req.bits.rs2_data[w])
+
+        #
+        # Output
+        #
+
+        warp_ctrl_pipe = m.submodules.warp_ctrl_pipe = Pipe(
+            len(warp_ctrl.bits), depth=self.num_stages)
+        m.d.comb += [
+            warp_ctrl_pipe.in_data.eq(warp_ctrl.bits),
+            warp_ctrl_pipe.in_valid.eq(warp_ctrl.valid),
+            self.warp_ctrl.eq(warp_ctrl_pipe.out),
+        ]
 
         return m

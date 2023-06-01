@@ -32,8 +32,6 @@ class Core(HasCoreParams, Elaboratable):
 
         self.periph_buses = [self.ibus]
 
-        self.ppl_ready = Signal()
-
     def elaborate(self, platform):
         m = Module()
 
@@ -117,6 +115,7 @@ class Core(HasCoreParams, Elaboratable):
         m.d.comb += [
             iregread.exec_req.connect(exec_unit.req),
             if_stage.br_res.eq(exec_unit.br_res),
+            if_stage.warp_ctrl.eq(exec_unit.warp_ctrl),
         ]
 
         csr_write_data = Signal(self.xlen)

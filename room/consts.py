@@ -127,6 +127,8 @@ class UOpCode(IntEnum):
     ERET = 106
     SFENCE = 107
 
+    GPU_TMC = 108
+
 
 class RegisterType(IntEnum):
     X = 0
@@ -229,8 +231,8 @@ class FUType(IntEnum):
     FDIV = 128
     I2F = 256
     F2I = 512
-
     F2IMEM = F2I | MEM
+    GPU = 1024
 
 
 class PCSel(IntEnum):

@@ -2,10 +2,69 @@ from amaranth import *
 
 from groom.if_stage import FetchBundle, WarpStallReq
 
+from room.consts import *
 from room.types import HasCoreParams, MicroOp
-from room.id_stage import DecodeUnit
+from room.id_stage import DecodeUnit as CommonDecodeUnit
 
 from roomsoc.interconnect.stream import Valid, Decoupled
+
+
+class DecodeUnit(HasCoreParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+        self.params = params
+
+        self.in_uop = MicroOp(params)
+        self.out_uop = MicroOp(params)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        decoder = m.submodules.decoder = CommonDecodeUnit(self.params)
+        m.d.comb += decoder.in_uop.eq(self.in_uop)
+
+        is_special = Signal()
+
+        inuop = self.in_uop
+        uop = MicroOp(self.params)
+        STALL = uop.stall_warp.eq(1)
+
+        m.d.comb += [
+            uop.eq(inuop),
+            uop.ldst.eq(inuop.inst[7:12]),
+            uop.lrs1.eq(inuop.inst[15:20]),
+            uop.lrs2.eq(inuop.inst[20:25]),
+            uop.lrs3.eq(inuop.inst[27:32]),
+            uop.ldst_valid.eq((uop.dst_rtype != RegisterType.X) & ~(
+                (uop.dst_rtype == RegisterType.FIX) & (uop.ldst == 0))),
+        ]
+
+        with m.Switch(inuop.inst[0:7]):
+            #
+            # GPU control
+            #
+
+            with m.Case(0b1101011):
+                m.d.comb += is_special.eq(1)
+
+                with m.Switch(inuop.inst[12:15]):
+                    with m.Case(0x0):  # gpu_tmc
+                        m.d.comb += [
+                            uop.opcode.eq(UOpCode.GPU_TMC),
+                            uop.iq_type.eq(IssueQueueType.INT),
+                            uop.fu_type.eq(FUType.GPU),
+                            uop.lrs2_rtype.eq(RegisterType.FIX),
+                            uop.imm_sel.eq(ImmSel.S),
+                            STALL,
+                        ]
+
+        with m.If(is_special):
+            m.d.comb += self.out_uop.eq(uop)
+        with m.Else():
+            m.d.comb += self.out_uop.eq(decoder.out_uop)
+
+        return m
 
 
 class DecodeStage(HasCoreParams, Elaboratable):
@@ -28,7 +87,7 @@ class DecodeStage(HasCoreParams, Elaboratable):
         dec_unit = m.submodules.dec_unit = DecodeUnit(self.params)
         m.d.comb += dec_unit.in_uop.eq(self.fetch_packet.bits.uop)
 
-        stall_warp = self.uop.is_br | self.uop.is_jal | self.uop.is_jalr | self.uop.is_ecall
+        stall_warp = self.uop.is_br | self.uop.is_jal | self.uop.is_jalr | self.uop.is_ecall | self.uop.stall_warp
         m.d.comb += [
             self.stall_req.valid.eq(self.fetch_packet.fire),
             self.stall_req.bits.wid.eq(self.fetch_packet.bits.wid),

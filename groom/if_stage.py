@@ -37,6 +37,20 @@ class WarpStallReq(HasCoreParams, Record):
                         src_loc_at=1 + src_loc_at)
 
 
+class WarpControlReq(HasCoreParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('wid', range(self.n_warps), DIR_FANOUT),
+            ('tmc_valid', 1, DIR_FANOUT),
+            ('tmc_mask', self.n_threads, DIR_FANOUT),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
 class BranchResolution(HasCoreParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
@@ -62,6 +76,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
 
         self.stall_req = Valid(WarpStallReq, params)
         self.br_res = Valid(BranchResolution, params)
+        self.warp_ctrl = Valid(WarpControlReq, params)
 
         self.tmask = BankedCSR(gpucsrnames.tmask,
                                [('value', self.n_threads, CSRAccess.RO)],
@@ -113,6 +128,15 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 wspawn_pc[0].eq(self.reset_vector),
             ]
             m.d.sync += warps_pc[0].eq(self.reset_vector)
+
+        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.tmc_valid):
+            with m.Switch(self.warp_ctrl.bits.wid):
+                for i in range(self.n_warps):
+                    with m.Case(i):
+                        m.d.sync += [
+                            thread_masks[i].eq(self.warp_ctrl.bits.tmc_mask),
+                            stalled_warps[i].eq(0),
+                        ]
 
         with m.If(self.br_res.valid):
             with m.Switch(self.br_res.bits.wid):
@@ -187,6 +211,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
 
         self.stall_req = Valid(WarpStallReq, params)
         self.br_res = Valid(BranchResolution, params)
+        self.warp_ctrl = Valid(WarpControlReq, params)
 
         self._warp_sched = WarpScheduler(self.params)
 
@@ -200,6 +225,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
             warp_sched.reset_vector.eq(self.reset_vector),
             warp_sched.stall_req.eq(self.stall_req),
             warp_sched.br_res.eq(self.br_res),
+            warp_sched.warp_ctrl.eq(self.warp_ctrl),
         ]
 
         #
