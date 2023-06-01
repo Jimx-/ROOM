@@ -10,6 +10,8 @@ class HasCoreParams:
 
         self.is_groom = params.get('is_groom', False)
 
+        self.core_id = params.get('core_id', 0)
+
         self.xlen = params['xlen']
         self.flen = self.params['flen']
         self.core_width = params['core_width']

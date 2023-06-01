@@ -5,6 +5,7 @@ from groom.if_stage import BranchResolution
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
+from room.utils import generate_imm
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
@@ -89,5 +90,11 @@ class ALUExecUnit(ExecUnit):
                     self.iresp.valid.eq(1),
                     self.iresp.bits.eq(iu.resp.bits),
                 ]
+
+        m.d.comb += [
+            self.iresp.bits.uop.csr_addr.eq(
+                generate_imm(alu.resp.bits.uop.imm_packed, ImmSel.I)),
+            self.iresp.bits.uop.csr_cmd.eq(alu.resp.bits.uop.csr_cmd),
+        ]
 
         return m

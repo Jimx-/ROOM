@@ -7,6 +7,7 @@ from groom.issue import Scoreboard
 from groom.regfile import RegisterFile, RegisterRead
 from groom.ex_stage import ALUExecUnit
 from groom.fu import ExecResp
+from groom.csr import CSRFile
 
 from room.consts import *
 from room.types import HasCoreParams
@@ -36,10 +37,13 @@ class Core(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        csr = m.submodules.csr = CSRFile(self.params, width=self.xlen)
+
         #
         # Instruction fetch
         #
         if_stage = m.submodules.if_stage = IFStage(self.ibus, self.params)
+        csr.add_csrs(if_stage.iter_csrs())
         m.d.comb += if_stage.reset_vector.eq(self.reset_vector)
 
         #
@@ -115,6 +119,20 @@ class Core(HasCoreParams, Elaboratable):
             if_stage.br_res.eq(exec_unit.br_res),
         ]
 
+        csr_write_data = Signal(self.xlen)
+        for w in reversed(range(self.n_threads)):
+            with m.If(exec_unit.iresp.bits.uop.tmask[w]):
+                m.d.comb += csr_write_data.eq(exec_unit.iresp.bits.data[w])
+
+        csr_port = csr.access_port()
+        m.d.comb += [
+            csr_port.wid.eq(exec_unit.iresp.bits.wid),
+            csr_port.addr.eq(exec_unit.iresp.bits.uop.csr_addr),
+            csr_port.cmd.eq(exec_unit.iresp.bits.uop.csr_cmd
+                            & ~Mux(exec_unit.iresp.valid, 0, CSRCommand.I)),
+            csr_port.w_data.eq(csr_write_data),
+        ]
+
         #
         # Writeback
         #
@@ -137,7 +155,10 @@ class Core(HasCoreParams, Elaboratable):
                             & (wb_req.bits.uop.dst_rtype == RegisterType.FIX)
                             & wb_req.bits.uop.tmask[i]),
                 wp.bits.addr.eq(Cat(wb_req.bits.uop.ldst, wb_req.bits.wid)),
-                wp.bits.data.eq(wb_req.bits.data[i]),
+                wp.bits.data.eq(
+                    Mux(wb_req.bits.uop.csr_cmd != CSRCommand.X,
+                        csr_port.r_data[i * self.xlen:(i + 1) * self.xlen],
+                        wb_req.bits.data[i])),
             ]
 
         return m

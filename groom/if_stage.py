@@ -1,6 +1,9 @@
 from amaranth import *
 from amaranth.hdl.rec import DIR_FANOUT
 
+from groom.csr import AutoCSR, BankedCSR, CSRAccess
+import groom.csrnames as gpucsrnames
+
 from room.types import HasCoreParams, MicroOp
 from room.icache import ICache
 
@@ -48,7 +51,7 @@ class BranchResolution(HasCoreParams, Record):
                         src_loc_at=1 + src_loc_at)
 
 
-class WarpScheduler(HasCoreParams, Elaboratable):
+class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
 
     def __init__(self, params):
         super().__init__(params)
@@ -59,6 +62,10 @@ class WarpScheduler(HasCoreParams, Elaboratable):
 
         self.stall_req = Valid(WarpStallReq, params)
         self.br_res = Valid(BranchResolution, params)
+
+        self.tmask = BankedCSR(gpucsrnames.tmask,
+                               [('value', self.n_threads, CSRAccess.RO)],
+                               params)
 
     def elaborate(self, platform):
         m = Module()
@@ -96,6 +103,9 @@ class WarpScheduler(HasCoreParams, Elaboratable):
             for i in range(self.n_warps))
         warps_pc = Array(
             Signal(32, name=f'warps_pc{i}') for i in range(self.n_warps))
+
+        for w in range(self.n_warps):
+            m.d.comb += self.tmask.r[w].eq(thread_masks[w])
 
         with m.If(reset_d1 & ~reset):
             m.d.comb += [
@@ -164,7 +174,7 @@ class FetchBundle(HasCoreParams):
         return ret
 
 
-class IFStage(HasCoreParams, Elaboratable):
+class IFStage(HasCoreParams, AutoCSR, Elaboratable):
 
     def __init__(self, ibus, params):
         super().__init__(params)
@@ -178,12 +188,14 @@ class IFStage(HasCoreParams, Elaboratable):
         self.stall_req = Valid(WarpStallReq, params)
         self.br_res = Valid(BranchResolution, params)
 
+        self._warp_sched = WarpScheduler(self.params)
+
     def elaborate(self, platform):
         m = Module()
 
         icache = m.submodules.icache = ICache(self.ibus, self.params)
 
-        warp_sched = m.submodules.warp_sched = WarpScheduler(self.params)
+        warp_sched = m.submodules.warp_sched = self._warp_sched
         m.d.comb += [
             warp_sched.reset_vector.eq(self.reset_vector),
             warp_sched.stall_req.eq(self.stall_req),
