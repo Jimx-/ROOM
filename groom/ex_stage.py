@@ -1,6 +1,6 @@
 from amaranth import *
 
-from groom.fu import ExecReq, ExecResp, ALUUnit, GPUControlUnit
+from groom.fu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, GPUControlUnit
 from groom.if_stage import BranchResolution, WarpControlReq
 
 from room.consts import *
@@ -21,6 +21,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         mem_irf_write=False,
         mem_frf_write=False,
         has_alu=False,
+        has_mem=False,
         has_ifpu=False,
         has_gpu=False,
     ):
@@ -32,6 +33,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.mem_irf_write = mem_irf_write
         self.mem_frf_write = mem_frf_write
         self.has_alu = has_alu
+        self.has_mem = has_mem
         self.has_ifpu = has_ifpu
         self.has_gpu = has_gpu
 
@@ -55,6 +57,9 @@ class ExecUnit(HasCoreParams, Elaboratable):
         if has_gpu:
             self.warp_ctrl = Valid(WarpControlReq, params)
 
+        if has_mem:
+            self.lsu_req = Decoupled(ExecResp, self.data_width, params)
+
     def elaborate(self, platform):
         m = Module()
 
@@ -69,6 +74,7 @@ class ALUExecUnit(ExecUnit):
                          irf_write=True,
                          mem_frf_write=has_ifpu,
                          has_alu=True,
+                         has_mem=True,
                          has_ifpu=has_ifpu,
                          has_gpu=True)
 
@@ -87,6 +93,16 @@ class ALUExecUnit(ExecUnit):
                                 | (self.req.bits.uop.fu_type == FUType.JMP)
                                 | (self.req.bits.uop.fu_type == FUType.CSR))),
             self.br_res.eq(alu.br_res),
+        ]
+
+        agu = m.submodules.agu = AddrGenUnit(self.params)
+
+        m.d.comb += [
+            agu.req.bits.eq(self.req.bits),
+            agu.req.valid.eq(self.req.valid
+                             & (self.req.bits.uop.fu_type == FUType.MEM)),
+            self.lsu_req.valid.eq(agu.resp.valid),
+            self.lsu_req.bits.eq(agu.resp.bits),
         ]
 
         gpu = m.submodules.gpu = GPUControlUnit(self.params)
@@ -110,5 +126,9 @@ class ALUExecUnit(ExecUnit):
                 generate_imm(alu.resp.bits.uop.imm_packed, ImmSel.I)),
             self.iresp.bits.uop.csr_cmd.eq(alu.resp.bits.uop.csr_cmd),
         ]
+
+        m.d.comb += self.req.ready.eq(1)
+        with m.If(self.req.bits.uop.fu_type == FUType.MEM):
+            m.d.comb += self.req.ready.eq(self.lsu_req.ready)
 
         return m

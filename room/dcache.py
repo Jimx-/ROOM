@@ -112,6 +112,8 @@ class HasDCacheParams(HasCoreParams):
         self.word_bits = self.xlen
         self.word_off_bits = log2_int(self.word_bits // 8)
 
+        self.row_words = self.row_bits // self.word_bits
+
         self.n_mshrs = dcache_params['n_mshrs']
         self.n_iomshrs = dcache_params['n_iomshrs']
         self.sdq_size = dcache_params['sdq_size']
@@ -475,6 +477,7 @@ class DataWriteReq(HasDCacheParams, Record):
 
         Record.__init__(self, [
             ('way_en', self.n_ways, DIR_FANOUT),
+            ('wmask', self.row_words, DIR_FANOUT),
             ('addr', self.untag_bits, DIR_FANOUT),
             ('data', self.row_bits, DIR_FANOUT),
         ],
@@ -566,7 +569,7 @@ class DuplicatedDataArray(BaseDataArray):
                 m.d.comb += mem_read.addr.eq(
                     self.read[i].bits.addr >> self.row_off_bits)
 
-                mem_write = mem.write_port()
+                mem_write = mem.write_port(granularity=self.word_bits)
                 setattr(m.submodules, f'mem_write{i}_{w}', mem_write)
 
                 for j in reversed(range(self.mem_width)):
@@ -575,7 +578,10 @@ class DuplicatedDataArray(BaseDataArray):
                             mem_write.addr.eq(
                                 self.write[j].bits.addr >> self.row_off_bits),
                             mem_write.data.eq(self.write[j].bits.data),
-                            mem_write.en.eq(self.write[j].bits.way_en[w]),
+                            mem_write.en.eq(
+                                Repl(self.write[j].bits.way_en[w],
+                                     self.row_words)
+                                & self.write[j].bits.wmask),
                         ]
 
                 m.d.sync += self.resp[i][w].eq(mem_read.data)
@@ -728,7 +734,7 @@ class BankedDataArray(BaseDataArray):
                         m.d.comb += mem_read.addr.eq(s0_ridxs[i])
                 m.d.sync += s2_bank_reads[b].eq(mem_read.data)
 
-                mem_write = mem.write_port()
+                mem_write = mem.write_port(granularity=self.word_bits)
                 setattr(m.submodules, f'mem_write{b}_{w}', mem_write)
 
                 for j in reversed(range(self.mem_width)):
@@ -738,7 +744,7 @@ class BankedDataArray(BaseDataArray):
                         m.d.comb += [
                             mem_write.addr.eq(s0_widxs[j]),
                             mem_write.data.eq(self.write[j].bits.data),
-                            mem_write.en.eq(1),
+                            mem_write.en.eq(self.write[j].bits.wmask),
                         ]
 
             for i in range(self.mem_width):
@@ -779,7 +785,7 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
         self.mem_release = Decoupled(
             tl.ChannelC,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
         self.mem_grant = Signal()
@@ -899,13 +905,13 @@ class ProbeUnit(HasDCacheParams, Elaboratable):
 
         self.req = Decoupled(tl.ChannelB,
                              addr_width=32,
-                             data_width=self.xlen,
+                             data_width=self.row_bits,
                              size_width=bits_for(self.lg_block_bytes))
 
         self.mem_release = Decoupled(
             tl.ChannelC,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
@@ -925,7 +931,7 @@ class ProbeUnit(HasDCacheParams, Elaboratable):
         m = Module()
 
         req = tl.ChannelB(addr_width=32,
-                          data_width=self.xlen,
+                          data_width=self.row_bits,
                           size_width=bits_for(self.lg_block_bytes))
         req_idx = self.addr_index(req.address)
         req_tag = self.addr_tag(req.address)
@@ -1111,12 +1117,12 @@ class MSHR(HasDCacheParams, Elaboratable):
         self.mem_acquire = Decoupled(
             tl.ChannelA,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
         self.mem_grant = Decoupled(tl.ChannelD,
-                                   data_width=self.xlen,
+                                   data_width=self.row_bits,
                                    size_width=bits_for(self.lg_block_bytes),
                                    sink_id_width=sink_id_width)
 
@@ -1326,12 +1332,19 @@ class MSHR(HasDCacheParams, Elaboratable):
 
                 rp_addr = Cat(self.addr_block_offset(rpq.r_data.addr), req_idx,
                               req_tag)
+                word_idx = 0
+                if self.row_words > 1:
+                    word_idx = rp_addr[log2_int(self.word_bits //
+                                                8):log2_int(self.word_bits *
+                                                            self.row_words //
+                                                            8)]
 
                 m.d.comb += [
                     load_gen.typ.eq(rpq.r_data.uop.mem_size),
                     load_gen.signed.eq(rpq.r_data.uop.mem_signed),
                     load_gen.addr.eq(rp_addr),
-                    load_gen.data_in.eq(self.lb_resp),
+                    load_gen.data_in.eq(self.lb_resp >> (
+                        word_idx << log2_int(self.word_bits))),
                 ]
 
                 m.d.comb += [
@@ -1428,6 +1441,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                             req.addr[self.block_off_bits:])),
                     self.refill.bits.way_en.eq(req.way_en),
                     self.refill.bits.data.eq(self.lb_resp),
+                    self.refill.bits.wmask.eq(Repl(1, self.row_words)),
                 ]
 
                 with m.If(self.refill.fire):
@@ -1498,12 +1512,12 @@ class IOMSHR(HasDCacheParams, Elaboratable):
         self.mem_access = Decoupled(
             tl.ChannelA,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
         self.mem_ack = Decoupled(tl.ChannelD,
-                                 data_width=self.xlen,
+                                 data_width=self.row_bits,
                                  size_width=bits_for(self.lg_block_bytes))
 
         self.req = Decoupled(DCacheReq, params)
@@ -1589,24 +1603,24 @@ class MSHRFile(HasDCacheParams, Elaboratable):
         self.mem_acquire = Decoupled(
             tl.ChannelA,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
         self.mem_grant = Decoupled(tl.ChannelD,
-                                   data_width=self.xlen,
+                                   data_width=self.row_bits,
                                    size_width=bits_for(self.lg_block_bytes),
                                    sink_id_width=sink_id_width)
 
         self.mem_access = Decoupled(
             tl.ChannelA,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
         self.mem_ack = Decoupled(tl.ChannelD,
-                                 data_width=self.xlen,
+                                 data_width=self.row_bits,
                                  size_width=bits_for(self.lg_block_bytes))
 
         self.mem_finish = Decoupled(tl.ChannelE, sink_id_width=sink_id_width)
@@ -1716,14 +1730,14 @@ class MSHRFile(HasDCacheParams, Elaboratable):
         mem_acquire_arbiter = m.submodules.mem_acquire_arbiter = tl.Arbiter(
             tl.ChannelA,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
         mem_access_arbiter = m.submodules.mem_access_arbiter = tl.Arbiter(
             tl.ChannelA,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
 
@@ -2023,7 +2037,7 @@ class DCache(HasDCacheParams, Elaboratable):
         mem_release_arbiter = m.submodules.mem_release_arbiter = tl.Arbiter(
             tl.ChannelC,
             addr_width=32,
-            data_width=self.xlen,
+            data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
         mem_release_arbiter.add(wb.mem_release)
@@ -2567,6 +2581,22 @@ class DCache(HasDCacheParams, Elaboratable):
         # Response selection
         #
 
+        s2_data_word_prebypass = [
+            Signal(self.word_bits, name=f's2_data_word_prebypass{i}')
+            for i in range(self.mem_width)
+        ]
+
+        for w in range(self.mem_width):
+            word_idx = 0
+            if self.row_words > 1:
+                word_idx = s2_req[w].addr[log2_int(self.word_bits // 8
+                                                   ):log2_int(self.word_bits *
+                                                              self.row_words //
+                                                              8)]
+
+            m.d.comb += s2_data_word_prebypass[w].eq(
+                s2_data_muxed[w] >> (word_idx << log2_int(self.word_bits)))
+
         s2_data_word = [
             Signal(self.word_bits, name=f's2_data_word{i}')
             for i in range(self.mem_width)
@@ -2578,7 +2608,7 @@ class DCache(HasDCacheParams, Elaboratable):
         ]
 
         for w in range(self.mem_width):
-            load_gen = LoadGen(max_size=self.dbus.data_width // 8)
+            load_gen = LoadGen(max_size=self.xlen // 8)
             m.submodules += load_gen
 
             m.d.comb += [
@@ -2671,10 +2701,19 @@ class DCache(HasDCacheParams, Elaboratable):
                 s3_way[w].eq(s2_tag_match_way[w]),
             ]
 
+            word_idx = 0
+            if self.row_words > 1:
+                word_idx = s3_req[w].addr[log2_int(self.word_bits // 8
+                                                   ):log2_int(self.word_bits *
+                                                              self.row_words //
+                                                              8)]
+
             m.d.comb += [
                 data_write_arb.inp[0].bits.req[w].addr.eq(s3_req[w].addr),
-                data_write_arb.inp[0].bits.req[w].data.eq(s3_req[w].data),
+                data_write_arb.inp[0].bits.req[w].data.eq(
+                    Repl(s3_req[w].data, self.row_words)),
                 data_write_arb.inp[0].bits.req[w].way_en.eq(s3_way[w]),
+                data_write_arb.inp[0].bits.req[w].wmask.eq(1 << word_idx),
                 data_write_arb.inp[0].bits.valid[w].eq(s3_valid[w]),
             ]
         m.d.comb += data_write_arb.inp[0].valid.eq(s3_valid != 0)
@@ -2704,7 +2743,7 @@ class DCache(HasDCacheParams, Elaboratable):
                 s5_req[w].eq(s4_req[w]),
             ]
 
-            m.d.comb += s2_data_word[w].eq(s2_data_muxed[w])
+            m.d.comb += s2_data_word[w].eq(s2_data_word_prebypass[w])
 
         for i in reversed(range(self.mem_width)):
             s3_bypass = Cat(s3_valid[i]

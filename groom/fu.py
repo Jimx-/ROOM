@@ -306,6 +306,30 @@ class ALUUnit(PipelinedFunctionalUnit):
         return m
 
 
+class AddrGenUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(0, params['xlen'], params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        for w in range(self.n_threads):
+            sum = self.req.bits.rs1_data[w].as_signed(
+            ) + self.req.bits.uop.imm_packed[8:20].as_signed()
+            ea_sign = Mux(sum[self.vaddr_bits - 1],
+                          ~sum[self.vaddr_bits:self.xlen] == 0,
+                          sum[self.vaddr_bits:self.xlen] != 0)
+            eff_addr = Cat(sum[:self.vaddr_bits], ea_sign).as_unsigned()
+
+            m.d.comb += [
+                self.resp.bits.addr[w].eq(eff_addr),
+                self.resp.bits.data[w].eq(self.req.bits.rs2_data[w]),
+            ]
+
+        return m
+
+
 class GPUControlUnit(PipelinedFunctionalUnit):
 
     def __init__(self, params):

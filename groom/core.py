@@ -8,6 +8,7 @@ from groom.regfile import RegisterFile, RegisterRead
 from groom.ex_stage import ALUExecUnit
 from groom.fu import ExecResp
 from groom.csr import CSRFile
+from groom.lsu import LoadStoreUnit
 
 from room.consts import *
 from room.types import HasCoreParams
@@ -30,7 +31,21 @@ class Core(HasCoreParams, Elaboratable):
                                  sink_id_width=4,
                                  name='ibus')
 
-        self.periph_buses = [self.ibus]
+        self.dbus = tl.Interface(data_width=64,
+                                 addr_width=32,
+                                 size_width=3,
+                                 source_id_width=4,
+                                 sink_id_width=4,
+                                 has_bce=True,
+                                 name='dbus')
+
+        self.dbus_mmio = tl.Interface(data_width=64,
+                                      addr_width=32,
+                                      size_width=3,
+                                      source_id_width=8,
+                                      name='dbus_mmio')
+
+        self.periph_buses = [self.ibus, self.dbus, self.dbus_mmio]
 
     def elaborate(self, platform):
         m = Module()
@@ -133,12 +148,24 @@ class Core(HasCoreParams, Elaboratable):
         ]
 
         #
+        # Load/store unit
+        #
+        lsu = m.submodules.lsu = LoadStoreUnit(self.dbus, self.dbus_mmio,
+                                               self.params)
+        m.d.comb += exec_unit.lsu_req.connect(lsu.exec_req)
+
+        #
         # Writeback
         #
 
         wb_req = Valid(ExecResp, self.xlen, self.params)
         with m.If(exec_unit.iresp.valid):
             m.d.comb += wb_req.eq(exec_unit.iresp)
+        with m.Elif(lsu.exec_iresp.valid):
+            m.d.comb += [
+                wb_req.eq(lsu.exec_iresp),
+                lsu.exec_iresp.ready.eq(1),
+            ]
 
         m.d.comb += [
             scoreboard.wakeup.valid.eq(

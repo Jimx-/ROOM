@@ -80,7 +80,7 @@ class SkidBuffer(Elaboratable):
 
         with m.If(self.enq.fire & (self.deq.valid & ~self.deq.ready)):
             m.d.sync += valid.eq(1)
-        with m.Else():
+        with m.Elif(self.deq.ready):
             m.d.sync += valid.eq(0)
 
         with m.If(self.enq.ready):

@@ -37,18 +37,23 @@ class Scoreboard(HasCoreParams, Elaboratable):
 
         busy_regs = Array(
             Signal(32, name=f'busy_regs{i}') for i in range(self.n_warps))
+        busy_regs_n = Array(
+            Signal(32, name=f'busy_regs_n{i}') for i in range(self.n_warps))
+        m.d.comb += Cat(*busy_regs_n).eq(Cat(*busy_regs))
 
         with m.If(self.dis_valid & self.dis_ready & self.dis_uop.ldst_valid):
             with m.Switch(self.dis_uop.ldst):
                 for i in range(32):
                     with m.Case(i):
-                        m.d.sync += busy_regs[self.dis_wid][i].eq(1)
+                        m.d.comb += busy_regs_n[self.dis_wid][i].eq(1)
 
         with m.If(self.wakeup.valid):
             with m.Switch(self.wakeup.bits.ldst):
                 for i in range(32):
                     with m.Case(i):
-                        m.d.sync += busy_regs[self.wakeup.bits.wid][i].eq(0)
+                        m.d.comb += busy_regs_n[self.wakeup.bits.wid][i].eq(0)
+
+        m.d.sync += Cat(*busy_regs).eq(Cat(*busy_regs_n))
 
         rd_busy = Signal()
         rs1_busy = Signal()
@@ -60,20 +65,23 @@ class Scoreboard(HasCoreParams, Elaboratable):
                                             ) & (self.wakeup.bits.ldst == i)
 
             with m.If((self.sb_uop.ldst == i) & self.sb_uop.ldst_valid):
-                m.d.sync += rd_busy.eq(busy_regs[self.sb_wid][i] & ~wb_valid)
+                m.d.sync += rd_busy.eq(busy_regs_n[self.sb_wid][i] & ~wb_valid)
 
             with m.If((self.sb_uop.lrs1 == i)
                       & (self.sb_uop.lrs1_rtype != RegisterType.X)):
-                m.d.sync += rs1_busy.eq(busy_regs[self.sb_wid][i] & ~wb_valid)
+                m.d.sync += rs1_busy.eq(busy_regs_n[self.sb_wid][i]
+                                        & ~wb_valid)
 
             with m.If((self.sb_uop.lrs2 == i)
                       & (self.sb_uop.lrs2_rtype != RegisterType.X)):
-                m.d.sync += rs2_busy.eq(busy_regs[self.sb_wid][i] & ~wb_valid)
+                m.d.sync += rs2_busy.eq(busy_regs_n[self.sb_wid][i]
+                                        & ~wb_valid)
 
             with m.If((self.sb_uop.lrs3 == i)
                       & (self.sb_uop.iq_type == IssueQueueType.FP)
                       & self.sb_uop.frs3_en):
-                m.d.sync += rs3_busy.eq(busy_regs[self.sb_wid][i] & ~wb_valid)
+                m.d.sync += rs3_busy.eq(busy_regs_n[self.sb_wid][i]
+                                        & ~wb_valid)
 
         m.d.comb += self.dis_ready.eq(~(rd_busy | rs1_busy | rs2_busy
                                         | rs3_busy))

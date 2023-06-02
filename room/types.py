@@ -84,6 +84,9 @@ class HasCoreParams:
             self.n_warps = params['n_warps']
             self.n_threads = params['n_threads']
 
+            self.mem_width = self.n_threads
+            self.max_br_count = 0
+
             #
             # Instruction fetch
             #
@@ -126,6 +129,7 @@ class MicroOp(HasCoreParams, Record):
             ('is_br', 1),
             ('is_jal', 1),
             ('is_jalr', 1),
+            ('br_mask', self.max_br_count),
             ('imm_packed', 20),
             ('mem_cmd', MemoryCommand),
             ('mem_size', 2),
@@ -159,6 +163,8 @@ class MicroOp(HasCoreParams, Record):
                 ('pc', 32),
                 ('tmask', self.n_threads),
                 ('stall_warp', 1),
+                ('lsq_wid', range(self.n_warps)),
+                ('lsq_tid', range(self.n_threads)),
             ]
 
             layout = common_layout + groom_layout
@@ -167,7 +173,6 @@ class MicroOp(HasCoreParams, Record):
                 ('is_rvc', 1),
                 ('issue_uops', 2),
                 ('br_tag', range(self.max_br_count)),
-                ('br_mask', self.max_br_count),
                 ('ftq_idx', range(self.ftq_size)),
                 ('edge_inst', 1),
                 ('pc_lsb', range(self.fetch_bytes)),
