@@ -6,7 +6,7 @@ from groom.if_stage import BranchResolution, WarpControlReq
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
-from room.alu import ALU, Multiplier
+from room.alu import ALU, Multiplier, IntDiv
 from room.utils import generate_imm, Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -401,5 +401,72 @@ class GPUControlUnit(PipelinedFunctionalUnit):
             warp_ctrl_pipe.in_valid.eq(warp_ctrl.valid),
             self.warp_ctrl.eq(warp_ctrl_pipe.out),
         ]
+
+        return m
+
+
+class IterativeFunctionalUnit(FunctionalUnit):
+
+    def __init__(self, data_width, params):
+        self.params = params
+
+        super().__init__(data_width, params)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        uop = MicroOp(self.params)
+
+        with m.If(self.req.fire):
+            m.d.sync += uop.eq(self.req.bits.uop)
+
+        m.d.comb += self.resp.bits.uop.eq(uop)
+
+        return m
+
+
+class DivUnit(IterativeFunctionalUnit):
+
+    def __init__(self, width, params):
+        self.width = width
+
+        super().__init__(width, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        tmask_valid = Signal()
+        tmask = Signal(self.n_threads)
+
+        with m.If(self.req.fire):
+            m.d.sync += [
+                tmask.eq(self.req.bits.uop.tmask),
+                tmask_valid.eq(1),
+            ]
+        with m.Elif(self.resp.fire):
+            m.d.sync += [
+                tmask.eq(0),
+                tmask_valid.eq(0),
+            ]
+        m.d.comb += self.req.ready.eq(~tmask_valid)
+
+        div_resp_valid = Signal(self.n_threads)
+        for w in range(self.n_threads):
+            div = IntDiv(self.width)
+            setattr(m.submodules, f'div{w}', div)
+
+            m.d.comb += [
+                div.req.bits.fn.eq(self.req.bits.uop.alu_fn),
+                div.req.bits.dw.eq(self.req.bits.uop.alu_dw),
+                div.req.bits.in1.eq(self.req.bits.rs1_data[w]),
+                div.req.bits.in2.eq(self.req.bits.rs2_data[w]),
+                div.req.valid.eq(self.req.valid & self.req.bits.uop.tmask[w]),
+                self.resp.bits.data[w].eq(div.resp.bits),
+                div_resp_valid[w].eq(div.resp.valid),
+                div.resp.ready.eq(~tmask_valid | self.resp.fire),
+            ]
+
+        m.d.comb += self.resp.valid.eq(tmask_valid
+                                       & ((tmask & div_resp_valid) == tmask))
 
         return m

@@ -1,10 +1,10 @@
 from amaranth import *
 
-from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, GPUControlUnit
+from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, GPUControlUnit, DivUnit
 from groom.if_stage import BranchResolution, WarpControlReq
 
 from room.consts import *
-from room.types import HasCoreParams, MicroOp
+from room.types import HasCoreParams
 from room.utils import generate_imm
 
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
@@ -116,8 +116,23 @@ class ALUExecUnit(ExecUnit):
             imul_queue.deq.ready.eq(~imul_resp_busy),
             imul_busy.eq(imul_queue.count.any()),
         ]
-
         iresp_units.append(imul)
+
+        div = m.submodules.div = DivUnit(self.data_width, self.params)
+        div_busy = Signal()
+
+        div_resp_busy = 0
+        for iu in iresp_units:
+            div_resp_busy |= iu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(div.req),
+            div.req.valid.eq(self.req.valid
+                             & (self.req.bits.uop.fu_type == FUType.DIV)),
+            div.resp.ready.eq(~div_resp_busy),
+            div_busy.eq(~div.req.ready),
+        ]
+        iresp_units.append(div)
 
         agu = m.submodules.agu = AddrGenUnit(self.params)
 
@@ -154,6 +169,8 @@ class ALUExecUnit(ExecUnit):
         m.d.comb += self.req.ready.eq(1)
         with m.If(self.req.bits.uop.fu_type == FUType.MUL):
             m.d.comb += self.req.ready.eq(~imul_busy)
+        with m.Elif(self.req.bits.uop.fu_type == FUType.DIV):
+            m.d.comb += self.req.ready.eq(~div_busy)
         with m.Elif(self.req.bits.uop.fu_type == FUType.MEM):
             m.d.comb += self.req.ready.eq(self.lsu_req.ready)
 
