@@ -241,7 +241,7 @@ class ALUExecUnit(ExecUnit):
                 ifpu_q.r_en.eq(self.mem_fresp.ready),
             ]
 
-            m.d.comb += ifpu_busy.eq(ifpu_q.r_rdy)
+            m.d.comb += ifpu_busy.eq(~ifpu_q.empty)
 
         if self.has_div:
             div = m.submodules.div = DivUnit(self.data_width, self.params)
@@ -416,7 +416,7 @@ class FPUExecUnit(ExecUnit):
                 resp_arb.out.connect(self.mem_iresp),
             ]
 
-            m.d.comb += fpiu_busy.eq(fpiu_q.r_rdy | fp_stq.r_rdy)
+            m.d.comb += fpiu_busy.eq(~fpiu_q.empty | ~fp_stq.empty)
 
         fresp_valid = 0
         for fu in reversed(fu_units):

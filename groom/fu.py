@@ -1,17 +1,18 @@
 from amaranth import *
 from amaranth import tracer
+from amaranth.hdl.ast import ValueCastable
 
 from groom.if_stage import BranchResolution, WarpControlReq
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
-from room.alu import ALU
+from room.alu import ALU, Multiplier
 from room.utils import generate_imm, Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
 
-class ExecReq(HasCoreParams):
+class ExecReq(HasCoreParams, ValueCastable):
 
     def __init__(self, data_width, params, name=None, src_loc_at=0):
         super().__init__(params)
@@ -35,15 +36,16 @@ class ExecReq(HasCoreParams):
             for t in range(self.n_threads)
         ]
 
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.wid, self.uop, *self.rs1_data, *self.rs2_data,
+                   *self.rs3_data)
+
     def eq(self, rhs):
-        return [self.wid.eq(rhs.wid),
-                self.uop.eq(rhs.uop)
-                ] + [a.eq(b) for a, b in zip(self.rs1_data, rhs.rs1_data)] + [
-                    a.eq(b) for a, b in zip(self.rs2_data, rhs.rs2_data)
-                ] + [a.eq(b) for a, b in zip(self.rs3_data, rhs.rs3_data)]
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
-class ExecResp(HasCoreParams):
+class ExecResp(HasCoreParams, ValueCastable):
 
     def __init__(self, data_width, params, name=None, src_loc_at=0):
         super().__init__(params)
@@ -63,11 +65,15 @@ class ExecResp(HasCoreParams):
             for t in range(self.n_threads)
         ]
 
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.wid, self.uop, *self.data, *self.addr)
+
+    def __len__(self):
+        return len(Value.cast(self))
+
     def eq(self, rhs):
-        return [self.wid.eq(rhs.wid),
-                self.uop.eq(rhs.uop)] + [
-                    a.eq(b) for a, b in zip(self.data, rhs.data)
-                ] + [a.eq(b) for a, b in zip(self.addr, rhs.addr)]
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
 class FunctionalUnit(HasCoreParams, Elaboratable):
@@ -302,6 +308,34 @@ class ALUUnit(PipelinedFunctionalUnit):
                 self.resp.bits.data[w].eq(data[self.num_stages - 1][w]),
                 self.br_res.eq(br_res_stages[self.num_stages - 1]),
             ]
+
+        return m
+
+
+class MultiplierUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, width, latency, params):
+        self.width = width
+        self.latency = latency
+
+        super().__init__(latency, width, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        for w in range(self.n_threads):
+            mul = Multiplier(self.width, self.latency)
+            setattr(m.submodules, f'mul{w}', mul)
+
+            m.d.comb += [
+                mul.req.bits.fn.eq(self.req.bits.uop.alu_fn),
+                mul.req.bits.dw.eq(self.req.bits.uop.alu_dw),
+                mul.req.bits.in1.eq(self.req.bits.rs1_data[w]),
+                mul.req.bits.in2.eq(self.req.bits.rs2_data[w]),
+                mul.req.valid.eq(self.req.valid),
+            ]
+
+            m.d.comb += self.resp.bits.data[w].eq(mul.resp_data)
 
         return m
 

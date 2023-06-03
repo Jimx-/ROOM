@@ -1,13 +1,13 @@
 from amaranth import *
 
-from groom.fu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, GPUControlUnit
+from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, GPUControlUnit
 from groom.if_stage import BranchResolution, WarpControlReq
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.utils import generate_imm
 
-from roomsoc.interconnect.stream import Decoupled, Valid
+from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
 
 class ExecUnit(HasCoreParams, Elaboratable):
@@ -95,6 +95,30 @@ class ALUExecUnit(ExecUnit):
             self.br_res.eq(alu.br_res),
         ]
 
+        imul = m.submodules.imul = MultiplierUnit(self.data_width, 3,
+                                                  self.params)
+        imul_queue = m.submodules.imul_queue = Queue(6,
+                                                     ExecResp,
+                                                     self.data_width,
+                                                     self.params,
+                                                     flow=True)
+        imul_busy = Signal()
+
+        imul_resp_busy = 0
+        for iu in iresp_units:
+            imul_resp_busy |= iu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(imul.req),
+            imul.req.valid.eq(self.req.valid
+                              & (self.req.bits.uop.fu_type == FUType.MUL)),
+            imul.resp.connect(imul_queue.enq),
+            imul_queue.deq.ready.eq(~imul_resp_busy),
+            imul_busy.eq(imul_queue.count.any()),
+        ]
+
+        iresp_units.append(imul)
+
         agu = m.submodules.agu = AddrGenUnit(self.params)
 
         m.d.comb += [
@@ -128,7 +152,9 @@ class ALUExecUnit(ExecUnit):
         ]
 
         m.d.comb += self.req.ready.eq(1)
-        with m.If(self.req.bits.uop.fu_type == FUType.MEM):
+        with m.If(self.req.bits.uop.fu_type == FUType.MUL):
+            m.d.comb += self.req.ready.eq(~imul_busy)
+        with m.Elif(self.req.bits.uop.fu_type == FUType.MEM):
             m.d.comb += self.req.ready.eq(self.lsu_req.ready)
 
         return m
