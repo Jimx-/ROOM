@@ -46,6 +46,9 @@ class WarpControlReq(HasCoreParams, Record):
             ('wid', range(self.n_warps), DIR_FANOUT),
             ('tmc_valid', 1, DIR_FANOUT),
             ('tmc_mask', self.n_threads, DIR_FANOUT),
+            ('wspawn_valid', 1, DIR_FANOUT),
+            ('wspawn_mask', self.n_warps, DIR_FANOUT),
+            ('wspawn_pc', 32, DIR_FANOUT),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
@@ -97,6 +100,15 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         active_warps = Signal(self.n_warps, reset=1)
         stalled_warps = Signal(self.n_warps)
 
+        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn_valid):
+            m.d.sync += active_warps.eq(self.warp_ctrl.bits.wspawn_mask)
+        with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.tmc_valid):
+            with m.Switch(self.warp_ctrl.bits.wid):
+                for w in range(self.n_threads):
+                    with m.Case(w):
+                        m.d.sync += active_warps[w].eq(
+                            self.warp_ctrl.bits.tmc_mask.any())
+
         ready_warps = active_warps & ~stalled_warps
 
         schedule_wid = Signal(range(self.n_warps))
@@ -128,6 +140,20 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 wspawn_pc[0].eq(self.reset_vector),
             ]
             m.d.sync += warps_pc[0].eq(self.reset_vector)
+        with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn_valid):
+            m.d.comb += [
+                wspawn_valid.eq(self.warp_ctrl.bits.wspawn_mask
+                                & ~Const(1, self.n_warps)),
+                Cat(*wspawn_pc).eq(
+                    Repl(self.warp_ctrl.bits.wspawn_pc, self.n_warps)),
+            ]
+
+            for w in range(self.n_warps):
+                with m.If(wspawn_valid[w]):
+                    m.d.sync += [
+                        warps_pc[w].eq(wspawn_pc[w]),
+                        thread_masks[w].eq(1),
+                    ]
 
         with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.tmc_valid):
             with m.Switch(self.warp_ctrl.bits.wid):

@@ -87,7 +87,6 @@ class Core(HasCoreParams, Elaboratable):
 
         scoreboard = m.submodules.scoreboard = Scoreboard(self.params)
         m.d.comb += [
-            scoreboard.dis_valid.eq(dispatcher.dis_valid),
             scoreboard.dis_uop.eq(dispatcher.dis_uop),
             scoreboard.dis_wid.eq(dispatcher.dis_wid),
             scoreboard.sb_uop.eq(dispatcher.sb_uop),
@@ -116,8 +115,11 @@ class Core(HasCoreParams, Elaboratable):
             iregread.dis_wid.eq(dispatcher.dis_wid),
         ]
 
-        m.d.comb += dispatcher.dis_ready.eq(scoreboard.dis_ready
-                                            & iregread.dis_ready)
+        m.d.comb += [
+            scoreboard.dis_valid.eq(dispatcher.dis_valid & iregread.dis_ready),
+            dispatcher.dis_ready.eq(scoreboard.dis_ready
+                                    & iregread.dis_ready),
+        ]
 
         for irr_rp, rp in zip(iregread.read_ports, iregfile.read_ports):
             m.d.comb += irr_rp.connect(rp)

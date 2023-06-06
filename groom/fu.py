@@ -390,6 +390,22 @@ class GPUControlUnit(PipelinedFunctionalUnit):
                             m.d.comb += warp_ctrl.bits.tmc_mask.eq(
                                 self.req.bits.rs2_data[w])
 
+                with m.Case(UOpCode.GPU_WSPAWN):
+                    m.d.comb += [
+                        warp_ctrl.valid.eq(1),
+                        warp_ctrl.bits.wspawn_valid.eq(1),
+                    ]
+
+                    for w in reversed(range(self.n_threads)):
+                        with m.If(uop.tmask[w]):
+                            for i in range(self.n_warps):
+                                m.d.comb += warp_ctrl.bits.wspawn_mask[i].eq(
+                                    i < self.req.bits.rs2_data[w])
+
+                            m.d.comb += warp_ctrl.bits.wspawn_pc.eq(
+                                self.req.bits.rs1_data[w].as_signed() +
+                                self.req.bits.uop.imm_packed[8:20].as_signed())
+
         #
         # Output
         #

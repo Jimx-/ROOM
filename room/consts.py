@@ -128,6 +128,7 @@ class UOpCode(IntEnum):
     SFENCE = 107
 
     GPU_TMC = 108
+    GPU_WSPAWN = 109
 
 
 class RegisterType(IntEnum):

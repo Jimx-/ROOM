@@ -59,6 +59,16 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             STALL,
                         ]
 
+                    with m.Case(0x1):  # gpu_wspawn
+                        m.d.comb += [
+                            uop.opcode.eq(UOpCode.GPU_WSPAWN),
+                            uop.iq_type.eq(IssueQueueType.INT),
+                            uop.fu_type.eq(FUType.GPU),
+                            uop.lrs1_rtype.eq(RegisterType.FIX),
+                            uop.lrs2_rtype.eq(RegisterType.FIX),
+                            uop.imm_sel.eq(ImmSel.S),
+                        ]
+
         with m.If(is_special):
             m.d.comb += self.out_uop.eq(uop)
         with m.Else():

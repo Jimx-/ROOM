@@ -121,7 +121,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         lsq_wakeup_idx = Signal(range(self.n_warps))
         lsq_wakeup_e = lsq[lsq_wakeup_idx]
-        with m.Switch(lsq_wakeup_valid):
+        with m.Switch(lsq_wakeup_idx):
             for i in range(self.n_warps):
                 with m.Case(i):
                     for pred in reversed(range(i)):
@@ -176,6 +176,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 m.d.comb += [
                     dmem_req.valid.eq(self.exec_req.bits.uop.tmask[w]),
                     dmem_req.bits.uop.eq(self.exec_req.bits.uop),
+                    dmem_req.bits.uop.lsq_wid.eq(self.exec_req.bits.wid),
                     dmem_req.bits.uop.lsq_tid.eq(w),
                     dmem_req.bits.addr.eq(self.exec_req.bits.addr[w]),
                     dmem_req.bits.data.eq(self.exec_req.bits.data[w]),
