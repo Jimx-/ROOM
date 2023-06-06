@@ -67,6 +67,7 @@ class Core(HasCoreParams, Elaboratable):
         m.d.comb += [
             if_stage.fetch_packet.connect(dec_stage.fetch_packet),
             if_stage.stall_req.eq(dec_stage.stall_req),
+            if_stage.join_req.eq(dec_stage.join_req),
         ]
 
         #

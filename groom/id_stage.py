@@ -69,6 +69,26 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             uop.imm_sel.eq(ImmSel.S),
                         ]
 
+                    with m.Case(0x2):  # gpu_split
+                        m.d.comb += [
+                            uop.opcode.eq(UOpCode.GPU_SPLIT),
+                            uop.iq_type.eq(IssueQueueType.INT),
+                            uop.fu_type.eq(FUType.GPU),
+                            uop.lrs2_rtype.eq(RegisterType.FIX),
+                            uop.imm_sel.eq(ImmSel.S),
+                            STALL,
+                        ]
+
+                    with m.Case(0x3):  # gpu_join
+                        m.d.comb += [
+                            uop.opcode.eq(UOpCode.GPU_JOIN),
+                            uop.iq_type.eq(IssueQueueType.INT),
+                            uop.fu_type.eq(FUType.GPU),
+                        ]
+
+                    with m.Default():
+                        m.d.comb += is_special.eq(0)
+
         with m.If(is_special):
             m.d.comb += self.out_uop.eq(uop)
         with m.Else():
@@ -90,6 +110,7 @@ class DecodeStage(HasCoreParams, Elaboratable):
         self.ready = Signal()
 
         self.stall_req = Valid(WarpStallReq, params)
+        self.join_req = Valid(Signal, range(self.n_warps))
 
     def elaborate(self, platform):
         m = Module()
@@ -102,6 +123,12 @@ class DecodeStage(HasCoreParams, Elaboratable):
             self.stall_req.valid.eq(self.fetch_packet.fire),
             self.stall_req.bits.wid.eq(self.fetch_packet.bits.wid),
             self.stall_req.bits.stall.eq(stall_warp),
+        ]
+
+        m.d.comb += [
+            self.join_req.valid.eq(self.valid & self.ready
+                                   & (self.uop.opcode == UOpCode.GPU_JOIN)),
+            self.join_req.bits.eq(self.wid),
         ]
 
         m.d.comb += [

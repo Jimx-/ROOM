@@ -374,6 +374,15 @@ class GPUControlUnit(PipelinedFunctionalUnit):
 
         uop = self.req.bits.uop
 
+        taken_mask = Signal(self.n_threads)
+        not_taken_mask = Signal(self.n_threads)
+        for w in range(self.n_threads):
+            taken = self.req.bits.rs2_data[w].any()
+            m.d.comb += [
+                taken_mask[w].eq(uop.tmask[w] & taken),
+                not_taken_mask[w].eq(uop.tmask[w] & ~taken),
+            ]
+
         warp_ctrl = Valid(WarpControlReq, self.params)
         m.d.comb += warp_ctrl.bits.wid.eq(self.req.bits.wid)
 
@@ -382,29 +391,40 @@ class GPUControlUnit(PipelinedFunctionalUnit):
                 with m.Case(UOpCode.GPU_TMC):
                     m.d.comb += [
                         warp_ctrl.valid.eq(1),
-                        warp_ctrl.bits.tmc_valid.eq(1),
+                        warp_ctrl.bits.tmc.valid.eq(1),
                     ]
 
                     for w in reversed(range(self.n_threads)):
                         with m.If(uop.tmask[w]):
-                            m.d.comb += warp_ctrl.bits.tmc_mask.eq(
+                            m.d.comb += warp_ctrl.bits.tmc.mask.eq(
                                 self.req.bits.rs2_data[w])
 
                 with m.Case(UOpCode.GPU_WSPAWN):
                     m.d.comb += [
                         warp_ctrl.valid.eq(1),
-                        warp_ctrl.bits.wspawn_valid.eq(1),
+                        warp_ctrl.bits.wspawn.valid.eq(1),
                     ]
 
                     for w in reversed(range(self.n_threads)):
                         with m.If(uop.tmask[w]):
                             for i in range(self.n_warps):
-                                m.d.comb += warp_ctrl.bits.wspawn_mask[i].eq(
+                                m.d.comb += warp_ctrl.bits.wspawn.mask[i].eq(
                                     i < self.req.bits.rs2_data[w])
 
-                            m.d.comb += warp_ctrl.bits.wspawn_pc.eq(
+                            m.d.comb += warp_ctrl.bits.wspawn.pc.eq(
                                 self.req.bits.rs1_data[w].as_signed() +
                                 self.req.bits.uop.imm_packed[8:20].as_signed())
+
+                with m.Case(UOpCode.GPU_SPLIT):
+                    m.d.comb += [
+                        warp_ctrl.valid.eq(1),
+                        warp_ctrl.bits.split.valid.eq(1),
+                        warp_ctrl.bits.split.diverged.eq(
+                            taken_mask.any() & not_taken_mask.any()),
+                        warp_ctrl.bits.split.then_mask.eq(taken_mask),
+                        warp_ctrl.bits.split.else_mask.eq(not_taken_mask),
+                        warp_ctrl.bits.split.pc.eq(uop.pc + 4),
+                    ]
 
         #
         # Output

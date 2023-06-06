@@ -44,11 +44,22 @@ class WarpControlReq(HasCoreParams, Record):
 
         Record.__init__(self, [
             ('wid', range(self.n_warps), DIR_FANOUT),
-            ('tmc_valid', 1, DIR_FANOUT),
-            ('tmc_mask', self.n_threads, DIR_FANOUT),
-            ('wspawn_valid', 1, DIR_FANOUT),
-            ('wspawn_mask', self.n_warps, DIR_FANOUT),
-            ('wspawn_pc', 32, DIR_FANOUT),
+            ('tmc', [
+                ('valid', 1, DIR_FANOUT),
+                ('mask', self.n_threads, DIR_FANOUT),
+            ]),
+            ('wspawn', [
+                ('valid', 1, DIR_FANOUT),
+                ('mask', self.n_warps, DIR_FANOUT),
+                ('pc', 32, DIR_FANOUT),
+            ]),
+            ('split', [
+                ('valid', 1, DIR_FANOUT),
+                ('diverged', 1, DIR_FANOUT),
+                ('then_mask', self.n_threads, DIR_FANOUT),
+                ('else_mask', self.n_threads, DIR_FANOUT),
+                ('pc', 32, DIR_FANOUT),
+            ]),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
@@ -68,6 +79,67 @@ class BranchResolution(HasCoreParams, Record):
                         src_loc_at=1 + src_loc_at)
 
 
+class IPDomStack(HasCoreParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.layout = [
+            ('pc', 32),
+            ('mask', self.n_threads),
+        ]
+
+        self.w_data1 = Record(self.layout)
+        self.w_data2 = Record(self.layout)
+        self.w_index = Signal()
+        self.w_en = Signal()
+
+        self.r_data = Record(self.layout)
+        self.r_index = Signal()
+        self.r_en = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        mem = Memory(depth=self.n_threads, width=2 * len(self.r_data))
+        r_ptr = Signal(range(self.n_threads + 1))
+        w_ptr = Signal(range(self.n_threads + 1))
+
+        index = Array(Signal(name=f'index{i}') for i in range(self.n_threads))
+
+        with m.If(self.w_en):
+            m.d.sync += [
+                index[w_ptr].eq(self.w_index),
+                r_ptr.eq(w_ptr),
+                w_ptr.eq(w_ptr + 1),
+            ]
+        with m.Elif(self.r_en):
+            m.d.sync += [
+                index[r_ptr].eq(1),
+                w_ptr.eq(w_ptr - index[r_ptr]),
+                r_ptr.eq(r_ptr - index[r_ptr]),
+            ]
+
+        m.d.comb += self.r_index.eq(index[r_ptr])
+
+        rport = m.submodules.rport = mem.read_port(domain='comb')
+        m.d.comb += [
+            rport.addr.eq(r_ptr),
+            self.r_data.eq(
+                Mux(self.r_index, rport.data[len(self.r_data):],
+                    rport.data[:len(self.r_data)])),
+        ]
+
+        wport = m.submodules.wport = mem.write_port()
+        m.d.comb += [
+            wport.addr.eq(w_ptr),
+            wport.data.eq(Cat(self.w_data1, self.w_data2)),
+            wport.en.eq(self.w_en),
+        ]
+
+        return m
+
+
 class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
 
     def __init__(self, params):
@@ -80,6 +152,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         self.stall_req = Valid(WarpStallReq, params)
         self.br_res = Valid(BranchResolution, params)
         self.warp_ctrl = Valid(WarpControlReq, params)
+        self.join_req = Valid(Signal, range(self.n_warps))
 
         self.tmask = BankedCSR(gpucsrnames.tmask,
                                [('value', self.n_threads, CSRAccess.RO)],
@@ -100,14 +173,14 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         active_warps = Signal(self.n_warps, reset=1)
         stalled_warps = Signal(self.n_warps)
 
-        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn_valid):
-            m.d.sync += active_warps.eq(self.warp_ctrl.bits.wspawn_mask)
-        with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.tmc_valid):
+        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
+            m.d.sync += active_warps.eq(self.warp_ctrl.bits.wspawn.mask)
+        with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.tmc.valid):
             with m.Switch(self.warp_ctrl.bits.wid):
                 for w in range(self.n_threads):
                     with m.Case(w):
                         m.d.sync += active_warps[w].eq(
-                            self.warp_ctrl.bits.tmc_mask.any())
+                            self.warp_ctrl.bits.tmc.mask.any())
 
         ready_warps = active_warps & ~stalled_warps
 
@@ -140,12 +213,12 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 wspawn_pc[0].eq(self.reset_vector),
             ]
             m.d.sync += warps_pc[0].eq(self.reset_vector)
-        with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn_valid):
+        with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
             m.d.comb += [
-                wspawn_valid.eq(self.warp_ctrl.bits.wspawn_mask
+                wspawn_valid.eq(self.warp_ctrl.bits.wspawn.mask
                                 & ~Const(1, self.n_warps)),
                 Cat(*wspawn_pc).eq(
-                    Repl(self.warp_ctrl.bits.wspawn_pc, self.n_warps)),
+                    Repl(self.warp_ctrl.bits.wspawn.pc, self.n_warps)),
             ]
 
             for w in range(self.n_warps):
@@ -155,14 +228,24 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                         thread_masks[w].eq(1),
                     ]
 
-        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.tmc_valid):
+        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.tmc.valid):
             with m.Switch(self.warp_ctrl.bits.wid):
                 for i in range(self.n_warps):
                     with m.Case(i):
                         m.d.sync += [
-                            thread_masks[i].eq(self.warp_ctrl.bits.tmc_mask),
+                            thread_masks[i].eq(self.warp_ctrl.bits.tmc.mask),
                             stalled_warps[i].eq(0),
                         ]
+
+        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.split.valid):
+            with m.Switch(self.warp_ctrl.bits.wid):
+                for i in range(self.n_warps):
+                    with m.Case(i):
+                        m.d.sync += stalled_warps[i].eq(0)
+
+                        with m.If(self.warp_ctrl.bits.split.diverged):
+                            m.d.sync += thread_masks[i].eq(
+                                self.warp_ctrl.bits.split.then_mask)
 
         with m.If(self.br_res.valid):
             with m.Switch(self.br_res.bits.wid):
@@ -185,6 +268,35 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
             for i in range(self.n_warps):
                 with m.If(self.stall_req.bits.wid == i):
                     m.d.sync += stalled_warps[i].eq(self.stall_req.bits.stall)
+
+        #
+        # IPDom stack
+        #
+
+        for w in range(self.n_warps):
+            stack = IPDomStack(self.params)
+            setattr(m.submodules, f'ipdom{w}', stack)
+
+            m.d.comb += [
+                stack.w_en.eq(self.warp_ctrl.valid
+                              & self.warp_ctrl.bits.split.valid
+                              & (self.warp_ctrl.bits.wid == w)),
+                stack.w_data1.pc.eq(self.warp_ctrl.bits.split.pc),
+                stack.w_data1.mask.eq(self.warp_ctrl.bits.split.else_mask),
+                stack.w_data2.mask.eq(thread_masks[w]),
+                stack.w_index.eq(~self.warp_ctrl.bits.split.diverged),
+            ]
+
+            with m.If(self.join_req.valid & (self.join_req.bits == w)):
+                m.d.comb += stack.r_en.eq(1)
+                m.d.sync += thread_masks[w].eq(stack.r_data.mask)
+
+                with m.If(~stack.r_index):
+                    m.d.sync += warps_pc[w].eq(stack.r_data.pc)
+
+        #
+        # Output
+        #
 
         with m.If(~req_stall):
             m.d.sync += [
@@ -238,6 +350,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
         self.stall_req = Valid(WarpStallReq, params)
         self.br_res = Valid(BranchResolution, params)
         self.warp_ctrl = Valid(WarpControlReq, params)
+        self.join_req = Valid(Signal, range(self.n_warps))
 
         self._warp_sched = WarpScheduler(self.params)
 
@@ -252,6 +365,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
             warp_sched.stall_req.eq(self.stall_req),
             warp_sched.br_res.eq(self.br_res),
             warp_sched.warp_ctrl.eq(self.warp_ctrl),
+            warp_sched.join_req.eq(self.join_req),
         ]
 
         #
