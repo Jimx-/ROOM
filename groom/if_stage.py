@@ -60,6 +60,11 @@ class WarpControlReq(HasCoreParams, Record):
                 ('else_mask', self.n_threads, DIR_FANOUT),
                 ('pc', 32, DIR_FANOUT),
             ]),
+            ('barrier', [
+                ('valid', 1, DIR_FANOUT),
+                ('id', range(self.n_barriers), DIR_FANOUT),
+                ('count', range(self.n_warps), DIR_FANOUT),
+            ]),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
@@ -172,6 +177,10 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
 
         active_warps = Signal(self.n_warps, reset=1)
         stalled_warps = Signal(self.n_warps)
+        ready_warps = Signal(self.n_warps)
+        barrier_masks = Array(
+            Signal(self.n_warps, name=f'barrier_mask{i}')
+            for i in range(self.n_barriers))
 
         with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
             m.d.sync += active_warps.eq(self.warp_ctrl.bits.wspawn.mask)
@@ -182,7 +191,12 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                         m.d.sync += active_warps[w].eq(
                             self.warp_ctrl.bits.tmc.mask.any())
 
-        ready_warps = active_warps & ~stalled_warps
+        barrier_stall_mask = 0
+        for b in range(self.n_barriers):
+            barrier_stall_mask |= barrier_masks[b]
+
+        m.d.comb += ready_warps.eq(active_warps
+                                   & ~(stalled_warps | barrier_stall_mask))
 
         schedule_wid = Signal(range(self.n_warps))
         schedule_valid = Signal()
@@ -201,8 +215,8 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         thread_masks = Array(
             Signal(self.n_threads, name=f'thread_mask{i}', reset=int(i == 0))
             for i in range(self.n_warps))
-        warps_pc = Array(
-            Signal(32, name=f'warps_pc{i}') for i in range(self.n_warps))
+        warp_pcs = Array(
+            Signal(32, name=f'warp_pcs{i}') for i in range(self.n_warps))
 
         for w in range(self.n_warps):
             m.d.comb += self.tmask.r[w].eq(thread_masks[w])
@@ -212,7 +226,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 wspawn_valid.eq(1),
                 wspawn_pc[0].eq(self.reset_vector),
             ]
-            m.d.sync += warps_pc[0].eq(self.reset_vector)
+            m.d.sync += warp_pcs[0].eq(self.reset_vector)
         with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
             m.d.comb += [
                 wspawn_valid.eq(self.warp_ctrl.bits.wspawn.mask
@@ -224,7 +238,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
             for w in range(self.n_warps):
                 with m.If(wspawn_valid[w]):
                     m.d.sync += [
-                        warps_pc[w].eq(wspawn_pc[w]),
+                        warp_pcs[w].eq(wspawn_pc[w]),
                         thread_masks[w].eq(1),
                     ]
 
@@ -236,6 +250,24 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                             thread_masks[i].eq(self.warp_ctrl.bits.tmc.mask),
                             stalled_warps[i].eq(0),
                         ]
+
+        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.barrier.valid):
+            active_barrier_count = 0
+            for b in barrier_masks[self.warp_ctrl.bits.barrier.id]:
+                active_barrier_count += b
+
+            with m.Switch(self.warp_ctrl.bits.wid):
+                for i in range(self.n_warps):
+                    with m.Case(i):
+                        m.d.sync += stalled_warps[i].eq(0)
+
+                        with m.If(active_barrier_count ==
+                                  self.warp_ctrl.bits.barrier.count):
+                            m.d.sync += barrier_masks[
+                                self.warp_ctrl.bits.barrier.id].eq(0)
+                        with m.Else():
+                            m.d.sync += barrier_masks[
+                                self.warp_ctrl.bits.barrier.id][i].eq(1)
 
         with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.split.valid):
             with m.Switch(self.warp_ctrl.bits.wid):
@@ -252,7 +284,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 for i in range(self.n_warps):
                     with m.Case(i):
                         with m.If(self.br_res.bits.taken):
-                            m.d.sync += warps_pc[i].eq(self.br_res.bits.target)
+                            m.d.sync += warp_pcs[i].eq(self.br_res.bits.target)
                         m.d.sync += stalled_warps[i].eq(0)
 
         with m.If(schedule_valid & ~req_stall):
@@ -261,7 +293,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                     m.d.sync += stalled_warps[i].eq(1)
 
         with m.If(self.ifetch_req.fire):
-            m.d.sync += warps_pc[self.ifetch_req.bits.wid].eq(
+            m.d.sync += warp_pcs[self.ifetch_req.bits.wid].eq(
                 self.ifetch_req.bits.pc + 4)
 
         with m.If(self.stall_req.valid):
@@ -292,7 +324,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 m.d.sync += thread_masks[w].eq(stack.r_data.mask)
 
                 with m.If(~stack.r_index):
-                    m.d.sync += warps_pc[w].eq(stack.r_data.pc)
+                    m.d.sync += warp_pcs[w].eq(stack.r_data.pc)
 
         #
         # Output
@@ -308,7 +340,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 with m.If(schedule_wid == i):
                     m.d.sync += [
                         self.ifetch_req.bits.pc.eq(
-                            Mux(wspawn_valid[i], wspawn_pc[i], warps_pc[i])),
+                            Mux(wspawn_valid[i], wspawn_pc[i], warp_pcs[i])),
                         self.ifetch_req.bits.tmask.eq(
                             Mux(wspawn_valid[i], 1, thread_masks[i])),
                     ]

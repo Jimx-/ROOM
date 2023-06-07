@@ -426,6 +426,21 @@ class GPUControlUnit(PipelinedFunctionalUnit):
                         warp_ctrl.bits.split.pc.eq(uop.pc + 4),
                     ]
 
+                with m.Case(UOpCode.GPU_BARRIER):
+                    m.d.comb += [
+                        warp_ctrl.valid.eq(1),
+                        warp_ctrl.bits.barrier.valid.eq(1),
+                    ]
+
+                    for w in reversed(range(self.n_threads)):
+                        with m.If(uop.tmask[w]):
+                            m.d.comb += [
+                                warp_ctrl.bits.barrier.id.eq(
+                                    self.req.bits.rs1_data[w]),
+                                warp_ctrl.bits.barrier.count.eq(
+                                    self.req.bits.rs2_data[w] - 1),
+                            ]
+
         #
         # Output
         #

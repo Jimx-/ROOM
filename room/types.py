@@ -83,6 +83,7 @@ class HasCoreParams:
         if self.is_groom:
             self.n_warps = params['n_warps']
             self.n_threads = params['n_threads']
+            self.n_barriers = params['n_barriers']
 
             self.mem_width = self.n_threads
             self.max_br_count = 0

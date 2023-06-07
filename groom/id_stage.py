@@ -86,6 +86,17 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             uop.fu_type.eq(FUType.GPU),
                         ]
 
+                    with m.Case(0x4):  # gpu_barrier
+                        m.d.comb += [
+                            uop.opcode.eq(UOpCode.GPU_BARRIER),
+                            uop.iq_type.eq(IssueQueueType.INT),
+                            uop.fu_type.eq(FUType.GPU),
+                            uop.lrs1_rtype.eq(RegisterType.FIX),
+                            uop.lrs2_rtype.eq(RegisterType.FIX),
+                            uop.imm_sel.eq(ImmSel.S),
+                            STALL,
+                        ]
+
                     with m.Default():
                         m.d.comb += is_special.eq(0)
 

@@ -131,6 +131,7 @@ class UOpCode(IntEnum):
     GPU_WSPAWN = 109
     GPU_SPLIT = 110
     GPU_JOIN = 111
+    GPU_BARRIER = 112
 
 
 class RegisterType(IntEnum):
