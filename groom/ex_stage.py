@@ -1,11 +1,12 @@
 from amaranth import *
 
-from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, GPUControlUnit, DivUnit
+from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, \
+    GPUControlUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit
 from groom.if_stage import BranchResolution, WarpControlReq
 
 from room.consts import *
 from room.types import HasCoreParams
-from room.utils import generate_imm
+from room.utils import Arbiter, generate_imm
 
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
@@ -118,6 +119,28 @@ class ALUExecUnit(ExecUnit):
         ]
         iresp_units.append(imul)
 
+        ifpu_busy = Signal()
+        if self.has_ifpu:
+            ifpu = m.submodules.ifpu = IntToFPUnit(self.data_width, 2,
+                                                   self.params)
+            m.d.comb += [
+                self.req.connect(ifpu.req),
+                ifpu.req.valid.eq(self.req.valid
+                                  & self.req.bits.uop.fu_type_has(FUType.I2F)),
+            ]
+
+            ifpu_q = m.submodules.ifpu_q = Queue(5,
+                                                 ExecResp,
+                                                 self.data_width,
+                                                 self.params,
+                                                 flow=True)
+
+            m.d.comb += [
+                ifpu.resp.connect(ifpu_q.enq),
+                ifpu_q.deq.connect(self.mem_fresp),
+                ifpu_busy.eq(ifpu_q.count.any()),
+            ]
+
         div = m.submodules.div = DivUnit(self.data_width, self.params)
         div_busy = Signal()
 
@@ -139,7 +162,7 @@ class ALUExecUnit(ExecUnit):
         m.d.comb += [
             agu.req.bits.eq(self.req.bits),
             agu.req.valid.eq(self.req.valid
-                             & (self.req.bits.uop.fu_type == FUType.MEM)),
+                             & self.req.bits.uop.fu_type_has(FUType.MEM)),
             self.lsu_req.valid.eq(agu.resp.valid),
             self.lsu_req.bits.eq(agu.resp.bits),
         ]
@@ -169,9 +192,113 @@ class ALUExecUnit(ExecUnit):
         m.d.comb += self.req.ready.eq(1)
         with m.If(self.req.bits.uop.fu_type == FUType.MUL):
             m.d.comb += self.req.ready.eq(~imul_busy)
+        with m.Elif(self.req.bits.uop.fu_type_has(FUType.I2F)):
+            m.d.comb += self.req.ready.eq(~ifpu_busy)
         with m.Elif(self.req.bits.uop.fu_type == FUType.DIV):
             m.d.comb += self.req.ready.eq(~div_busy)
-        with m.Elif(self.req.bits.uop.fu_type == FUType.MEM):
+        with m.Elif(self.req.bits.uop.fu_type_has(FUType.MEM)):
             m.d.comb += self.req.ready.eq(self.lsu_req.ready)
+
+        return m
+
+
+class FPUExecUnit(ExecUnit):
+
+    def __init__(self, params, name=None):
+        super().__init__(params['flen'],
+                         params,
+                         frf_write=True,
+                         mem_irf_write=True)
+        self.name = name
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        fu_units = []
+
+        fpu = m.submodules.fpu = FPUUnit(self.data_width, self.params)
+
+        m.d.comb += [
+            self.req.connect(fpu.req),
+            fpu.req.valid.eq(self.req.valid
+                             & (self.req.bits.uop.fu_type_has(FUType.FPU)
+                                | self.req.bits.uop.fu_type_has(FUType.F2I))),
+        ]
+
+        fu_units.append(fpu)
+
+        fdiv = m.submodules.fdiv = FDivUnit(self.data_width, self.params)
+        fdiv_busy = Signal()
+        fdiv_resp_busy = 0
+        for fu in fu_units:
+            fdiv_resp_busy |= fu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(fdiv.req),
+            fdiv.req.valid.eq(self.req.valid
+                              & self.req.bits.uop.fu_type_has(FUType.FDIV)),
+            fdiv.resp.ready.eq(~fdiv_resp_busy),
+            fdiv_busy.eq(~fdiv.req.ready),
+        ]
+
+        fu_units.append(fdiv)
+
+        fpiu_busy = Signal()
+        fpiu_q = m.submodules.fpiu_q = Queue(6,
+                                             ExecResp,
+                                             self.data_width,
+                                             self.params,
+                                             flow=True)
+        m.d.comb += [
+            fpiu_q.enq.bits.eq(fpu.resp.bits),
+            fpiu_q.enq.valid.eq(fpu.resp.valid
+                                & fpu.resp.bits.uop.fu_type_has(FUType.F2I)
+                                & (fpu.resp.bits.uop.opcode != UOpCode.STA)),
+        ]
+
+        fp_stq = m.submodules.fp_stq = Queue(3,
+                                             ExecResp,
+                                             self.data_width,
+                                             self.params,
+                                             flow=True)
+
+        m.d.comb += [
+            fp_stq.enq.bits.uop.eq(self.req.bits.uop),
+            Cat(*fp_stq.enq.bits.data).eq(Cat(*self.req.bits.rs2_data)),
+            fp_stq.enq.valid.eq(self.req.valid
+                                & (self.req.bits.uop.opcode == UOpCode.STA)),
+        ]
+
+        resp_arb = m.submodules.resp_arb = Arbiter(2, ExecResp,
+                                                   self.data_width,
+                                                   self.params)
+
+        m.d.comb += [
+            fpiu_q.deq.connect(resp_arb.inp[0]),
+            fp_stq.deq.connect(resp_arb.inp[1]),
+            resp_arb.out.connect(self.mem_iresp),
+        ]
+
+        m.d.comb += fpiu_busy.eq(fpiu_q.count.any() | fp_stq.count.any())
+
+        fresp_valid = 0
+        for fu in reversed(fu_units):
+            fresp_valid |= fu.resp.valid
+
+            with m.If(fu.resp.valid):
+                m.d.comb += [
+                    Cat(*self.fresp.bits.data).eq(Cat(*fu.resp.bits.data)),
+                    self.fresp.bits.uop.eq(fu.resp.bits.uop),
+                ]
+
+        m.d.comb += self.fresp.valid.eq(
+            fresp_valid
+            & ~(fpu.resp.valid & fpu.resp.bits.uop.fu_type_has(FUType.F2I)))
+
+        m.d.comb += self.req.ready.eq(1)
+        with m.If(self.req.bits.uop.fu_type_has(FUType.FDIV)):
+            m.d.comb += self.req.ready.eq(~fdiv_busy)
+        with m.Elif(self.req.bits.uop.fu_type_has(FUType.F2I)):
+            m.d.comb += self.req.ready.eq(~fpiu_busy)
 
         return m

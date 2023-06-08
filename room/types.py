@@ -101,6 +101,17 @@ class HasCoreParams:
             self.issue_params = params['issue_params']
             self.issue_queue_depth = self.issue_params['queue_depth']
 
+            #
+            # Shared memory
+            #
+
+            self.use_smem = params.get('smem_params') is not None
+            if self.use_smem:
+                self.smem_params = params['smem_params']
+                self.smem_base = self.smem_params['base']
+                self.smem_size = self.smem_params['size']
+                self.smem_banks = self.smem_params['n_banks']
+
 
 class MicroOp(HasCoreParams, Record):
 

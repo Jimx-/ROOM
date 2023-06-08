@@ -9,9 +9,11 @@ from groom.ex_stage import ALUExecUnit
 from groom.fu import ExecResp
 from groom.csr import CSRFile
 from groom.lsu import LoadStoreUnit
+from groom.fp_pipeline import FPPipeline
 
 from room.consts import *
 from room.types import HasCoreParams
+from room.utils import Arbiter
 
 from roomsoc.interconnect import tilelink as tl
 from roomsoc.interconnect.stream import Valid
@@ -52,6 +54,9 @@ class Core(HasCoreParams, Elaboratable):
 
         csr = m.submodules.csr = CSRFile(self.params, width=self.xlen)
 
+        if self.use_fpu:
+            fp_pipeline = m.submodules.fp_pipeline = FPPipeline(self.params)
+
         #
         # Instruction fetch
         #
@@ -86,13 +91,26 @@ class Core(HasCoreParams, Elaboratable):
         # Issue
         #
 
-        scoreboard = m.submodules.scoreboard = Scoreboard(self.params)
+        scoreboard = m.submodules.scoreboard = Scoreboard(is_float=False,
+                                                          params=self.params)
         m.d.comb += [
             scoreboard.dis_uop.eq(dispatcher.dis_uop),
             scoreboard.dis_wid.eq(dispatcher.dis_wid),
             scoreboard.sb_uop.eq(dispatcher.sb_uop),
             scoreboard.sb_wid.eq(dispatcher.sb_wid),
         ]
+
+        fp_sb_ready = fp_pipeline.sb_ready if self.use_fpu else 1
+        sb_ready = scoreboard.dis_ready & fp_sb_ready
+
+        if self.use_fpu:
+            m.d.comb += [
+                fp_pipeline.dis_valid.eq(dispatcher.dis_valid),
+                fp_pipeline.dis_uop.eq(dispatcher.dis_uop),
+                fp_pipeline.dis_wid.eq(dispatcher.dis_wid),
+                fp_pipeline.sb_uop.eq(dispatcher.sb_uop),
+                fp_pipeline.sb_wid.eq(dispatcher.sb_wid),
+            ]
 
         #
         # Register read
@@ -110,17 +128,31 @@ class Core(HasCoreParams, Elaboratable):
             reg_width=self.xlen,
             params=self.params)
 
+        dis_is_fp = (dispatcher.dis_uop.iq_type & IssueQueueType.FP) != 0
+        dis_is_int = (dispatcher.dis_uop.iq_type &
+                      (IssueQueueType.INT | IssueQueueType.MEM)) != 0
+
         m.d.comb += [
-            iregread.dis_valid.eq(dispatcher.dis_valid & scoreboard.dis_ready),
+            iregread.dis_valid.eq(dispatcher.dis_valid & dis_is_int
+                                  & sb_ready),
             iregread.dis_uop.eq(dispatcher.dis_uop),
             iregread.dis_wid.eq(dispatcher.dis_wid),
         ]
 
+        dis_ready = ~dis_is_int | iregread.dis_ready
+        if self.use_fpu:
+            dis_ready &= ~dis_is_fp | fp_pipeline.dis_ready
+
         m.d.comb += [
-            scoreboard.dis_valid.eq(dispatcher.dis_valid & iregread.dis_ready),
-            dispatcher.dis_ready.eq(scoreboard.dis_ready
-                                    & iregread.dis_ready),
+            scoreboard.dis_valid.eq(dispatcher.dis_valid & dis_ready),
+            dispatcher.dis_ready.eq(sb_ready & dis_ready),
         ]
+
+        if self.use_fpu:
+            m.d.comb += [
+                fp_pipeline.int_dis_ready.eq(iregread.dis_ready),
+                fp_pipeline.int_sb_ready.eq(scoreboard.dis_ready),
+            ]
 
         for irr_rp, rp in zip(iregread.read_ports, iregfile.read_ports):
             m.d.comb += irr_rp.connect(rp)
@@ -129,7 +161,8 @@ class Core(HasCoreParams, Elaboratable):
         # Execute
         #
 
-        exec_unit = m.submodules.exec_unit = ALUExecUnit(self.params)
+        exec_unit = m.submodules.exec_unit = ALUExecUnit(self.params,
+                                                         has_ifpu=self.use_fpu)
         m.d.comb += [
             iregread.exec_req.connect(exec_unit.req),
             if_stage.br_res.eq(exec_unit.br_res),
@@ -150,6 +183,9 @@ class Core(HasCoreParams, Elaboratable):
             csr_port.w_data.eq(csr_write_data),
         ]
 
+        if self.use_fpu:
+            m.d.comb += exec_unit.mem_fresp.connect(fp_pipeline.from_int)
+
         #
         # Load/store unit
         #
@@ -157,23 +193,34 @@ class Core(HasCoreParams, Elaboratable):
                                                self.params)
         m.d.comb += exec_unit.lsu_req.connect(lsu.exec_req)
 
+        if self.use_fpu:
+            m.d.comb += [
+                lsu.exec_fresp.connect(fp_pipeline.mem_wb_port),
+                fp_pipeline.to_lsu.connect(lsu.fp_std),
+            ]
+
+        #
         #
         # Writeback
         #
 
+        wb_arb = m.submodules.wb_arb = Arbiter(2 + self.use_fpu, ExecResp,
+                                               self.xlen, self.params)
         wb_req = Valid(ExecResp, self.xlen, self.params)
-        with m.If(exec_unit.iresp.valid):
-            m.d.comb += wb_req.eq(exec_unit.iresp)
-        with m.Elif(lsu.exec_iresp.valid):
-            m.d.comb += [
-                wb_req.eq(lsu.exec_iresp),
-                lsu.exec_iresp.ready.eq(1),
-            ]
+        m.d.comb += [
+            wb_arb.inp[0].bits.eq(exec_unit.iresp.bits),
+            wb_arb.inp[0].valid.eq(exec_unit.iresp.valid),
+            lsu.exec_iresp.connect(wb_arb.inp[1]),
+            wb_req.eq(wb_arb.out),
+            wb_arb.out.ready.eq(1),
+        ]
+        if self.use_fpu:
+            m.d.comb += fp_pipeline.to_int.connect(wb_arb.inp[2])
 
         m.d.comb += [
             scoreboard.wakeup.valid.eq(
                 wb_req.valid & wb_req.bits.uop.rf_wen()
-                & wb_req.bits.uop.dst_rtype == RegisterType.FIX),
+                & (wb_req.bits.uop.dst_rtype == RegisterType.FIX)),
             scoreboard.wakeup.bits.wid.eq(wb_req.bits.wid),
             scoreboard.wakeup.bits.ldst.eq(wb_req.bits.uop.ldst),
         ]

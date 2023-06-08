@@ -7,7 +7,8 @@ from groom.if_stage import BranchResolution, WarpControlReq
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.alu import ALU, Multiplier, IntDiv
-from room.utils import generate_imm, Pipe
+from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
+from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -61,8 +62,7 @@ class ExecResp(HasCoreParams, ValueCastable):
             for t in range(self.n_threads)
         ]
         self.addr = [
-            Signal(self.vaddr_bits + 1, name=f'{name}_addr{t}')
-            for t in range(self.n_threads)
+            Signal(32, name=f'{name}_addr{t}') for t in range(self.n_threads)
         ]
 
     @ValueCastable.lowermethod
@@ -351,13 +351,9 @@ class AddrGenUnit(PipelinedFunctionalUnit):
         for w in range(self.n_threads):
             sum = self.req.bits.rs1_data[w].as_signed(
             ) + self.req.bits.uop.imm_packed[8:20].as_signed()
-            ea_sign = Mux(sum[self.vaddr_bits - 1],
-                          ~sum[self.vaddr_bits:self.xlen] == 0,
-                          sum[self.vaddr_bits:self.xlen] != 0)
-            eff_addr = Cat(sum[:self.vaddr_bits], ea_sign).as_unsigned()
 
             m.d.comb += [
-                self.resp.bits.addr[w].eq(eff_addr),
+                self.resp.bits.addr[w].eq(sum),
                 self.resp.bits.data[w].eq(self.req.bits.rs2_data[w]),
             ]
 
@@ -515,6 +511,340 @@ class DivUnit(IterativeFunctionalUnit):
                 self.resp.bits.data[w].eq(div.resp.bits),
                 div_resp_valid[w].eq(div.resp.valid),
                 div.resp.ready.eq(~tmask_valid | self.resp.fire),
+            ]
+
+        m.d.comb += self.resp.valid.eq(tmask_valid
+                                       & ((tmask & div_resp_valid) == tmask))
+
+        return m
+
+
+class IntToFPUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, width, latency, params):
+        self.width = width
+        self.latency = latency
+
+        super().__init__(latency, width, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        cast_en = Signal()
+
+        with m.Switch(self.req.bits.uop.opcode):
+            with m.Case(UOpCode.FCVT_S_X, UOpCode.FCVT_D_X):
+                m.d.comb += cast_en.eq(1)
+
+        typ = generate_imm_type(self.req.bits.uop.imm_packed)
+
+        for w in range(self.n_threads):
+            in_pipe = Pipe(width=len(self.req.bits.rs1_data[w]),
+                           depth=self.latency)
+            setattr(m.submodules, f'in_pipe{w}', in_pipe)
+            m.d.comb += [
+                in_pipe.in_valid.eq(self.req.valid),
+                in_pipe.in_data.eq(self.req.bits.rs1_data[w]),
+            ]
+
+            ifpu = FPUCastMulti(latency=self.latency)
+            setattr(m.submodules, f'ifpu{w}', ifpu)
+
+            m.d.comb += [
+                ifpu.inp.valid.eq(self.req.valid & cast_en),
+                ifpu.inp.bits.fn.eq(FPUOperator.I2F),
+                ifpu.inp.bits.fn_mod.eq(typ[0]),
+                ifpu.inp.bits.in1.eq(self.req.bits.rs1_data[w]),
+                ifpu.inp.bits.dst_fmt.eq(
+                    Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
+                ifpu.inp.bits.int_fmt.eq(Cat(typ[1], 1)),
+            ]
+
+            m.d.comb += self.resp.bits.data[w].eq(
+                Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits))
+
+        return m
+
+
+class FPUUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, width, params):
+        self.width = width
+
+        super().__init__(params['fma_latency'], width, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        fma_en = Signal()
+        cast_en = Signal()
+        cmp_en = Signal()
+
+        fma_op = Signal(FPUOperator)
+        fma_op_mod = Signal()
+
+        fmt_in = Signal(FPFormat)
+        fmt_out = Signal(FPFormat)
+        fmt_int = Signal(2)
+
+        swap32 = Signal()
+
+        fp_rm = Mux(
+            generate_imm_rm(self.req.bits.uop.imm_packed) == 7, 0,
+            generate_imm_rm(self.req.bits.uop.imm_packed))
+
+        with m.Switch(self.req.bits.uop.opcode):
+            with m.Case(UOpCode.FADD_S, UOpCode.FADD_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.ADD),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    swap32.eq(1),
+                ]
+
+            with m.Case(UOpCode.FSUB_S, UOpCode.FSUB_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.ADD),
+                    fma_op_mod.eq(1),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    swap32.eq(1),
+                ]
+
+            with m.Case(UOpCode.FMUL_S, UOpCode.FMUL_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.MUL),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.FMADD_S, UOpCode.FMADD_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FMADD),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.FMSUB_S, UOpCode.FMSUB_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FMADD),
+                    fma_op.eq(1),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.FNMSUB_S, UOpCode.FNMSUB_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FNMSUB),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.FNMADD_S, UOpCode.FNMADD_D):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FNMSUB),
+                    fma_op.eq(1),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.FCVT_X_S, UOpCode.FCVT_X_D):
+                typ = generate_imm_type(self.req.bits.uop.imm_packed)
+
+                m.d.comb += [
+                    cast_en.eq(1),
+                    fma_op.eq(FPUOperator.F2I),
+                    fma_op_mod.eq(typ[0]),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_int.eq(Cat(typ[1], 1)),
+                ]
+
+            with m.Case(UOpCode.FCVT_D_S, UOpCode.FCVT_S_D):
+                m.d.comb += [
+                    cast_en.eq(1),
+                    fma_op.eq(FPUOperator.F2F),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.D,
+                            FPFormat.S)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.FSGNJ_S, UOpCode.FSGNJ_D):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.SGNJ),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.FMINMAX_S, UOpCode.FMINMAX_D):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.MINMAX),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                    fmt_out.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.CMPR_S, UOpCode.CMPR_D):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.CMP),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+            with m.Case(UOpCode.FCLASS_S, UOpCode.FCLASS_D):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.CLASSIFY),
+                    fmt_in.eq(
+                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
+                            FPFormat.D)),
+                ]
+
+        for w in range(self.n_threads):
+            in_pipe = Pipe(width=len(self.req.bits.rs1_data[w]),
+                           depth=self.fma_latency)
+            setattr(m.submodules, f'in_pipe{w}', in_pipe)
+            m.d.comb += [
+                in_pipe.in_valid.eq(self.req.valid),
+                in_pipe.in_data.eq(self.req.bits.rs1_data[w]),
+            ]
+
+            def set_fu_input(inp):
+                m.d.comb += [
+                    inp.bits.in1.eq(self.req.bits.rs1_data[w]),
+                    inp.bits.in2.eq(self.req.bits.rs2_data[w]),
+                    inp.bits.in3.eq(self.req.bits.rs3_data[w]),
+                    inp.bits.fn.eq(fma_op),
+                    inp.bits.fn_mod.eq(fma_op_mod),
+                    inp.bits.rm.eq(fp_rm),
+                    inp.bits.src_fmt.eq(fmt_in),
+                    inp.bits.dst_fmt.eq(fmt_out),
+                    inp.bits.int_fmt.eq(fmt_int),
+                ]
+
+                with m.If(swap32):
+                    m.d.comb += inp.bits.in3.eq(self.req.bits.rs2_data[w])
+
+            sfma = FPUFMA(32, FPFormat.S, latency=self.fma_latency)
+            setattr(m.submodules, f'sfma{w}', sfma)
+            set_fu_input(sfma.inp)
+            m.d.comb += sfma.inp.valid.eq(self.req.valid & fma_en
+                                          & (fmt_out == FPFormat.S))
+
+            fpiu = FPUCastMulti(latency=self.fma_latency)
+            setattr(m.submodules, f'fpiu{w}', fpiu)
+            set_fu_input(fpiu.inp)
+            m.d.comb += fpiu.inp.valid.eq(self.req.valid & cast_en)
+
+            scmp = FPUComp(32, FPFormat.S, latency=self.fma_latency)
+            setattr(m.submodules, f'scmp{w}', scmp)
+            set_fu_input(scmp.inp)
+            m.d.comb += scmp.inp.valid.eq(self.req.valid & cmp_en
+                                          & (fmt_in == FPFormat.S))
+
+            m.d.comb += self.resp.bits.data[w].eq(
+                Mux(
+                    sfma.out.valid, sfma.out.bits.data,
+                    Mux(
+                        fpiu.out.valid, fpiu.out.bits.data,
+                        Mux(scmp.out.valid, scmp.out.bits.data,
+                            in_pipe.out.bits))))
+
+        return m
+
+
+class FDivUnit(IterativeFunctionalUnit):
+
+    def __init__(self, width, params):
+        self.width = width
+
+        super().__init__(width, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        tmask_valid = Signal()
+        tmask = Signal(self.n_threads)
+
+        with m.If(self.req.fire):
+            m.d.sync += [
+                tmask.eq(self.req.bits.uop.tmask),
+                tmask_valid.eq(1),
+            ]
+        with m.Elif(self.resp.fire):
+            m.d.sync += [
+                tmask.eq(0),
+                tmask_valid.eq(0),
+            ]
+        m.d.comb += self.req.ready.eq(~tmask_valid)
+
+        div_resp_valid = Signal(self.n_threads)
+        for w in range(self.n_threads):
+            fdiv = FPUDivSqrtMulti()
+            setattr(m.submodules, f'fdiv{w}', fdiv)
+
+            m.d.comb += [
+                fdiv.a.eq(self.req.bits.rs1_data[w]),
+                fdiv.b.eq(self.req.bits.rs2_data[w]),
+                fdiv.is_sqrt.eq((self.req.bits.uop.opcode == UOpCode.FSQRT_S)
+                                |
+                                (self.req.bits.uop.opcode == UOpCode.FSQRT_D)),
+                fdiv.fmt.eq(
+                    Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
+                fdiv.in_valid.eq(self.req.valid & self.req.bits.uop.tmask[w]),
+                self.resp.bits.data[w].eq(fdiv.out.bits),
+                div_resp_valid[w].eq(fdiv.out.valid),
+                fdiv.out.ready.eq(~tmask_valid | self.resp.fire),
             ]
 
         m.d.comb += self.resp.valid.eq(tmask_valid

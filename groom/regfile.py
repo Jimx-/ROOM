@@ -2,6 +2,7 @@ from amaranth import *
 
 from groom.fu import ExecReq
 
+from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.regfile import RFReadPort, RFWritePort, RegReadDecoder as CommonDecoder
 
@@ -182,13 +183,16 @@ class RegisterRead(HasCoreParams, Elaboratable):
 
             if nrps > 0:
                 m.d.comb += rs1_data.eq(
-                    Mux(rrd_uop.lrs1 == 0, 0, self.read_ports[idx].data))
+                    Mux((rrd_uop.lrs1 == 0) &
+                        (rrd_uop.lrs1_rtype == RegisterType.FIX), 0,
+                        self.read_ports[idx].data))
             if nrps > 1:
                 m.d.comb += rs2_data.eq(
-                    Mux(rrd_uop.lrs2 == 0, 0, self.read_ports[idx + 1].data))
+                    Mux((rrd_uop.lrs2 == 0) &
+                        (rrd_uop.lrs2_rtype == RegisterType.FIX), 0,
+                        self.read_ports[idx + 1].data))
             if nrps > 2:
-                m.d.comb += rs3_data.eq(
-                    Mux(rrd_uop.prs3 == 0, 0, self.read_ports[idx + 2].data))
+                m.d.comb += rs3_data.eq(self.read_ports[idx + 2].data)
 
             idx += nrps
 
