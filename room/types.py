@@ -14,7 +14,6 @@ class HasCoreParams:
 
         self.xlen = params['xlen']
         self.flen = self.params['flen']
-        self.core_width = params['core_width']
         self.use_fpu = self.params['use_fpu']
 
         self.vaddr_bits = params['vaddr_bits']
@@ -30,6 +29,8 @@ class HasCoreParams:
         self.fma_latency = params['fma_latency']
 
         if not self.is_groom:
+            self.core_width = params['core_width']
+
             #
             # Instruction fetch
             #

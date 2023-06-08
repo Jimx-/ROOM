@@ -1,0 +1,38 @@
+{
+  "is_groom": true,
+  "xlen": 32,
+  "vaddr_bits": 32,
+  "n_warps": 4,
+  "n_threads": 4,
+  "n_barriers": 4,
+  "issue_params": {
+    "queue_depth": 4
+  },
+  "icache_params": {
+    "n_sets": 64,
+    "n_ways": 4,
+    "block_bytes": 64
+  },
+  "dcache_params": {
+    "n_sets": 64,
+    "n_ways": 4,
+    "block_bytes": 64,
+    "row_bits": 64,
+    "n_mshrs": 1,
+    "n_iomshrs": 1,
+    "sdq_size": 17,
+    "rpq_size": 16,
+    "n_banks": 4
+  },
+  "use_fpu": true,
+  "flen": 32,
+  "fma_latency": 4,
+  "smem_params": {
+    "base": 131072,
+    "size": 16384,
+    "n_banks": 4
+  },
+  "io_regions": {
+    "3221225472": 1073741824
+  }
+}
