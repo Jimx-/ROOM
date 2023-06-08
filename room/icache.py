@@ -82,7 +82,6 @@ class ICache(HasICacheParams, Elaboratable):
         s2_valid = Signal()
         s2_paddr = Signal.like(self.s1_paddr)
         s2_hit = Signal()
-        s2_miss = s2_valid & ~s2_hit
 
         m.d.sync += [
             s1_valid.eq(s0_valid),
@@ -94,6 +93,8 @@ class ICache(HasICacheParams, Elaboratable):
         refill_way = Signal(range(self.n_ways))
         invalidated = Signal()
         refill_valid = Signal()
+        refill_valid_d1 = Signal()
+        s2_miss = s2_valid & ~s2_hit & ~refill_valid_d1
         refill_paddr = Signal.like(self.s1_paddr)
         refill_index = refill_paddr[block_off_bits:untag_bits]
         refill_tag = refill_paddr[untag_bits:untag_bits + tag_bits]
@@ -101,6 +102,7 @@ class ICache(HasICacheParams, Elaboratable):
         refill_counter = Signal(range(refill_cycles))
         refill_one_beat = self.ibus.d.fire & self.ibus.has_data(
             self.ibus.d.bits)
+        m.d.sync += refill_valid_d1.eq(refill_valid)
         with m.If(s1_valid & ~(s2_miss | refill_valid)):
             m.d.sync += refill_paddr.eq(self.s1_paddr)
 
