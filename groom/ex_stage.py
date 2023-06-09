@@ -116,9 +116,8 @@ class ALUExecUnit(ExecUnit):
             imul.resp.connect(imul_queue.enq),
             imul_queue.deq.ready.eq(~imul_resp_busy),
             imul_busy.eq(imul_queue.count.any()),
-            self.iresp.valid.eq(imul_queue.deq.valid),
-            self.iresp.bits.eq(imul_queue.deq.bits),
         ]
+        iresp_units.append(imul_queue)
 
         ifpu_busy = Signal()
         if self.has_ifpu:
@@ -145,9 +144,12 @@ class ALUExecUnit(ExecUnit):
         div = m.submodules.div = DivUnit(self.data_width, self.params)
         div_busy = Signal()
 
-        div_resp_busy = imul_queue.deq.valid
+        div_resp_busy = 0
         for iu in iresp_units:
-            div_resp_busy |= iu.resp.valid
+            if isinstance(iu, Queue):
+                div_resp_busy |= iu.deq.valid
+            else:
+                div_resp_busy |= iu.resp.valid
 
         m.d.comb += [
             self.req.connect(div.req),
@@ -178,11 +180,18 @@ class ALUExecUnit(ExecUnit):
         ]
 
         for iu in reversed(iresp_units):
-            with m.If(iu.resp.valid):
-                m.d.comb += [
-                    self.iresp.valid.eq(1),
-                    self.iresp.bits.eq(iu.resp.bits),
-                ]
+            if isinstance(iu, Queue):
+                with m.If(iu.deq.valid):
+                    m.d.comb += [
+                        self.iresp.valid.eq(1),
+                        self.iresp.bits.eq(iu.deq.bits),
+                    ]
+            else:
+                with m.If(iu.resp.valid):
+                    m.d.comb += [
+                        self.iresp.valid.eq(1),
+                        self.iresp.bits.eq(iu.resp.bits),
+                    ]
 
         m.d.comb += [
             self.iresp.bits.uop.csr_addr.eq(
