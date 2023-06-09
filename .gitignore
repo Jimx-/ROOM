@@ -18,6 +18,7 @@ CMakeUserPresets.json
 # Object files
 *.o
 *.d
+*.a
 obj_dir
 bootrom*
 
