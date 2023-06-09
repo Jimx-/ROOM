@@ -2486,10 +2486,13 @@ class DCache(HasDCacheParams, Elaboratable):
                 s2_send_nack[w].eq(s2_need_resp[w] & s2_nack[w]),
             ]
 
-        # Kill younger stores if an older store failed
-        m.d.comb += s2_store_failed.eq(s2_valid[0] & s2_nack[0]
-                                       & s2_send_nack[0]
-                                       & s2_req[0].uop.uses_stq)
+        if self.is_groom:
+            m.d.comb += s2_store_failed.eq(0)
+        else:
+            # Kill younger stores if an older store failed
+            m.d.comb += s2_store_failed.eq(s2_valid[0] & s2_nack[0]
+                                           & s2_send_nack[0]
+                                           & s2_req[0].uop.uses_stq)
 
         #
         # Cache miss

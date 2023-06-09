@@ -3,7 +3,7 @@ ENTRY( _start )
 
 SECTIONS
 {
-  . = 0x80000000;
+  . = 0x10000;
 
   .init :
   {
@@ -25,6 +25,8 @@ SECTIONS
   PROVIDE (__etext = .);
   PROVIDE (_etext = .);
   PROVIDE (etext = .);
+
+  . = 0x80000000;
 
   _sidata = .;
   .data :

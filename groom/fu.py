@@ -42,6 +42,9 @@ class ExecReq(HasCoreParams, ValueCastable):
         return Cat(self.wid, self.uop, *self.rs1_data, *self.rs2_data,
                    *self.rs3_data)
 
+    def __len__(self):
+        return len(Value.cast(self))
+
     def eq(self, rhs):
         return Value.cast(self).eq(Value.cast(rhs))
 

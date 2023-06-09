@@ -116,8 +116,9 @@ class ALUExecUnit(ExecUnit):
             imul.resp.connect(imul_queue.enq),
             imul_queue.deq.ready.eq(~imul_resp_busy),
             imul_busy.eq(imul_queue.count.any()),
+            self.iresp.valid.eq(imul_queue.deq.valid),
+            self.iresp.bits.eq(imul_queue.deq.bits),
         ]
-        iresp_units.append(imul)
 
         ifpu_busy = Signal()
         if self.has_ifpu:
@@ -144,7 +145,7 @@ class ALUExecUnit(ExecUnit):
         div = m.submodules.div = DivUnit(self.data_width, self.params)
         div_busy = Signal()
 
-        div_resp_busy = 0
+        div_resp_busy = imul_queue.deq.valid
         for iu in iresp_units:
             div_resp_busy |= iu.resp.valid
 

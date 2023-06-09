@@ -54,7 +54,8 @@ class Dispatcher(HasCoreParams, Elaboratable):
             writing = dec_fire & (self.dec_wid == i)
             reading = dis_fire & (self.dis_wid == i)
 
-            going_empty = ~out_valid | (out_valid & reading)
+            going_empty = ~out_valid | (out_valid & reading
+                                        & ~queue.count.any())
             with m.If(writing):
                 m.d.comb += can_passthrough.eq(going_empty)
 

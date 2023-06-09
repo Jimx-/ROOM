@@ -3,10 +3,10 @@ LD	= $(RISCV)/bin/riscv64-unknown-elf-ld
 AR	= $(RISCV)/bin/riscv64-unknown-elf-ar
 OBJCOPY	= $(RISCV)/bin/riscv64-unknown-elf-objcopy
 
-CFLAGS	= -march=rv32imf -mabi=ilp32 -g
+CFLAGS	= -march=rv32imf -mabi=ilp32 -g -O2
 CFLAGS	+= -I../include/
 
-SRCS	= start.S
+SRCS	= start.S spawn.c
 OBJS	= $(patsubst %.c, %.o, $(patsubst %.S, %.o, $(patsubst %.asm, %.o, $(SRCS))))
 DEPS	= $(OBJS:.o=.d)
 
