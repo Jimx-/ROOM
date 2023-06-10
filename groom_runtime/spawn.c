@@ -71,7 +71,7 @@ void gpu_spawn_tasks(int num_tasks, gpu_task_func_t func, void* arg)
     int WT = NW * NT;
     int nC;
     int nW;
-    int tasks_per_core;
+    int tasks_per_core, real_tasks_per_core;
     int fW, rW;
     int rT;
 
@@ -81,13 +81,14 @@ void gpu_spawn_tasks(int num_tasks, gpu_task_func_t func, void* arg)
     if (nC > NC) nC = NC;
 
     tasks_per_core = num_tasks / nC;
+    real_tasks_per_core = tasks_per_core;
     if (core_id == nC - 1) {
         int rem = num_tasks - (nC * tasks_per_core);
-        tasks_per_core += rem;
+        real_tasks_per_core += rem;
     }
 
-    nW = tasks_per_core / NT;
-    rT = tasks_per_core - (nW * NT);
+    nW = real_tasks_per_core / NT;
+    rT = real_tasks_per_core - (nW * NT);
     fW = (nW >= NW) ? (nW / NW) : 0;
     rW = (fW != 0) ? (nW - fW * NW) : 0;
     if (fW == 0) fW = 1;
@@ -111,7 +112,7 @@ void gpu_spawn_tasks(int num_tasks, gpu_task_func_t func, void* arg)
     if (rT != 0) {
         int tmask = (1 << rT) - 1;
 
-        spawn_args.offset = tasks_per_core - rT;
+        spawn_args.offset = core_id * tasks_per_core + real_tasks_per_core - rT;
         spawn_task_rem(tmask);
     }
 }
