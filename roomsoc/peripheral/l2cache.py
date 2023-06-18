@@ -526,7 +526,7 @@ class SourceB(HasL2CacheParams, Elaboratable):
 
         for i in reversed(range(self.client_bits)):
             with m.If(todo[i]):
-                m.d.comb += next[i].eq(1)
+                m.d.comb += next.eq(1 << i)
 
         m.d.comb += self.req.ready.eq(~busy)
         with m.If(self.req.fire):
@@ -537,6 +537,8 @@ class SourceB(HasL2CacheParams, Elaboratable):
         m.d.comb += b.valid.eq(busy | self.req.valid)
         with m.If(b.fire):
             m.d.comb += remain_clr.eq(next)
+
+        m.d.sync += remain.eq((remain | remain_set) & ~remain_clr)
 
         tag_reg = Signal.like(self.req.bits.tag)
         set_reg = Signal.like(self.req.bits.set)
