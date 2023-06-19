@@ -82,6 +82,7 @@ class HasCoreParams:
         #
 
         if self.is_groom:
+            self.n_cores = params['n_cores']
             self.n_warps = params['n_warps']
             self.n_threads = params['n_threads']
             self.n_barriers = params['n_barriers']

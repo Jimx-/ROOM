@@ -186,7 +186,7 @@ class CSRFile(HasCoreParams, Elaboratable):
             self.gcid.r.eq(self.core_id),
             self.mnt.r.eq(self.n_threads),
             self.mnw.r.eq(self.n_warps),
-            self.mnc.r.eq(1),
+            self.mnc.r.eq(self.n_cores),
         ]
 
         for p in self._ports:

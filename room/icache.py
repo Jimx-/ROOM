@@ -231,7 +231,7 @@ class ICache(HasICacheParams, Elaboratable):
                             refill_paddr[block_off_bits:]),
                                                size=self.lg_block_bytes,
                                                mask=~0,
-                                               source=~0),
+                                               source=0),
                         self.ibus.a.valid.eq(1),
                     ]
 

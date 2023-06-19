@@ -119,6 +119,8 @@ class HasDCacheParams(HasCoreParams):
         self.sdq_size = dcache_params['sdq_size']
         self.rpq_size = dcache_params['rpq_size']
 
+        self.source_id_bits = bits_for(self.n_mshrs + self.n_iomshrs + 1)
+
     def addr_block_offset(self, addr):
         return addr[:self.block_off_bits]
 
@@ -127,6 +129,12 @@ class HasDCacheParams(HasCoreParams):
 
     def addr_tag(self, addr):
         return addr[self.untag_bits:self.untag_bits + self.tag_bits]
+
+    def make_source(self, id):
+        return Const(id, self.source_id_bits)
+
+    def get_source_id(self, source):
+        return source[:self.source_id_bits]
 
 
 class DCacheReqType(IntEnum):
@@ -782,12 +790,11 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
     def __init__(self, params):
         super().__init__(params)
 
-        self.mem_release = Decoupled(
-            tl.ChannelC,
-            addr_width=32,
-            data_width=self.row_bits,
-            size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+        self.mem_release = Decoupled(tl.ChannelC,
+                                     addr_width=32,
+                                     data_width=self.row_bits,
+                                     size_width=bits_for(self.lg_block_bytes),
+                                     source_id_width=self.source_id_bits)
         self.mem_grant = Signal()
 
         self.req = Decoupled(WritebackReq, params)
@@ -868,8 +875,8 @@ class WritebackUnit(HasDCacheParams, Elaboratable):
                             tl.ChannelCOpcode.ProbeAckData)),
                     self.mem_release.bits.param.eq(req.param),
                     self.mem_release.bits.size.eq(self.lg_block_bytes),
-                    self.mem_release.bits.source.eq(self.n_mshrs +
-                                                    self.n_iomshrs),
+                    self.mem_release.bits.source.eq(
+                        self.make_source(self.n_mshrs + self.n_iomshrs)),
                     self.mem_release.bits.address.eq(
                         Cat(Const(0, self.block_off_bits), req.idx, req.tag)),
                     self.mem_release.bits.data.eq(wb_buffer[wb_counter]),
@@ -908,12 +915,11 @@ class ProbeUnit(HasDCacheParams, Elaboratable):
                              data_width=self.row_bits,
                              size_width=bits_for(self.lg_block_bytes))
 
-        self.mem_release = Decoupled(
-            tl.ChannelC,
-            addr_width=32,
-            data_width=self.row_bits,
-            size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+        self.mem_release = Decoupled(tl.ChannelC,
+                                     addr_width=32,
+                                     data_width=self.row_bits,
+                                     size_width=bits_for(self.lg_block_bytes),
+                                     source_id_width=self.source_id_bits)
 
         self.meta_read = Decoupled(MetaReadReq, params)
         self.meta_write = Decoupled(MetaWriteReq, params)
@@ -1114,12 +1120,11 @@ class MSHR(HasDCacheParams, Elaboratable):
         self.id = id
         self.sink_id_width = sink_id_width
 
-        self.mem_acquire = Decoupled(
-            tl.ChannelA,
-            addr_width=32,
-            data_width=self.row_bits,
-            size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+        self.mem_acquire = Decoupled(tl.ChannelA,
+                                     addr_width=32,
+                                     data_width=self.row_bits,
+                                     size_width=bits_for(self.lg_block_bytes),
+                                     source_id_width=self.source_id_bits)
 
         self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.row_bits,
@@ -1273,7 +1278,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                         tl.ChannelAOpcode.AcquireBlock),
                     self.mem_acquire.bits.param.eq(grow_param),
                     self.mem_acquire.bits.size.eq(self.lg_block_bytes),
-                    self.mem_acquire.bits.source.eq(self.id),
+                    self.mem_acquire.bits.source.eq(self.make_source(self.id)),
                     self.mem_acquire.bits.address.eq(
                         Cat(Const(0, self.block_off_bits), req_idx, req_tag)),
                     self.mem_acquire.bits.mask.eq(~0),
@@ -1509,12 +1514,11 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
         self.id = id
 
-        self.mem_access = Decoupled(
-            tl.ChannelA,
-            addr_width=32,
-            data_width=self.row_bits,
-            size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+        self.mem_access = Decoupled(tl.ChannelA,
+                                    addr_width=32,
+                                    data_width=self.row_bits,
+                                    size_width=bits_for(self.lg_block_bytes),
+                                    source_id_width=self.source_id_bits)
 
         self.mem_ack = Decoupled(tl.ChannelD,
                                  data_width=self.row_bits,
@@ -1562,7 +1566,7 @@ class IOMSHR(HasDCacheParams, Elaboratable):
                             tl.ChannelAOpcode.PutPartialData,
                             tl.ChannelAOpcode.Get)),
                     self.mem_access.bits.size.eq(req.uop.mem_size),
-                    self.mem_access.bits.source.eq(self.id),
+                    self.mem_access.bits.source.eq(self.make_source(self.id)),
                     self.mem_access.bits.address.eq(req.addr),
                     self.mem_access.bits.mask.eq(store_gen.mask),
                     self.mem_access.bits.data.eq(store_gen.data_out),
@@ -1600,24 +1604,22 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         self.sink_id_width = sink_id_width
 
-        self.mem_acquire = Decoupled(
-            tl.ChannelA,
-            addr_width=32,
-            data_width=self.row_bits,
-            size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+        self.mem_acquire = Decoupled(tl.ChannelA,
+                                     addr_width=32,
+                                     data_width=self.row_bits,
+                                     size_width=bits_for(self.lg_block_bytes),
+                                     source_id_width=self.source_id_bits)
 
         self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.row_bits,
                                    size_width=bits_for(self.lg_block_bytes),
                                    sink_id_width=sink_id_width)
 
-        self.mem_access = Decoupled(
-            tl.ChannelA,
-            addr_width=32,
-            data_width=self.row_bits,
-            size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+        self.mem_access = Decoupled(tl.ChannelA,
+                                    addr_width=32,
+                                    data_width=self.row_bits,
+                                    size_width=bits_for(self.lg_block_bytes),
+                                    source_id_width=self.source_id_bits)
 
         self.mem_ack = Decoupled(tl.ChannelD,
                                  data_width=self.row_bits,
@@ -1732,14 +1734,14 @@ class MSHRFile(HasDCacheParams, Elaboratable):
             addr_width=32,
             data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+            source_id_width=self.source_id_bits)
 
         mem_access_arbiter = m.submodules.mem_access_arbiter = tl.Arbiter(
             tl.ChannelA,
             addr_width=32,
             data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+            source_id_width=self.source_id_bits)
 
         mem_finish_arbiter = m.submodules.mem_finish_arbiter = tl.Arbiter(
             tl.ChannelE, sink_id_width=self.sink_id_width)
@@ -1848,7 +1850,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                 mshr.wb_resp.eq(self.wb_resp),
             ]
 
-            with m.If(self.mem_grant.bits.source == i):
+            with m.If(self.get_source_id(self.mem_grant.bits.source) == i):
                 m.d.comb += self.mem_grant.connect(mshr.mem_grant)
 
             m.d.comb += mshr.resp.connect(resp_arb.inp[i])
@@ -1890,10 +1892,12 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
             m.d.comb += [
                 mshr.mem_ack.bits.eq(self.mem_ack.bits),
-                mshr.mem_ack.valid.eq(self.mem_ack.valid
-                                      & (self.mem_ack.bits.source == mshr_id)),
+                mshr.mem_ack.valid.eq(
+                    self.mem_ack.valid
+                    &
+                    (self.get_source_id(self.mem_ack.bits.source) == mshr_id)),
             ]
-            with m.If(self.mem_ack.bits.source == mshr_id):
+            with m.If(self.get_source_id(self.mem_ack.bits.source) == mshr_id):
                 m.d.comb += self.mem_ack.ready.eq(1)
 
             m.d.comb += mshr.resp.connect(resp_arb.inp[self.n_mshrs + i])
@@ -2039,12 +2043,14 @@ class DCache(HasDCacheParams, Elaboratable):
             addr_width=32,
             data_width=self.row_bits,
             size_width=bits_for(self.lg_block_bytes),
-            source_id_width=bits_for(self.n_mshrs + self.n_iomshrs + 1))
+            source_id_width=self.source_id_bits)
         mem_release_arbiter.add(wb.mem_release)
         mem_release_arbiter.add(prober.mem_release)
         m.d.comb += mem_release_arbiter.bus.connect(self.dbus.c)
 
-        with m.If(self.dbus.d.bits.source == self.n_mshrs + self.n_iomshrs):
+        with m.If(
+                self.get_source_id(self.dbus.d.bits.source) == self.n_mshrs +
+                self.n_iomshrs):
             m.d.comb += [
                 self.dbus.d.ready.eq(1),
                 mshrs.mem_grant.valid.eq(0),
@@ -2054,8 +2060,8 @@ class DCache(HasDCacheParams, Elaboratable):
 
         m.d.comb += self.dbus_mmio.d.connect(mshrs.mem_ack)
 
-        m.d.comb += wb.mem_grant.eq(self.dbus.d.fire & (
-            self.dbus.d.bits.source == self.n_mshrs + self.n_iomshrs))
+        m.d.comb += wb.mem_grant.eq(self.dbus.d.fire & (self.get_source_id(
+            self.dbus.d.bits.source) == self.n_mshrs + self.n_iomshrs))
 
         m.d.comb += mshrs.mem_finish.connect(self.dbus.e)
 

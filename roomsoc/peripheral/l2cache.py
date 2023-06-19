@@ -31,7 +31,9 @@ class HasL2CacheParams:
         self.untag_bits = self.offset_bits + self.index_bits
         self.tag_bits = 32 - self.untag_bits
 
-        self.client_bits = 1
+        self.client_source_map = params['client_source_map']
+        self.num_clients = len(self.client_source_map)
+        self.client_bits = max(self.num_clients, 1)
 
         self.n_rel_lists = 1
         self.n_rel_entries = self.block_bytes // self.beat_bytes
@@ -52,7 +54,18 @@ class HasL2CacheParams:
         return Cat(offset, set, tag)
 
     def client_bit(self, source_id):
-        return 1
+        return Cat((source_id >= self.client_source_map[c][0])
+                   & (source_id <= self.client_source_map[c][1])
+                   for c in range(self.num_clients))
+
+    def client_source(self, m, bit):
+        source = Signal(self.in_source_id_width)
+
+        for c in range(self.num_clients):
+            with m.If(bit[c]):
+                m.d.comb += source.eq(self.client_source_map[c][0])
+
+        return source
 
     def need_t(self, opcode, param):
         return ~opcode[2] | (((opcode == tl.ChannelAOpcode.AcquireBlock) |
@@ -555,7 +568,7 @@ class SourceB(HasL2CacheParams, Elaboratable):
             b.bits.opcode.eq(tl.ChannelBOpcode.Probe),
             b.bits.param.eq(Mux(~busy, self.req.bits.param, param_reg)),
             b.bits.size.eq(self.offset_bits),
-            b.bits.source.eq(0),
+            b.bits.source.eq(self.client_source(m, next)),
             b.bits.address.eq(
                 self.make_addr(Mux(~busy, self.req.bits.tag, tag_reg),
                                Mux(~busy, self.req.bits.set, set_reg),
@@ -1422,12 +1435,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
         m.d.comb += new_request.eq(request)
         with m.If(self.allocate.valid):
             m.d.comb += new_request.eq(self.allocate.bits)
-
-        with m.If(new_request.prio[0]
-                  & (new_request.opcode == tl.ChannelAOpcode.Get)):
-            m.d.comb += new_client_bit.eq(0)
-        with m.Else():
-            m.d.comb += new_client_bit.eq(self.client_bit(new_request.source))
+        m.d.comb += new_client_bit.eq(self.client_bit(new_request.source))
 
         m.d.comb += [
             self.status.valid.eq(request_valid),
@@ -1508,10 +1516,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
             (meta.clients == 0) & (meta.state == CacheState.TIP), got_t)
 
         req_client_bit = Signal(self.client_bits)
-        with m.If(request.prio[0] & (request.opcode == tl.ChannelAOpcode.Get)):
-            m.d.comb += req_client_bit.eq(0)
-        with m.Else():
-            m.d.comb += req_client_bit.eq(self.client_bit(request.source))
+        m.d.comb += req_client_bit.eq(self.client_bit(request.source))
 
         honor_b_to_t = meta.hit & ((meta.clients & req_client_bit) != 0)
 

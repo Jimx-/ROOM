@@ -21,7 +21,7 @@ from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
 from room.utils import Arbiter
 
-from roomsoc.interconnect.stream import Valid
+from roomsoc.interconnect.stream import Valid, Decoupled
 from roomsoc.interconnect import wishbone, tilelink as tl
 
 
@@ -1032,7 +1032,18 @@ class Core(HasCoreParams, Elaboratable):
                 size_width=self.dbus.size_width,
                 source_id_width=self.dbus.source_id_width)
 
-            a_arbiter.add(self.ibus.a)
+            ibus_a = Decoupled(tl.ChannelA,
+                               data_width=self.ibus.data_width,
+                               addr_width=self.ibus.addr_width,
+                               size_width=self.ibus.size_width,
+                               source_id_width=self.ibus.source_id_width)
+            m.d.comb += [
+                self.ibus.a.connect(ibus_a),
+                ibus_a.bits.source.eq(
+                    Cat(self.ibus.a.bits.source[:-1], Const(1, 1))),
+            ]
+
+            a_arbiter.add(ibus_a)
             a_arbiter.add(self.dbus.a)
 
             m.d.comb += [
