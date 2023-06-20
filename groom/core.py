@@ -262,13 +262,19 @@ class Cluster(HasClusterParams, Elaboratable):
 
         self.reset_vector = Signal(32)
 
+        self.dbus_mmio = tl.Interface(data_width=64,
+                                      addr_width=32,
+                                      size_width=3,
+                                      source_id_width=8,
+                                      name='dbus_mmio')
+
         self.l2cache_params['client_source_map'] = dict(
             (i, (self.make_source(True, i, Const(0, 8)),
                  self.make_source(True, i, Const(~0, 8))))
             for i in range(self.num_cores))
         self.l2cache = L2Cache(self.l2cache_params)
 
-        self.periph_buses = [self.l2cache.out_bus]
+        self.periph_buses = [self.dbus_mmio, self.l2cache.out_bus]
 
     def make_source(self, is_dbus, core_id, source):
         return Cat(source[:-(1 + self.core_bits)],
@@ -288,6 +294,12 @@ class Cluster(HasClusterParams, Elaboratable):
                                                         addr_width=32,
                                                         size_width=3,
                                                         source_id_width=8)
+        mmio_a_arbiter = m.submodules.mmio_a_arbiter = tl.Arbiter(
+            tl.ChannelA,
+            data_width=64,
+            addr_width=32,
+            size_width=3,
+            source_id_width=8)
 
         c_arbiter = m.submodules.c_arbiter = tl.Arbiter(tl.ChannelC,
                                                         data_width=64,
@@ -318,6 +330,12 @@ class Cluster(HasClusterParams, Elaboratable):
                                addr_width=core.dbus.addr_width,
                                size_width=core.dbus.size_width,
                                source_id_width=core.dbus.source_id_width)
+            dbus_mmio_a = Decoupled(
+                tl.ChannelA,
+                data_width=core.dbus_mmio.data_width,
+                addr_width=core.dbus_mmio.addr_width,
+                size_width=core.dbus_mmio.size_width,
+                source_id_width=core.dbus_mmio.source_id_width)
             m.d.comb += [
                 core.ibus.a.connect(ibus_a),
                 ibus_a.bits.source.eq(
@@ -329,10 +347,16 @@ class Cluster(HasClusterParams, Elaboratable):
                     self.make_source(is_dbus=True,
                                      core_id=i,
                                      source=core.dbus.a.bits.source)),
+                core.dbus_mmio.a.connect(dbus_mmio_a),
+                dbus_mmio_a.bits.source.eq(
+                    self.make_source(is_dbus=True,
+                                     core_id=i,
+                                     source=core.dbus_mmio.a.bits.source)),
             ]
 
             a_arbiter.add(ibus_a)
             a_arbiter.add(dbus_a)
+            mmio_a_arbiter.add(dbus_mmio_a)
 
             dbus_c = Decoupled(tl.ChannelC,
                                data_width=core.dbus.data_width,
@@ -353,6 +377,7 @@ class Cluster(HasClusterParams, Elaboratable):
 
         m.d.comb += [
             a_arbiter.bus.connect(self.l2cache.in_bus.a),
+            mmio_a_arbiter.bus.connect(self.dbus_mmio.a),
             c_arbiter.bus.connect(self.l2cache.in_bus.c),
             e_arbiter.bus.connect(self.l2cache.in_bus.e),
         ]
@@ -385,5 +410,16 @@ class Cluster(HasClusterParams, Elaboratable):
                             self.l2cache.in_bus.d.connect(core.ibus.d),
                             core.ibus.d.bits.source.eq(d_source_id),
                         ]
+
+        _, mmio_d_core_id, mmio_d_source_id = self.unpack_source(
+            self.dbus_mmio.d.bits.source)
+
+        with m.Switch(mmio_d_core_id):
+            for i, core in enumerate(cores):
+                with m.Case(i):
+                    m.d.comb += [
+                        self.dbus_mmio.d.connect(core.dbus_mmio.d),
+                        core.dbus_mmio.d.bits.source.eq(mmio_d_source_id),
+                    ]
 
         return m
