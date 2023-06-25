@@ -24,6 +24,8 @@
 #define BUFSIZE_BYTE 256
 
 struct tcp_buf {
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
   unsigned int rptr;
   unsigned int wptr;
   char buf[BUFSIZE_BYTE];
@@ -58,22 +60,32 @@ static bool tcp_buffer_is_empty(struct tcp_buf *buf) {
 }
 
 static void tcp_buffer_put_byte(struct tcp_buf *buf, char dat) {
-  bool done = false;
-  while (!done) {
-    if (!tcp_buffer_is_full(buf)) {
-      buf->buf[buf->wptr++] = dat;
-      buf->wptr %= BUFSIZE_BYTE;
-      done = true;
-    }
-  }
+  pthread_mutex_lock(&buf->mutex);
+  while (tcp_buffer_is_full(buf))
+    pthread_cond_wait(&buf->cond, &buf->mutex);
+
+  buf->buf[buf->wptr++] = dat;
+  buf->wptr %= BUFSIZE_BYTE;
+  pthread_mutex_unlock(&buf->mutex);
 }
 
 static bool tcp_buffer_get_byte(struct tcp_buf *buf, char *dat) {
+  bool was_full;
+
+  pthread_mutex_lock(&buf->mutex);
   if (tcp_buffer_is_empty(buf)) {
+    pthread_mutex_unlock(&buf->mutex);
     return false;
   }
+
+  was_full = tcp_buffer_is_full(buf);
+
   *dat = buf->buf[buf->rptr++];
   buf->rptr %= BUFSIZE_BYTE;
+
+  if (was_full)
+    pthread_cond_signal(&buf->cond);
+  pthread_mutex_unlock(&buf->mutex);
   return true;
 }
 
@@ -82,6 +94,8 @@ static struct tcp_buf *tcp_buffer_new(void) {
   buf_new = (struct tcp_buf *)malloc(sizeof(struct tcp_buf));
   buf_new->rptr = 0;
   buf_new->wptr = 0;
+  pthread_mutex_init(&buf_new->mutex, NULL);
+  pthread_cond_init(&buf_new->cond, NULL);
   return buf_new;
 }
 
