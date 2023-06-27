@@ -5,6 +5,7 @@ from amaranth.hdl.rec import *
 from amaranth.utils import bits_for, log2_int
 from amaranth.lib.scheduler import RoundRobin
 from amaranth.lib.fifo import SyncFIFO
+from amaranth.hdl.ast import ValueCastable
 
 from .peripheral import Peripheral
 
@@ -25,6 +26,7 @@ class HasL2CacheParams:
                                                    self.n_ways)
         self.beat_bytes = params.get('beat_bytes', 8)
         self.n_mshrs = params.get('n_mshrs', 4)
+        self.secondary = self.n_mshrs
 
         self.offset_bits = log2_int(self.block_bytes)
         self.index_bits = log2_int(self.n_sets)
@@ -35,8 +37,10 @@ class HasL2CacheParams:
         self.num_clients = len(self.client_source_map)
         self.client_bits = max(self.num_clients, 1)
 
-        self.n_rel_lists = 1
+        self.n_rel_lists = 2
         self.n_rel_entries = self.block_bytes // self.beat_bytes
+
+        self.put_bits = bits_for(self.n_rel_lists - 1)
 
         in_bus_params = params['in_bus']
         self.in_source_id_width = in_bus_params['source_id_width']
@@ -230,7 +234,7 @@ class BankedStore(HasL2CacheParams, Elaboratable):
         return m
 
 
-class BaseRequest(HasL2CacheParams):
+class BaseRequest(HasL2CacheParams, ValueCastable):
 
     def __init__(self, params, name=None, src_loc_at=0):
         super().__init__(params)
@@ -247,13 +251,18 @@ class BaseRequest(HasL2CacheParams):
         self.source = Signal(self.in_source_id_width, name=f'{name}_source')
         self.tag = Signal(self.tag_bits, name=f'{name}_tag')
         self.offset = Signal(self.offset_bits, name=f'{name}_offset')
+        self.put = Signal(self.put_bits, name=f'{name}_put')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.prio, self.control, self.opcode, self.param, self.size,
+                   self.source, self.tag, self.offset, self.put)
+
+    def __len__(self):
+        return len(Value.cast(self))
 
     def eq(self, rhs):
-        attrs = [
-            'prio', 'control', 'opcode', 'param', 'size', 'source', 'tag',
-            'offset'
-        ]
-        return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
 class FullRequest(BaseRequest):
@@ -263,8 +272,9 @@ class FullRequest(BaseRequest):
 
         self.set = Signal(self.index_bits, name=f'{self.name}_set')
 
-    def eq(self, rhs):
-        return super().eq(rhs) + [self.set.eq(rhs.set)]
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(super().as_value(), self.set)
 
 
 class AllocateRequest(FullRequest):
@@ -274,9 +284,9 @@ class AllocateRequest(FullRequest):
 
         self.repeat = Signal(name=f'{self.name}_repeat')
 
-    def eq(self, rhs):
-        return super().eq(rhs) + ([self.repeat.eq(rhs.repeat)] if hasattr(
-            rhs, 'repeat') else [])
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(super().as_value(), self.repeat)
 
 
 class Directory(HasL2CacheParams, Elaboratable):
@@ -739,14 +749,9 @@ class SourceD(HasL2CacheParams, Elaboratable):
             self.way = Signal(self.n_ways, name=f'{self.name}_way')
             self.bad = Signal(name=f'{self.name}_bad')
 
-        def eq(self, rhs):
-            return [
-                x for x in super().eq(rhs) + [
-                    self.sink.eq(rhs.sink) if hasattr(rhs, 'sink') else None,
-                    self.way.eq(rhs.way) if hasattr(rhs, 'way') else None,
-                    self.bad.eq(rhs.bad) if hasattr(rhs, 'bad') else None,
-                ] if x is not None
-            ]
+        @ValueCastable.lowermethod
+        def as_value(self):
+            return Cat(super().as_value(), self.sink, self.way, self.bad)
 
     def __init__(self, params):
         super().__init__(params=params)
@@ -879,6 +884,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
 
         m.d.comb += [
             self.rel_pop.valid.eq(s2_valid_pb & ~s2_req.prio[0]),
+            self.rel_pop.bits.index.eq(s2_req.put),
             self.rel_pop.bits.last.eq(s2_last),
         ]
 
@@ -1098,6 +1104,7 @@ class PutBufferPop(HasL2CacheParams, Record):
         HasL2CacheParams.__init__(self, params=params)
 
         Record.__init__(self, [
+            ('index', self.put_bits, Direction.FANOUT),
             ('last', 1, Direction.FANOUT),
         ],
                         name=name,
@@ -1238,23 +1245,45 @@ class SinkC(HasL2CacheParams, Elaboratable):
             self.resp.bits.data.eq(has_data),
         ]
 
-        putbuffer = m.submodules.putbuffer = SyncFIFO(width=len(
-            self.rel_entry),
-                                                      depth=self.n_rel_entries)
-        putbuffer_ready = Signal(reset=1)
+        lists = Signal(self.n_rel_lists)
+        lists_set = Signal.like(lists)
+        lists_clr = Signal.like(lists)
+        m.d.sync += lists.eq((lists | lists_set) & ~lists_clr)
 
-        req_stall = first & ~self.req.ready & ~(has_data & ~putbuffer_ready)
+        free_idx = Signal(range(self.n_rel_lists))
+        free_idx_reg = Signal.like(free_idx)
+        for i in reversed(range(self.n_rel_lists)):
+            with m.If(~lists[i]):
+                m.d.comb += free_idx.eq(i)
+        with m.If(first):
+            m.d.sync += free_idx_reg.eq(free_idx)
+
+        put = Mux(first, free_idx, free_idx_reg)
+
+        putbuffers = Array(
+            SyncFIFO(width=len(self.rel_entry), depth=self.n_rel_entries)
+            for _ in range(self.n_rel_lists))
+        for i, pb in enumerate(putbuffers):
+            setattr(m.submodules, f'putbuffer{i}', pb)
+
+        putbuffer = putbuffers[put]
+
+        req_stall = first & ~self.req.ready
         buf_stall = has_data & ~putbuffer.w_rdy
+        list_stall = has_data & first & lists.all()
 
-        m.d.comb += c.ready.eq(Mux(resp, 1, ~req_stall & ~buf_stall))
+        m.d.comb += c.ready.eq(
+            Mux(resp, 1, ~req_stall & ~buf_stall & ~list_stall))
 
         m.d.comb += [
-            self.req.valid.eq(~is_resp & c.valid & first & ~buf_stall),
-            putbuffer.w_en.eq(~is_resp & c.valid & has_data & ~req_stall),
+            self.req.valid.eq(~is_resp & c.valid & first & ~buf_stall
+                              & ~list_stall),
+            putbuffer.w_en.eq(~is_resp & c.valid & has_data & ~req_stall
+                              & ~list_stall),
         ]
         with m.If(~is_resp & c.valid & first & has_data & ~req_stall
                   & ~buf_stall):
-            m.d.sync += putbuffer_ready.eq(0)
+            m.d.comb += lists_set.eq(1 << free_idx)
 
         m.d.comb += [
             self.req.bits.prio.eq(4),
@@ -1265,6 +1294,7 @@ class SinkC(HasL2CacheParams, Elaboratable):
             self.req.bits.set.eq(set),
             self.req.bits.tag.eq(tag),
             self.req.bits.offset.eq(offset),
+            self.req.bits.put.eq(put),
         ]
 
         putbuffer_wdata = SinkC.PutBufferEntry(self.params)
@@ -1275,13 +1305,13 @@ class SinkC(HasL2CacheParams, Elaboratable):
         ]
 
         m.d.comb += [
-            self.rel_pop.ready.eq(putbuffer.r_rdy),
-            putbuffer.r_en.eq(self.rel_pop.fire),
-            self.rel_entry.eq(putbuffer.r_data),
+            self.rel_pop.ready.eq(putbuffers[self.rel_pop.bits.index].r_rdy),
+            putbuffers[self.rel_pop.bits.index].r_en.eq(self.rel_pop.fire),
+            self.rel_entry.eq(putbuffers[self.rel_pop.bits.index].r_data),
         ]
 
         with m.If(self.rel_pop.fire & self.rel_pop.bits.last):
-            m.d.sync += putbuffer_ready.eq(1)
+            m.d.comb += lists_clr.eq(1 << self.rel_pop.bits.index)
 
         return m
 
@@ -1451,6 +1481,7 @@ class ScheduleRequest(HasL2CacheParams):
         self.e = Valid(SourceE.Request, params)
         self.x = Valid(SourceX.Request)
         self.dir = Valid(Directory.WriteReq, params)
+        self.reload = Signal()
 
     def eq(self, rhs):
         return [
@@ -1461,6 +1492,7 @@ class ScheduleRequest(HasL2CacheParams):
             self.e.eq(rhs.e),
             self.x.eq(rhs.x),
             self.dir.eq(rhs.dir),
+            self.reload.eq(rhs.reload),
         ]
 
 
@@ -1500,13 +1532,6 @@ class MSHR(HasL2CacheParams, Elaboratable):
         meta_valid = Signal()
         meta = Directory.Result(self.params)
 
-        with m.If(self.allocate.valid):
-            m.d.sync += [
-                request_valid.eq(1),
-                request.eq(self.allocate.bits),
-            ]
-
-        new_meta = self.directory.bits
         new_request = FullRequest(self.params)
         new_client_bit = Signal(self.client_bits)
         new_need_t = self.need_t(new_request.opcode, new_request.param)
@@ -1516,15 +1541,6 @@ class MSHR(HasL2CacheParams, Elaboratable):
         with m.If(self.allocate.valid):
             m.d.comb += new_request.eq(self.allocate.bits)
         m.d.comb += new_client_bit.eq(self.client_bit(new_request.source))
-
-        m.d.comb += [
-            self.status.valid.eq(request_valid),
-            self.status.bits.set.eq(request.set),
-            self.status.bits.tag.eq(request.tag),
-            self.status.bits.way.eq(meta.way),
-            self.status.bits.block_c.eq(0),
-            self.status.bits.nest_c.eq(0),
-        ]
 
         s_rprobe = Signal(reset=1)
         w_rprobeackfirst = Signal(reset=1)
@@ -1545,6 +1561,17 @@ class MSHR(HasL2CacheParams, Elaboratable):
         s_writeback = Signal(reset=1)
         s_flush = Signal(reset=1)
 
+        m.d.comb += [
+            self.status.valid.eq(request_valid),
+            self.status.bits.set.eq(request.set),
+            self.status.bits.tag.eq(request.tag),
+            self.status.bits.way.eq(meta.way),
+            self.status.bits.block_c.eq(0),
+            self.status.bits.nest_c.eq(meta_valid
+                                       & (~w_rprobeackfirst | ~w_pprobeackfirst
+                                          | ~w_grantfirst)),
+        ]
+
         got_t = Signal()
         no_wait = w_rprobeacklast & w_releaseack & w_grantlast & w_pprobeacklast & w_grantack
 
@@ -1558,6 +1585,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
             self.schedule.bits.x.valid.eq(~s_flush & w_releaseack),
             self.schedule.bits.dir.valid.eq((~s_writeback & no_wait)
                                             | (~s_release & w_rprobeackfirst)),
+            self.schedule.bits.reload.eq(no_wait),
             self.schedule.valid.eq(self.schedule.bits.a.valid
                                    | self.schedule.bits.b.valid
                                    | self.schedule.bits.c.valid
@@ -1757,7 +1785,20 @@ class MSHR(HasL2CacheParams, Elaboratable):
         with m.If(self.sinke.valid):
             m.d.sync += w_grantack.eq(1)
 
-        with m.If(self.directory.valid):
+        new_meta = Directory.Result(self.params)
+        with m.If(self.allocate.valid & self.allocate.bits.repeat):
+            m.d.comb += new_meta.eq(meta_writeback)
+        with m.Else():
+            m.d.comb += new_meta.eq(self.directory.bits)
+
+        with m.If(self.allocate.valid):
+            m.d.sync += [
+                request_valid.eq(1),
+                request.eq(self.allocate.bits),
+            ]
+
+        with m.If(self.directory.valid
+                  | (self.allocate.valid & self.allocate.bits.repeat)):
             m.d.sync += [
                 meta_valid.eq(1),
                 meta.eq(new_meta),
@@ -1915,6 +1956,12 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             setattr(m.submodules, f'mshr{i}', mshr)
         abc_mshrs, c_mshr = mshrs[:-1], mshrs[-1]
 
+        req_queues = Array(
+            Queue(self.secondary, BaseRequest, self.params, flow=False)
+            for _ in range(self.n_mshrs * 3))
+        for i, queue in enumerate(req_queues):
+            setattr(m.submodules, f'req_queue{i}', queue)
+
         mshr_stall_abc = Cat(c_mshr.status.valid
                              & (m.status.bits.set == c_mshr.status.bits.set)
                              for m in abc_mshrs)
@@ -1953,53 +2000,58 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                 mshr.sinke.bits.eq(sink_e.resp.bits),
             ]
 
-        mshr_rr = m.submodules.mshr_rr = RoundRobin(count=self.n_mshrs)
-        m.d.comb += mshr_rr.requests.eq(mshr_request)
+        mshr_grant = Signal(range(self.n_mshrs))
+        mshr_grant_mask = Signal(self.n_mshrs)
+        mshr_last_grant = Signal.like(mshr_grant)
+        m.d.sync += mshr_last_grant.eq(mshr_grant)
+        m.d.comb += mshr_grant.eq(mshr_last_grant)
+        with m.Switch(mshr_last_grant):
+            for i in range(self.n_mshrs):
+                with m.Case(i):
+                    for pred in reversed(range(i)):
+                        with m.If(mshr_request[pred]):
+                            m.d.comb += mshr_grant.eq(pred)
+                    for succ in reversed(range(i + 1, self.n_mshrs)):
+                        with m.If(mshr_request[succ]):
+                            m.d.comb += mshr_grant.eq(succ)
+
+        with m.If(mshr_request.any()):
+            m.d.comb += mshr_grant_mask.eq(1 << mshr_grant)
 
         schedule = ScheduleRequest(self.params)
-        schedule_req = Signal()
         schedule_tag = Signal(self.tag_bits)
         schedule_set = Signal(self.index_bits)
-        with m.Switch(mshr_rr.grant):
-            for i, mshr in enumerate(mshrs):
-                with m.Case(i):
-                    m.d.comb += [
-                        schedule.eq(mshr.schedule.bits),
-                        schedule_req.eq(mshr_request[i]),
-                        mshr.schedule.ready.eq(mshr_rr.valid
-                                               & mshr_request[i]),
-                        schedule_tag.eq(mshr.status.bits.tag),
-                        schedule_set.eq(mshr.status.bits.set),
-                    ]
+        for i, mshr in enumerate(mshrs):
+            m.d.comb += mshr.schedule.ready.eq(mshr_grant_mask[i])
+
+            with m.If(mshr_grant_mask[i]):
+                m.d.comb += [
+                    schedule.eq(mshr.schedule.bits),
+                    schedule_tag.eq(mshr.status.bits.tag),
+                    schedule_set.eq(mshr.status.bits.set),
+                ]
 
         m.d.comb += [
-            schedule.a.bits.source.eq(mshr_rr.grant),
+            schedule.a.bits.source.eq(mshr_grant),
             schedule.c.bits.source.eq(
-                Mux(schedule.c.bits.opcode[1], mshr_rr.grant, 0)),
-            schedule.d.bits.sink.eq(mshr_rr.grant),
+                Mux(schedule.c.bits.opcode[1], mshr_grant, 0)),
+            schedule.d.bits.sink.eq(mshr_grant),
         ]
 
         m.d.comb += [
-            source_a.req.valid.eq(schedule.a.valid & mshr_rr.valid
-                                  & schedule_req),
+            source_a.req.valid.eq(schedule.a.valid),
             source_a.req.bits.eq(schedule.a.bits),
-            source_b.req.valid.eq(schedule.b.valid & mshr_rr.valid
-                                  & schedule_req),
+            source_b.req.valid.eq(schedule.b.valid),
             source_b.req.bits.eq(schedule.b.bits),
-            source_c.req.valid.eq(schedule.c.valid & mshr_rr.valid
-                                  & schedule_req),
+            source_c.req.valid.eq(schedule.c.valid),
             source_c.req.bits.eq(schedule.c.bits),
-            source_d.req.valid.eq(schedule.d.valid & mshr_rr.valid
-                                  & schedule_req),
+            source_d.req.valid.eq(schedule.d.valid),
             source_d.req.bits.eq(schedule.d.bits),
-            source_e.req.valid.eq(schedule.e.valid & mshr_rr.valid
-                                  & schedule_req),
+            source_e.req.valid.eq(schedule.e.valid),
             source_e.req.bits.eq(schedule.e.bits),
-            source_x.req.valid.eq(schedule.x.valid & mshr_rr.valid
-                                  & schedule_req),
+            source_x.req.valid.eq(schedule.x.valid),
             source_x.req.bits.eq(schedule.x.bits),
-            directory.write.valid.eq(schedule.dir.valid & mshr_rr.valid
-                                     & schedule_req),
+            directory.write.valid.eq(schedule.dir.valid),
             directory.write.bits.eq(schedule.dir.bits),
         ]
 
@@ -2026,11 +2078,12 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             m.status.valid & (m.status.bits.set == request.bits.set)
             for m in mshrs
         ])
-        alloc_mshr = set_matches == 0
+        alloc_mshr = ~set_matches.any()
         block_c = Signal()
         nest_c = Signal()
         prio_filter = Cat(Repl(1, self.n_mshrs - 1), request.bits.prio[2])
-        queue = ((set_matches & prio_filter) != 0) & ~block_c & ~nest_c
+        lower_matches = set_matches & prio_filter
+        request_enq = lower_matches.any() & ~block_c & ~nest_c
         for i, mshr in enumerate(mshrs):
             with m.If(set_matches[i] & mshr.status.bits.block_c
                       & request.bits.prio[2]):
@@ -2039,16 +2092,104 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                       & request.bits.prio[2]):
                 m.d.comb += nest_c.eq(1)
 
-        mshr_free = Signal()
-        request_will_alloc = (alloc_mshr & mshr_free)
+        lower_matches1 = Signal.like(lower_matches)
+        m.d.comb += lower_matches1.eq(
+            Mux(
+                lower_matches[self.n_mshrs - 1], 1 << (self.n_mshrs - 1),
+                Mux(lower_matches[self.n_mshrs - 2], 1 << (self.n_mshrs - 2),
+                    lower_matches)))
 
-        m.d.comb += request.ready.eq(request_will_alloc)
+        queue_valids = Signal(self.n_mshrs * 3)
+        for i, queue in enumerate(req_queues):
+            m.d.comb += queue_valids[i].eq(queue.deq.valid
+                                           & mshr_grant_mask[i % self.n_mshrs])
+
+        deq_index = Signal(range(self.n_mshrs * 3))
+        for i, mshr in enumerate(mshrs):
+            a_deq = queue_valids[i]
+            b_deq = queue_valids[self.n_mshrs + i]
+            c_deq = queue_valids[self.n_mshrs * 2 + i]
+            bypass_matches = lower_matches1[i] & Mux(
+                c_deq | request.bits.prio[2], ~c_deq,
+                Mux(b_deq | request.bits.prio[1], ~b_deq, ~a_deq))
+            may_deq = a_deq | b_deq | c_deq
+            may_bypass = request.valid & request_enq & bypass_matches
+            will_reload = mshr.schedule.bits.reload & (may_deq | may_bypass)
+            mshr_deq_index = Signal(range(self.n_mshrs * 3))
+
+            with m.If(c_deq):
+                m.d.comb += mshr_deq_index.eq(self.n_mshrs * 2 + i)
+            with m.Elif(b_deq):
+                m.d.comb += mshr_deq_index.eq(self.n_mshrs * 1 + i)
+            with m.Else():
+                m.d.comb += mshr_deq_index.eq(self.n_mshrs * 0 + i)
+
+            with m.If(mshr_grant_mask[i]):
+                m.d.comb += deq_index.eq(mshr_deq_index)
+
+            m.d.comb += [
+                mshr.allocate.bits.eq(
+                    Mux(may_bypass, request.bits,
+                        req_queues[mshr_deq_index].deq.bits)),
+                mshr.allocate.bits.set.eq(mshr.status.bits.set),
+                mshr.allocate.bits.repeat.eq(
+                    mshr.allocate.bits.tag == mshr.status.bits.tag),
+                mshr.allocate.valid.eq(mshr_grant_mask[i] & will_reload),
+            ]
+
+        a_deq = queue_valids[:self.n_mshrs].any()
+        b_deq = queue_valids[self.n_mshrs:self.n_mshrs * 2].any()
+        c_deq = queue_valids[self.n_mshrs * 2:].any()
+        bypass_matches = (mshr_grant_mask & lower_matches1).any() & Mux(
+            c_deq | request.bits.prio[2], ~c_deq,
+            Mux(b_deq | request.bits.prio[1], ~b_deq, ~a_deq))
+        may_deq = a_deq | b_deq | c_deq
+        may_bypass = request.valid & request_enq & bypass_matches
+        will_reload = schedule.reload & (may_deq | may_bypass)
+        will_deq = schedule.reload & may_deq & ~may_bypass
+
+        m.d.comb += req_queues[deq_index].deq.ready.eq(will_deq)
+
+        deq_tag_mismatch = schedule_tag != req_queues[deq_index].deq.bits.tag
+        mshr_uses_dir_no_bypass = schedule.reload & may_deq & deq_tag_mismatch
+        mshr_uses_dir_deq = will_deq & deq_tag_mismatch
+        mshr_uses_dir = will_reload & (schedule_tag != Mux(
+            may_bypass, request.bits.tag, req_queues[deq_index].deq.bits.tag))
+
+        mshr_free = Signal()
+        req_queue_ready = Signal()
+        will_bypass = schedule.reload & bypass_matches
+        request_will_alloc = (alloc_mshr & ~mshr_uses_dir_no_bypass
+                              & mshr_free) | (nest_c & ~mshr_uses_dir_no_bypass
+                                              & ~c_mshr.status.valid)
+        alloc_uses_dir = request.valid & request_will_alloc
+
+        m.d.comb += request.ready.eq(request_will_alloc
+                                     | (request_enq
+                                        & (will_bypass | req_queue_ready)))
 
         m.d.comb += [
-            directory.read.valid.eq(request.valid & request_will_alloc),
-            directory.read.bits.set.eq(request.bits.set),
-            directory.read.bits.tag.eq(request.bits.tag),
+            directory.read.valid.eq(alloc_uses_dir
+                                    | mshr_uses_dir),
+            directory.read.bits.set.eq(
+                Mux(mshr_uses_dir_deq, schedule_set, request.bits.set)),
+            directory.read.bits.tag.eq(
+                Mux(mshr_uses_dir_deq, req_queues[deq_index].deq.bits.tag,
+                    request.bits.tag)),
         ]
+
+        for i in range(self.n_mshrs):
+            with m.If(lower_matches1[i]):
+                index = Mux(request.bits.prio[2], self.n_mshrs * 2,
+                            Mux(request.bits.prio[1], self.n_mshrs * 1, 0)) + i
+
+                m.d.comb += [
+                    req_queues[index].enq.valid.eq(request.valid
+                                                   & request_enq
+                                                   & ~will_bypass),
+                    req_queues[index].enq.bits.eq(request.bits),
+                    req_queue_ready.eq(req_queues[index].enq.ready),
+                ]
 
         mshr_write_index = Signal(range(self.n_mshrs))
         for i in reversed(range(self.n_mshrs)):
@@ -2058,7 +2199,7 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                     mshr_free.eq(1),
                 ]
 
-        with m.If(request.valid & alloc_mshr):
+        with m.If(request.valid & alloc_mshr & ~mshr_uses_dir_no_bypass):
             with m.Switch(mshr_write_index):
                 for i, mshr in enumerate(mshrs):
                     with m.Case(i):
@@ -2069,8 +2210,20 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                                 mshr.allocate.bits.repeat.eq(0),
                             ]
 
+        with m.If(request.valid & nest_c & ~c_mshr.status.valid
+                  & ~mshr_uses_dir_no_bypass):
+            m.d.comb += [
+                c_mshr.allocate.valid.eq(1),
+                c_mshr.allocate.bits.eq(request.bits),
+                c_mshr.allocate.bits.repeat.eq(0),
+            ]
+
         dir_target = Signal(range(self.n_mshrs))
-        m.d.sync += dir_target.eq(mshr_write_index)
+        m.d.sync += dir_target.eq(
+            Mux(
+                mshr_uses_dir, mshr_grant,
+                Mux(alloc_uses_dir,
+                    Mux(alloc_mshr, mshr_write_index, self.n_mshrs - 1), 0)))
 
         for i, mshr in enumerate(mshrs):
             with m.If(dir_target == i):
