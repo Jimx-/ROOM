@@ -49,6 +49,7 @@ class HasL2CacheParams:
 
         out_bus_params = params['out_bus']
         self.out_source_id_width = out_bus_params['source_id_width']
+        self.out_sink_id_width = out_bus_params['sink_id_width']
 
     def parse_addr(self, addr):
         return addr[self.untag_bits:], addr[
@@ -87,6 +88,81 @@ class CacheState(IntEnum):
     BRANCH = 1
     TRUNK = 2
     TIP = 3
+
+    @staticmethod
+    def on_shrink(m, state, param):
+        resp_param = Signal(3)
+        new_state = Signal(CacheState)
+
+        with m.Switch(param):
+            with m.Case(tl.CapParam.toT):
+                with m.Switch(state):
+                    with m.Case(CacheState.TIP):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.TtoT),
+                            new_state.eq(CacheState.TIP),
+                        ]
+                    with m.Case(CacheState.TRUNK):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.TtoT),
+                            new_state.eq(CacheState.TRUNK),
+                        ]
+                    with m.Case(CacheState.BRANCH):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.BtoB),
+                            new_state.eq(CacheState.BRANCH),
+                        ]
+                    with m.Case(CacheState.INVALID):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.NtoN),
+                            new_state.eq(CacheState.INVALID),
+                        ]
+            with m.Case(tl.CapParam.toB):
+                with m.Switch(state):
+                    with m.Case(CacheState.TIP):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.TtoB),
+                            new_state.eq(CacheState.BRANCH),
+                        ]
+                    with m.Case(CacheState.TRUNK):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.TtoB),
+                            new_state.eq(CacheState.BRANCH),
+                        ]
+                    with m.Case(CacheState.BRANCH):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.BtoB),
+                            new_state.eq(CacheState.BRANCH),
+                        ]
+                    with m.Case(CacheState.INVALID):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.NtoN),
+                            new_state.eq(CacheState.INVALID),
+                        ]
+            with m.Case(tl.CapParam.toN):
+                with m.Switch(state):
+                    with m.Case(CacheState.TIP):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.TtoN),
+                            new_state.eq(CacheState.INVALID),
+                        ]
+                    with m.Case(CacheState.TRUNK):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.TtoN),
+                            new_state.eq(CacheState.INVALID),
+                        ]
+                    with m.Case(CacheState.BRANCH):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.BtoN),
+                            new_state.eq(CacheState.INVALID),
+                        ]
+                    with m.Case(CacheState.INVALID):
+                        m.d.comb += [
+                            resp_param.eq(tl.ShrinkReportParam.NtoN),
+                            new_state.eq(CacheState.INVALID),
+                        ]
+
+        return resp_param, new_state
 
 
 class BankedStore(HasL2CacheParams, Elaboratable):
@@ -1030,7 +1106,7 @@ class SourceE(HasL2CacheParams, Elaboratable):
             HasL2CacheParams.__init__(self, params=params)
 
             Record.__init__(self, [
-                ('sink', 1),
+                ('sink', self.out_sink_id_width),
             ],
                             name=name,
                             src_loc_at=1 + src_loc_at)
@@ -1146,6 +1222,45 @@ class SinkA(HasL2CacheParams, Elaboratable):
             self.req.bits.param.eq(a.bits.param),
             self.req.bits.size.eq(a.bits.size),
             self.req.bits.source.eq(a.bits.source),
+            self.req.bits.offset.eq(offset),
+            self.req.bits.set.eq(set),
+            self.req.bits.tag.eq(tag),
+        ]
+
+        return m
+
+
+class SinkB(HasL2CacheParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params=params)
+
+        self.b = Decoupled(tl.ChannelB,
+                           addr_width=32,
+                           data_width=self.beat_bytes * 8,
+                           size_width=self.in_size_width,
+                           source_id_width=self.out_source_id_width)
+
+        self.req = Decoupled(FullRequest, params)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        b = self.b
+
+        m.d.comb += [
+            b.ready.eq(self.req.ready),
+            self.req.valid.eq(b.valid),
+        ]
+
+        tag, set, offset = self.parse_addr(b.bits.address)
+
+        m.d.comb += [
+            self.req.bits.prio.eq(2),
+            self.req.bits.opcode.eq(b.bits.opcode),
+            self.req.bits.param.eq(b.bits.param),
+            self.req.bits.size.eq(b.bits.size),
+            self.req.bits.source.eq(b.bits.source),
             self.req.bits.offset.eq(offset),
             self.req.bits.set.eq(set),
             self.req.bits.tag.eq(tag),
@@ -1507,6 +1622,8 @@ class MSHR(HasL2CacheParams, Elaboratable):
                 ('set', self.index_bits),
                 ('tag', self.tag_bits),
                 ('way', range(self.n_ways)),
+                ('block_b', 1),
+                ('nest_b', 1),
                 ('block_c', 1),
                 ('nest_c', 1),
             ],
@@ -1559,6 +1676,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
         s_execute = Signal(reset=1)
         s_grantack = Signal(reset=1)
         s_writeback = Signal(reset=1)
+        s_probeack = Signal(reset=1)
         s_flush = Signal(reset=1)
 
         m.d.comb += [
@@ -1566,7 +1684,12 @@ class MSHR(HasL2CacheParams, Elaboratable):
             self.status.bits.set.eq(request.set),
             self.status.bits.tag.eq(request.tag),
             self.status.bits.way.eq(meta.way),
-            self.status.bits.block_c.eq(0),
+            self.status.bits.block_b.eq(~meta_valid),
+            self.status.bits.nest_b.eq(meta_valid
+                                       & w_releaseack & w_rprobeacklast
+                                       & w_pprobeacklast
+                                       & ~w_grantfirst),
+            self.status.bits.block_c.eq(~meta_valid),
             self.status.bits.nest_c.eq(meta_valid
                                        & (~w_rprobeackfirst | ~w_pprobeackfirst
                                           | ~w_grantfirst)),
@@ -1579,7 +1702,8 @@ class MSHR(HasL2CacheParams, Elaboratable):
             self.schedule.bits.a.valid.eq(~s_acquire & s_release
                                           & s_pprobe),
             self.schedule.bits.b.valid.eq(~s_rprobe | ~s_pprobe),
-            self.schedule.bits.c.valid.eq(~s_release & w_rprobeackfirst),
+            self.schedule.bits.c.valid.eq((~s_release & w_rprobeackfirst)
+                                          | (~s_probeack & w_pprobeackfirst)),
             self.schedule.bits.d.valid.eq(~s_execute & w_pprobeack & w_grant),
             self.schedule.bits.e.valid.eq(~s_grantack & w_grantfirst),
             self.schedule.bits.x.valid.eq(~s_flush & w_releaseack),
@@ -1607,6 +1731,8 @@ class MSHR(HasL2CacheParams, Elaboratable):
                 m.d.sync += s_acquire.eq(1)
             with m.If(w_releaseack):
                 m.d.sync += s_flush.eq(1)
+            with m.If(w_pprobeackfirst):
+                m.d.sync += s_probeack.eq(1)
             with m.If(w_grantfirst):
                 m.d.sync += s_grantack.eq(1)
             with m.If(w_pprobeack & w_grant):
@@ -1633,6 +1759,9 @@ class MSHR(HasL2CacheParams, Elaboratable):
 
         honor_b_to_t = meta.hit & ((meta.clients & req_client_bit) != 0)
 
+        report_param, probe_next_state = CacheState.on_shrink(
+            m, meta.state, request.param)
+
         with m.If(request.prio[2]):
             m.d.comb += [
                 meta_writeback.dirty.eq(meta.dirty | request.opcode[0]),
@@ -1644,6 +1773,16 @@ class MSHR(HasL2CacheParams, Elaboratable):
                     (request.param == tl.ShrinkReportParam.BtoN) |
                     (request.param == tl.ShrinkReportParam.TtoN),
                     req_client_bit, 0)),
+                meta_writeback.hit.eq(1),
+            ]
+
+        with m.Elif(request.prio[1]):
+            m.d.comb += [
+                meta_writeback.dirty.eq((request.param == tl.CapParam.toT)
+                                        & meta.dirty),
+                meta_writeback.state.eq(probe_next_state),
+                meta_writeback.clients.eq(
+                    Mux(request.param == tl.CapParam.toN, 0, meta.clients)),
                 meta_writeback.hit.eq(1),
             ]
 
@@ -1710,11 +1849,18 @@ class MSHR(HasL2CacheParams, Elaboratable):
                                                  & ~excluded_clients),
             # Channel C
             self.schedule.bits.c.bits.opcode.eq(
-                Mux(meta.dirty, tl.ChannelCOpcode.ReleaseData,
-                    tl.ChannelCOpcode.Release)),
+                Mux(
+                    request.prio[1],
+                    Mux(meta.dirty, tl.ChannelCOpcode.ProbeAckData,
+                        tl.ChannelCOpcode.ProbeAck),
+                    Mux(meta.dirty, tl.ChannelCOpcode.ReleaseData,
+                        tl.ChannelCOpcode.Release))),
             self.schedule.bits.c.bits.param.eq(
-                Mux(meta.state == CacheState.BRANCH, tl.ShrinkReportParam.BtoN,
-                    tl.ShrinkReportParam.TtoN)),
+                Mux(
+                    request.prio[1], report_param,
+                    Mux(meta.state == CacheState.BRANCH,
+                        tl.ShrinkReportParam.BtoN,
+                        tl.ShrinkReportParam.TtoN))),
             self.schedule.bits.c.bits.tag.eq(meta.tag),
             self.schedule.bits.c.bits.set.eq(request.set),
             self.schedule.bits.c.bits.way.eq(meta.way),
@@ -1823,6 +1969,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
                 s_execute.eq(1),
                 s_grantack.eq(1),
                 s_writeback.eq(1),
+                s_probeack.eq(1),
                 s_flush.eq(1),
             ]
 
@@ -1840,6 +1987,24 @@ class MSHR(HasL2CacheParams, Elaboratable):
                            | (new_request.param == tl.ShrinkReportParam.BtoN))
                           & ((new_meta.clients & new_client_bit) != 0)):
                     m.d.sync += s_writeback.eq(0)
+
+            with m.Elif(new_request.prio[1]):
+                m.d.sync += s_probeack.eq(0)
+
+                with m.If(new_meta.hit):
+                    with m.If(((new_meta.state >= CacheState.TRUNK)
+                               & (new_request.param != tl.CapParam.toT))
+                              | ((new_meta.state == CacheState.BRANCH)
+                                 & (new_request.param == tl.CapParam.toN))):
+                        m.d.sync += s_writeback.eq(0)
+
+                        with m.If(new_meta.clients != 0):
+                            m.d.sync += [
+                                s_pprobe.eq(0),
+                                w_pprobeackfirst.eq(0),
+                                w_pprobeacklast.eq(0),
+                                w_pprobeack.eq(0),
+                            ]
 
             with m.Elif(new_request.control):
                 m.d.sync += s_flush.eq(0)
@@ -1936,6 +2101,7 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         ]
 
         sink_a = m.submodules.sink_a = SinkA(self.params)
+        sink_b = m.submodules.sink_b = SinkB(self.params)
         sink_c = m.submodules.sink_c = SinkC(self.params)
         sink_d = m.submodules.sink_d = SinkD(self.params)
         sink_e = m.submodules.sink_e = SinkE(self.params)
@@ -1943,6 +2109,7 @@ class Scheduler(HasL2CacheParams, Elaboratable):
 
         m.d.comb += [
             self.in_bus.a.connect(sink_a.a),
+            self.out_bus.b.connect(sink_b.b),
             self.in_bus.c.connect(sink_c.c),
             self.out_bus.d.connect(sink_d.d),
             self.in_bus.e.connect(sink_e.e),
@@ -1954,7 +2121,7 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         mshrs = [MSHR(self.params) for _ in range(self.n_mshrs)]
         for i, mshr in enumerate(mshrs):
             setattr(m.submodules, f'mshr{i}', mshr)
-        abc_mshrs, c_mshr = mshrs[:-1], mshrs[-1]
+        abc_mshrs, bc_mshr, c_mshr = mshrs[:-2], mshrs[-2], mshrs[-1]
 
         req_queues = Array(
             Queue(self.secondary, BaseRequest, self.params, flow=False)
@@ -1962,12 +2129,18 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         for i, queue in enumerate(req_queues):
             setattr(m.submodules, f'req_queue{i}', queue)
 
-        mshr_stall_abc = Cat(c_mshr.status.valid
-                             & (m.status.bits.set == c_mshr.status.bits.set)
-                             for m in abc_mshrs)
+        mshr_stall_abc = Cat(
+            (bc_mshr.status.valid
+             & (m.status.bits.set == bc_mshr.status.bits.set))
+            | (c_mshr.status.valid
+               & (m.status.bits.set == c_mshr.status.bits.set))
+            for m in abc_mshrs)
+        mshr_stall_bc = (c_mshr.status.valid
+                         & (bc_mshr.status.bits.set == c_mshr.status.bits.set))
         mshr_stall_c = Const(0, 1)
         mshr_stall = Signal(self.n_mshrs)
-        m.d.comb += mshr_stall.eq(Cat(mshr_stall_abc, mshr_stall_c))
+        m.d.comb += mshr_stall.eq(
+            Cat(mshr_stall_abc, mshr_stall_bc, mshr_stall_c))
 
         mshr_request = Signal(self.n_mshrs)
         for i, mshr in enumerate(mshrs):
@@ -2057,10 +2230,13 @@ class Scheduler(HasL2CacheParams, Elaboratable):
 
         request = Decoupled(FullRequest, self.params)
         m.d.comb += request.valid.eq(directory.ready
-                                     & (sink_a.req.valid | sink_c.req.valid
+                                     & (sink_a.req.valid | sink_b.req.valid
+                                        | sink_c.req.valid
                                         | sink_x.req.valid))
         with m.If(sink_c.req.valid):
             m.d.comb += request.bits.eq(sink_c.req.bits)
+        with m.Elif(sink_b.req.valid):
+            m.d.comb += request.bits.eq(sink_b.req.bits)
         with m.Elif(sink_x.req.valid):
             m.d.comb += request.bits.eq(sink_x.req.bits)
         with m.Elif(sink_a.req.valid):
@@ -2068,10 +2244,13 @@ class Scheduler(HasL2CacheParams, Elaboratable):
 
         m.d.comb += [
             sink_c.req.ready.eq(directory.ready & request.ready),
-            sink_x.req.ready.eq(directory.ready & request.ready
+            sink_b.req.ready.eq(directory.ready & request.ready
                                 & ~sink_c.req.valid),
+            sink_x.req.ready.eq(directory.ready & request.ready
+                                & ~sink_c.req.valid & ~sink_b.req.valid),
             sink_a.req.ready.eq(directory.ready & request.ready
-                                & ~sink_c.req.valid & ~sink_x.req.valid),
+                                & ~sink_c.req.valid & ~sink_b.req.valid
+                                & ~sink_x.req.valid),
         ]
 
         set_matches = Cat([
@@ -2079,12 +2258,22 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             for m in mshrs
         ])
         alloc_mshr = ~set_matches.any()
+        block_b = Signal()
+        nest_b = Signal()
         block_c = Signal()
         nest_c = Signal()
-        prio_filter = Cat(Repl(1, self.n_mshrs - 1), request.bits.prio[2])
+        prio_filter = Cat(Repl(1, self.n_mshrs - 2), ~request.bits.prio[0],
+                          request.bits.prio[2])
         lower_matches = set_matches & prio_filter
-        request_enq = lower_matches.any() & ~block_c & ~nest_c
+        request_enq = lower_matches.any(
+        ) & ~block_b & ~nest_b & ~block_c & ~nest_c
         for i, mshr in enumerate(mshrs):
+            with m.If(set_matches[i] & mshr.status.bits.block_b
+                      & request.bits.prio[1]):
+                m.d.comb += block_b.eq(1)
+            with m.If(set_matches[i] & mshr.status.bits.nest_b
+                      & request.bits.prio[1]):
+                m.d.comb += nest_b.eq(1)
             with m.If(set_matches[i] & mshr.status.bits.block_c
                       & request.bits.prio[2]):
                 m.d.comb += block_c.eq(1)
@@ -2159,9 +2348,11 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         mshr_free = Signal()
         req_queue_ready = Signal()
         will_bypass = schedule.reload & bypass_matches
-        request_will_alloc = (alloc_mshr & ~mshr_uses_dir_no_bypass
-                              & mshr_free) | (nest_c & ~mshr_uses_dir_no_bypass
-                                              & ~c_mshr.status.valid)
+        request_will_alloc = (
+            alloc_mshr & ~mshr_uses_dir_no_bypass & mshr_free) | (
+                nest_b & ~mshr_uses_dir_no_bypass & ~bc_mshr.status.valid
+                & ~c_mshr.status.valid) | (nest_c & ~mshr_uses_dir_no_bypass
+                                           & ~c_mshr.status.valid)
         alloc_uses_dir = request.valid & request_will_alloc
 
         m.d.comb += request.ready.eq(request_will_alloc
@@ -2209,6 +2400,15 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                                 mshr.allocate.bits.eq(request.bits),
                                 mshr.allocate.bits.repeat.eq(0),
                             ]
+
+        with m.If(request.valid & nest_b & ~bc_mshr.status.valid
+                  & ~c_mshr.status.valid
+                  & ~mshr_uses_dir_no_bypass):
+            m.d.comb += [
+                bc_mshr.allocate.valid.eq(1),
+                bc_mshr.allocate.bits.eq(request.bits),
+                bc_mshr.allocate.bits.repeat.eq(0),
+            ]
 
         with m.If(request.valid & nest_c & ~c_mshr.status.valid
                   & ~mshr_uses_dir_no_bypass):
@@ -2284,6 +2484,7 @@ class L2Cache(HasL2CacheParams, Peripheral, Elaboratable):
                                     addr_width=32,
                                     size_width=bits_for(self.lg_block_bytes),
                                     source_id_width=self.out_source_id_width,
+                                    sink_id_width=self.out_sink_id_width,
                                     has_bce=True)
 
     def elaborate(self, platform):

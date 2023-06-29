@@ -95,7 +95,10 @@ l2cache_params = dict(
         sink_id_width=4,
         size_width=3,
     ),
-    out_bus=dict(source_id_width=4, ),
+    out_bus=dict(
+        source_id_width=4,
+        sink_id_width=1,
+    ),
     client_source_map={0: (0, 7)},
 )
 
