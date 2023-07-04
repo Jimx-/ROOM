@@ -1924,6 +1924,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
                     w_grantlast.eq(self.sinkd.bits.last),
                     w_grant.eq(self.sinkd.bits.last),
                     got_t.eq(self.sinkd.bits.param == tl.CapParam.toT),
+                    self.schedule.bits.e.bits.sink.eq(self.sinkd.bits.sink),
                 ]
             with m.Elif(
                     self.sinkd.bits.opcode == tl.ChannelDOpcode.ReleaseAck):
@@ -2422,8 +2423,10 @@ class Scheduler(HasL2CacheParams, Elaboratable):
         m.d.sync += dir_target.eq(
             Mux(
                 mshr_uses_dir, mshr_grant,
-                Mux(alloc_uses_dir,
-                    Mux(alloc_mshr, mshr_write_index, self.n_mshrs - 1), 0)))
+                Mux(
+                    alloc_uses_dir,
+                    Mux(alloc_mshr, mshr_write_index,
+                        Mux(nest_b, self.n_mshrs - 2, self.n_mshrs - 1)), 0)))
 
         for i, mshr in enumerate(mshrs):
             with m.If(dir_target == i):
