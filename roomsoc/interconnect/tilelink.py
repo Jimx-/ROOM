@@ -743,10 +743,6 @@ class Arbiter(Elaboratable):
         with m.Switch(early_grant):
             for i, intr_bus in enumerate(self._intrs):
                 with m.Case(i):
-                    m.d.comb += [
-                        self.bus.bits.eq(intr_bus.bits),
-                        self.bus.valid.eq(intr_bus.valid),
-                        intr_bus.ready.eq(self.bus.ready),
-                    ]
+                    m.d.comb += intr_bus.connect(self.bus)
 
         return m

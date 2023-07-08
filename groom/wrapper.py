@@ -1,6 +1,7 @@
 from amaranth import *
 
 from groom.core import Core
+from groom.raster import RasterUnit
 
 from roomsoc.interconnect import tilelink as tl
 from roomsoc.interconnect.stream import Decoupled
@@ -22,6 +23,8 @@ class HasClusterParams:
         self.l3cache_params = params['l3cache_params']
 
         self.io_regions = params['io_regions']
+
+        self.raster_params = params.get('raster_params', None)
 
 
 class Cluster(HasClusterParams, Elaboratable):
@@ -150,6 +153,24 @@ class Cluster(HasClusterParams, Elaboratable):
 
             e_arbiter.add(core.dbus.e)
 
+        if self.raster_params is not None:
+            raster_unit = m.submodules.raster_unit = RasterUnit(
+                self.raster_params)
+
+            mem_bus_a = Decoupled(
+                tl.ChannelA,
+                data_width=raster_unit.mem_bus.data_width,
+                addr_width=raster_unit.mem_bus.addr_width,
+                size_width=raster_unit.mem_bus.size_width,
+                source_id_width=self.l2cache.in_source_id_width)
+
+            m.d.comb += [
+                raster_unit.mem_bus.a.connect(mem_bus_a),
+                mem_bus_a.bits.source.eq(~0),
+            ]
+
+            a_arbiter.add(mem_bus_a)
+
         m.d.comb += [
             a_arbiter.bus.connect(self.l2cache.in_bus.a),
             mmio_a_arbiter.bus.connect(self.dbus_mmio.a),
@@ -168,23 +189,29 @@ class Cluster(HasClusterParams, Elaboratable):
                         core.dbus.b.bits.source.eq(b_source_id),
                     ]
 
-        d_is_dbus, d_core_id, d_source_id = self.unpack_source(
-            self.l2cache.in_bus.d.bits.source)
+        with m.If(~self.l2cache.in_bus.d.bits.source.all()):
+            d_is_dbus, d_core_id, d_source_id = self.unpack_source(
+                self.l2cache.in_bus.d.bits.source)
 
-        with m.Switch(d_core_id):
-            for i, core in enumerate(cores):
-                with m.Case(i):
-                    with m.If(d_is_dbus):
-                        m.d.comb += [
-                            self.l2cache.in_bus.d.connect(core.dbus.d),
-                            core.dbus.d.bits.source.eq(d_source_id),
-                        ]
+            with m.Switch(d_core_id):
+                for i, core in enumerate(cores):
+                    with m.Case(i):
+                        with m.If(d_is_dbus):
+                            m.d.comb += [
+                                self.l2cache.in_bus.d.connect(core.dbus.d),
+                                core.dbus.d.bits.source.eq(d_source_id),
+                            ]
 
-                    with m.Else():
-                        m.d.comb += [
-                            self.l2cache.in_bus.d.connect(core.ibus.d),
-                            core.ibus.d.bits.source.eq(d_source_id),
-                        ]
+                        with m.Else():
+                            m.d.comb += [
+                                self.l2cache.in_bus.d.connect(core.ibus.d),
+                                core.ibus.d.bits.source.eq(d_source_id),
+                            ]
+
+        if self.raster_params is not None:
+            with m.If(self.l2cache.in_bus.d.bits.source.all()):
+                m.d.comb += self.l2cache.in_bus.d.connect(
+                    raster_unit.mem_bus.d)
 
         _, mmio_d_core_id, mmio_d_source_id = self.unpack_source(
             self.dbus_mmio.d.bits.source)
