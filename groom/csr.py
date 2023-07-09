@@ -11,7 +11,9 @@ import groom.csrnames as gpucsrnames
 from room.consts import *
 from room.types import HasCoreParams
 
-__all__ = ["CSRAccess", "CSR", "BankedCSR", "AutoCSR", "CSRFile"]
+__all__ = [
+    "CSRAccess", "CSR", "ThreadLocalCSR", "BankedCSR", "AutoCSR", "CSRFile"
+]
 
 
 class CSRAccess(Enum):
@@ -37,7 +39,12 @@ def _get_fields_from_description(description):
 
 class CSR(Record):
 
-    def __init__(self, addr, description, name=None, src_loc_at=0):
+    def __init__(self,
+                 addr,
+                 description,
+                 params=None,
+                 name=None,
+                 src_loc_at=0):
         fields, self.mask = _get_fields_from_description(description)
         self.addr = addr
 
@@ -51,7 +58,7 @@ class CSR(Record):
                          src_loc_at=1 + src_loc_at)
 
 
-class BankedCSR(HasCoreParams):
+class ThreadLocalCSR(HasCoreParams):
 
     def __init__(self, addr, description, params, name=None, src_loc_at=0):
         super().__init__(params)
@@ -63,20 +70,45 @@ class BankedCSR(HasCoreParams):
         self.addr = addr
 
         self.r = [
-            Record(fields, name=f'{name}__r{i}') for i in range(self.n_warps)
+            Record(fields, name=f'{name}__r{i}') for i in range(self.n_threads)
         ]
         self.w = [
-            Record(fields, name=f'{name}__w{i}') for i in range(self.n_warps)
+            Record(fields, name=f'{name}__w{i}') for i in range(self.n_threads)
         ]
         self.re = Signal(self.n_warps, name=f'{name}__re')
         self.we = Signal(self.n_warps, name=f'{name}__we')
+
+
+class BankedCSR(HasCoreParams):
+
+    def __init__(self,
+                 cls,
+                 addr,
+                 description,
+                 params,
+                 name=None,
+                 src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.addr = addr
+
+        self.warps = [
+            cls(addr=addr,
+                description=description,
+                params=params,
+                name=f'{name}{i}') for i in range(self.n_warps)
+        ]
 
 
 class AutoCSR:
 
     def iter_csrs(self):
         for v in vars(self).values():
-            if isinstance(v, CSR) or isinstance(v, BankedCSR):
+            if isinstance(v, CSR) or isinstance(
+                    v, ThreadLocalCSR) or isinstance(v, BankedCSR):
                 yield v
             elif hasattr(v, "iter_csrs"):
                 yield from v.iter_csrs()
@@ -100,19 +132,22 @@ class CSRFile(HasCoreParams, Elaboratable):
         self._csr_map = OrderedDict()
         self._ports = []
 
-        self.mhartid = CSR(csrnames.mhartid,
-                           [('value', self.width, CSRAccess.RO)])
+        self.mhartid = BankedCSR(CSR, csrnames.mhartid,
+                                 [('value', self.width, CSRAccess.RO)], params)
         self.misa = CSR(csrnames.misa, misa_layout(self.width))
 
         self.mcycle = CSR(csrnames.mcycle,
                           [('value', self.width, CSRAccess.RW)])
 
-        self.ltid = BankedCSR(gpucsrnames.ltid,
+        self.wtid = ThreadLocalCSR(gpucsrnames.wtid,
+                                   [('value', self.width, CSRAccess.RO)],
+                                   params)
+        self.ltid = BankedCSR(ThreadLocalCSR, gpucsrnames.ltid,
                               [('value', self.width, CSRAccess.RO)], params)
-        self.lwid = BankedCSR(gpucsrnames.lwid,
+        self.lwid = BankedCSR(CSR, gpucsrnames.lwid,
                               [('value', self.width, CSRAccess.RO)], params)
 
-        self.gtid = BankedCSR(gpucsrnames.gtid,
+        self.gtid = BankedCSR(ThreadLocalCSR, gpucsrnames.gtid,
                               [('value', self.width, CSRAccess.RO)], params)
         self.gcid = CSR(gpucsrnames.gcid,
                         [('value', self.width, CSRAccess.RO)])
@@ -123,7 +158,7 @@ class CSRFile(HasCoreParams, Elaboratable):
 
         self.add_csrs([self.mhartid, self.misa])
         self.add_csrs([self.mcycle])
-        self.add_csrs([self.ltid, self.lwid, self.gtid, self.gcid])
+        self.add_csrs([self.wtid, self.ltid, self.lwid, self.gtid, self.gcid])
         self.add_csrs([self.mnt, self.mnw, self.mnc])
 
         if self.width == 32:
@@ -133,7 +168,8 @@ class CSRFile(HasCoreParams, Elaboratable):
 
     def add_csrs(self, csrs):
         for csr in csrs:
-            if not isinstance(csr, CSR) and not isinstance(csr, BankedCSR):
+            if not isinstance(csr, CSR) and not isinstance(
+                    csr, ThreadLocalCSR) and not isinstance(csr, BankedCSR):
                 raise TypeError("Object {!r} is not a CSR".format(csr))
             if csr.addr in self._csr_map:
                 raise ValueError(
@@ -144,6 +180,7 @@ class CSRFile(HasCoreParams, Elaboratable):
     def access_port(self):
         port = Record([
             ("wid", bits_for(self.n_warps)),
+            ("tmask", self.n_threads),
             ("addr", bits_for(self.depth)),
             ("cmd", Shape.cast(CSRCommand).width),
             ("r_data", self.width * self.n_threads),
@@ -173,15 +210,24 @@ class CSRFile(HasCoreParams, Elaboratable):
         if self.width == 32:
             m.d.comb += self.mcycleh.r.eq(cycles[32:])
 
+        for t in range(self.n_threads):
+            m.d.comb += self.wtid.r[t].eq(t)
+
         for w in range(self.n_warps):
             m.d.comb += [
-                self.ltid.r[w].eq(w),
-                self.lwid.r[w].eq(w),
-                self.gtid.r[w].eq((self.core_id << log2_int(self.n_warps)) +
-                                  w),
-                self.mhartid.r[w].eq((self.core_id << log2_int(self.n_warps)) +
-                                     w),
+                self.lwid.warps[w].r.eq(w),
+                self.mhartid.warps[w].r.eq(
+                    (self.core_id << log2_int(self.n_warps)) + w),
             ]
+
+            for t in range(self.n_threads):
+                m.d.comb += [
+                    self.ltid.warps[w].r[t].eq(w * self.n_threads + t),
+                    self.gtid.warps[w].r[t].eq(
+                        (self.core_id * self.n_warps + w) * self.n_threads +
+                        t),
+                ]
+
         m.d.comb += [
             self.gcid.r.eq(self.core_id),
             self.mnt.r.eq(self.n_threads),
@@ -190,11 +236,42 @@ class CSRFile(HasCoreParams, Elaboratable):
         ]
 
         for p in self._ports:
-            r_data = Signal(self.width)
+            r_data = Signal(self.width * self.n_threads)
 
             with m.Switch(p.addr):
-                w_data = (Mux(p.cmd[1], r_data, 0)
-                          | p.w_data) & ~Mux(p.cmd[0] & p.cmd[1], p.w_data, 0)
+                w_data = (
+                    Mux(p.cmd[1], r_data, 0)
+                    | Repl(p.w_data, self.n_threads)) & ~Mux(
+                        p.cmd[0] & p.cmd[1], Repl(p.w_data, self.n_threads),
+                        Const(0, self.width * self.n_threads))
+
+                def rw_csr(csr):
+                    if isinstance(csr, CSR):
+                        m.d.comb += [
+                            csr.re.eq(p.cmd[1]),
+                            r_data.eq(Repl(csr.r, self.n_threads)),
+                        ]
+
+                        m.d.comb += csr.we.eq(p.cmd[2])
+                        for i in range(min(self.width, len(csr.w))):
+                            rw = (1 << i) & csr.mask
+                            m.d.comb += csr.w[i].eq(
+                                w_data[i] if rw else csr.r[i])
+
+                    elif isinstance(csr, ThreadLocalCSR):
+                        for t in range(self.n_threads):
+                            m.d.comb += [
+                                csr.re[t].eq(p.cmd[1] & p.tmask[t]),
+                                r_data[t * self.width:(t + 1) * self.width].eq(
+                                    csr.r[t]),
+                            ]
+
+                            m.d.comb += csr.we[t].eq(p.cmd[2] & p.tmask[t])
+                            for i in range(min(self.width, len(csr.w[t]))):
+                                rw = (1 << i) & csr.mask
+                                m.d.comb += csr.w[t][i].eq(
+                                    w_data[t * self.width +
+                                           i] if rw else csr.r[w][i])
 
                 for addr, csr in self._csr_map.items():
                     with m.Case(addr):
@@ -202,41 +279,11 @@ class CSRFile(HasCoreParams, Elaboratable):
                             with m.Switch(p.wid):
                                 for w in range(self.n_warps):
                                     with m.Case(w):
-                                        m.d.comb += [
-                                            csr.re[w].eq(p.cmd[1]),
-                                            r_data.eq(csr.r[w]),
-                                        ]
-
-                                        m.d.comb += csr.we[w].eq(p.cmd[2])
-                                        for i in range(
-                                                min(self.width,
-                                                    len(csr.w[0]))):
-                                            rw = (1 << i) & csr.mask
-                                            m.d.comb += csr.w[w][i].eq(
-                                                w_data[i] if rw else csr.
-                                                r[w][i])
+                                        rw_csr(csr.warps[w])
 
                         else:
-                            m.d.comb += [
-                                csr.re.eq(p.cmd[1]),
-                                r_data.eq(csr.r),
-                            ]
+                            rw_csr(csr)
 
-                            m.d.comb += csr.we.eq(p.cmd[2])
-                            for i in range(min(self.width, len(csr.w))):
-                                rw = (1 << i) & csr.mask
-                                m.d.comb += csr.w[i].eq(
-                                    w_data[i] if rw else csr.r[i])
-
-            with m.If(p.addr == gpucsrnames.wtid):
-                m.d.comb += p.r_data.eq(
-                    Cat(Const(w, self.width) for w in range(self.n_threads)))
-            with m.Elif((p.addr == gpucsrnames.ltid)
-                        | (p.addr == gpucsrnames.gtid)):
-                m.d.comb += p.r_data.eq(
-                    Cat(((r_data << log2_int(self.n_threads)) + w)[:self.width]
-                        for w in range(self.n_threads)))
-            with m.Else():
-                m.d.comb += p.r_data.eq(Repl(r_data, self.n_threads))
+            m.d.comb += p.r_data.eq(r_data)
 
         return m

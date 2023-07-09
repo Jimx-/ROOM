@@ -177,6 +177,7 @@ class Core(HasCoreParams, Elaboratable):
         csr_port = csr.access_port()
         m.d.comb += [
             csr_port.wid.eq(exec_unit.iresp.bits.wid),
+            csr_port.tmask.eq(exec_unit.iresp.bits.uop.tmask),
             csr_port.addr.eq(exec_unit.iresp.bits.uop.csr_addr),
             csr_port.cmd.eq(exec_unit.iresp.bits.uop.csr_cmd
                             & ~Mux(exec_unit.iresp.valid, 0, CSRCommand.I)),

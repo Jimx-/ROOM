@@ -1,7 +1,7 @@
 from amaranth import *
 from amaranth.hdl.rec import DIR_FANOUT
 
-from groom.csr import AutoCSR, BankedCSR, CSRAccess
+from groom.csr import AutoCSR, CSR, BankedCSR, CSRAccess
 import groom.csrnames as gpucsrnames
 
 from room.types import HasCoreParams, MicroOp
@@ -159,7 +159,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         self.warp_ctrl = Valid(WarpControlReq, params)
         self.join_req = Valid(Signal, range(self.n_warps))
 
-        self.tmask = BankedCSR(gpucsrnames.tmask,
+        self.tmask = BankedCSR(CSR, gpucsrnames.tmask,
                                [('value', self.n_threads, CSRAccess.RO)],
                                params)
 
@@ -219,7 +219,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
             Signal(32, name=f'warp_pcs{i}') for i in range(self.n_warps))
 
         for w in range(self.n_warps):
-            m.d.comb += self.tmask.r[w].eq(thread_masks[w])
+            m.d.comb += self.tmask.warps[w].r.eq(thread_masks[w])
 
         with m.If(reset_d1 & ~reset):
             m.d.comb += [
