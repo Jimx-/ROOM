@@ -2,6 +2,7 @@
   "is_groom": true,
   "xlen": 32,
   "vaddr_bits": 32,
+  "n_cores": 1,
   "n_warps": 4,
   "n_threads": 4,
   "n_barriers": 4,
@@ -32,6 +33,7 @@
     "size": 16384,
     "n_banks": 4
   },
+  "use_raster": true,
   "io_regions": {
     "3221225472": 1073741824
   }

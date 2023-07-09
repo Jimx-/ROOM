@@ -38,11 +38,17 @@ extern "C"
         asm volatile(".insn s 0x6b, 3, x0, 0(x0)");
     }
 
-    inline void gpu_barrier(unsigned int barried_id, unsigned int num_warps)
+    static inline void gpu_barrier(unsigned int barried_id, unsigned int num_warps)
     {
         asm volatile (".insn s 0x6b, 4, %1, 0(%0)" :: "r"(barried_id), "r"(num_warps));
     }
 
+    static inline int gpu_rast(void)
+    {
+        int result;
+        asm volatile(".insn r 0x5b, 0, 0, %0, x0, x0" : "=r"(result));
+        return result;
+    }
 
     static inline int gpu_thread_id(void)
     {

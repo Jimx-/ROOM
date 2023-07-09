@@ -10,13 +10,14 @@ from groom.fu import ExecResp
 from groom.csr import CSRFile
 from groom.lsu import LoadStoreUnit
 from groom.fp_pipeline import FPPipeline
+from groom.raster import RasterRequest
 
 from room.consts import *
 from room.types import HasCoreParams
 from room.utils import Arbiter
 
 from roomsoc.interconnect import tilelink as tl
-from roomsoc.interconnect.stream import Valid
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class Core(HasCoreParams, Elaboratable):
@@ -25,6 +26,9 @@ class Core(HasCoreParams, Elaboratable):
         super().__init__(params)
 
         self.reset_vector = Signal(32)
+
+        if self.use_raster:
+            self.raster_req = Decoupled(RasterRequest, self.params)
 
         self.ibus = tl.Interface(data_width=64,
                                  addr_width=32,
@@ -161,8 +165,9 @@ class Core(HasCoreParams, Elaboratable):
         # Execute
         #
 
-        exec_unit = m.submodules.exec_unit = ALUExecUnit(self.params,
-                                                         has_ifpu=self.use_fpu)
+        exec_unit = m.submodules.exec_unit = ALUExecUnit(
+            self.params, has_ifpu=self.use_fpu, has_raster=self.use_raster)
+        csr.add_csrs(exec_unit.iter_csrs())
         m.d.comb += [
             iregread.exec_req.connect(exec_unit.req),
             if_stage.br_res.eq(exec_unit.br_res),
@@ -186,6 +191,9 @@ class Core(HasCoreParams, Elaboratable):
 
         if self.use_fpu:
             m.d.comb += exec_unit.mem_fresp.connect(fp_pipeline.from_int)
+
+        if self.use_raster:
+            m.d.comb += exec_unit.raster_req.connect(self.raster_req)
 
         #
         # Load/store unit

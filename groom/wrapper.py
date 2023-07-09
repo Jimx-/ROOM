@@ -155,7 +155,7 @@ class Cluster(HasClusterParams, Elaboratable):
 
         if self.raster_params is not None:
             raster_unit = m.submodules.raster_unit = RasterUnit(
-                self.raster_params)
+                self.num_cores, self.raster_params)
 
             mem_bus_a = Decoupled(
                 tl.ChannelA,
@@ -170,6 +170,9 @@ class Cluster(HasClusterParams, Elaboratable):
             ]
 
             a_arbiter.add(mem_bus_a)
+
+            for rr, core in zip(raster_unit.req, cores):
+                m.d.comb += core.raster_req.connect(rr)
 
         m.d.comb += [
             a_arbiter.bus.connect(self.l2cache.in_bus.a),

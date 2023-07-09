@@ -1,8 +1,10 @@
 from amaranth import *
 
 from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, \
-    GPUControlUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit
+    GPUControlUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit, RasterUnit
 from groom.if_stage import BranchResolution, WarpControlReq
+from groom.csr import AutoCSR
+from groom.raster import RasterRequest
 
 from room.consts import *
 from room.types import HasCoreParams
@@ -25,6 +27,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         has_mem=False,
         has_ifpu=False,
         has_gpu=False,
+        has_raster=False,
     ):
         super().__init__(params)
 
@@ -37,6 +40,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.has_mem = has_mem
         self.has_ifpu = has_ifpu
         self.has_gpu = has_gpu
+        self.has_raster = has_raster
 
         self.req = Decoupled(ExecReq, data_width, params)
 
@@ -58,6 +62,9 @@ class ExecUnit(HasCoreParams, Elaboratable):
         if has_gpu:
             self.warp_ctrl = Valid(WarpControlReq, params)
 
+        if has_raster:
+            self.raster_req = Decoupled(RasterRequest, params)
+
         if has_mem:
             self.lsu_req = Decoupled(ExecResp, self.data_width, params)
 
@@ -67,9 +74,9 @@ class ExecUnit(HasCoreParams, Elaboratable):
         return m
 
 
-class ALUExecUnit(ExecUnit):
+class ALUExecUnit(ExecUnit, AutoCSR):
 
-    def __init__(self, params, has_ifpu=False):
+    def __init__(self, params, has_ifpu=False, has_raster=False):
         super().__init__(params['xlen'],
                          params,
                          irf_write=True,
@@ -77,7 +84,11 @@ class ALUExecUnit(ExecUnit):
                          has_alu=True,
                          has_mem=True,
                          has_ifpu=has_ifpu,
-                         has_gpu=True)
+                         has_gpu=True,
+                         has_raster=has_raster)
+
+        if has_raster:
+            self._raster = RasterUnit(self.data_width, params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -141,6 +152,26 @@ class ALUExecUnit(ExecUnit):
                 ifpu_busy.eq(ifpu_q.count.any()),
             ]
 
+        agu = m.submodules.agu = AddrGenUnit(self.params)
+
+        m.d.comb += [
+            agu.req.bits.eq(self.req.bits),
+            agu.req.valid.eq(self.req.valid
+                             & self.req.bits.uop.fu_type_has(FUType.MEM)),
+            self.lsu_req.valid.eq(agu.resp.valid),
+            self.lsu_req.bits.eq(agu.resp.bits),
+        ]
+
+        gpu = m.submodules.gpu = GPUControlUnit(self.params)
+        iresp_units.append(gpu)
+        m.d.comb += [
+            self.req.connect(gpu.req),
+            gpu.req.valid.eq(self.req.valid
+                             & (self.req.bits.uop.fu_type == FUType.GPU)
+                             & (self.req.bits.uop.opcode != UOpCode.GPU_RAST)),
+            self.warp_ctrl.eq(gpu.warp_ctrl),
+        ]
+
         div = m.submodules.div = DivUnit(self.data_width, self.params)
         div_busy = Signal()
 
@@ -160,24 +191,28 @@ class ALUExecUnit(ExecUnit):
         ]
         iresp_units.append(div)
 
-        agu = m.submodules.agu = AddrGenUnit(self.params)
+        if self.has_raster:
+            raster = m.submodules.raster = self._raster
+            raster_busy = Signal()
 
-        m.d.comb += [
-            agu.req.bits.eq(self.req.bits),
-            agu.req.valid.eq(self.req.valid
-                             & self.req.bits.uop.fu_type_has(FUType.MEM)),
-            self.lsu_req.valid.eq(agu.resp.valid),
-            self.lsu_req.bits.eq(agu.resp.bits),
-        ]
+            raster_resp_busy = 0
+            for iu in iresp_units:
+                if isinstance(iu, Queue):
+                    raster_resp_busy |= iu.deq.valid
+                else:
+                    raster_resp_busy |= iu.resp.valid
 
-        gpu = m.submodules.gpu = GPUControlUnit(self.params)
-        iresp_units.append(gpu)
-        m.d.comb += [
-            self.req.connect(gpu.req),
-            gpu.req.valid.eq(self.req.valid
-                             & (self.req.bits.uop.fu_type == FUType.GPU)),
-            self.warp_ctrl.eq(gpu.warp_ctrl),
-        ]
+            m.d.comb += [
+                self.req.connect(raster.req),
+                raster.req.valid.eq(
+                    self.req.valid
+                    & (self.req.bits.uop.fu_type == FUType.GPU)
+                    & (self.req.bits.uop.opcode == UOpCode.GPU_RAST)),
+                raster.raster_req.connect(self.raster_req),
+                raster.resp.ready.eq(~raster_resp_busy),
+                raster_busy.eq(~raster.req.ready),
+            ]
+            iresp_units.append(raster)
 
         for iu in reversed(iresp_units):
             if isinstance(iu, Queue):
@@ -208,6 +243,10 @@ class ALUExecUnit(ExecUnit):
             m.d.comb += self.req.ready.eq(~div_busy)
         with m.Elif(self.req.bits.uop.fu_type_has(FUType.MEM)):
             m.d.comb += self.req.ready.eq(self.lsu_req.ready)
+        if self.has_raster:
+            with m.Elif((self.req.bits.uop.fu_type == FUType.GPU)
+                        & (self.req.bits.uop.opcode == UOpCode.GPU_RAST)):
+                m.d.comb += self.req.ready.eq(~raster_busy)
 
         return m
 

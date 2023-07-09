@@ -114,6 +114,12 @@ class HasCoreParams:
                 self.smem_size = self.smem_params['size']
                 self.smem_banks = self.smem_params['n_banks']
 
+            #
+            # Rasterizer
+            #
+
+            self.use_raster = params['use_raster']
+
 
 class MicroOp(HasCoreParams, Record):
 

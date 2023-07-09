@@ -3,6 +3,9 @@ from amaranth import tracer
 from amaranth.hdl.ast import ValueCastable
 
 from groom.if_stage import BranchResolution, WarpControlReq
+from groom.raster import RasterRequest, Fragment
+from groom.csr import AutoCSR, ThreadLocalCSR, BankedCSR, CSRAccess
+import groom.csrnames as gpucsrnames
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
@@ -81,7 +84,12 @@ class ExecResp(HasCoreParams, ValueCastable):
 
 class FunctionalUnit(HasCoreParams, Elaboratable):
 
-    def __init__(self, data_width, params, is_alu=False, is_gpu=False):
+    def __init__(self,
+                 data_width,
+                 params,
+                 is_alu=False,
+                 is_gpu=False,
+                 is_raster=False):
         super().__init__(params)
 
         self.req = Decoupled(ExecReq, data_width, params)
@@ -92,6 +100,9 @@ class FunctionalUnit(HasCoreParams, Elaboratable):
 
         if is_gpu:
             self.warp_ctrl = Valid(WarpControlReq, params)
+
+        if is_raster:
+            self.raster_req = Decoupled(RasterRequest, params)
 
 
 class PipelinedFunctionalUnit(FunctionalUnit):
@@ -457,20 +468,27 @@ class GPUControlUnit(PipelinedFunctionalUnit):
 
 class IterativeFunctionalUnit(FunctionalUnit):
 
-    def __init__(self, data_width, params):
+    def __init__(self, data_width, params, is_raster=False):
         self.params = params
 
-        super().__init__(data_width, params)
+        super().__init__(data_width, params, is_raster=is_raster)
 
     def elaborate(self, platform):
         m = Module()
 
+        wid = Signal(range(self.n_warps))
         uop = MicroOp(self.params)
 
         with m.If(self.req.fire):
-            m.d.sync += uop.eq(self.req.bits.uop)
+            m.d.sync += [
+                wid.eq(self.req.bits.wid),
+                uop.eq(self.req.bits.uop),
+            ]
 
-        m.d.comb += self.resp.bits.uop.eq(uop)
+        m.d.comb += [
+            self.resp.bits.wid.eq(wid),
+            self.resp.bits.uop.eq(uop),
+        ]
 
         return m
 
@@ -852,5 +870,85 @@ class FDivUnit(IterativeFunctionalUnit):
 
         m.d.comb += self.resp.valid.eq(tmask_valid
                                        & ((tmask & div_resp_valid) == tmask))
+
+        return m
+
+
+class RasterUnit(IterativeFunctionalUnit, AutoCSR):
+
+    def __init__(self, width, params):
+        super().__init__(width, params, is_raster=True)
+
+        self.rastpos = BankedCSR(ThreadLocalCSR, gpucsrnames.rastpos,
+                                 [('value', 32, CSRAccess.RO)], params)
+        self.rastpid = BankedCSR(ThreadLocalCSR, gpucsrnames.rastpid,
+                                 [('value', 32, CSRAccess.RO)], params)
+        self.rastbca = BankedCSR(ThreadLocalCSR, gpucsrnames.rastbca,
+                                 [('value', 32, CSRAccess.RO)], params)
+        self.rastbcb = BankedCSR(ThreadLocalCSR, gpucsrnames.rastbcb,
+                                 [('value', 32, CSRAccess.RO)], params)
+        self.rastbcc = BankedCSR(ThreadLocalCSR, gpucsrnames.rastbcc,
+                                 [('value', 32, CSRAccess.RO)], params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        wid = Signal(range(self.n_warps))
+        tmask = Signal(self.n_threads)
+        fragments = [[
+            Fragment(name=f'fragment{w}_{t}') for t in range(self.n_threads)
+        ] for w in range(self.n_warps)]
+
+        for w in range(self.n_warps):
+            for t in range(self.n_threads):
+                m.d.comb += [
+                    self.rastpos.warps[w].r[t][:16].eq(fragments[w][t].x),
+                    self.rastpos.warps[w].r[t][16:].eq(fragments[w][t].y),
+                    self.rastpid.warps[w].r[t].eq(fragments[w][t].pid),
+                    self.rastbca.warps[w].r[t].eq(
+                        fragments[w][t].barycentric.x),
+                    self.rastbcb.warps[w].r[t].eq(
+                        fragments[w][t].barycentric.y),
+                    self.rastbcc.warps[w].r[t].eq(
+                        fragments[w][t].barycentric.z),
+                ]
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.comb += self.req.ready.eq(1)
+
+                with m.If(self.req.fire):
+                    m.d.sync += [
+                        wid.eq(self.req.bits.wid),
+                        tmask.eq(self.req.bits.uop.tmask),
+                    ]
+                    m.next = 'ACT'
+
+            with m.State('ACT'):
+                m.d.comb += [
+                    self.raster_req.valid.eq(1),
+                    self.raster_req.bits.tmask.eq(tmask),
+                ]
+
+                with m.If(self.raster_req.ready):
+                    with m.Switch(wid):
+                        for w in range(self.n_warps):
+                            with m.Case(w):
+                                for frag, resp in zip(
+                                        fragments[w],
+                                        self.raster_req.bits.resp):
+                                    m.d.sync += frag.eq(resp.bits)
+
+                    for t in range(self.n_threads):
+                        m.d.sync += self.resp.bits.data[t].eq(
+                            self.raster_req.bits.resp[t].valid),
+
+                    m.next = 'ACK'
+
+            with m.State('ACK'):
+                m.d.comb += self.resp.valid.eq(1)
+
+                with m.If(self.resp.ready):
+                    m.next = 'IDLE'
 
         return m

@@ -41,10 +41,10 @@ class DecodeUnit(HasCoreParams, Elaboratable):
         ]
 
         with m.Switch(inuop.inst[0:7]):
+
             #
             # GPU control
             #
-
             with m.Case(0b1101011):
                 m.d.comb += is_special.eq(1)
 
@@ -95,6 +95,24 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             uop.lrs2_rtype.eq(RegisterType.FIX),
                             uop.imm_sel.eq(ImmSel.S),
                             STALL,
+                        ]
+
+                    with m.Default():
+                        m.d.comb += is_special.eq(0)
+
+            #
+            # Rasterizer
+            #
+            with m.Case(0b1011011):
+                m.d.comb += is_special.eq(1)
+
+                with m.Switch(inuop.inst[12:15]):
+                    with m.Case(0x0):  # gpu_rast
+                        m.d.comb += [
+                            uop.opcode.eq(UOpCode.GPU_RAST),
+                            uop.iq_type.eq(IssueQueueType.INT),
+                            uop.fu_type.eq(FUType.GPU),
+                            uop.dst_rtype.eq(RegisterType.FIX),
                         ]
 
                     with m.Default():

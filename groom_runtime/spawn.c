@@ -79,6 +79,7 @@ void gpu_spawn_tasks(int num_tasks, gpu_task_func_t func, void* arg)
 
     nC = (num_tasks > WT) ? (num_tasks / WT) : 1;
     if (nC > NC) nC = NC;
+    if (core_id >= nC) return;
 
     tasks_per_core = num_tasks / nC;
     real_tasks_per_core = tasks_per_core;

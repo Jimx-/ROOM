@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth import tracer
 from amaranth.hdl.rec import *
 
 from room.icache import ICache
@@ -8,18 +9,18 @@ from roomsoc.interconnect import tilelink as tl
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
 
-def vec2_layout(w):
+def vec2_layout(w, dir=DIR_FANOUT):
     return [
-        ('x', w, DIR_FANOUT),
-        ('y', w, DIR_FANOUT),
+        ('x', w, dir),
+        ('y', w, dir),
     ]
 
 
-def vec3_layout(w):
+def vec3_layout(w, dir=DIR_FANOUT):
     return [
-        ('x', w, DIR_FANOUT),
-        ('y', w, DIR_FANOUT),
-        ('z', w, DIR_FANOUT),
+        ('x', w, dir),
+        ('y', w, dir),
+        ('z', w, dir),
     ]
 
 
@@ -49,12 +50,14 @@ tile_layout = [
     ('level', 4, DIR_FANOUT),
 ]
 
-fragment_layout = [
-    ('pid', 16, DIR_FANOUT),
-    ('x', 15, DIR_FANOUT),
-    ('y', 15, DIR_FANOUT),
-    ('barycentric', vec3_layout(32)),
-]
+
+def fragment_layout(dir=DIR_FANOUT):
+    return [
+        ('pid', 16, dir),
+        ('x', 15, dir),
+        ('y', 15, dir),
+        ('barycentric', vec3_layout(32, dir)),
+    ]
 
 
 class Viewport(Record):
@@ -74,6 +77,14 @@ class Viewport(Record):
             y >= self.y0) & (y <= (self.y0 + self.height))
 
 
+class Fragment(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__(fragment_layout(),
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class HasRasterParams:
 
     def __init__(self, params, *args, **kwargs):
@@ -81,10 +92,30 @@ class HasRasterParams:
 
         self.n_threads = params['n_threads']
 
-        self.scan_level = params['scan_level']
-        self.block_level = params['block_level']
+        self.scan_level = params.get('scan_level', 5)
+        self.block_level = params.get('block_level', 2)
 
-        self.quad_queue_depth = params['quad_queue_depth']
+        self.quad_queue_depth = params.get('quad_queue_depth', 16)
+
+
+class RasterRequest(HasRasterParams):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.tmask = Signal(self.n_threads, name=f'{name}__tmask')
+
+        self.resp = [
+            Valid(Fragment, name=f'{name}__resp{t}')
+            for t in range(self.n_threads)
+        ]
+
+    def connect(self, subord):
+        return [subord.tmask.eq(self.tmask)
+                ] + [(r.eq(rr) for r, rr in zip(self.resp, subord.resp))]
 
 
 class FetchUnit(HasRasterParams, Elaboratable):
@@ -484,9 +515,7 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
 
         self.req = Decoupled(Record, tile_layout)
 
-        self.quads = [
-            Valid(Record, fragment_layout, name=f'quads{i}') for i in range(4)
-        ]
+        self.quads = [Valid(Fragment, name=f'quads{i}') for i in range(4)]
         self.quad_ready = Signal()
 
         self.busy = Signal()
@@ -603,15 +632,14 @@ class QuadQueue(HasRasterParams, Elaboratable):
         self.depth = self.quad_queue_depth
 
         self.w_quads = [
-            Valid(Record, fragment_layout, name=f'w_quads{i}')
+            Valid(Fragment, name=f'w_quads{i}')
             for i in range(4 * (self.block_level - 1)**2)
         ]
         self.w_en = Signal()
         self.w_rdy = Signal()
 
         self.r_quads = [
-            Valid(Record, fragment_layout, name=f'r_quads{i}')
-            for i in range(self.n_threads)
+            Valid(Fragment, name=f'r_quads{i}') for i in range(self.n_threads)
         ]
         self.r_en = Signal()
         self.r_rdy = Signal()
@@ -624,8 +652,7 @@ class QuadQueue(HasRasterParams, Elaboratable):
         num_entries = self.depth
         num_rows = self.depth // self.n_threads
 
-        mem = Array(
-            Record(fragment_layout, name=f'mem{i}') for i in range(self.depth))
+        mem = Array(Fragment(name=f'mem{i}') for i in range(self.depth))
 
         head = Signal(num_rows, reset=1)
         tail = Signal(num_entries, reset=1)
@@ -733,8 +760,7 @@ class BlockEvaluator(HasRasterParams, Elaboratable):
         self.req = Decoupled(Record, tile_layout)
 
         self.r_quads = [
-            Valid(Record, fragment_layout, name=f'r_quads{i}')
-            for i in range(self.n_threads)
+            Valid(Fragment, name=f'r_quads{i}') for i in range(self.n_threads)
         ]
         self.r_en = Signal()
         self.r_rdy = Signal()
@@ -745,7 +771,7 @@ class BlockEvaluator(HasRasterParams, Elaboratable):
         m = Module()
 
         enq_quads = [
-            Valid(Record, fragment_layout, name=f'enq_quads{i}')
+            Valid(Fragment, name=f'enq_quads{i}')
             for i in range(4 * (self.block_level - 1)**2)
         ]
         enq_ready = Signal()
@@ -809,8 +835,7 @@ class RasterSlice(HasRasterParams, Elaboratable):
         self.req = Decoupled(FetchUnit.Request)
 
         self.r_quads = [
-            Valid(Record, fragment_layout, name=f'r_quads{i}')
-            for i in range(self.n_threads)
+            Valid(Fragment, name=f'r_quads{i}') for i in range(self.n_threads)
         ]
         self.r_en = Signal()
         self.r_rdy = Signal()
@@ -994,17 +1019,15 @@ class RasterSlice(HasRasterParams, Elaboratable):
 
 class RasterUnit(HasRasterParams, Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, n_cores, params):
         super().__init__(params)
 
         self.mem_bus = tl.Interface(data_width=64, addr_width=32, size_width=3)
 
-        self.r_quads = [
-            Valid(Record, fragment_layout, name=f'r_quads{i}')
-            for i in range(self.n_threads)
+        self.req = [
+            Decoupled(RasterRequest, params, name=f'req{i}')
+            for i in range(n_cores)
         ]
-        self.r_en = Signal()
-        self.r_rdy = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -1020,11 +1043,38 @@ class RasterUnit(HasRasterParams, Elaboratable):
             raster_slice.viewport.height.eq(768),
         ]
 
-        for q, qq in zip(self.r_quads, raster_slice.r_quads):
-            m.d.comb += q.eq(qq)
-        m.d.comb += [
-            self.r_rdy.eq(raster_slice.r_rdy),
-            raster_slice.r_en.eq(self.r_en),
-        ]
+        request = Signal(len(self.req))
+        m.d.comb += request.eq(Cat(r.valid for r in self.req))
+
+        req_grant = Signal(range(len(self.req)))
+        req_last_grant = Signal.like(req_grant)
+        m.d.sync += req_last_grant.eq(req_grant)
+        m.d.comb += req_grant.eq(req_last_grant)
+        with m.Switch(req_last_grant):
+            for i in range(len(request)):
+                with m.Case(i):
+                    for pred in reversed(range(i)):
+                        with m.If(request[pred]):
+                            m.d.comb += req_grant.eq(pred)
+                    for succ in reversed(range(i + 1, len(request))):
+                        with m.If(request[succ]):
+                            m.d.comb += req_grant.eq(succ)
+
+        quad_valids = Cat(r.valid for r in raster_slice.r_quads)
+
+        with m.Switch(req_grant):
+            for i, req in enumerate(self.req):
+                with m.Case(i):
+                    with m.If(req.valid & raster_slice.r_rdy & (
+                        (req.bits.tmask & quad_valids) == req.bits.tmask)):
+                        m.d.comb += [
+                            req.ready.eq(1),
+                            raster_slice.r_en.eq(1),
+                        ]
+
+                        m.d.comb += [
+                            rr.eq(r) for rr, r in zip(req.bits.resp,
+                                                      raster_slice.r_quads)
+                        ]
 
         return m
