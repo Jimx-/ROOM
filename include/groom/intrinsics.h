@@ -120,6 +120,31 @@ extern "C"
         return result;
     }
 
+    static inline void gpu_rast_position(unsigned int* x, unsigned int* y) {
+        unsigned int result;
+        asm volatile("csrr %0, %1" : "=r"(result) : "i"(CSR_RASTPOS));
+        *x = result & 0xffff;
+        *y = (result >> 16) & 0xffff;
+    }
+
+    static inline int gpu_rast_primitive(void) {
+        unsigned int result;
+        asm volatile("csrr %0, %1" : "=r"(result) : "i"(CSR_RASTPID));
+        return result;
+    }
+
+    static inline void gpu_rast_barycentric(unsigned int* ap, unsigned int* bp,
+                                            unsigned int* cp)
+    {
+        unsigned int a, b, c;
+        asm volatile("csrr %0, %1" : "=r"(a) : "i"(CSR_RASTBCA));
+        asm volatile("csrr %0, %1" : "=r"(b) : "i"(CSR_RASTBCB));
+        asm volatile("csrr %0, %1" : "=r"(c) : "i"(CSR_RASTBCC));
+        *ap = a;
+        *bp = b;
+        *cp = c;
+    }
+
 #ifdef __cplusplus
 }
 #endif

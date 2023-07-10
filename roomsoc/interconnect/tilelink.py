@@ -428,6 +428,12 @@ class TileLink2Wishbone(Elaboratable):
         wen = Signal()
         rdata = Signal.like(wb.dat_r)
 
+        with m.If(tl.a.fire):
+            m.d.sync += [
+                tl.d.bits.size.eq(tl.a.bits.size),
+                tl.d.bits.source.eq(tl.a.bits.source),
+            ]
+
         with m.FSM():
             with m.State('IDLE'):
                 m.d.comb += tl.a.ready.eq(1)
@@ -441,8 +447,6 @@ class TileLink2Wishbone(Elaboratable):
                         burst_len.eq(1 << tl.a.bits.size),
                         mask.eq(tl.a.bits.mask),
                         wen.eq(is_write),
-                        tl.d.bits.size.eq(tl.a.bits.size),
-                        tl.d.bits.source.eq(tl.a.bits.source),
                     ]
 
                     m.d.comb += tl.a.ready.eq(~is_write)

@@ -1522,7 +1522,8 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
         self.mem_ack = Decoupled(tl.ChannelD,
                                  data_width=self.row_bits,
-                                 size_width=bits_for(self.lg_block_bytes))
+                                 size_width=bits_for(self.lg_block_bytes),
+                                 source_id_width=self.source_id_bits)
 
         self.req = Decoupled(DCacheReq, params)
         self.resp = Decoupled(DCacheResp, params)
@@ -1623,7 +1624,8 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
         self.mem_ack = Decoupled(tl.ChannelD,
                                  data_width=self.row_bits,
-                                 size_width=bits_for(self.lg_block_bytes))
+                                 size_width=bits_for(self.lg_block_bytes),
+                                 source_id_width=self.source_id_bits)
 
         self.mem_finish = Decoupled(tl.ChannelE, sink_id_width=sink_id_width)
 

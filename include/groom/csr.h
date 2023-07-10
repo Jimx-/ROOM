@@ -9,6 +9,12 @@
 #define CSR_GCID 0xcc4
 #define CSR_TMASK 0xcc5
 
+#define CSR_RASTPOS 0xcd0
+#define CSR_RASTPID 0xcd1
+#define CSR_RASTBCA 0xcd2
+#define CSR_RASTBCB 0xcd3
+#define CSR_RASTBCC 0xcd4
+
 #define CSR_MNT 0xfc0
 #define CSR_MNW 0xfc1
 #define CSR_MNC 0xfc2
