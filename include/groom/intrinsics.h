@@ -145,6 +145,12 @@ extern "C"
         *cp = c;
     }
 
+    static inline int gpu_rast_mask(void) {
+        unsigned int result;
+        asm volatile("csrr %0, %1" : "=r"(result) : "i"(CSR_RASTMASK));
+        return result;
+    }
+
 #ifdef __cplusplus
 }
 #endif

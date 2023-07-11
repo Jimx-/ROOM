@@ -14,6 +14,7 @@
 #define CSR_RASTBCA 0xcd2
 #define CSR_RASTBCB 0xcd3
 #define CSR_RASTBCC 0xcd4
+#define CSR_RASTMASK 0xcd5
 
 #define CSR_MNT 0xfc0
 #define CSR_MNW 0xfc1

@@ -57,6 +57,7 @@ def fragment_layout(dir=DIR_FANOUT):
         ('x', 15, dir),
         ('y', 15, dir),
         ('barycentric', vec3_layout(32, dir)),
+        ('mask', 4, dir),
     ]
 
 
@@ -526,6 +527,7 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         s1_ready = Signal()
         s2_ready = Signal()
         s3_ready = Signal()
+        s4_ready = Signal()
 
         s0_valid = Signal()
         s0_tile = Record(tile_layout)
@@ -554,7 +556,7 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
                 ev.edge2.eq(self.prim.edge2),
                 ev.edge3.eq(self.prim.edge3),
                 ev.p.eq(sample),
-                ev.out.ready.eq(self.quad_ready),
+                ev.out.ready.eq(s4_ready),
             ]
 
         s1_valid = Signal()
@@ -584,7 +586,8 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         s3_samples = [
             Record(vec2_layout(15), name=f's3_sample{i}') for i in range(9)
         ]
-        m.d.comb += s3_ready.eq(~s3_valid | self.quad_ready)
+        s3_quads = [Valid(Fragment, name=f's3_quads{i}') for i in range(4)]
+        m.d.comb += s3_ready.eq(~s3_valid | s4_ready)
         with m.If(s3_ready):
             m.d.sync += s3_valid.eq(s2_valid)
         with m.If(s2_valid & s3_ready):
@@ -598,7 +601,7 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         ]
         starts = (0, 1, 3, 4)
         for i, (quad, corner,
-                start) in enumerate(zip(self.quads, corners, starts)):
+                start) in enumerate(zip(s3_quads, corners, starts)):
             m.d.comb += [
                 quad.bits.x.eq(s3_tile.x + 2 * (i & 1)),
                 quad.bits.y.eq(s3_tile.y + 2 * (i >> 1)),
@@ -619,7 +622,48 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
                     & self.viewport.inside(quad.bits.x, quad.bits.y)),
             ]
 
-        m.d.comb += self.busy.eq(s1_valid | s2_valid | s3_valid)
+        s4_valid = Signal()
+        s4_tile = Record(tile_layout)
+        s4_samples = [
+            Record(vec2_layout(15), name=f's4_sample{i}') for i in range(9)
+        ]
+        s4_quads = [Valid(Fragment, name=f's4_quads{i}') for i in range(4)]
+        s4_mask = [Signal(4, name=f's4_mask{i}') for i in range(4)]
+        m.d.comb += s4_ready.eq(~s4_valid | self.quad_ready)
+        with m.If(s4_ready):
+            m.d.sync += s4_valid.eq(s3_valid)
+        with m.If(s3_valid & s4_ready):
+            m.d.sync += Cat(s4_tile, *s4_samples).eq(Cat(s3_tile, *s3_samples))
+            for s4_q, s3_q in zip(s4_quads, s3_quads):
+                m.d.sync += s4_q.eq(s3_q)
+
+        for i, quad in enumerate(s4_quads):
+
+            for j in range(4):
+                dx = j // 2
+                dy = j % 2
+
+                s = [Signal(signed(32)) for _ in range(3)]
+                m.d.comb += [
+                    s[0].eq(quad.bits.barycentric.x.as_signed() +
+                            (self.prim.edge1.a.as_signed() if dx == 1 else 0) +
+                            (self.prim.edge1.b.as_signed() if dy == 1 else 0)),
+                    s[1].eq(quad.bits.barycentric.y.as_signed() +
+                            (self.prim.edge2.a.as_signed() if dx == 1 else 0) +
+                            (self.prim.edge2.b.as_signed() if dy == 1 else 0)),
+                    s[2].eq(quad.bits.barycentric.z.as_signed() +
+                            (self.prim.edge3.a.as_signed() if dx == 1 else 0) +
+                            (self.prim.edge3.b.as_signed() if dy == 1 else 0)),
+                    s4_mask[i][j].eq(~Cat(x < 0 for x in s).any()),
+                ]
+
+        for q, qq, mask in zip(self.quads, s4_quads, s4_mask):
+            m.d.comb += [
+                q.eq(qq),
+                q.bits.mask.eq(mask),
+            ]
+
+        m.d.comb += self.busy.eq(s1_valid | s2_valid | s3_valid | s4_valid)
 
         return m
 

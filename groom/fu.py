@@ -889,6 +889,8 @@ class RasterUnit(IterativeFunctionalUnit, AutoCSR):
                                  [('value', 32, CSRAccess.RO)], params)
         self.rastbcc = BankedCSR(ThreadLocalCSR, gpucsrnames.rastbcc,
                                  [('value', 32, CSRAccess.RO)], params)
+        self.rastmask = BankedCSR(ThreadLocalCSR, gpucsrnames.rastmask,
+                                  [('value', 4, CSRAccess.RO)], params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -911,6 +913,7 @@ class RasterUnit(IterativeFunctionalUnit, AutoCSR):
                         fragments[w][t].barycentric.y),
                     self.rastbcc.warps[w].r[t].eq(
                         fragments[w][t].barycentric.z),
+                    self.rastmask.warps[w].r[t].eq(fragments[w][t].mask),
                 ]
 
         with m.FSM():
