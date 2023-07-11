@@ -247,10 +247,10 @@ class CSRFile(HasCoreParams, Elaboratable):
 
                 def rw_csr(csr):
                     if isinstance(csr, CSR):
-                        m.d.comb += [
-                            csr.re.eq(p.cmd[1]),
-                            r_data.eq(Repl(csr.r, self.n_threads)),
-                        ]
+                        m.d.comb += csr.re.eq(p.cmd[1])
+                        for t in range(self.n_threads):
+                            m.d.comb += r_data[t * self.width:(t + 1) *
+                                               self.width].eq(csr.r)
 
                         m.d.comb += csr.we.eq(p.cmd[2])
                         for i in range(min(self.width, len(csr.w))):

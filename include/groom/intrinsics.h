@@ -43,6 +43,11 @@ extern "C"
         asm volatile (".insn s 0x6b, 4, %1, 0(%0)" :: "r"(barried_id), "r"(num_warps));
     }
 
+    static inline void gpu_pred(unsigned int pred)
+    {
+        asm volatile(".insn s 0x6b, 5, %0, 0(x0)" ::"r"(pred));
+    }
+
     static inline int gpu_rast(void)
     {
         int result;
@@ -133,10 +138,9 @@ extern "C"
         return result;
     }
 
-    static inline void gpu_rast_barycentric(unsigned int* ap, unsigned int* bp,
-                                            unsigned int* cp)
+    static inline void gpu_rast_barycentric(int* ap, int* bp, int* cp)
     {
-        unsigned int a, b, c;
+        int a, b, c;
         asm volatile("csrr %0, %1" : "=r"(a) : "i"(CSR_RASTBCA));
         asm volatile("csrr %0, %1" : "=r"(b) : "i"(CSR_RASTBCB));
         asm volatile("csrr %0, %1" : "=r"(c) : "i"(CSR_RASTBCC));

@@ -640,8 +640,8 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         for i, quad in enumerate(s4_quads):
 
             for j in range(4):
-                dx = j // 2
-                dy = j % 2
+                dx = j % 2
+                dy = j // 2
 
                 s = [Signal(signed(32)) for _ in range(3)]
                 m.d.comb += [

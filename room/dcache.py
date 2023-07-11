@@ -1535,7 +1535,7 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
         resp_data = Signal.like(self.resp.bits.data)
 
-        load_gen = m.submodules.load_gen = LoadGen(max_size=self.xlen // 8)
+        load_gen = m.submodules.load_gen = LoadGen(max_size=self.row_bits // 8)
         m.d.comb += [
             load_gen.typ.eq(req.uop.mem_size),
             load_gen.signed.eq(req.uop.mem_signed),
@@ -1543,7 +1543,8 @@ class IOMSHR(HasDCacheParams, Elaboratable):
             load_gen.data_in.eq(resp_data),
         ]
 
-        store_gen = m.submodules.store_gen = StoreGen(max_size=self.xlen // 8)
+        store_gen = m.submodules.store_gen = StoreGen(max_size=self.row_bits //
+                                                      8)
         m.d.comb += [
             store_gen.typ.eq(req.uop.mem_size),
             store_gen.addr.eq(req.addr),

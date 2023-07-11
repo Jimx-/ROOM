@@ -97,6 +97,16 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             STALL,
                         ]
 
+                    with m.Case(0x5):  # gpu_pred
+                        m.d.comb += [
+                            uop.opcode.eq(UOpCode.GPU_PRED),
+                            uop.iq_type.eq(IssueQueueType.INT),
+                            uop.fu_type.eq(FUType.GPU),
+                            uop.lrs2_rtype.eq(RegisterType.FIX),
+                            uop.imm_sel.eq(ImmSel.S),
+                            STALL,
+                        ]
+
                     with m.Default():
                         m.d.comb += is_special.eq(0)
 
