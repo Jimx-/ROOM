@@ -323,3 +323,43 @@ class Gearbox(Elaboratable):
             m.d.comb += self.source.bits.eq(r_data[::-1])
 
         return m
+
+
+class Repeater(Elaboratable):
+
+    def __init__(self, cls, *args, **kwargs):
+        self.cls = cls
+        self.args = args
+        self.kwargs = kwargs
+
+        self.enq = Decoupled(cls, *args, **kwargs)
+        self.deq = Decoupled(cls, *args, **kwargs)
+        self.full = Signal()
+        self.repeat = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        full = Signal()
+        data = self.cls(*self.args, **self.kwargs)
+
+        m.d.comb += [
+            self.deq.valid.eq(self.enq.valid | full),
+            self.enq.ready.eq(self.deq.ready & ~full),
+            self.full.eq(full),
+        ]
+
+        with m.If(full):
+            m.d.comb += self.deq.bits.eq(data)
+        with m.Else():
+            m.d.comb += self.deq.bits.eq(self.enq.bits)
+
+        with m.If(self.enq.fire & self.repeat):
+            m.d.sync += [
+                full.eq(1),
+                data.eq(self.enq.bits),
+            ]
+        with m.If(self.deq.fire & ~self.repeat):
+            m.d.sync += full.eq(0)
+
+        return m

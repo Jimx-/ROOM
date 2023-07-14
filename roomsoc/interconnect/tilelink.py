@@ -5,7 +5,7 @@ from amaranth.hdl.rec import Direction
 from amaranth.utils import log2_int
 from amaranth_soc.memory import MemoryMap
 
-from roomsoc.interconnect.stream import Decoupled
+from roomsoc.interconnect.stream import Decoupled, Repeater, Queue
 
 
 class ChannelAOpcode(Enum):
@@ -397,138 +397,6 @@ class Interface:
         ]
 
 
-class TileLink2Wishbone(Elaboratable):
-
-    def __init__(self, tl, wishbone, base_addr=0x00000000):
-        self.base_addr = base_addr
-
-        self.tl = tl
-        self.wishbone = wishbone
-
-    def elaborate(self, platform):
-        m = Module()
-
-        tl = self.tl
-        wb = self.wishbone
-
-        if tl.has_bce:
-            tl_adapted = Interface(addr_width=tl.addr_width,
-                                   data_width=tl.data_width,
-                                   size_width=tl.size_width,
-                                   source_id_width=tl.source_id_width,
-                                   sink_id_width=tl.sink_id_width)
-            m.submodules.cache_adapter = CacheCork(tl, tl_adapted)
-            tl = tl_adapted
-
-        wb_adr_shift = log2_int(tl.data_width // 8)
-
-        wb_addr = Signal(wb.addr_width)
-        burst_len = Signal(2**tl.size_width + 1)
-        mask = Signal.like(tl.a.bits.mask)
-        wen = Signal()
-        rdata = Signal.like(wb.dat_r)
-
-        with m.If(tl.a.fire):
-            m.d.sync += [
-                tl.d.bits.size.eq(tl.a.bits.size),
-                tl.d.bits.source.eq(tl.a.bits.source),
-            ]
-
-        with m.FSM():
-            with m.State('IDLE'):
-                m.d.comb += tl.a.ready.eq(1)
-
-                with m.If(tl.a.valid):
-                    is_write = Interface.has_data(tl.a.bits)
-
-                    m.d.sync += [
-                        wb_addr.eq((tl.a.bits.address -
-                                    self.base_addr)[wb_adr_shift:]),
-                        burst_len.eq(1 << tl.a.bits.size),
-                        mask.eq(tl.a.bits.mask),
-                        wen.eq(is_write),
-                    ]
-
-                    m.d.comb += tl.a.ready.eq(~is_write)
-
-                    m.next = 'ACT'
-
-            with m.State('ACT'):
-                m.d.comb += [
-                    wb.cyc.eq(~wen | tl.a.valid),
-                    wb.stb.eq(wb.cyc),
-                    wb.adr.eq(wb_addr),
-                    wb.we.eq(wen),
-                    wb.sel.eq(mask),
-                ]
-
-                with m.If(wb.we):
-                    m.d.comb += [
-                        wb.dat_w.eq(tl.a.bits.data),
-                        tl.a.ready.eq(wb.ack),
-                    ]
-
-                with m.If(wb.ack):
-                    m.d.sync += wb_addr.eq(wb_addr + 1)
-
-                    with m.If(~wb.we):
-                        m.d.comb += [
-                            tl.d.bits.opcode.eq(ChannelDOpcode.AccessAckData),
-                            tl.d.bits.data.eq(wb.dat_r),
-                            tl.d.valid.eq(1),
-                        ]
-
-                        with m.If(tl.d.ready):
-                            with m.If(burst_len > tl.data_width // 8):
-                                m.d.sync += burst_len.eq(burst_len -
-                                                         tl.data_width // 8)
-                            with m.Else():
-                                m.d.sync += burst_len.eq(0)
-
-                                m.next = 'IDLE'
-                        with m.Else():
-                            m.d.sync += rdata.eq(wb.dat_r)
-
-                            m.next = 'WAIT_ACK'
-
-                    with m.Else():
-                        with m.If(burst_len > tl.data_width // 8):
-                            m.d.sync += burst_len.eq(burst_len -
-                                                     tl.data_width // 8)
-                        with m.Else():
-                            m.d.sync += burst_len.eq(0)
-
-                            m.next = 'WRITE_ACK'
-
-            with m.State('WAIT_ACK'):
-                m.d.comb += [
-                    tl.d.bits.opcode.eq(ChannelDOpcode.AccessAckData),
-                    tl.d.bits.data.eq(rdata),
-                    tl.d.bits.param.eq(CapParam.toT),
-                    tl.d.valid.eq(1),
-                ]
-
-                with m.If(tl.d.ready):
-                    with m.If(burst_len > tl.data_width // 8):
-                        m.d.sync += burst_len.eq(burst_len -
-                                                 tl.data_width // 8)
-                        m.next = 'ACT'
-                    with m.Else():
-                        m.d.sync += burst_len.eq(0)
-                        m.next = 'IDLE'
-
-            with m.State('WRITE_ACK'):
-                m.d.comb += [
-                    tl.d.bits.opcode.eq(ChannelDOpcode.AccessAck),
-                    tl.d.valid.eq(1),
-                ]
-
-                with m.If(tl.d.ready):
-                    m.next = 'IDLE'
-
-        return m
-
-
 class CacheCork(Elaboratable):
 
     def __init__(self, in_bus, out_bus):
@@ -748,5 +616,262 @@ class Arbiter(Elaboratable):
             for i, intr_bus in enumerate(self._intrs):
                 with m.Case(i):
                     m.d.comb += intr_bus.connect(self.bus)
+
+        return m
+
+
+class Fragmenter(Elaboratable):
+
+    def __init__(self, max_size, min_size, in_bus):
+        self.max_size = max_size
+        self.min_size = min_size
+
+        added_bits = log2_int(max_size // min_size) + 1
+
+        self.in_bus = in_bus
+        self.out_bus = Interface(addr_width=in_bus.addr_width,
+                                 data_width=in_bus.data_width,
+                                 size_width=in_bus.size_width,
+                                 source_id_width=in_bus.source_id_width +
+                                 added_bits)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_bus = self.in_bus
+        out_bus = self.out_bus
+
+        if self.min_size == self.max_size:
+            m.d.comb += in_bus.connect(out_bus)
+        else:
+            beat_bytes = out_bus.data_width // 8
+            counter_bits = log2_int(self.max_size // beat_bytes)
+
+            acknum = Signal(counter_bits)
+            d_orig = Signal.like(in_bus.d.bits.size)
+            d_toggle = Signal()
+            d_fragnum = out_bus.d.bits.source[:log2_int(self.max_size //
+                                                        self.min_size)]
+            d_first = acknum == 0
+            d_last = d_fragnum == 0
+            dsize_bytes = (1 << out_bus.d.bits.size)[:log2_int(self.min_size) +
+                                                     1]
+            dsize_mask = (dsize_bytes - 1)[:log2_int(self.min_size)]
+            d_has_data = Interface.has_data(out_bus.d.bits)
+
+            acknum_fragment = d_fragnum << log2_int(
+                self.min_size // beat_bytes)
+            acknum_size = dsize_mask >> log2_int(beat_bytes)
+            d_first_acknum = acknum_fragment | Mux(d_has_data, acknum_size, 0)
+            ack_decrement = Mux(d_has_data, 1,
+                                dsize_bytes >> log2_int(beat_bytes))
+            d_first_size_mask = Signal(log2_int(self.max_size))
+            d_first_size = Signal.like(in_bus.d.bits.size)
+
+            m.d.comb += d_first_size_mask.eq(
+                d_fragnum << log2_int(self.min_size)
+                | dsize_mask)
+            for i in range(len(d_first_size_mask)):
+                with m.If(d_first_size_mask[i]):
+                    m.d.comb += d_first_size.eq(i + 1)
+
+            with m.If(out_bus.d.fire):
+                m.d.sync += acknum.eq(
+                    Mux(d_first, d_first_acknum, acknum - ack_decrement))
+                with m.If(d_first):
+                    m.d.sync += [
+                        d_orig.eq(d_first_size),
+                        d_toggle.eq(out_bus.d.bits.source[log2_int(
+                            self.max_size // self.min_size)]),
+                    ]
+
+            drop = ~(d_has_data | d_last)
+            m.d.comb += [
+                out_bus.d.ready.eq(in_bus.d.ready | drop),
+                in_bus.d.valid.eq(out_bus.d.valid & ~drop),
+                out_bus.d.bits.connect(in_bus.d.bits),
+                in_bus.d.bits.source.eq(
+                    out_bus.d.bits.source[log2_int(self.max_size //
+                                                   self.min_size) + 1:]),
+                in_bus.d.bits.size.eq(Mux(d_first, d_first_size, d_orig)),
+            ]
+
+            repeater = m.submodules.repeater = Repeater(
+                ChannelA,
+                addr_width=in_bus.addr_width,
+                data_width=in_bus.data_width,
+                size_width=in_bus.size_width,
+                source_id_width=in_bus.source_id_width,
+            )
+            m.d.comb += in_bus.a.connect(repeater.enq)
+            in_a = repeater.deq
+
+            a_limit = log2_int(self.min_size)
+            a_orig = in_a.bits.size
+            a_frag = Mux(a_orig > a_limit, a_limit, a_orig)
+            a_orig_mask = ((1 << a_orig) - 1)[:log2_int(self.max_size)]
+            a_frag_mask = ((1 << a_frag) - 1)[:log2_int(self.min_size)]
+            a_has_data = Interface.has_data(in_a.bits)
+            a_mask = Mux(a_has_data, 0, a_frag_mask)
+
+            gennum = Signal(counter_bits)
+            a_first = gennum == 0
+            old_gennum = Mux(a_first, a_orig_mask >> log2_int(beat_bytes),
+                             gennum - 1)[:counter_bits]
+            new_gennum = ~(~old_gennum | (a_mask >> log2_int(beat_bytes)))
+            a_fragnum = Signal(counter_bits)
+            m.d.comb += a_fragnum.eq(
+                ~(~(old_gennum >> log2_int(self.min_size // beat_bytes)))
+                | (a_frag_mask >> log2_int(self.min_size)))
+            d_toggle_last = Signal()
+            a_toggle = ~Mux(a_first, d_toggle, d_toggle_last)
+
+            with m.If(a_first):
+                m.d.sync += d_toggle_last.eq(d_toggle)
+
+            with m.If(out_bus.a.fire):
+                m.d.sync += gennum.eq(new_gennum)
+
+            m.d.comb += [
+                repeater.repeat.eq(~a_has_data & (a_fragnum != 0)),
+                in_a.connect(out_bus.a),
+                out_bus.a.bits.address.eq(in_a.bits.address | ~(
+                    (old_gennum << log2_int(beat_bytes)) | ~a_orig_mask
+                    | a_frag_mask | (self.min_size - 1))),
+                out_bus.a.bits.source.eq(
+                    Cat(a_fragnum, a_toggle, in_a.bits.source)),
+                out_bus.a.bits.size.eq(a_frag),
+                out_bus.a.bits.data.eq(in_bus.a.bits.data),
+                out_bus.a.bits.mask.eq(
+                    Mux(repeater.full, Repl(1, beat_bytes),
+                        in_bus.a.bits.mask)),
+            ]
+
+            if in_bus.has_bce:
+                m.d.comb += [
+                    in_bus.c.ready.eq(1),
+                    in_bus.e.ready.eq(1),
+                ]
+
+            if out_bus.has_bce:
+                m.d.comb += out_bus.b.ready.eq(1)
+
+        return m
+
+
+class TileLink2Wishbone(Elaboratable):
+
+    def __init__(self, tl, wishbone, base_addr=0x00000000):
+        self.base_addr = base_addr
+
+        self.tl = tl
+        self.wishbone = wishbone
+
+    def elaborate(self, platform):
+        m = Module()
+
+        tl = self.tl
+        wb = self.wishbone
+
+        if tl.has_bce:
+            tl_adapted = Interface(addr_width=tl.addr_width,
+                                   data_width=tl.data_width,
+                                   size_width=tl.size_width,
+                                   source_id_width=tl.source_id_width,
+                                   sink_id_width=tl.sink_id_width)
+            m.submodules.cache_adapter = CacheCork(tl, tl_adapted)
+            tl = tl_adapted
+
+        fragmenter = m.submodules.fragmenter = Fragmenter(
+            max_size=2**(1 << tl.size_width),
+            min_size=wb.data_width // 8,
+            in_bus=tl,
+        )
+        tl = fragmenter.out_bus
+
+        wb_adr_shift = log2_int(tl.data_width // 8)
+
+        d = Decoupled(
+            ChannelD,
+            data_width=tl.data_width,
+            size_width=tl.size_width,
+            source_id_width=tl.source_id_width,
+            sink_id_width=tl.sink_id_width,
+        )
+        d_queue = m.submodules.d_queue = Queue(
+            1,
+            ChannelD,
+            data_width=tl.data_width,
+            size_width=tl.size_width,
+            source_id_width=tl.source_id_width,
+            sink_id_width=tl.sink_id_width,
+            flow=True,
+        )
+        m.d.comb += [
+            d.connect(d_queue.enq),
+            d_queue.deq.connect(tl.d),
+        ]
+
+        a = m.submodules.a_queue = Queue(
+            1,
+            ChannelA,
+            addr_width=tl.addr_width,
+            data_width=tl.data_width,
+            size_width=tl.size_width,
+            source_id_width=tl.source_id_width,
+            flow=True,
+        )
+        m.d.comb += tl.a.connect(a.enq)
+
+        d_stall = Signal()
+        m.d.sync += d_stall.eq(tl.d.valid & ~tl.d.ready)
+
+        a_cyc = a.deq.valid & ~d_stall
+        a_enable = Signal()
+        a_write = Interface.has_data(a.deq.bits)
+
+        with m.If(a_cyc):
+            m.d.sync += a_enable.eq(1)
+        with m.If(d.fire):
+            m.d.sync += a_enable.eq(0)
+
+        d_write = Signal()
+        d_source = Signal.like(a.deq.bits.source)
+        d_size = Signal.like(a.deq.bits.size)
+        with m.If(a_cyc & ~a_enable):
+            m.d.sync += [
+                d_write.eq(a_write),
+                d_source.eq(a.deq.bits.source),
+                d_size.eq(a.deq.bits.size),
+            ]
+
+        m.d.comb += [
+            wb.cyc.eq(a_cyc),
+            wb.stb.eq(a_cyc),
+            wb.adr.eq((a.deq.bits.address - self.base_addr)[wb_adr_shift:]),
+            wb.dat_w.eq(a.deq.bits.data),
+            wb.we.eq(a_write),
+            wb.sel.eq(a.deq.bits.mask),
+        ]
+
+        m.d.comb += [
+            a.deq.ready.eq(a_enable & wb.ack),
+            d.valid.eq(a_enable & wb.ack),
+        ]
+
+        m.d.comb += [
+            d.bits.opcode.eq(
+                Mux(d_write, ChannelDOpcode.AccessAck,
+                    ChannelDOpcode.AccessAckData)),
+            d.bits.size.eq(d_size),
+            d.bits.source.eq(d_source),
+            d.bits.data.eq(wb.dat_r),
+        ]
+
+        if hasattr(wb, 'err'):
+            m.d.comb += [
+                d.bits.denied.eq(d_write & wb.err),
+                d.bits.corrupt.eq(~d_write & wb.err),
+            ]
 
         return m
