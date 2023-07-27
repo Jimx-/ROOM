@@ -231,7 +231,8 @@ class ALUExecUnit(ExecUnit, AutoCSR):
         m.d.comb += [
             self.iresp.bits.uop.csr_addr.eq(
                 generate_imm(alu.resp.bits.uop.imm_packed, ImmSel.I)),
-            self.iresp.bits.uop.csr_cmd.eq(alu.resp.bits.uop.csr_cmd),
+            self.iresp.bits.uop.csr_cmd.eq(
+                Mux(alu.resp.valid, alu.resp.bits.uop.csr_cmd, CSRCommand.X)),
         ]
 
         m.d.comb += self.req.ready.eq(1)

@@ -1083,8 +1083,8 @@ class RasterUnit(HasRasterParams, Elaboratable):
         m.d.comb += fetch_unit.req.connect(raster_slice.req)
 
         m.d.comb += [
-            raster_slice.viewport.width.eq(1024),
-            raster_slice.viewport.height.eq(768),
+            raster_slice.viewport.width.eq(640),
+            raster_slice.viewport.height.eq(480),
         ]
 
         request = Signal(len(self.req))

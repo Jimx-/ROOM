@@ -13,6 +13,9 @@ typedef void (*gpu_thread_func_t)();
 
 #define __endif gpu_join();
 
+#define __UNIFORM__ __attribute__((annotate("groom.uniform")))
+#define __DIVERGENT__ __attribute__((annotate("groom.divergent")))
+
 #ifdef __cplusplus
 extern "C"
 {

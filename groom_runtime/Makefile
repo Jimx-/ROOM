@@ -3,7 +3,7 @@ LD	= $(RISCV)/bin/riscv64-unknown-elf-ld
 AR	= $(RISCV)/bin/riscv64-unknown-elf-ar
 OBJCOPY	= $(RISCV)/bin/riscv64-unknown-elf-objcopy
 
-CFLAGS	= -march=rv32imf -mabi=ilp32 -g -O2
+CFLAGS	= -march=rv32imf -mabi=ilp32f -g -O2
 CFLAGS	+= -I../include/
 
 SRCS	= start.S spawn.c

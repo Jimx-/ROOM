@@ -189,7 +189,8 @@ class FPUFMA(Elaboratable):
         s1_valid = Signal()
         s1_inp = FPUInput(self.width)
 
-        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp.bits))
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp.bits),
+                                                depth=self.latency - 2)
         m.d.comb += [
             inp_pipe.in_valid.eq(self.inp.valid),
             inp_pipe.in_data.eq(self.inp.bits),
@@ -440,8 +441,7 @@ class FPUFMA(Elaboratable):
         # S3 - Output
         #
 
-        out_pipe = m.submodules.out_pipe = Pipe(width=len(result),
-                                                depth=self.latency - 2)
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(result))
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
             out_pipe.in_data.eq(result),

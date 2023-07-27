@@ -2,7 +2,7 @@
   "is_groom": true,
   "xlen": 32,
   "vaddr_bits": 32,
-  "n_cores": 1,
+  "n_cores": 2,
   "n_warps": 4,
   "n_threads": 4,
   "n_barriers": 4,
@@ -20,7 +20,7 @@
     "block_bytes": 64,
     "row_bits": 64,
     "n_mshrs": 1,
-    "n_iomshrs": 1,
+    "n_iomshrs": 4,
     "sdq_size": 17,
     "rpq_size": 16,
     "n_banks": 4
