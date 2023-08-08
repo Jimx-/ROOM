@@ -660,6 +660,7 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         for q, qq, mask in zip(self.quads, s4_quads, s4_mask):
             m.d.comb += [
                 q.eq(qq),
+                q.valid.eq(qq.valid & s4_valid),
                 q.bits.mask.eq(mask),
             ]
 
@@ -1051,8 +1052,19 @@ class RasterSlice(HasRasterParams, Elaboratable):
             self.done.eq(~(busy | block_eval.busy)),
         ]
 
-        for q, qq in zip(self.r_quads, block_eval.r_quads):
-            m.d.comb += q.eq(qq)
+        r_quads_mask = Signal(self.n_threads)
+        with m.If(self.r_en & self.r_rdy & self.r_quads[-1].valid):
+            m.d.sync += r_quads_mask.eq(0)
+        with m.Else():
+            m.d.sync += r_quads_mask.eq(r_quads_mask
+                                        | Cat(q.valid & self.r_en & self.r_rdy
+                                              for q in self.r_quads))
+
+        for q, qq, mask in zip(self.r_quads, block_eval.r_quads, r_quads_mask):
+            m.d.comb += [
+                q.eq(qq),
+                q.valid.eq(qq.valid & ~mask),
+            ]
         m.d.comb += [
             self.r_rdy.eq(block_eval.r_rdy),
             block_eval.r_en.eq(self.r_en),
@@ -1110,7 +1122,8 @@ class RasterUnit(HasRasterParams, Elaboratable):
             for i, req in enumerate(self.req):
                 with m.Case(i):
                     with m.If(req.valid & raster_slice.r_rdy & (
-                        (req.bits.tmask & quad_valids) == req.bits.tmask)):
+                        ((req.bits.tmask & quad_valids) == req.bits.tmask)
+                            | raster_slice.done)):
                         m.d.comb += [
                             req.ready.eq(1),
                             raster_slice.r_en.eq(1),
