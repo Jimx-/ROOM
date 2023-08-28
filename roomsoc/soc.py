@@ -33,10 +33,15 @@ class SoCIORegion(SoCRegion):
 
 class BusHelper(Elaboratable):
 
-    def __init__(self, standard='wishbone', data_width=32, addr_width=32):
+    def __init__(self,
+                 standard='wishbone',
+                 data_width=32,
+                 addr_width=32,
+                 timeout=128):
         self.standard = standard
         self.data_width = data_width
         self.addr_width = addr_width
+        self.timeout = timeout
 
         self.regions = dict()
         self.io_regions = dict()
@@ -45,9 +50,7 @@ class BusHelper(Elaboratable):
         self.slaves = dict()
         self.converters = dict()
 
-        self.decoder = wishbone.Decoder(data_width=self.data_width,
-                                        addr_width=self.get_addr_width(),
-                                        granularity=8)
+        self.bus_error = Signal()
 
     def check_regions_overlap(self, regions):
         i = 0
@@ -230,7 +233,6 @@ class BusHelper(Elaboratable):
 
         slave = self.add_adapter(name, slave, 's2m')
         self.slaves[name] = slave
-        self.decoder.add(slave, addr=region.origin)
 
         print(f'Add {name} as bus slave.')
 
@@ -240,10 +242,32 @@ class BusHelper(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.decoder = self.decoder
+        interconnect_p2p_cls = {
+            'wishbone': wishbone.InterconnectP2P,
+        }[self.standard]
+        interconnect_cls = {
+            'wishbone': wishbone.InterconnectShared,
+        }[self.standard]
 
         for k, v in self.converters.items():
             setattr(m.submodules, k, v)
+
+        if len(self.masters) and len(self.slaves):
+            if len(self.masters) == 1 and len(self.slaves) == 1:
+                m.submodules.interconnect = interconnect_p2p_cls(
+                    master=next(iter(self.masters.values())),
+                    slave=next(iter(self.slaves.values())))
+            else:
+                interconnect = m.submodules.interconnect = interconnect_cls(
+                    data_width=self.data_width,
+                    addr_width=self.get_addr_width(),
+                    masters=list(self.masters.values()),
+                    slaves=[(self.regions[n], s)
+                            for n, s in self.slaves.items()],
+                    timeout_cycles=self.timeout)
+
+                if hasattr(interconnect, 'timeout_error'):
+                    m.d.comb += self.bus_error.eq(interconnect.timeout_error)
 
         return m
 
@@ -266,8 +290,8 @@ class SoCController(Peripheral, Elaboratable):
         if with_scratch:
             self._scratch = bank.csr(32, 'r')
 
-        self._bus_error_addr = bank.csr(32, 'r')
-        self.bus_error_addr = Signal(32)
+        self._bus_errors = bank.csr(32, 'r')
+        self.bus_error = Signal()
 
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
@@ -286,16 +310,20 @@ class SoCController(Peripheral, Elaboratable):
         if self.with_scratch:
             m.d.comb += self._scratch.r_data.eq(0x12345678)
 
-        m.d.comb += self._bus_error_addr.r_data.eq(self.bus_error_addr)
+        bus_errors = Signal(32)
+        with m.If(self.bus_error):
+            m.d.sync += bus_errors.eq(bus_errors + 1)
+        m.d.comb += self._bus_errors.r_data.eq(bus_errors)
 
         return m
 
 
 class SoC(Elaboratable):
 
-    def __init__(self, bus_data_width=32, bus_addr_width=32):
+    def __init__(self, bus_data_width=32, bus_addr_width=32, bus_timeout=128):
         self.bus = BusHelper(data_width=bus_data_width,
-                             addr_width=bus_addr_width)
+                             addr_width=bus_addr_width,
+                             timeout=bus_timeout)
 
         self.peripherals = dict()
 
@@ -364,44 +392,24 @@ class SoC(Elaboratable):
         m = Module()
 
         m.submodules.bus = self.bus
+        if hasattr(self, 'ctrl'):
+            m.d.comb += self.ctrl.bus_error.eq(self.bus.bus_error)
 
         m.submodules.cpu = self.cpu
 
         for k, v in self.peripherals.items():
             setattr(m.submodules, k, v)
 
-        if len(self.bus.masters) and len(self.bus.slaves):
-            if len(self.bus.masters) > 1:
-                arbiter = m.submodules.bus_arbiter = wishbone.Arbiter(
-                    data_width=self.bus.data_width,
-                    addr_width=self.bus.get_addr_width(),
-                    granularity=8)
-                for master in self.bus.masters.values():
-                    arbiter.add(master)
-                master = arbiter.bus
-            else:
-                master = list(self.bus.masters.values())[0]
-
-            slave = self.bus.decoder.bus
-
-            timeout = m.submodules.timeout = wishbone.Timeout(master, 128)
-            m.d.comb += timeout.bus.connect(slave)
-
-            if hasattr(self, 'ctrl'):
-                m.d.comb += self.ctrl.bus_error_addr.eq(timeout.error_addr)
-
         return m
 
     def resources(self):
-        memory_map = self.bus.decoder.bus.memory_map
-
-        for peripheral, (peripheral_start, _, _) in memory_map.windows():
-            resources = peripheral.all_resources()
+        for name, slave in self.bus.slaves.items():
+            resources = slave.memory_map.all_resources()
+            region = self.bus.regions[name]
 
             for res in resources:
-
                 size = res.end - res.start
-                yield res.resource, peripheral_start + res.start, size
+                yield res.resource, region.origin + res.start, size
 
     def generate_platform_header(self, macro_name='PLATFORM', file=None):
 

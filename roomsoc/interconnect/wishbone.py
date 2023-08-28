@@ -181,7 +181,7 @@ class Timeout(Elaboratable):
                              addr_width=master.addr_width,
                              granularity=master.granularity)
 
-        self.error_addr = Signal.like(master.adr)
+        self.error = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -199,8 +199,63 @@ class Timeout(Elaboratable):
             m.d.comb += [
                 self.master.dat_r.eq(~0),
                 self.master.ack.eq(1),
+                self.error.eq(1),
             ]
 
-            m.d.sync += self.error_addr.eq(self.master.adr)
+        return m
+
+
+class InterconnectP2P(Elaboratable):
+
+    def __init__(self, master, slave):
+        self.master = master
+        self.slave = slave
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += self.master.connect(self.slave)
+
+        return m
+
+
+class InterconnectShared(Elaboratable):
+
+    def __init__(self,
+                 addr_width,
+                 data_width,
+                 masters,
+                 slaves,
+                 timeout_cycles=1e6):
+        self.addr_width = addr_width
+        self.data_width = data_width
+        self.masters = masters
+        self.slaves = slaves
+        self.timeout_cycles = timeout_cycles
+
+        self.timeout_error = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        arbiter = m.submodules.arbiter = Arbiter(data_width=self.data_width,
+                                                 addr_width=self.addr_width,
+                                                 granularity=8)
+        for master in self.masters:
+            arbiter.add(master)
+        shared = arbiter.bus
+
+        if self.timeout_cycles is not None:
+            timeout = m.submodules.timeout = Timeout(shared,
+                                                     self.timeout_cycles)
+            m.d.comb += self.timeout_error.eq(timeout.error)
+            shared = timeout.bus
+
+        decoder = m.submodules.decoder = Decoder(data_width=self.data_width,
+                                                 addr_width=self.addr_width,
+                                                 granularity=8)
+        for region, slave in self.slaves:
+            decoder.add(slave, addr=region.origin)
+        m.d.comb += shared.connect(decoder.bus)
 
         return m
