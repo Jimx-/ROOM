@@ -1,6 +1,7 @@
 from amaranth import *
 from amaranth.hdl.rec import DIR_FANIN, DIR_FANOUT
 from amaranth.utils import log2_int
+from amaranth_soc.memory import MemoryMap
 from enum import IntEnum
 
 from .axi_lite import AXILiteInterface, Wishbone2AXILite, AXILite2Wishbone
@@ -124,12 +125,34 @@ class AXIInterface(Record):
         self.addr_width = addr_width
         self.data_width = data_width
         self.id_width = id_width
+        self._map = None
 
         super().__init__(make_axi_layout(data_width=data_width,
                                          addr_width=addr_width,
                                          id_width=id_width),
                          name=name,
                          src_loc_at=src_loc_at)
+
+    @property
+    def memory_map(self):
+        if self._map is None:
+            raise NotImplementedError(
+                "Bus interface {!r} does not have a memory map".format(self))
+        return self._map
+
+    @memory_map.setter
+    def memory_map(self, memory_map):
+        if not isinstance(memory_map, MemoryMap):
+            raise TypeError(
+                "Memory map must be an instance of MemoryMap, not {!r}".format(
+                    memory_map))
+        if memory_map.addr_width != max(1, self.addr_width):
+            raise ValueError(
+                "Memory map has address width {}, which is not the same as bus "
+                "interface address width {}".format(memory_map.addr_width,
+                                                    self.addr_width))
+        memory_map.freeze()
+        self._map = memory_map
 
 
 class AXILite2AXI(Elaboratable):
@@ -435,6 +458,268 @@ class AXI2Wishbone(Elaboratable):
         return m
 
 
+class _RequestCounter(Elaboratable):
+
+    def __init__(self, max_requests=256):
+        self.max_requests = max_requests
+
+        self.req = Signal()
+        self.resp = Signal()
+        self.ready = Signal()
+        self.stall = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        counter = Signal(range(self.max_requests))
+        full = counter == self.max_requests - 1
+        empty = counter == 0
+        m.d.comb += [
+            self.ready.eq(empty),
+            self.stall.eq(self.req & full),
+        ]
+
+        with m.If(self.req & self.resp):
+            m.d.sync += counter.eq(counter)
+        with m.Elif(self.req & ~full):
+            m.d.sync += counter.eq(counter + 1)
+        with m.Elif(self.resp & ~empty):
+            m.d.sync += counter.eq(counter - 1)
+
+        return m
+
+
+class AXIArbiter(Elaboratable):
+
+    def __init__(self, *, addr_width, data_width, id_width):
+        self.bus = AXIInterface(addr_width=addr_width,
+                                data_width=data_width,
+                                id_width=id_width)
+        self._intrs = []
+
+    def add(self, intr_bus):
+        if not isinstance(intr_bus, AXIInterface):
+            raise TypeError(
+                "Initiator bus must be an instance of AXIInterface, not {!r}".
+                format(intr_bus))
+        if intr_bus.addr_width != self.bus.addr_width:
+            raise ValueError(
+                "Initiator bus has address width {}, which is not the same as "
+                "arbiter address width {}".format(intr_bus.addr_width,
+                                                  self.bus.addr_width))
+        if intr_bus.data_width != self.bus.data_width:
+            raise ValueError(
+                "Initiator bus has data width {}, which is not the same as "
+                "arbiter data width {}".format(intr_bus.data_width,
+                                               self.bus.data_width))
+
+        self._intrs.append(intr_bus)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        rd_requests = Signal(len(self._intrs))
+        rd_grant = Signal(range(len(self._intrs)))
+        rd_early_grant = Signal.like(rd_grant)
+        m.d.comb += [
+            rd_requests.eq(Cat(intr_bus.ar.valid for intr_bus in self._intrs)),
+            rd_early_grant.eq(rd_grant),
+        ]
+        rd_lock = m.submodules.rd_lock = _RequestCounter()
+        m.d.comb += [
+            rd_lock.req.eq(self.bus.ar.valid & self.bus.ar.ready),
+            rd_lock.resp.eq(self.bus.r.valid & self.bus.r.ready
+                            & self.bus.r.bits.last),
+        ]
+
+        with m.If(rd_lock.ready):
+            with m.Switch(rd_grant):
+                for i in range(len(rd_requests)):
+                    with m.Case(i):
+                        with m.If(rd_requests[i]):
+                            m.d.comb += rd_early_grant.eq(i)
+
+                        for pred in reversed(range(i)):
+                            with m.If(rd_requests[pred]):
+                                m.d.comb += rd_early_grant.eq(pred)
+
+                                with m.If(rd_lock.req):
+                                    m.d.sync += rd_grant.eq(pred)
+
+                        for succ in reversed(range(i + 1, len(rd_requests))):
+                            with m.If(rd_requests[succ]):
+                                m.d.comb += rd_early_grant.eq(succ)
+
+                                with m.If(rd_lock.req):
+                                    m.d.sync += rd_grant.eq(succ)
+
+        wr_requests = Signal(len(self._intrs))
+        wr_grant = Signal(range(len(self._intrs)))
+        wr_early_grant = Signal.like(wr_grant)
+        m.d.comb += [
+            wr_requests.eq(Cat(intr_bus.aw.valid for intr_bus in self._intrs)),
+            wr_early_grant.eq(wr_grant),
+        ]
+        wr_lock = m.submodules.wr_lock = _RequestCounter()
+        m.d.comb += [
+            wr_lock.req.eq(self.bus.aw.valid & self.bus.aw.ready),
+            wr_lock.resp.eq(self.bus.b.valid & self.bus.b.ready),
+        ]
+
+        with m.If(wr_lock.ready):
+            with m.Switch(wr_grant):
+                for i in range(len(wr_requests)):
+                    with m.Case(i):
+                        with m.If(wr_requests[i]):
+                            m.d.comb += wr_early_grant.eq(i)
+
+                        for pred in reversed(range(i)):
+                            with m.If(wr_requests[pred]):
+                                m.d.comb += wr_early_grant.eq(pred)
+
+                                with m.If(wr_lock.req):
+                                    m.d.sync += wr_grant.eq(pred)
+
+                        for succ in reversed(range(i + 1, len(wr_requests))):
+                            with m.If(wr_requests[succ]):
+                                m.d.comb += wr_early_grant.eq(succ)
+
+                                with m.If(wr_lock.req):
+                                    m.d.sync += wr_grant.eq(succ)
+
+        with m.Switch(rd_early_grant):
+            for i, intr_bus in enumerate(self._intrs):
+                with m.Case(i):
+                    m.d.comb += [
+                        intr_bus.ar.connect(self.bus.ar),
+                        intr_bus.r.connect(self.bus.r),
+                    ]
+
+        with m.Switch(wr_early_grant):
+            for i, intr_bus in enumerate(self._intrs):
+                with m.Case(i):
+                    m.d.comb += [
+                        intr_bus.aw.connect(self.bus.aw),
+                        intr_bus.w.connect(self.bus.w),
+                        intr_bus.b.connect(self.bus.b),
+                    ]
+
+        return m
+
+
+class AXIDecoder(Elaboratable):
+
+    def __init__(self,
+                 *,
+                 addr_width,
+                 data_width,
+                 id_width,
+                 alignment=0,
+                 name=None):
+        self.data_width = data_width
+        self.id_width = id_width
+        self.alignment = alignment
+
+        self._map = MemoryMap(addr_width=max(1, addr_width),
+                              data_width=8,
+                              alignment=alignment,
+                              name=name)
+        self._subs = dict()
+        self._bus = None
+
+    @property
+    def bus(self):
+        if self._bus is None:
+            self._map.freeze()
+            self._bus = AXIInterface(addr_width=self._map.addr_width,
+                                     data_width=self.data_width,
+                                     id_width=self.id_width)
+            self._bus.memory_map = self._map
+        return self._bus
+
+    def align_to(self, alignment):
+        return self._map.align_to(alignment)
+
+    def add(self, sub_bus, *, addr=None, sparse=False, extend=False):
+        if not isinstance(sub_bus, AXIInterface):
+            raise TypeError(
+                "Subordinate bus must be an instance of AXIInterface, not {!r}"
+                .format(sub_bus))
+        if not sparse:
+            if sub_bus.data_width != self.data_width:
+                raise ValueError(
+                    "Subordinate bus has data width {}, which is not the same as "
+                    "decoder data width {} (required for dense address translation)"
+                    .format(sub_bus.data_width, self.data_width))
+
+        self._subs[sub_bus.memory_map] = sub_bus
+        return self._map.add_window(sub_bus.memory_map,
+                                    addr=addr,
+                                    sparse=sparse,
+                                    extend=extend)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        rd_sel_dec = Signal(len(self._subs))
+        rd_sel_reg = Signal(len(self._subs))
+        rd_sel = Signal(len(self._subs))
+
+        wr_sel_dec = Signal(len(self._subs))
+        wr_sel_reg = Signal(len(self._subs))
+        wr_sel = Signal(len(self._subs))
+
+        with m.Switch(self.bus.ar.bits.addr):
+            for i, (_, (sub_pat, _)) in enumerate(self._map.window_patterns()):
+                with m.Case(sub_pat):
+                    m.d.comb += rd_sel_dec[i].eq(1)
+
+        with m.Switch(self.bus.aw.bits.addr):
+            for i, (_, (sub_pat, _)) in enumerate(self._map.window_patterns()):
+                with m.Case(sub_pat):
+                    m.d.comb += wr_sel_dec[i].eq(1)
+
+        rd_lock = m.submodules.rd_lock = _RequestCounter()
+        m.d.comb += [
+            rd_lock.req.eq(self.bus.ar.valid & self.bus.ar.ready),
+            rd_lock.resp.eq(self.bus.r.valid & self.bus.r.ready
+                            & self.bus.r.bits.last),
+        ]
+        wr_lock = m.submodules.wr_lock = _RequestCounter()
+        m.d.comb += [
+            wr_lock.req.eq(self.bus.aw.valid & self.bus.aw.ready),
+            wr_lock.resp.eq(self.bus.b.valid & self.bus.b.ready),
+        ]
+
+        with m.If(rd_lock.ready):
+            m.d.sync += rd_sel_reg.eq(rd_sel_dec)
+        with m.If(wr_lock.ready):
+            m.d.sync += wr_sel_reg.eq(wr_sel_dec)
+
+        m.d.comb += [
+            rd_sel.eq(Mux(rd_lock.ready, rd_sel_dec, rd_sel_reg)),
+            wr_sel.eq(Mux(wr_lock.ready, wr_sel_dec, wr_sel_reg)),
+        ]
+
+        for i, (sub_map, (_, _)) in enumerate(self._map.window_patterns()):
+            sub_bus = self._subs[sub_map]
+
+            with m.If(rd_sel[i]):
+                m.d.comb += [
+                    self.bus.ar.connect(sub_bus.ar),
+                    self.bus.r.connect(sub_bus.r),
+                ]
+
+            with m.If(wr_sel[i]):
+                m.d.comb += [
+                    self.bus.aw.connect(sub_bus.aw),
+                    self.bus.w.connect(sub_bus.w),
+                    self.bus.b.connect(sub_bus.b),
+                ]
+
+        return m
+
+
 class AXIInterconnectP2P(Elaboratable):
 
     def __init__(self, master, slave):
@@ -449,6 +734,15 @@ class AXIInterconnectP2P(Elaboratable):
         return m
 
 
+def _check_parameter(intrs, param_fn):
+    param = param_fn(intrs[0])
+    if len(intrs) > 1:
+        for intr in intrs[1:]:
+            assert param_fn(intr) == param
+
+    return param
+
+
 class AXIInterconnectShared(Elaboratable):
 
     def __init__(self,
@@ -459,10 +753,27 @@ class AXIInterconnectShared(Elaboratable):
                  timeout_cycles=None):
         self.addr_width = addr_width
         self.data_width = data_width
+        self.id_width = _check_parameter(intrs=masters +
+                                         [s for _, s in slaves],
+                                         param_fn=lambda intr: intr.id_width)
         self.masters = masters
         self.slaves = slaves
 
     def elaborate(self, platform):
         m = Module()
+
+        arbiter = m.submodules.arbiter = AXIArbiter(data_width=self.data_width,
+                                                    addr_width=self.addr_width,
+                                                    id_width=self.id_width)
+        for master in self.masters:
+            arbiter.add(master)
+        shared = arbiter.bus
+
+        decoder = m.submodules.decoder = AXIDecoder(data_width=self.data_width,
+                                                    addr_width=self.addr_width,
+                                                    id_width=self.id_width)
+        for region, slave in self.slaves:
+            decoder.add(slave, addr=region.origin)
+        m.d.comb += shared.connect(decoder.bus)
 
         return m

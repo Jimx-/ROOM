@@ -141,17 +141,20 @@ class BusHelper(Elaboratable):
                 return interface
 
             main_bus_params = dict(data_width=self.data_width,
-                                   addr_width=self.get_addr_width(),
                                    name=f'{name}_bus_adapted')
             if self.standard == 'wishbone':
                 main_bus_params['granularity'] = 8
 
-            adapted_interface = main_bus_cls(**main_bus_params)
-
             if direction == 'm2s':
+                main_bus_params['addr_width'] = self.get_addr_width()
+                adapted_interface = main_bus_cls(**main_bus_params)
                 master, slave = interface, adapted_interface
             else:
+                main_bus_params['addr_width'] = self.get_addr_width(
+                    interface.addr_width + log2_int(interface.data_width // 8))
+                adapted_interface = main_bus_cls(**main_bus_params)
                 master, slave = adapted_interface, interface
+                master.memory_map = slave.memory_map
 
             bridge_cls = {
                 (axi.AXILiteInterface, wishbone.Interface):
@@ -243,8 +246,13 @@ class BusHelper(Elaboratable):
 
         print(f'Add {name} as bus slave.')
 
-    def get_addr_width(self):
-        return self.addr_width - Shape.cast(range(self.data_width // 8)).width
+    def get_addr_width(self, addr_width=None):
+        if addr_width is None:
+            addr_width = self.addr_width
+
+        if self.standard == 'wishbone':
+            return addr_width - Shape.cast(range(self.data_width // 8)).width
+        return addr_width
 
     def elaborate(self, platform):
         m = Module()
