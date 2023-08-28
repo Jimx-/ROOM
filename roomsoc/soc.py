@@ -131,6 +131,7 @@ class BusHelper(Elaboratable):
             main_bus_cls = {
                 'wishbone': wishbone.Interface,
                 'axi-lite': axi.AXILiteInterface,
+                'axi': axi.AXIInterface,
                 'ahb': ahb.Interface,
                 'tilelink': tilelink.Interface,
                 'apb': apb.Interface,
@@ -139,10 +140,13 @@ class BusHelper(Elaboratable):
             if isinstance(interface, main_bus_cls):
                 return interface
 
-            adapted_interface = main_bus_cls(data_width=self.data_width,
-                                             addr_width=self.get_addr_width(),
-                                             granularity=8,
-                                             name=f'{name}_bus_adapted')
+            main_bus_params = dict(data_width=self.data_width,
+                                   addr_width=self.get_addr_width(),
+                                   name=f'{name}_bus_adapted')
+            if self.standard == 'wishbone':
+                main_bus_params['granularity'] = 8
+
+            adapted_interface = main_bus_cls(**main_bus_params)
 
             if direction == 'm2s':
                 master, slave = interface, adapted_interface
@@ -152,6 +156,8 @@ class BusHelper(Elaboratable):
             bridge_cls = {
                 (axi.AXILiteInterface, wishbone.Interface):
                 axi.AXILite2Wishbone,
+                (axi.AXIInterface, wishbone.Interface):
+                axi.AXI2Wishbone,
                 (ahb.Interface, wishbone.Interface):
                 ahb.AHB2Wishbone,
                 (apb.Interface, wishbone.Interface):
@@ -197,6 +203,7 @@ class BusHelper(Elaboratable):
         bus_names = {
             wishbone.Interface: "Wishbone",
             axi.AXILiteInterface: "AXI-Lite",
+            axi.AXIInterface: "AXI",
             ahb.Interface: 'AHB',
             apb.Interface: 'APB',
             tilelink.Interface: 'TileLink',
@@ -244,9 +251,11 @@ class BusHelper(Elaboratable):
 
         interconnect_p2p_cls = {
             'wishbone': wishbone.InterconnectP2P,
+            'axi': axi.AXIInterconnectP2P,
         }[self.standard]
         interconnect_cls = {
             'wishbone': wishbone.InterconnectShared,
+            'axi': axi.AXIInterconnectShared,
         }[self.standard]
 
         for k, v in self.converters.items():
@@ -320,8 +329,13 @@ class SoCController(Peripheral, Elaboratable):
 
 class SoC(Elaboratable):
 
-    def __init__(self, bus_data_width=32, bus_addr_width=32, bus_timeout=128):
-        self.bus = BusHelper(data_width=bus_data_width,
+    def __init__(self,
+                 bus_standard='wishbone',
+                 bus_data_width=32,
+                 bus_addr_width=32,
+                 bus_timeout=128):
+        self.bus = BusHelper(standard=bus_standard,
+                             data_width=bus_data_width,
                              addr_width=bus_addr_width,
                              timeout=bus_timeout)
 
