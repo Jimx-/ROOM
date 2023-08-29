@@ -140,34 +140,45 @@ class BusHelper(Elaboratable):
             if isinstance(interface, main_bus_cls):
                 return interface
 
-            main_bus_params = dict(data_width=self.data_width,
-                                   name=f'{name}_bus_adapted')
-            if self.standard == 'wishbone':
-                main_bus_params['granularity'] = 8
-
             if direction == 'm2s':
-                main_bus_params['addr_width'] = self.get_addr_width()
-                adapted_interface = main_bus_cls(**main_bus_params)
-                master, slave = interface, adapted_interface
+                master_cls, slave_cls = type(interface), main_bus_cls
             else:
-                main_bus_params['addr_width'] = self.get_addr_width(
-                    interface.addr_width + log2_int(interface.data_width // 8))
-                adapted_interface = main_bus_cls(**main_bus_params)
-                master, slave = adapted_interface, interface
-                master.memory_map = slave.memory_map
+                master_cls, slave_cls = main_bus_cls, type(interface)
 
             bridge_cls = {
                 (axi.AXILiteInterface, wishbone.Interface):
                 axi.AXILite2Wishbone,
-                (axi.AXIInterface, wishbone.Interface):
-                axi.AXI2Wishbone,
-                (ahb.Interface, wishbone.Interface):
-                ahb.AHB2Wishbone,
-                (apb.Interface, wishbone.Interface):
-                apb.APB2Wishbone,
+                (axi.AXIInterface, wishbone.Interface): axi.AXI2Wishbone,
+                (ahb.Interface, wishbone.Interface): ahb.AHB2Wishbone,
+                (apb.Interface, wishbone.Interface): apb.APB2Wishbone,
                 (tilelink.Interface, wishbone.Interface):
                 tilelink.TileLink2Wishbone,
-            }[type(master), type(slave)]
+                (tilelink.Interface, axi.AXIInterface): axi.TileLink2AXI,
+            }[master_cls, slave_cls]
+
+            if hasattr(bridge_cls, 'get_adapted_interface'):
+                adapted_interface = bridge_cls.get_adapted_interface(interface)
+            else:
+                main_bus_params = dict(data_width=self.data_width,
+                                       name=f'{name}_bus_adapted')
+                if self.standard == 'wishbone':
+                    main_bus_params['granularity'] = 8
+
+                if direction == 'm2s':
+                    main_bus_params['addr_width'] = self.get_addr_width()
+                else:
+                    main_bus_params['addr_width'] = self.get_addr_width(
+                        interface.addr_width +
+                        log2_int(interface.data_width // 8))
+
+                adapted_interface = main_bus_cls(**main_bus_params)
+
+            if direction == 'm2s':
+                master, slave = interface, adapted_interface
+            else:
+                master, slave = adapted_interface, interface
+                master.memory_map = slave.memory_map
+
             self.converters[f'{name}_bridge'] = bridge_cls(master, slave)
 
             return adapted_interface

@@ -743,6 +743,51 @@ def _check_parameter(intrs, param_fn):
     return param
 
 
+class AXIIDWidthConverter(Elaboratable):
+
+    def __init__(self, in_bus, out_bus):
+        self.in_bus = in_bus
+        self.out_bus = out_bus
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_id_width = self.in_bus.id_width
+        out_id_width = self.out_bus.id_width
+
+        m.d.comb += self.in_bus.connect(self.out_bus)
+
+        if in_id_width > out_id_width:
+            rd_lock = m.submodules.rd_lock = _RequestCounter()
+            m.d.comb += [
+                rd_lock.req.eq(self.in_bus.ar.valid & self.in_bus.ar.ready),
+                rd_lock.resp.eq(self.in_bus.r.valid & self.in_bus.r.ready
+                                & self.in_bus.r.bits.last),
+            ]
+            wr_lock = m.submodules.wr_lock = _RequestCounter()
+            m.d.comb += [
+                wr_lock.req.eq(self.in_bus.aw.valid & self.in_bus.aw.ready),
+                wr_lock.resp.eq(self.in_bus.b.valid & self.in_bus.b.ready),
+            ]
+
+            rid = Signal(in_id_width)
+            wid = Signal(in_id_width)
+
+            with m.If(self.in_bus.ar.valid & self.in_bus.ar.ready):
+                m.d.sync += rid.eq(self.in_bus.ar.bits.id)
+            with m.If(self.in_bus.aw.valid & self.in_bus.aw.ready):
+                m.d.sync += wid.eq(self.in_bus.aw.bits.id)
+
+            m.d.comb += [
+                self.in_bus.ar.ready.eq(self.out_bus.ar.ready & rd_lock.ready),
+                self.in_bus.r.bits.id.eq(rid),
+                self.in_bus.aw.ready.eq(self.out_bus.aw.ready & wr_lock.ready),
+                self.in_bus.b.bits.id.eq(wid),
+            ]
+
+        return m
+
+
 class AXIInterconnectShared(Elaboratable):
 
     def __init__(self,
@@ -753,8 +798,7 @@ class AXIInterconnectShared(Elaboratable):
                  timeout_cycles=None):
         self.addr_width = addr_width
         self.data_width = data_width
-        self.id_width = _check_parameter(intrs=masters +
-                                         [s for _, s in slaves],
+        self.id_width = _check_parameter(intrs=masters,
                                          param_fn=lambda intr: intr.id_width)
         self.masters = masters
         self.slaves = slaves
@@ -773,6 +817,16 @@ class AXIInterconnectShared(Elaboratable):
                                                     addr_width=self.addr_width,
                                                     id_width=self.id_width)
         for region, slave in self.slaves:
+            if slave.id_width != self.id_width:
+                adapted_bus = AXIInterface(addr_width=slave.addr_width,
+                                           data_width=slave.data_width,
+                                           id_width=self.id_width)
+                adapted_bus.memory_map = slave.memory_map
+
+                iw_converter = AXIIDWidthConverter(adapted_bus, slave)
+                m.submodules += iw_converter
+                slave = adapted_bus
+
             decoder.add(slave, addr=region.origin)
         m.d.comb += shared.connect(decoder.bus)
 

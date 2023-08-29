@@ -368,14 +368,14 @@ class Interface:
             self.a.bits.corrupt.eq(0),
         ]
 
-    def tilelink_access_ack(self, size, source=0, sink=0):
+    def tilelink_access_ack(self, size, source=0, sink=0, denied=0):
         return [
             self.d.bits.opcode.eq(ChannelDOpcode.AccessAck),
             self.d.bits.param.eq(0),
             self.d.bits.size.eq(size),
             self.d.bits.source.eq(source),
             self.d.bits.sink.eq(sink),
-            self.d.bits.denied.eq(0),
+            self.d.bits.denied.eq(denied),
             self.d.bits.corrupt.eq(0),
         ]
 
