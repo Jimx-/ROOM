@@ -403,6 +403,12 @@ class CacheCork(Elaboratable):
         self.in_bus = in_bus
         self.out_bus = out_bus
 
+        if self.out_bus.source_id_width < self.in_bus.source_id_width + 1:
+            raise ValueError(
+                "Subordinate bus has source ID width {}, which is smaller than required ({})"
+                .format(self.out_bus.source_id_width,
+                        self.in_bus.source_id_width + 1))
+
     def elaborate(self, platform):
         m = Module()
 
@@ -412,137 +418,138 @@ class CacheCork(Elaboratable):
         if not self.in_bus.has_bce:
             m.d.comb += in_bus.connect(out_bus)
         else:
-            busy = Signal(reset=1)
-            req_from_c = Signal()
-            release_data = Signal()
+            a_a = Decoupled(ChannelA,
+                            addr_width=out_bus.addr_width,
+                            data_width=out_bus.data_width,
+                            size_width=out_bus.size_width,
+                            source_id_width=out_bus.source_id_width)
+            a_d = Decoupled(ChannelD,
+                            data_width=in_bus.data_width,
+                            size_width=in_bus.size_width,
+                            source_id_width=in_bus.source_id_width,
+                            sink_id_width=in_bus.sink_id_width)
+            a_write = (in_bus.a.bits.opcode == ChannelAOpcode.PutFullData) | (
+                in_bus.a.bits.opcode == ChannelAOpcode.PutPartialData)
+            to_d = ((in_bus.a.bits.opcode == ChannelAOpcode.AcquireBlock) &
+                    (in_bus.a.bits.param == GrowParam.BtoT)) | (
+                        in_bus.a.bits.opcode == ChannelAOpcode.AcquirePerm)
+            m.d.comb += in_bus.a.ready.eq(Mux(to_d, a_d.ready, a_a.ready))
 
-            req_opcode = Signal(ChannelAOpcode)
-            req_param = Signal(GrowParam)
-            req_source = Signal.like(in_bus.a.bits.source)
-
-            resp_opcode = Signal(ChannelDOpcode)
-            with m.Switch(req_opcode):
-                with m.Case(ChannelAOpcode.PutFullData):
-                    m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAck)
-                with m.Case(ChannelAOpcode.PutPartialData):
-                    m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAck)
-                with m.Case(ChannelAOpcode.Get):
-                    m.d.comb += resp_opcode.eq(ChannelDOpcode.AccessAckData)
-                with m.Case(ChannelAOpcode.AcquireBlock):
-                    m.d.comb += resp_opcode.eq(
-                        Mux(req_param == GrowParam.BtoT, ChannelDOpcode.Grant,
-                            ChannelDOpcode.GrantData))
-                with m.Case(ChannelAOpcode.AcquirePerm):
-                    m.d.comb += resp_opcode.eq(ChannelDOpcode.Grant)
-
-            with m.If(req_from_c):
-                m.d.comb += resp_opcode.eq(ChannelDOpcode.ReleaseAck)
-
-            with m.If(release_data | (in_bus.c.valid & ~busy)):
+            m.d.comb += [
+                a_a.valid.eq(in_bus.a.valid & ~to_d),
+                in_bus.a.bits.connect(a_a.bits),
+                a_a.bits.source.eq((in_bus.a.bits.source << 1) | a_write),
+            ]
+            with m.If((in_bus.a.bits.opcode == ChannelAOpcode.AcquireBlock)
+                      | (in_bus.a.bits.opcode == ChannelAOpcode.AcquirePerm)):
                 m.d.comb += [
-                    out_bus.a.bits.opcode.eq(ChannelAOpcode.PutFullData),
-                    out_bus.a.bits.param.eq(0),
-                    out_bus.a.bits.size.eq(in_bus.c.bits.size),
-                    out_bus.a.bits.source.eq(in_bus.c.bits.source),
-                    out_bus.a.bits.address.eq(in_bus.c.bits.address),
-                    out_bus.a.bits.mask.eq(~0),
-                    out_bus.a.bits.data.eq(in_bus.c.bits.data),
-                    out_bus.a.bits.corrupt.eq(in_bus.c.bits.corrupt),
-                    out_bus.a.valid.eq(in_bus.c.valid & (
-                        in_bus.c.bits.opcode != ChannelCOpcode.Release)),
-                    in_bus.c.ready.eq(out_bus.a.ready),
+                    a_a.bits.opcode.eq(ChannelAOpcode.Get),
+                    a_a.bits.param.eq(0),
+                    a_a.bits.source.eq((in_bus.a.bits.source << 1) | 1),
                 ]
 
-            with m.Elif(~req_from_c):
-                m.d.comb += in_bus.a.connect(out_bus.a)
+            m.d.comb += [
+                a_d.valid.eq(in_bus.a.valid & to_d),
+                a_d.bits.opcode.eq(ChannelDOpcode.Grant),
+                a_d.bits.source.eq(in_bus.a.bits.source),
+                a_d.bits.size.eq(in_bus.a.bits.size),
+            ]
 
-                with m.If(in_bus.a.bits.opcode == ChannelAOpcode.AcquireBlock):
-                    m.d.comb += out_bus.a.bits.opcode.eq(ChannelAOpcode.Get)
+            c_a = Decoupled(ChannelA,
+                            addr_width=out_bus.addr_width,
+                            data_width=out_bus.data_width,
+                            size_width=out_bus.size_width,
+                            source_id_width=out_bus.source_id_width)
+            m.d.comb += [
+                c_a.valid.eq(in_bus.c.valid & (
+                    in_bus.c.bits.opcode == ChannelCOpcode.ReleaseData)),
+                c_a.bits.opcode.eq(ChannelAOpcode.PutFullData),
+                c_a.bits.param.eq(0),
+                c_a.bits.size.eq(in_bus.c.bits.size),
+                c_a.bits.source.eq(in_bus.c.bits.source << 1),
+                c_a.bits.address.eq(in_bus.c.bits.address),
+                c_a.bits.mask.eq(~0),
+                c_a.bits.data.eq(in_bus.c.bits.data),
+                c_a.bits.corrupt.eq(in_bus.c.bits.corrupt),
+            ]
 
-            with m.FSM():
-                with m.State('IDLE'):
-                    m.d.comb += [
-                        busy.eq(0),
-                        in_bus.a.ready.eq(1),
-                        in_bus.c.ready.eq(1),
-                    ]
+            c_d = Decoupled(ChannelD,
+                            data_width=in_bus.data_width,
+                            size_width=in_bus.size_width,
+                            source_id_width=in_bus.source_id_width,
+                            sink_id_width=in_bus.sink_id_width)
+            m.d.comb += [
+                c_d.valid.eq(in_bus.c.valid &
+                             (in_bus.c.bits.opcode == ChannelCOpcode.Release)),
+                c_d.bits.opcode.eq(ChannelDOpcode.ReleaseAck),
+                c_d.bits.size.eq(in_bus.c.bits.size),
+                c_d.bits.source.eq(in_bus.c.bits.source),
+            ]
 
-                    m.d.sync += [
-                        req_from_c.eq(0),
-                        release_data.eq(0),
-                    ]
-
-                    with m.If(in_bus.a.valid):
-                        to_d = ((in_bus.a.bits.opcode
-                                 == ChannelAOpcode.AcquireBlock)
-                                & (in_bus.a.bits.param == GrowParam.BtoT)) | (
-                                    in_bus.a.bits.opcode
-                                    == ChannelAOpcode.AcquirePerm)
-
-                        m.d.comb += in_bus.a.ready.eq(out_bus.a.ready)
-
-                        m.d.sync += [
-                            req_opcode.eq(in_bus.a.bits.opcode),
-                            req_param.eq(in_bus.a.bits.param),
-                            req_source.eq(in_bus.a.bits.source),
-                        ]
-
-                        with m.If(in_bus.a.fire):
-                            with m.If(to_d):
-                                m.next = 'ACK'
-                            with m.Else():
-                                m.next = 'ACT'
-
-                    with m.If(in_bus.c.valid):
-                        m.d.comb += [
-                            in_bus.a.ready.eq(0),
-                            in_bus.c.ready.eq((
-                                in_bus.c.bits.opcode == ChannelCOpcode.Release)
-                                              | out_bus.a.ready),
-                        ]
-
-                        m.d.sync += [
-                            req_from_c.eq(1),
-                            req_source.eq(in_bus.c.bits.source),
-                        ]
-
-                        with m.If(in_bus.c.fire):
-                            with m.If(in_bus.c.bits.opcode ==
-                                      ChannelCOpcode.Release):
-                                m.next = 'ACK'
-                            with m.Else():
-                                m.d.sync += release_data.eq(1)
-                                m.next = 'ACT'
-
-                with m.State('ACT'):
-                    _, _, done, _ = Interface.count(m, out_bus.d.bits,
-                                                    out_bus.d.fire)
-
-                    m.d.comb += [
-                        out_bus.d.connect(in_bus.d),
-                        in_bus.d.bits.opcode.eq(resp_opcode),
-                        in_bus.d.bits.param.eq(CapParam.toT),
-                    ]
-
-                    with m.If(done):
-                        m.d.sync += [
-                            req_from_c.eq(0),
-                            release_data.eq(0),
-                        ]
-                        m.next = 'IDLE'
-
-                with m.State('ACK'):
-                    m.d.comb += [
-                        in_bus.d.valid.eq(1),
-                        in_bus.d.bits.opcode.eq(resp_opcode),
-                        in_bus.d.bits.source.eq(req_source),
-                    ]
-
-                    with m.If(in_bus.d.ready):
-                        m.d.sync += req_from_c.eq(0)
-                        m.next = 'IDLE'
+            m.d.comb += in_bus.c.ready.eq(
+                Mux(in_bus.c.bits.opcode == ChannelCOpcode.Release, c_d.ready,
+                    c_a.ready))
 
             m.d.comb += in_bus.e.ready.eq(1)
+
+            d_d = Decoupled(ChannelD,
+                            data_width=in_bus.data_width,
+                            size_width=in_bus.size_width,
+                            source_id_width=in_bus.source_id_width,
+                            sink_id_width=in_bus.sink_id_width)
+            m.d.comb += [
+                out_bus.d.connect(d_d),
+                d_d.bits.source.eq(out_bus.d.bits.source >> 1),
+            ]
+
+            with m.If((out_bus.d.bits.opcode == ChannelDOpcode.AccessAckData)
+                      & out_bus.d.bits.source[0]):
+                m.d.comb += [
+                    d_d.bits.opcode.eq(ChannelDOpcode.GrantData),
+                    d_d.bits.param.eq(CapParam.toT),
+                ]
+            with m.If((out_bus.d.bits.opcode == ChannelDOpcode.AccessAck)
+                      & ~out_bus.d.bits.source[0]):
+                m.d.comb += d_d.bits.opcode.eq(ChannelDOpcode.ReleaseAck)
+
+            a_arbiter = m.submodules.a_arbiter = ArbiterLowest(
+                ChannelA,
+                addr_width=out_bus.addr_width,
+                data_width=out_bus.data_width,
+                size_width=out_bus.size_width,
+                source_id_width=out_bus.source_id_width)
+            a_arbiter.add(c_a)
+            a_arbiter.add(a_a)
+            m.d.comb += a_arbiter.bus.connect(out_bus.a)
+
+            c_d_queue = m.submodules.c_d_queue = Queue(
+                2,
+                ChannelD,
+                data_width=in_bus.data_width,
+                size_width=in_bus.size_width,
+                source_id_width=in_bus.source_id_width,
+                sink_id_width=in_bus.sink_id_width,
+                flow=False)
+            m.d.comb += c_d.connect(c_d_queue.enq)
+            a_d_queue = m.submodules.a_d_queue = Queue(
+                2,
+                ChannelD,
+                data_width=in_bus.data_width,
+                size_width=in_bus.size_width,
+                source_id_width=in_bus.source_id_width,
+                sink_id_width=in_bus.sink_id_width,
+                flow=False)
+            m.d.comb += a_d.connect(a_d_queue.enq)
+            d_arbiter = m.submodules.d_arbiter = ArbiterLowest(
+                ChannelD,
+                data_width=in_bus.data_width,
+                size_width=in_bus.size_width,
+                source_id_width=in_bus.source_id_width,
+                sink_id_width=in_bus.sink_id_width)
+            d_arbiter.add(d_d)
+            d_arbiter.add(c_d_queue.deq)
+            d_arbiter.add(a_d_queue.deq)
+            m.d.comb += d_arbiter.bus.connect(in_bus.d)
 
         return m
 
@@ -608,6 +615,57 @@ class Arbiter(Elaboratable):
                             with m.If(self.bus.fire):
                                 m.d.sync += beats_left.eq(
                                     Interface.num_beats0(self._intrs[i].bits))
+
+        with m.If(bus_busy):
+            m.d.sync += beats_left.eq(beats_left - self.bus.fire)
+
+        with m.Switch(early_grant):
+            for i, intr_bus in enumerate(self._intrs):
+                with m.Case(i):
+                    m.d.comb += intr_bus.connect(self.bus)
+
+        return m
+
+
+class ArbiterLowest(Elaboratable):
+
+    def __init__(self, cls, *args, **kwargs):
+        self.bus = Decoupled(cls, *args, **kwargs)
+
+        self._intrs = []
+
+    def add(self, intr_bus):
+        self._intrs.append(intr_bus)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        requests = Signal(len(self._intrs))
+        grant = Signal(range(len(self._intrs)))
+        early_grant = Signal.like(grant)
+        m.d.comb += [
+            requests.eq(Cat(intr_bus.valid for intr_bus in self._intrs)),
+            early_grant.eq(grant),
+        ]
+
+        if hasattr(self.bus.bits, 'size'):
+            beats_left = Signal(2**len(self.bus.bits.size) + 1)
+        else:
+            beats_left = Signal()
+
+        bus_busy = beats_left != 0
+
+        with m.If(~bus_busy):
+            for i in reversed(range(len(self._intrs))):
+                with m.If(requests[i]):
+                    m.d.comb += early_grant.eq(i)
+
+                    with m.If(self.bus.fire):
+                        m.d.sync += [
+                            grant.eq(i),
+                            beats_left.eq(
+                                Interface.num_beats0(self._intrs[i].bits)),
+                        ]
 
         with m.If(bus_busy):
             m.d.sync += beats_left.eq(beats_left - self.bus.fire)
@@ -777,7 +835,7 @@ class TileLink2Wishbone(Elaboratable):
             tl_adapted = Interface(addr_width=tl.addr_width,
                                    data_width=tl.data_width,
                                    size_width=tl.size_width,
-                                   source_id_width=tl.source_id_width,
+                                   source_id_width=tl.source_id_width + 1,
                                    sink_id_width=tl.sink_id_width)
             m.submodules.cache_adapter = CacheCork(tl, tl_adapted)
             tl = tl_adapted

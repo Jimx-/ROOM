@@ -19,22 +19,33 @@ class TileLink2AXI(Elaboratable):
         self.tl = tl
         self.axi = axi
 
-        if len(tl.a.bits.source) > len(axi.ar.bits.id):
+        if len(tl.a.bits.source) + tl.has_bce > len(axi.ar.bits.id):
             raise ValueError(
-                "AXI bus has ID width {}, which is smaller than TileLink source ID width {}"
-                .format(len(axi.ar.bits.id), len(tl.a.bits.source)))
+                "AXI bus has ID width {}, which is smaller than required TileLink source ID width {}"
+                .format(len(axi.ar.bits.id),
+                        len(tl.a.bits.source) + tl.has_bce))
 
     @staticmethod
     def get_adapted_interface(tl):
         return AXIInterface(data_width=tl.data_width,
                             addr_width=tl.addr_width,
-                            id_width=tl.source_id_width)
+                            id_width=tl.source_id_width + tl.has_bce)
 
     def elaborate(self, platform):
         m = Module()
 
         tl = self.tl
         axi = self.axi
+
+        if tl.has_bce:
+            tl_adapted = tilelink.Interface(
+                addr_width=tl.addr_width,
+                data_width=tl.data_width,
+                size_width=tl.size_width,
+                source_id_width=tl.source_id_width + 1,
+                sink_id_width=tl.sink_id_width)
+            m.submodules.cache_adapter = tilelink.CacheCork(tl, tl_adapted)
+            tl = tl_adapted
 
         ax_layout = list(axi.ar.bits.layout) + [
             ('wen', 1, DIR_FANOUT),
@@ -93,7 +104,9 @@ class TileLink2AXI(Elaboratable):
             ax.a_size.eq(a_size),
             ax.id.eq(a_source),
             ax.addr.eq(a_address),
-            ax.len.eq(((1 << a_size) >> log2_int(beat_bytes)) - 1),
+            ax.len.eq(
+                Mux(a_size >= max_size,
+                    ((1 << a_size) >> log2_int(beat_bytes)) - 1, 0)),
             ax.size.eq(Mux(a_size >= max_size, max_size, a_size)),
             ax.burst.eq(burst_type),
             ax.prot.eq(self.prot),

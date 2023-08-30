@@ -738,7 +738,7 @@ def _check_parameter(intrs, param_fn):
     param = param_fn(intrs[0])
     if len(intrs) > 1:
         for intr in intrs[1:]:
-            assert param_fn(intr) == param
+            param = max(param, param_fn(intr))
 
     return param
 
