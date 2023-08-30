@@ -154,6 +154,7 @@ class BusHelper(Elaboratable):
                 (tilelink.Interface, wishbone.Interface):
                 tilelink.TileLink2Wishbone,
                 (tilelink.Interface, axi.AXIInterface): axi.TileLink2AXI,
+                (axi.AXIInterface, tilelink.Interface): axi.AXI2Tilelink,
             }[master_cls, slave_cls]
 
             if hasattr(bridge_cls, 'get_adapted_interface'):

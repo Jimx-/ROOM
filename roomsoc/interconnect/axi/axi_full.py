@@ -2,17 +2,10 @@ from amaranth import *
 from amaranth.hdl.rec import DIR_FANIN, DIR_FANOUT
 from amaranth.utils import log2_int
 from amaranth_soc.memory import MemoryMap
-from enum import IntEnum
 
 from .axi_lite import AXILiteInterface, Wishbone2AXILite, AXILite2Wishbone
+from .common import *
 from roomsoc.interconnect.stream import SkidBuffer, Decoupled
-
-
-class BurstType(IntEnum):
-    FIXED = 0b00
-    INCR = 0b01
-    WRAP = 0b10
-    RESERVED = 0b11
 
 
 def make_ax_layout(addr_width=32, id_width=1, version='axi4', user_width=0):
@@ -22,7 +15,7 @@ def make_ax_layout(addr_width=32, id_width=1, version='axi4', user_width=0):
 
     layout = [
         ('addr', addr_width, DIR_FANOUT),
-        ('burst', 2, DIR_FANOUT),
+        ('burst', AXIBurst, DIR_FANOUT),
         ('len', len_width, DIR_FANOUT),
         ('size', size_width, DIR_FANOUT),
         ('lock', lock_width, DIR_FANOUT),
@@ -61,7 +54,7 @@ def make_axi_layout(data_width=32,
         w_layout.append(('id', id_width, DIR_FANOUT))
 
     b_layout = [
-        ("resp", 2, DIR_FANIN),  # write response
+        ("resp", AXIResp, DIR_FANIN),  # write response
         ("id", id_width, DIR_FANIN),
         ("user", b_user_width, DIR_FANIN),
     ]
@@ -71,7 +64,7 @@ def make_axi_layout(data_width=32,
         ("id", id_width, DIR_FANIN),
         ("user", r_user_width, DIR_FANIN),
         ("last", 1, DIR_FANIN),
-        ("resp", 2, DIR_FANIN),  # read response
+        ("resp", AXIResp, DIR_FANIN),  # read response
     ]
 
     return [
@@ -301,11 +294,11 @@ class AXIFragmenter(Elaboratable):
                 ]
             with m.Else():
                 m.d.sync += beat_count.eq(beat_count + 1)
-                with m.If((self.in_bus.bits.burst == BurstType.INCR)
-                          | (self.in_bus.bits.burst == BurstType.WRAP)):
+                with m.If((self.in_bus.bits.burst == AXIBurst.INCR)
+                          | (self.in_bus.bits.burst == AXIBurst.WRAP)):
                     m.d.sync += beat_offset.eq(beat_offset + beat_size)
 
-            with m.If(self.in_bus.bits.burst == BurstType.WRAP):
+            with m.If(self.in_bus.bits.burst == AXIBurst.WRAP):
                 with m.If((self.out_bus.bits.addr & beat_wrap) == beat_wrap):
                     m.d.sync += beat_offset.eq(beat_offset - beat_wrap)
 

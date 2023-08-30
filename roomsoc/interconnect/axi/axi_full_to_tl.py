@@ -1,9 +1,10 @@
 from amaranth import *
 from amaranth.hdl.rec import DIR_FANOUT
 from amaranth.lib.fifo import SyncFIFO
-from amaranth.utils import log2_int
+from amaranth.utils import log2_int, bits_for
 
 from .axi_full import AXIInterface
+from .common import *
 from .. import tilelink
 
 from roomsoc.interconnect.stream import SkidBuffer, Decoupled
@@ -207,5 +208,210 @@ class TileLink2AXI(Elaboratable):
                 tl.c.ready.eq(1),
                 tl.e.ready.eq(1),
             ]
+
+        return m
+
+
+class AXI2Tilelink(Elaboratable):
+
+    def __init__(self, axi, tl, max_flights=1):
+        self.max_flights = max_flights
+
+        self.axi = axi
+        self.tl = tl
+
+        if len(tl.a.bits.source) < len(
+                axi.ar.bits.id) + bits_for(max_flights - 1) + 1:
+            raise ValueError(
+                "TileLink bus has source ID width {}, which is smaller than required width {}"
+                .format(len(tl.a.bits.source),
+                        len(axi.ar.bits.id) + bits_for(max_flights - 1) + 1))
+
+    @staticmethod
+    def get_adapted_interface(axi, max_flights=1, src_loc_at=0):
+        return tilelink.Interface(data_width=axi.data_width,
+                                  addr_width=axi.addr_width,
+                                  size_width=4,
+                                  source_id_width=axi.id_width +
+                                  bits_for(max_flights - 1) + 1,
+                                  src_loc_at=src_loc_at + 1)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        axi = self.axi
+        tl = self.tl
+
+        max_bytes = 2**len(axi.ar.bits.len) * 2**len(axi.ar.bits.size)
+        log_flights = bits_for(self.max_flights - 1)
+        txn_count_bits = bits_for(self.max_flights)
+        added_bits = log_flights + 1
+
+        def bytesm1(bits):
+            max_shift = 1 << len(bits.size)
+            tail = Const((1 << max_shift) - 1, max_shift)
+            return (Cat(tail, bits.len) << bits.size) >> max_shift
+
+        out_r = Decoupled(tilelink.ChannelA,
+                          addr_width=tl.addr_width,
+                          data_width=tl.data_width,
+                          size_width=tl.size_width,
+                          source_id_width=tl.source_id_width)
+        r_size_mask = Signal(range(max_bytes))
+        r_size = Signal(bits_for(len(r_size_mask)))
+        if self.max_flights > 1:
+            r_count = Array(
+                Signal(txn_count_bits, name=f'r_count{i}')
+                for i in range(2**len(axi.ar.bits.id)))
+        r_id = Signal.like(out_r.bits.source)
+
+        m.d.comb += r_size_mask.eq(bytesm1(axi.ar.bits))
+        for i in range(len(r_size_mask)):
+            with m.If(r_size_mask[i]):
+                m.d.comb += r_size.eq(i + 1)
+
+        if self.max_flights == 1:
+            m.d.comb += r_id.eq(axi.ar.bits.id << 1)
+        else:
+            m.d.comb += r_id.eq(
+                Cat(Const(0, 1), r_count[axi.ar.bits.id][:log_flights],
+                    axi.ar.bits.id))
+
+        m.d.comb += [
+            axi.ar.ready.eq(out_r.ready),
+            out_r.valid.eq(axi.ar.valid),
+            out_r.bits.opcode.eq(tilelink.ChannelAOpcode.Get),
+            out_r.bits.address.eq(axi.ar.bits.addr),
+            out_r.bits.size.eq(r_size),
+            out_r.bits.source.eq(r_id),
+        ]
+
+        if self.max_flights > 1:
+            with m.Switch(axi.ar.bits.id):
+                for i, count in enumerate(r_count):
+                    with m.Case(i):
+                        with m.If(axi.ar.valid & axi.ar.ready):
+                            m.d.sync += count.eq(count + 1)
+
+        out_w = Decoupled(tilelink.ChannelA,
+                          addr_width=tl.addr_width,
+                          data_width=tl.data_width,
+                          size_width=tl.size_width,
+                          source_id_width=tl.source_id_width)
+        w_size_mask = Signal(range(max_bytes))
+        w_size = Signal(bits_for(len(w_size_mask)))
+        if self.max_flights > 1:
+            w_count = Array(
+                Signal(txn_count_bits, name=f'w_count{i}')
+                for i in range(2**len(axi.aw.bits.id)))
+        w_id = Signal.like(out_w.bits.source)
+
+        m.d.comb += w_size_mask.eq(bytesm1(axi.aw.bits))
+        for i in range(len(w_size_mask)):
+            with m.If(w_size_mask[i]):
+                m.d.comb += w_size.eq(i + 1)
+
+        if self.max_flights == 1:
+            m.d.comb += w_id.eq((axi.aw.bits.id << 1) | 1)
+        else:
+            m.d.comb += w_id.eq(
+                Cat(Const(1, 1), w_count[axi.aw.bits.id][:log_flights],
+                    axi.aw.bits.id))
+
+        m.d.comb += [
+            axi.aw.ready.eq(out_w.ready & axi.w.valid & axi.w.bits.last),
+            axi.w.ready.eq(out_w.ready & axi.aw.valid),
+            out_w.valid.eq(axi.aw.valid & axi.w.valid),
+            out_w.bits.opcode.eq(tilelink.ChannelAOpcode.PutPartialData),
+            out_w.bits.address.eq(axi.aw.bits.addr),
+            out_w.bits.size.eq(w_size),
+            out_w.bits.source.eq(w_id),
+            out_w.bits.data.eq(axi.w.bits.data),
+            out_w.bits.mask.eq(axi.w.bits.strb),
+        ]
+
+        if self.max_flights > 1:
+            with m.Switch(axi.aw.bits.id):
+                for i, count in enumerate(w_count):
+                    with m.Case(i):
+                        with m.If(axi.aw.valid & axi.aw.ready):
+                            m.d.sync += count.eq(count + 1)
+
+        a_arbiter = m.submodules.a_arbiter = tilelink.Arbiter(
+            tilelink.ChannelA,
+            addr_width=tl.addr_width,
+            data_width=tl.data_width,
+            size_width=tl.size_width,
+            source_id_width=tl.source_id_width)
+        a_arbiter.add(out_r)
+        a_arbiter.add(out_w)
+        m.d.comb += a_arbiter.bus.connect(tl.a)
+
+        ok_b = Decoupled(Record, axi.b.bits.layout)
+        ok_r = Decoupled(Record, axi.r.bits.layout)
+
+        d_resp = Mux(tl.d.bits.denied | tl.d.bits.corrupt, AXIResp.SLVERR,
+                     AXIResp.OKAY)
+        d_has_data = tilelink.Interface.has_data(tl.d.bits)
+        _, d_last, _, _ = tilelink.Interface.count(m, tl.d.bits, tl.d.fire)
+
+        m.d.comb += [
+            tl.d.ready.eq(Mux(d_has_data, ok_r.ready, ok_b.ready)),
+            ok_r.valid.eq(tl.d.valid & d_has_data),
+            ok_b.valid.eq(tl.d.valid & ~d_has_data),
+        ]
+
+        m.d.comb += [
+            ok_r.bits.id.eq(tl.d.bits.source >> added_bits),
+            ok_r.bits.data.eq(tl.d.bits.data),
+            ok_r.bits.resp.eq(d_resp),
+            ok_r.bits.last.eq(d_last),
+        ]
+
+        r_buffer = m.submodules.r_buffer = SkidBuffer(Record,
+                                                      axi.r.bits.layout)
+        m.d.comb += [
+            r_buffer.enq.bits.connect(ok_r.bits),
+            r_buffer.enq.valid.eq(ok_r.valid),
+            ok_r.ready.eq(r_buffer.enq.ready),
+            axi.r.bits.connect(r_buffer.deq.bits),
+            axi.r.valid.eq(r_buffer.deq.valid),
+            r_buffer.deq.ready.eq(axi.r.ready),
+        ]
+
+        m.d.comb += [
+            ok_b.bits.id.eq(tl.d.bits.source >> added_bits),
+            ok_b.bits.resp.eq(d_resp),
+        ]
+
+        b_buffer = m.submodules.b_buffer = SkidBuffer(Record,
+                                                      axi.b.bits.layout)
+        m.d.comb += [
+            b_buffer.enq.bits.connect(ok_b.bits),
+            b_buffer.enq.valid.eq(ok_b.valid),
+            ok_b.ready.eq(b_buffer.enq.ready),
+        ]
+
+        b_allow = 1
+        if self.max_flights > 1:
+            b_count = Array(
+                Signal(txn_count_bits, name=f'b_count{i}')
+                for i in range(2**len(axi.aw.bits.id)))
+            b_allow = b_count[axi.b.bits.id] != w_count[axi.b.bits.id]
+
+            with m.Switch(axi.b.bits.id):
+                for i, count in enumerate(b_count):
+                    with m.Case(i):
+                        with m.If(axi.b.valid & axi.b.ready):
+                            m.d.sync += count.eq(count + 1)
+
+        m.d.comb += [
+            axi.b.bits.connect(b_buffer.deq.bits),
+            axi.b.valid.eq(b_buffer.deq.valid & b_allow),
+            b_buffer.deq.ready.eq(axi.b.ready & b_allow),
+        ]
+
+        if tl.has_bce:
+            m.d.comb += tl.b.readye.eq(1)
 
         return m
