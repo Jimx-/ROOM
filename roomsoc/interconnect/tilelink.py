@@ -512,12 +512,13 @@ class CacheCork(Elaboratable):
                       & ~out_bus.d.bits.source[0]):
                 m.d.comb += d_d.bits.opcode.eq(ChannelDOpcode.ReleaseAck)
 
-            a_arbiter = m.submodules.a_arbiter = ArbiterLowest(
+            a_arbiter = m.submodules.a_arbiter = Arbiter(
                 ChannelA,
                 addr_width=out_bus.addr_width,
                 data_width=out_bus.data_width,
                 size_width=out_bus.size_width,
-                source_id_width=out_bus.source_id_width)
+                source_id_width=out_bus.source_id_width,
+                policy='lowest')
             a_arbiter.add(c_a)
             a_arbiter.add(a_a)
             m.d.comb += a_arbiter.bus.connect(out_bus.a)
@@ -540,12 +541,13 @@ class CacheCork(Elaboratable):
                 sink_id_width=in_bus.sink_id_width,
                 flow=False)
             m.d.comb += a_d.connect(a_d_queue.enq)
-            d_arbiter = m.submodules.d_arbiter = ArbiterLowest(
+            d_arbiter = m.submodules.d_arbiter = Arbiter(
                 ChannelD,
                 data_width=in_bus.data_width,
                 size_width=in_bus.size_width,
                 source_id_width=in_bus.source_id_width,
-                sink_id_width=in_bus.sink_id_width)
+                sink_id_width=in_bus.sink_id_width,
+                policy='lowest')
             d_arbiter.add(d_d)
             d_arbiter.add(c_d_queue.deq)
             d_arbiter.add(a_d_queue.deq)
@@ -556,8 +558,32 @@ class CacheCork(Elaboratable):
 
 class Arbiter(Elaboratable):
 
-    def __init__(self, cls, *args, **kwargs):
+    @staticmethod
+    def _round_robin(m, requests, grant, early_grant):
+        with m.Switch(grant):
+            for i in range(len(requests)):
+                with m.Case(i):
+                    for pred in reversed(range(i)):
+                        with m.If(requests[pred]):
+                            m.d.comb += early_grant.eq(pred)
+
+                    for succ in reversed(range(i + 1, len(requests))):
+                        with m.If(requests[succ]):
+                            m.d.comb += early_grant.eq(succ)
+
+    @staticmethod
+    def _lowest(m, requests, grant, early_grant):
+        for i in reversed(range(len(requests))):
+            with m.If(requests[i]):
+                m.d.comb += early_grant.eq(i)
+
+    def __init__(self, cls, *args, policy='rr', **kwargs):
         self.bus = Decoupled(cls, *args, **kwargs)
+
+        self.policy = dict(
+            rr=Arbiter._round_robin,
+            lowest=Arbiter._lowest,
+        )[policy]
 
         self._intrs = []
 
@@ -583,89 +609,17 @@ class Arbiter(Elaboratable):
         bus_busy = beats_left != 0
 
         with m.If(~bus_busy):
-            with m.Switch(grant):
+            self.policy(m, requests, grant, early_grant)
+
+            with m.Switch(early_grant):
                 for i in range(len(requests)):
                     with m.Case(i):
-                        for pred in reversed(range(i)):
-                            with m.If(requests[pred]):
-                                m.d.comb += early_grant.eq(pred)
-
-                                with m.If(self.bus.fire):
-                                    m.d.sync += [
-                                        grant.eq(pred),
-                                        beats_left.eq(
-                                            Interface.num_beats0(
-                                                self._intrs[pred].bits)),
-                                    ]
-                        for succ in reversed(range(i + 1, len(requests))):
-                            with m.If(requests[succ]):
-                                m.d.comb += early_grant.eq(succ)
-
-                                with m.If(self.bus.fire):
-                                    m.d.sync += [
-                                        grant.eq(succ),
-                                        beats_left.eq(
-                                            Interface.num_beats0(
-                                                self._intrs[succ].bits)),
-                                    ]
-
-                        with m.If(requests[i]):
-                            m.d.comb += early_grant.eq(i)
-
-                            with m.If(self.bus.fire):
-                                m.d.sync += beats_left.eq(
-                                    Interface.num_beats0(self._intrs[i].bits))
-
-        with m.If(bus_busy):
-            m.d.sync += beats_left.eq(beats_left - self.bus.fire)
-
-        with m.Switch(early_grant):
-            for i, intr_bus in enumerate(self._intrs):
-                with m.Case(i):
-                    m.d.comb += intr_bus.connect(self.bus)
-
-        return m
-
-
-class ArbiterLowest(Elaboratable):
-
-    def __init__(self, cls, *args, **kwargs):
-        self.bus = Decoupled(cls, *args, **kwargs)
-
-        self._intrs = []
-
-    def add(self, intr_bus):
-        self._intrs.append(intr_bus)
-
-    def elaborate(self, platform):
-        m = Module()
-
-        requests = Signal(len(self._intrs))
-        grant = Signal(range(len(self._intrs)))
-        early_grant = Signal.like(grant)
-        m.d.comb += [
-            requests.eq(Cat(intr_bus.valid for intr_bus in self._intrs)),
-            early_grant.eq(grant),
-        ]
-
-        if hasattr(self.bus.bits, 'size'):
-            beats_left = Signal(2**len(self.bus.bits.size) + 1)
-        else:
-            beats_left = Signal()
-
-        bus_busy = beats_left != 0
-
-        with m.If(~bus_busy):
-            for i in reversed(range(len(self._intrs))):
-                with m.If(requests[i]):
-                    m.d.comb += early_grant.eq(i)
-
-                    with m.If(self.bus.fire):
-                        m.d.sync += [
-                            grant.eq(i),
-                            beats_left.eq(
-                                Interface.num_beats0(self._intrs[i].bits)),
-                        ]
+                        with m.If(requests[i] & self.bus.fire):
+                            m.d.sync += [
+                                grant.eq(i),
+                                beats_left.eq(
+                                    Interface.num_beats0(self._intrs[i].bits)),
+                            ]
 
         with m.If(bus_busy):
             m.d.sync += beats_left.eq(beats_left - self.bus.fire)
