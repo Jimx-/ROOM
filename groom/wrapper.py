@@ -39,7 +39,7 @@ class Cluster(HasClusterParams, Elaboratable):
         self.dbus_mmio = tl.Interface(data_width=64,
                                       addr_width=32,
                                       size_width=3,
-                                      source_id_width=8,
+                                      source_id_width=5,
                                       name='dbus_mmio')
 
         self.l2cache_params['client_source_map'] = dict(
@@ -76,7 +76,7 @@ class Cluster(HasClusterParams, Elaboratable):
             data_width=64,
             addr_width=32,
             size_width=3,
-            source_id_width=8)
+            source_id_width=5)
 
         c_arbiter = m.submodules.c_arbiter = tl.Arbiter(
             tl.ChannelC,
@@ -129,7 +129,8 @@ class Cluster(HasClusterParams, Elaboratable):
                 dbus_mmio_a.bits.source.eq(
                     self.make_source(is_dbus=True,
                                      core_id=i,
-                                     source=core.dbus_mmio.a.bits.source)),
+                                     source=core.dbus_mmio.a.bits.
+                                     source[:self.dbus_mmio.source_id_width])),
             ]
 
             a_arbiter.add(ibus_a)
@@ -240,7 +241,7 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         self.dbus_mmio = tl.Interface(data_width=64,
                                       addr_width=32,
                                       size_width=3,
-                                      source_id_width=8 + self.cluster_bits,
+                                      source_id_width=5 + self.cluster_bits,
                                       name='dbus_mmio')
 
         self.l3cache_params['client_source_map'] = dict(
@@ -276,7 +277,7 @@ class GroomWrapper(HasClusterParams, Elaboratable):
             data_width=64,
             addr_width=32,
             size_width=3,
-            source_id_width=8 + self.cluster_bits)
+            source_id_width=5 + self.cluster_bits)
 
         c_arbiter = m.submodules.c_arbiter = tl.Arbiter(
             tl.ChannelC,
@@ -374,9 +375,15 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                         cluster.l2cache.out_bus.d.bits.source.eq(d_source_id),
                     ]
 
-        with m.Switch(self.dbus_mmio.d.bits.source[8:]):
+        d_mmio_cluster_id, d_mmio_source_id = self.unpack_source(
+            self.dbus_mmio.d.bits.source)
+
+        with m.Switch(d_mmio_cluster_id):
             for i, cluster in enumerate(clusters):
                 with m.Case(i):
-                    m.d.comb += self.dbus_mmio.d.connect(cluster.dbus_mmio.d)
+                    m.d.comb += [
+                        self.dbus_mmio.d.connect(cluster.dbus_mmio.d),
+                        cluster.dbus_mmio.d.bits.source.eq(d_mmio_source_id),
+                    ]
 
         return m

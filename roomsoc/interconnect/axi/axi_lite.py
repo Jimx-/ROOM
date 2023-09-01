@@ -284,3 +284,92 @@ class Wishbone2AXILite(Elaboratable):
                 m.next = 'IDLE'
 
         return m
+
+
+class AXILiteUpConverter(Elaboratable):
+
+    def __init__(self, master, slave):
+        self.master = master
+        self.slave = slave
+
+    def elaborate(self, platform):
+        m = Module()
+
+        master = self.master
+        slave = self.slave
+
+        dw_from = self.master.data_width
+        dw_to = self.slave.data_width
+        ratio = dw_to // dw_from
+        master_align = log2_int(self.master.data_width // 8)
+        slave_align = log2_int(self.slave.data_width // 8)
+
+        wr_word = Signal(range(ratio))
+        wr_word_r = Signal.like(wr_word)
+        rd_word = Signal(range(ratio))
+        rd_word_r = Signal.like(rd_word)
+
+        m.d.comb += master.connect(slave)
+
+        m.d.comb += [
+            slave.aw.addr[slave_align:].eq(master.aw.addr[slave_align:]),
+            slave.ar.addr[slave_align:].eq(master.ar.addr[slave_align:]),
+        ]
+
+        with m.If(master.aw.valid):
+            m.d.sync += wr_word_r.eq(wr_word)
+        with m.If(master.ar.valid):
+            m.d.sync += rd_word_r.eq(rd_word)
+
+        m.d.comb += [
+            wr_word.eq(
+                Mux(master.aw.valid, master.aw.addr[master_align:slave_align],
+                    wr_word_r)),
+            rd_word.eq(
+                Mux(master.ar.valid, master.ar.addr[master_align:slave_align],
+                    rd_word_r)),
+        ]
+
+        with m.Switch(wr_word):
+            for i in range(ratio):
+                with m.Case(i):
+                    m.d.comb += [
+                        slave.w.strb[i * dw_from // 8:(i + 1) * dw_from //
+                                     8].eq(master.w.strb),
+                        slave.w.data[i * dw_from:(i + 1) * dw_from].eq(
+                            master.w.data),
+                    ]
+
+        with m.Switch(rd_word):
+            for i in range(ratio):
+                with m.Case(i):
+                    m.d.comb += [
+                        master.r.data[i * dw_from:(i + 1) * dw_from].eq(
+                            slave.r.data),
+                    ]
+
+        return m
+
+
+class AXILiteConverter(Elaboratable):
+
+    def __init__(self, master, slave):
+        self.master = master
+        self.slave = slave
+
+    def elaborate(self, platform):
+        m = Module()
+
+        dw_from = self.master.data_width
+        dw_to = self.slave.data_width
+
+        if dw_from > dw_to:
+            raise NotImplementedError(
+                "AXI-Lite down converter not implemented")
+        elif dw_from < dw_to:
+            m.submodules.upconverter = AXILiteUpConverter(
+                self.master, self.slave)
+        else:
+            m.d.comb += self.master.connect(self.slave)
+
+        return m

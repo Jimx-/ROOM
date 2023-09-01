@@ -148,6 +148,7 @@ class BusHelper(Elaboratable):
             bridge_cls = {
                 (axi.AXILiteInterface, wishbone.Interface):
                 axi.AXILite2Wishbone,
+                (axi.AXILiteInterface, axi.AXIInterface): axi.AXILite2AXI,
                 (axi.AXIInterface, wishbone.Interface): axi.AXI2Wishbone,
                 (ahb.Interface, wishbone.Interface): ahb.AHB2Wishbone,
                 (apb.Interface, wishbone.Interface): apb.APB2Wishbone,
@@ -189,25 +190,35 @@ class BusHelper(Elaboratable):
                 return interface
             else:
 
+                interface_cls = type(interface)
+                converter_cls = {
+                    wishbone.Interface: wishbone.Converter,
+                    axi.AXILiteInterface: axi.AXILiteConverter,
+                }[interface_cls]
+
+                adapted_bus_params = dict(data_width=self.data_width,
+                                          name=f'{name}_dw_adapted')
                 if direction == 'm2s':
-                    adapted_interface = wishbone.Interface(
-                        data_width=self.data_width,
-                        addr_width=self.get_addr_width(),
-                        granularity=8,
-                        name=f'{name}_dw_adapted')
+                    adapted_bus_params['addr_width'] = self.addr_width
+                else:
+                    adapted_bus_params[
+                        'addr_width'] = interface.addr_width + log2_int(
+                            interface.data_width // 8)
+
+                if interface_cls is wishbone.Interface:
+                    adapted_bus_params['granularity'] = 8
+                    adapted_bus_params['addr_width'] -= log2_int(
+                        self.data_width // 8)
+
+                adapted_interface = interface_cls(**adapted_bus_params)
+
+                if direction == 'm2s':
                     master, slave = interface, adapted_interface
                 else:
-                    adapted_interface = wishbone.Interface(
-                        data_width=self.data_width,
-                        addr_width=interface.addr_width +
-                        log2_int(interface.data_width // 8) -
-                        log2_int(self.data_width // 8),
-                        granularity=8,
-                        name=f'{name}_dw_adapted')
                     master, slave = adapted_interface, interface
                     master.memory_map = slave.memory_map
 
-                self.converters[f'{name}_dw_converter'] = wishbone.Converter(
+                self.converters[f'{name}_dw_converter'] = converter_cls(
                     master=master, slave=slave)
                 return adapted_interface
 
