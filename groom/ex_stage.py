@@ -123,7 +123,8 @@ class ALUExecUnit(ExecUnit, AutoCSR):
         m.d.comb += [
             self.req.connect(imul.req),
             imul.req.valid.eq(self.req.valid
-                              & (self.req.bits.uop.fu_type == FUType.MUL)),
+                              & (self.req.bits.uop.fu_type == FUType.MUL)
+                              & ~imul_busy),
             imul.resp.connect(imul_queue.enq),
             imul_queue.deq.ready.eq(~imul_resp_busy),
             imul_busy.eq(imul_queue.count.any()),
@@ -137,7 +138,8 @@ class ALUExecUnit(ExecUnit, AutoCSR):
             m.d.comb += [
                 self.req.connect(ifpu.req),
                 ifpu.req.valid.eq(self.req.valid
-                                  & self.req.bits.uop.fu_type_has(FUType.I2F)),
+                                  & self.req.bits.uop.fu_type_has(FUType.I2F)
+                                  & ~ifpu_busy),
             ]
 
             ifpu_q = m.submodules.ifpu_q = Queue(5,
@@ -270,7 +272,7 @@ class FPUExecUnit(ExecUnit):
 
         m.d.comb += [
             self.req.connect(fpu.req),
-            fpu.req.valid.eq(self.req.valid
+            fpu.req.valid.eq(self.req.valid & self.req.ready
                              & (self.req.bits.uop.fu_type_has(FUType.FPU)
                                 | self.req.bits.uop.fu_type_has(FUType.F2I))),
         ]
