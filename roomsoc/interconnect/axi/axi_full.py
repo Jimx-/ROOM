@@ -1,11 +1,12 @@
 from amaranth import *
 from amaranth.hdl.rec import DIR_FANIN, DIR_FANOUT
+from amaranth.lib.fifo import SyncFIFO
 from amaranth.utils import log2_int
 from amaranth_soc.memory import MemoryMap
 
 from .axi_lite import AXILiteInterface, Wishbone2AXILite, AXILite2Wishbone
 from .common import *
-from roomsoc.interconnect.stream import SkidBuffer, Decoupled
+from roomsoc.interconnect.stream import SkidBuffer, Decoupled, Queue
 
 
 def make_ax_layout(addr_width=32, id_width=1, version='axi4', user_width=0):
@@ -253,54 +254,238 @@ class Wishbone2AXI(Elaboratable):
         return m
 
 
-class AXIFragmenter(Elaboratable):
+class _AXFragmenter(Elaboratable):
 
-    def __init__(self, in_bus):
-        self.in_bus = in_bus
+    def __init__(self, ax, data_width, max_size1=0):
+        self.ax = ax
+        self.data_width = data_width
+        self.max_size1 = max_size1
 
-        ax_layout = make_ax_layout(addr_width=len(in_bus.bits.addr),
-                                   id_width=len(in_bus.bits.id))
-        self.out_bus = Decoupled(Record, ax_layout + [('last', 1, DIR_FANOUT)])
+        self.out = Decoupled(Record, ax.bits.layout)
+        self.beats = Signal(len(self.ax.bits.len) + 1)
+        self.last = Signal()
 
     def elaborate(self, platform):
         m = Module()
 
-        beat_count = Signal(8)
-        beat_size = Signal(8 + 4)
-        beat_offset = Signal(8 + 4 + 1)
-        beat_wrap = Signal(8 + 4)
-        beat_last = beat_count == self.in_bus.bits.len
+        beat_bytes = self.data_width // 8
+        lg_bytes = log2_int(beat_bytes)
 
+        busy = Signal()
+
+        addr_reg = Signal.like(self.ax.bits.addr)
+        len_reg = Signal.like(self.ax.bits.len)
+
+        addr = Mux(busy, addr_reg, self.ax.bits.addr)
+        length = Mux(busy, len_reg, self.ax.bits.len)
+
+        fixed = self.ax.bits.burst == AXIBurst.FIXED
+        narrow = self.ax.bits.size != lg_bytes
+        bad = fixed | narrow
+
+        beats1 = Signal(len(self.ax.bits.len))
+        beats = Signal(len(self.ax.bits.len) + 1)
         m.d.comb += [
-            beat_size.eq(1 << self.in_bus.bits.size),
-            beat_wrap.eq(self.in_bus.bits.len << self.in_bus.bits.size),
+            beats1.eq(Mux(bad, 0, self.max_size1)),
+            beats.eq(beats1 + 1),
         ]
 
+        def bytesm1(bits):
+            max_shift = 1 << len(bits.size)
+            tail = Const((1 << max_shift) - 1, max_shift)
+            return (Cat(tail, bits.len) << bits.size) >> max_shift
+
+        burst_addr = addr + (beats << self.ax.bits.size)
+        wrap_mask = Signal.like(self.ax.bits.addr)
+        mux_addr = Signal.like(self.ax.bits.addr)
+        addr_mask = Signal.like(self.ax.bits.addr)
+        m.d.comb += mux_addr.eq(burst_addr)
+        with m.If(self.ax.bits.burst == AXIBurst.WRAP):
+            m.d.comb += mux_addr.eq((burst_addr & wrap_mask)
+                                    | (self.ax.bits.addr & ~wrap_mask))
+        with m.If(self.ax.bits.burst == AXIBurst.FIXED):
+            m.d.comb += mux_addr.eq(self.ax.bits.addr)
         m.d.comb += [
-            self.out_bus.valid.eq(self.in_bus.valid | (beat_count != 0)),
-            self.out_bus.bits.addr.eq(self.in_bus.bits.addr + beat_offset),
-            self.out_bus.bits.id.eq(self.in_bus.bits.id),
-            self.out_bus.bits.last.eq(beat_last),
+            wrap_mask.eq(bytesm1(self.ax.bits)),
+            addr_mask.eq(self.ax.bits.size),
         ]
 
-        with m.If(self.out_bus.ready & beat_last):
-            m.d.comb += self.in_bus.ready.eq(1)
+        last = length == beats1
+        m.d.comb += [
+            self.ax.ready.eq(self.out.ready & last),
+            self.out.valid.eq(self.ax.valid),
+            self.ax.bits.connect(self.out.bits),
+            self.out.bits.len.eq(beats1),
+            self.out.bits.addr.eq(addr & ~addr_mask),
+            self.beats.eq(beats),
+            self.last.eq(last),
+        ]
 
-        with m.If(self.out_bus.fire):
-            with m.If(beat_last):
-                m.d.sync += [
-                    beat_count.eq(0),
-                    beat_offset.eq(0),
-                ]
-            with m.Else():
-                m.d.sync += beat_count.eq(beat_count + 1)
-                with m.If((self.in_bus.bits.burst == AXIBurst.INCR)
-                          | (self.in_bus.bits.burst == AXIBurst.WRAP)):
-                    m.d.sync += beat_offset.eq(beat_offset + beat_size)
+        with m.If(self.out.fire):
+            m.d.sync += [
+                busy.eq(~last),
+                addr_reg.eq(mux_addr),
+                len_reg.eq(length - beats),
+            ]
 
-            with m.If(self.in_bus.bits.burst == AXIBurst.WRAP):
-                with m.If((self.out_bus.bits.addr & beat_wrap) == beat_wrap):
-                    m.d.sync += beat_offset.eq(beat_offset - beat_wrap)
+        return m
+
+
+class AXIFragmenter(Elaboratable):
+
+    def __init__(self, in_bus, max_size=8, max_flights=1):
+        self.max_size = max_size
+        self.max_flights = max_flights
+        self.in_bus = in_bus
+
+        self.out_bus = AXIInterface(addr_width=in_bus.addr_width,
+                                    data_width=in_bus.data_width,
+                                    id_width=in_bus.id_width)
+
+        if max_size * 8 < in_bus.data_width:
+            raise ValueError(
+                "Max transfer size {} should not be smaller than bus data width {}"
+                .format(max_size * 8, in_bus.data_width))
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_bus = self.in_bus
+        out_bus = self.out_bus
+        beat_bytes = out_bus.data_width // 8
+        max_size1 = self.max_size // beat_bytes - 1
+
+        ar_queue = m.submodules.ar_queue = Queue(1,
+                                                 Record,
+                                                 self.in_bus.ar.bits.layout,
+                                                 flow=True)
+        aw_queue = m.submodules.aw_queue = Queue(1,
+                                                 Record,
+                                                 self.in_bus.aw.bits.layout,
+                                                 flow=True)
+        m.d.comb += [
+            in_bus.ar.bits.connect(ar_queue.enq.bits),
+            ar_queue.enq.valid.eq(in_bus.ar.valid),
+            in_bus.ar.ready.eq(ar_queue.enq.ready),
+            in_bus.aw.bits.connect(aw_queue.enq.bits),
+            aw_queue.enq.valid.eq(in_bus.aw.valid),
+            in_bus.aw.ready.eq(aw_queue.enq.ready),
+        ]
+        ar_frag = m.submodules.ar_frag = _AXFragmenter(
+            ar_queue.deq, data_width=in_bus.data_width, max_size1=max_size1)
+        aw_frag = m.submodules.aw_frag = _AXFragmenter(
+            aw_queue.deq, data_width=in_bus.data_width, max_size1=max_size1)
+
+        w_queue = m.submodules.w_queue = Queue(1,
+                                               Record,
+                                               self.in_bus.w.bits.layout,
+                                               flow=True)
+        m.d.comb += [
+            in_bus.w.bits.connect(w_queue.enq.bits),
+            w_queue.enq.valid.eq(in_bus.w.valid),
+            in_bus.w.ready.eq(w_queue.enq.ready),
+        ]
+
+        rqueues = [
+            SyncFIFO(depth=self.max_flights, width=1)
+            for _ in range(2**len(in_bus.ar.bits.id))
+        ]
+        m.submodules += rqueues
+        ar_ready = Signal()
+
+        with m.Switch(out_bus.ar.bits.id):
+            for i, q in enumerate(rqueues):
+                with m.Case(i):
+                    m.d.comb += [
+                        ar_ready.eq(q.w_rdy),
+                        q.w_en.eq(out_bus.ar.valid & out_bus.ar.ready),
+                        q.w_data.eq(ar_frag.last),
+                    ]
+
+        m.d.comb += [
+            ar_frag.out.bits.connect(out_bus.ar.bits),
+            out_bus.ar.valid.eq(ar_frag.out.valid & ar_ready),
+            ar_frag.out.ready.eq(out_bus.ar.ready & ar_ready),
+        ]
+
+        wqueues = [
+            SyncFIFO(depth=self.max_flights, width=1)
+            for _ in range(2**len(in_bus.aw.bits.id))
+        ]
+        m.submodules += wqueues
+        aw_ready = Signal()
+
+        with m.Switch(out_bus.aw.bits.id):
+            for i, q in enumerate(wqueues):
+                with m.Case(i):
+                    m.d.comb += [
+                        aw_ready.eq(q.w_rdy),
+                        q.w_en.eq(out_bus.aw.valid & out_bus.aw.ready),
+                        q.w_data.eq(aw_frag.last),
+                    ]
+
+        wbeats_valid = Signal()
+        wbeats_ready = Signal()
+        wbeats_latched = Signal()
+        with m.If(wbeats_valid & wbeats_ready):
+            m.d.sync += wbeats_latched.eq(1)
+        with m.If(out_bus.aw.valid & out_bus.aw.ready):
+            m.d.sync += wbeats_latched.eq(0)
+
+        m.d.comb += [
+            aw_frag.out.bits.connect(out_bus.aw.bits),
+            out_bus.aw.valid.eq(aw_frag.out.valid
+                                & (wbeats_ready | wbeats_latched) & aw_ready),
+            aw_frag.out.ready.eq(out_bus.aw.ready
+                                 & (wbeats_ready | wbeats_latched) & aw_ready),
+            wbeats_valid.eq(aw_frag.out.valid & aw_ready & ~wbeats_latched),
+        ]
+
+        w_counter = Signal(len(in_bus.aw.bits.len) + 1)
+        w_idle = ~w_counter.any()
+        w_rem = Mux(w_idle, Mux(wbeats_valid, aw_frag.beats, 0), w_counter)
+        w_last = w_rem == 1
+        m.d.sync += w_counter.eq(w_rem - (out_bus.w.valid & out_bus.w.ready))
+
+        m.d.comb += [
+            wbeats_ready.eq(w_idle),
+            w_queue.deq.bits.connect(out_bus.w.bits),
+            out_bus.w.bits.last.eq(w_last),
+            out_bus.w.valid.eq(w_queue.deq.valid
+                               & (~wbeats_ready | wbeats_valid)),
+            w_queue.deq.ready.eq(out_bus.w.ready
+                                 & (~wbeats_ready | wbeats_valid)),
+        ]
+
+        r_last = Signal()
+        with m.Switch(out_bus.r.bits.id):
+            for i, q in enumerate(rqueues):
+                with m.Case(i):
+                    m.d.comb += [
+                        r_last.eq(q.r_data),
+                        q.r_en.eq(out_bus.r.valid & out_bus.r.ready
+                                  & out_bus.r.bits.last),
+                    ]
+
+        m.d.comb += [
+            in_bus.r.connect(out_bus.r),
+            in_bus.r.bits.last.eq(out_bus.r.bits.last & r_last),
+        ]
+
+        b_last = Signal()
+        with m.Switch(out_bus.b.bits.id):
+            for i, q in enumerate(wqueues):
+                with m.Case(i):
+                    m.d.comb += [
+                        b_last.eq(q.r_data),
+                        q.r_en.eq(out_bus.b.valid & out_bus.b.ready),
+                    ]
+
+        m.d.comb += [
+            in_bus.b.bits.connect(out_bus.b.bits),
+            in_bus.b.valid.eq(out_bus.b.valid & b_last),
+            out_bus.b.ready.eq(in_bus.b.ready | ~b_last),
+        ]
 
         return m
 
@@ -320,7 +505,8 @@ class AXI2AXILite(Elaboratable):
         ax_layout = make_ax_layout(addr_width=axi.addr_width,
                                    id_width=axi.id_width)
         ax_buffer = m.submodules.ax_buffer = SkidBuffer(Record, ax_layout)
-        fragmenter = m.submodules.fragmenter = AXIFragmenter(ax_buffer.deq)
+        fragmenter = m.submodules.fragmenter = _AXFragmenter(
+            ax_buffer.deq, data_width=axil.data_width, max_size1=0)
 
         cmd_done = Signal()
         last_ar = Signal()
@@ -368,39 +554,37 @@ class AXI2AXILite(Elaboratable):
 
             with m.State('READ'):
                 m.d.comb += [
-                    axil.ar.valid.eq(fragmenter.out_bus.valid & ~cmd_done),
-                    axil.ar.addr.eq(fragmenter.out_bus.bits.addr),
-                    fragmenter.out_bus.ready.eq(axil.ar.ready & ~cmd_done),
+                    axil.ar.valid.eq(fragmenter.out.valid & ~cmd_done),
+                    axil.ar.addr.eq(fragmenter.out.bits.addr),
+                    fragmenter.out.ready.eq(axil.ar.ready & ~cmd_done),
                 ]
-                with m.If(fragmenter.out_bus.valid
-                          & fragmenter.out_bus.bits.last):
+                with m.If(fragmenter.out.valid & fragmenter.last):
                     with m.If(axil.ar.ready):
-                        m.d.comb += fragmenter.out_bus.ready.eq(0)
+                        m.d.comb += fragmenter.out.ready.eq(0)
                         m.d.sync += cmd_done.eq(1)
 
                 m.d.comb += [
                     axi.r.valid.eq(axil.r.valid),
                     axi.r.bits.last.eq(cmd_done),
                     axi.r.bits.resp.eq(0),
-                    axi.r.bits.id.eq(fragmenter.out_bus.bits.id),
+                    axi.r.bits.id.eq(fragmenter.out.bits.id),
                     axi.r.bits.data.eq(axil.r.data),
                     axil.r.ready.eq(axi.r.ready),
                 ]
 
                 with m.If(axi.r.valid & axi.r.ready & axi.r.bits.last):
-                    m.d.comb += fragmenter.out_bus.ready.eq(1)
+                    m.d.comb += fragmenter.out.ready.eq(1)
                     m.next = 'IDLE'
 
             with m.State('WRITE'):
                 m.d.comb += [
-                    axil.aw.valid.eq(fragmenter.out_bus.valid & ~cmd_done),
-                    axil.aw.addr.eq(fragmenter.out_bus.bits.addr),
-                    fragmenter.out_bus.ready.eq(axil.aw.ready & ~cmd_done),
+                    axil.aw.valid.eq(fragmenter.out.valid & ~cmd_done),
+                    axil.aw.addr.eq(fragmenter.out.bits.addr),
+                    fragmenter.out.ready.eq(axil.aw.ready & ~cmd_done),
                 ]
-                with m.If(fragmenter.out_bus.valid
-                          & fragmenter.out_bus.bits.last):
+                with m.If(fragmenter.out.valid & fragmenter.last):
                     with m.If(axil.aw.ready):
-                        m.d.comb += fragmenter.out_bus.ready.eq(0)
+                        m.d.comb += fragmenter.out.ready.eq(0)
                         m.d.sync += cmd_done.eq(1)
 
                 m.d.comb += [
@@ -417,10 +601,10 @@ class AXI2AXILite(Elaboratable):
                 m.d.comb += [
                     axi.b.valid.eq(1),
                     axi.b.bits.resp.eq(0),
-                    axi.b.bits.id.eq(fragmenter.out_bus.bits.id),
+                    axi.b.bits.id.eq(fragmenter.out.bits.id),
                 ]
                 with m.If(axi.b.ready):
-                    m.d.comb += fragmenter.out_bus.ready.eq(1)
+                    m.d.comb += fragmenter.out.ready.eq(1)
                     m.next = 'IDLE'
 
         return m
