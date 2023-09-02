@@ -233,8 +233,12 @@ class Cluster(HasClusterParams, Elaboratable):
 
 class GroomWrapper(HasClusterParams, Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, bus_master=None):
         super().__init__(params)
+        self.bus_master = bus_master
+
+        if bus_master is not None:
+            self.cluster_bits = Shape.cast(range(self.num_clusters + 1)).width
 
         self.reset_vector = Signal(32)
 
@@ -344,6 +348,25 @@ class GroomWrapper(HasClusterParams, Elaboratable):
 
             e_arbiter.add(cluster.l2cache.out_bus.e)
 
+        if self.bus_master is not None:
+            bus_master_a = Decoupled(
+                tl.ChannelA,
+                data_width=64,
+                addr_width=32,
+                size_width=3,
+                source_id_width=self.l3cache.in_source_id_width)
+            m.d.comb += [
+                self.bus_master.a.connect(bus_master_a),
+                bus_master_a.bits.source.eq(
+                    self.make_source(
+                        cluster_id=self.num_clusters,
+                        source=Cat(
+                            self.bus_master.a.bits.source,
+                            Const(0,
+                                  8 - len(self.bus_master.a.bits.source))))),
+            ]
+            a_arbiter.add(bus_master_a)
+
         m.d.comb += [
             a_arbiter.bus.connect(self.l3cache.in_bus.a),
             mmio_a_arbiter.bus.connect(self.dbus_mmio.a),
@@ -373,6 +396,13 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                         self.l3cache.in_bus.d.connect(
                             cluster.l2cache.out_bus.d),
                         cluster.l2cache.out_bus.d.bits.source.eq(d_source_id),
+                    ]
+
+            if self.bus_master is not None:
+                with m.Case(self.num_clusters):
+                    m.d.comb += [
+                        self.l3cache.in_bus.d.connect(self.bus_master.d),
+                        self.bus_master.d.bits.source.eq(d_source_id),
                     ]
 
         d_mmio_cluster_id, d_mmio_source_id = self.unpack_source(
