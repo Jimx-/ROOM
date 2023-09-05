@@ -37,10 +37,13 @@ class HasL2CacheParams:
         self.num_clients = len(self.client_source_map)
         self.client_bits = max(self.num_clients, 1)
 
+        self.n_put_lists = 2
+        self.n_put_entries = self.block_bytes // self.beat_bytes
+
         self.n_rel_lists = 2
         self.n_rel_entries = self.block_bytes // self.beat_bytes
 
-        self.put_bits = bits_for(self.n_rel_lists - 1)
+        self.put_bits = bits_for(max(self.n_put_lists, self.n_rel_lists) - 1)
 
         in_bus_params = params['in_bus']
         self.in_source_id_width = in_bus_params['source_id_width']
@@ -843,6 +846,9 @@ class SourceD(HasL2CacheParams, Elaboratable):
         self.bs_rport = Decoupled(BankedStore.Port, params, write=False)
         self.bs_wport = Decoupled(BankedStore.Port, params, write=True)
 
+        self.pb_pop = Decoupled(PutBufferPop, params)
+        self.pb_entry = SinkA.PutBufferEntry(params)
+
         self.rel_pop = Decoupled(PutBufferPop, params)
         self.rel_entry = SinkC.PutBufferEntry(params)
 
@@ -865,13 +871,15 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s1_grant = ((s1_req.opcode == tl.ChannelAOpcode.AcquireBlock) &
                     (s1_req.param == tl.GrowParam.BtoT)) | (
                         s1_req.opcode == tl.ChannelAOpcode.AcquirePerm)
-        s1_need_r = s1_req.prio[0] & ~s1_grant
+        s1_need_r = s1_req.prio[0] & ~s1_grant & (
+            s1_req.opcode != tl.ChannelAOpcode.PutFullData)
         s1_valid_r = (busy | self.req.valid) & s1_need_r & ~s1_block_r
         s1_need_pb = Mux(s1_req.prio[0], ~s1_req.opcode[2], s1_req.opcode[0])
         s1_single = Mux(s1_req.prio[0], s1_grant,
                         s1_req.opcode == tl.ChannelCOpcode.Release)
         s1_num_beats = Mux(s1_single, 1,
                            (1 << s1_req.size) >> log2_int(self.beat_bytes))
+        s1_beat = (s1_req.offset >> log2_int(self.beat_bytes)) | s1_counter
         s1_last = s1_counter == s1_num_beats - 1
         s1_first = s1_counter == 0
 
@@ -884,7 +892,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
             self.bs_rport.valid.eq(s1_valid_r),
             self.bs_rport.bits.way.eq(s1_req.way),
             self.bs_rport.bits.set.eq(s1_req.set),
-            self.bs_rport.bits.beat.eq(s1_counter),
+            self.bs_rport.bits.beat.eq(s1_beat),
         ]
 
         bs_rport_fire_d1 = Signal()
@@ -943,9 +951,11 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s2_pb_corrupt_reg = Signal()
         s2_counter = Signal.like(s1_counter)
 
-        s2_pb_data_raw = Mux(s2_req.prio[0], 0, self.rel_entry.data)
-        s2_pb_mask_raw = Mux(s2_req.prio[0], 0, ~0)
-        s2_pb_corrupt_raw = Mux(s2_req.prio[0], 0, self.rel_entry.corrupt)
+        s2_pb_data_raw = Mux(s2_req.prio[0], self.pb_entry.data,
+                             self.rel_entry.data)
+        s2_pb_mask_raw = Mux(s2_req.prio[0], self.pb_entry.mask, ~0)
+        s2_pb_corrupt_raw = Mux(s2_req.prio[0], self.pb_entry.corrupt,
+                                self.rel_entry.corrupt)
 
         with m.If(s2_valid_pb):
             m.d.sync += [
@@ -959,12 +969,15 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s2_pb_corrupt = Mux(s2_valid_pb, s2_pb_corrupt_raw, s2_pb_corrupt_reg)
 
         m.d.comb += [
+            self.pb_pop.valid.eq(s2_valid_pb & s2_req.prio[0]),
+            self.pb_pop.bits.index.eq(s2_req.put),
+            self.pb_pop.bits.last.eq(s2_last),
             self.rel_pop.valid.eq(s2_valid_pb & ~s2_req.prio[0]),
             self.rel_pop.bits.index.eq(s2_req.put),
             self.rel_pop.bits.last.eq(s2_last),
         ]
 
-        pb_ready = Mux(s2_req.prio[0], 0, self.rel_pop.ready)
+        pb_ready = Mux(s2_req.prio[0], self.pb_pop.ready, self.rel_pop.ready)
         with m.If(pb_ready):
             m.d.sync += s2_valid_pb.eq(0)
         with m.If(s2_valid & s3_ready):
@@ -1189,6 +1202,19 @@ class PutBufferPop(HasL2CacheParams, Record):
 
 class SinkA(HasL2CacheParams, Elaboratable):
 
+    class PutBufferEntry(HasL2CacheParams, Record):
+
+        def __init__(self, params, name=None, src_loc_at=0):
+            HasL2CacheParams.__init__(self, params=params)
+
+            Record.__init__(self, [
+                ('data', self.beat_bytes * 8),
+                ('mask', self.beat_bytes),
+                ('corrupt', 1),
+            ],
+                            name=name,
+                            src_loc_at=1 + src_loc_at)
+
     def __init__(self, params):
         super().__init__(params=params)
 
@@ -1200,19 +1226,54 @@ class SinkA(HasL2CacheParams, Elaboratable):
 
         self.req = Decoupled(FullRequest, params)
 
+        self.pb_pop = Decoupled(PutBufferPop, params)
+        self.pb_entry = SinkA.PutBufferEntry(params)
+
     def elaborate(self, platform):
         m = Module()
 
         a = self.a
 
         first, _, _, _ = tl.Interface.count(m, a.bits, a.fire)
+        has_data = tl.Interface.has_data(a.bits)
+
+        lists = Signal(self.n_put_lists)
+        lists_set = Signal.like(lists)
+        lists_clr = Signal.like(lists)
+        m.d.sync += lists.eq((lists | lists_set) & ~lists_clr)
+
+        free_idx = Signal(range(self.n_put_lists))
+        free_idx_reg = Signal.like(free_idx)
+        for i in reversed(range(self.n_put_lists)):
+            with m.If(~lists[i]):
+                m.d.comb += free_idx.eq(i)
+        with m.If(first):
+            m.d.sync += free_idx_reg.eq(free_idx)
+
+        put = Mux(first, free_idx, free_idx_reg)
+
+        putbuffers = Array(
+            SyncFIFO(width=len(self.pb_entry), depth=self.n_put_entries)
+            for _ in range(self.n_put_lists))
+        for i, pb in enumerate(putbuffers):
+            setattr(m.submodules, f'putbuffer{i}', pb)
+
+        putbuffer = putbuffers[put]
 
         req_stall = first & ~self.req.ready
+        buf_stall = has_data & ~putbuffer.w_rdy
+        list_stall = has_data & first & lists.all()
 
         m.d.comb += [
-            a.ready.eq(~req_stall),
-            self.req.valid.eq(a.valid),
+            a.ready.eq(~req_stall & ~buf_stall & ~list_stall),
+            self.req.valid.eq(a.valid & first & ~buf_stall
+                              & ~list_stall),
+            putbuffer.w_en.eq(a.valid & has_data & ~req_stall
+                              & ~list_stall),
         ]
+
+        with m.If(a.valid & first & has_data & ~req_stall & ~buf_stall):
+            m.d.comb += lists_set.eq(1 << free_idx)
 
         tag, set, offset = self.parse_addr(a.bits.address)
 
@@ -1225,7 +1286,25 @@ class SinkA(HasL2CacheParams, Elaboratable):
             self.req.bits.offset.eq(offset),
             self.req.bits.set.eq(set),
             self.req.bits.tag.eq(tag),
+            self.req.bits.put.eq(put),
         ]
+
+        putbuffer_wdata = SinkA.PutBufferEntry(self.params)
+        m.d.comb += [
+            putbuffer_wdata.data.eq(a.bits.data),
+            putbuffer_wdata.mask.eq(a.bits.mask),
+            putbuffer_wdata.corrupt.eq(a.bits.corrupt),
+            putbuffer.w_data.eq(putbuffer_wdata),
+        ]
+
+        m.d.comb += [
+            self.pb_pop.ready.eq(putbuffers[self.pb_pop.bits.index].r_rdy),
+            putbuffers[self.pb_pop.bits.index].r_en.eq(self.pb_pop.fire),
+            self.pb_entry.eq(putbuffers[self.pb_pop.bits.index].r_data),
+        ]
+
+        with m.If(self.pb_pop.fire & self.pb_pop.bits.last):
+            m.d.comb += lists_clr.eq(1 << self.pb_pop.bits.index)
 
         return m
 
@@ -2445,6 +2524,8 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                 ]
 
         m.d.comb += [
+            source_d.pb_pop.connect(sink_a.pb_pop),
+            source_d.pb_entry.eq(sink_a.pb_entry),
             source_d.rel_pop.connect(sink_c.rel_pop),
             source_d.rel_entry.eq(sink_c.rel_entry),
         ]
