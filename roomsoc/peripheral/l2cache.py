@@ -949,7 +949,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s2_pb_data_reg = Signal(self.beat_bytes * 8)
         s2_pb_mask_reg = Signal(self.beat_bytes)
         s2_pb_corrupt_reg = Signal()
-        s2_counter = Signal.like(s1_counter)
+        s2_beat = Signal.like(s1_counter)
 
         s2_pb_data_raw = Mux(s2_req.prio[0], self.pb_entry.data,
                              self.rel_entry.data)
@@ -991,7 +991,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
                 s2_need_r.eq(s1_need_r),
                 s2_need_d.eq(~s1_need_pb | s1_first),
                 s2_need_pb.eq(s1_need_pb),
-                s2_counter.eq(s1_counter),
+                s2_beat.eq(s1_beat),
             ]
 
         m.d.comb += [
@@ -1009,7 +1009,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s3_pb_data = Signal(self.beat_bytes * 8)
         s3_pb_mask = Signal(self.beat_bytes)
         s3_pb_corrupt = Signal()
-        s3_counter = Signal.like(s2_counter)
+        s3_beat = Signal.like(s2_beat)
         s3_acquire = (s3_req.opcode == tl.ChannelAOpcode.AcquireBlock) | (
             s3_req.opcode == tl.ChannelAOpcode.AcquirePerm)
 
@@ -1067,7 +1067,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
                 s3_pb_mask.eq(s2_pb_mask),
                 s3_pb_corrupt.eq(s2_pb_corrupt),
                 s3_need_r.eq(s2_need_r),
-                s3_counter.eq(s2_counter),
+                s3_beat.eq(s2_beat),
             ]
 
         m.d.comb += [
@@ -1082,13 +1082,13 @@ class SourceD(HasL2CacheParams, Elaboratable):
         s4_pb_data = Signal(self.beat_bytes * 8)
         s4_pb_mask = Signal(self.beat_bytes)
         s4_pb_corrupt = Signal()
-        s4_counter = Signal.like(s3_counter)
+        s4_beat = Signal.like(s3_beat)
 
         m.d.comb += [
             self.bs_wport.valid.eq(s4_full & s4_need_wb),
             self.bs_wport.bits.way.eq(s4_req.way),
             self.bs_wport.bits.set.eq(s4_req.set),
-            self.bs_wport.bits.beat.eq(s4_counter),
+            self.bs_wport.bits.beat.eq(s4_beat),
             self.bs_wport.bits.mask.eq(s4_pb_mask),
             self.bs_wport.bits.data.eq(s4_pb_data),
         ]
@@ -1103,7 +1103,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
                 s4_pb_data.eq(s3_pb_data),
                 s4_pb_mask.eq(s3_pb_mask),
                 s4_pb_corrupt.eq(s3_pb_corrupt),
-                s4_counter.eq(s3_counter),
+                s4_beat.eq(s3_beat),
             ]
 
         m.d.comb += s4_ready.eq(~s4_full | self.bs_wport.ready | ~s4_need_wb)

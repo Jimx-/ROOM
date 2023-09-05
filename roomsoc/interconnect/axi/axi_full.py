@@ -278,6 +278,20 @@ class _AXFragmenter(Elaboratable):
 
         addr = Mux(busy, addr_reg, self.ax.bits.addr)
         length = Mux(busy, len_reg, self.ax.bits.len)
+        alignment = (addr >> lg_bytes)[:len(self.ax.bits.len)]
+
+        remain1 = Signal.like(self.ax.bits.len)
+        for i in range(len(self.ax.bits.len) + 1):
+            with m.If((length + 1) & (1 << i)):
+                m.d.comb += remain1.eq((1 << i) - 1)
+
+        align1 = Signal.like(self.ax.bits.len)
+        m.d.comb += align1.eq(~0)
+        for i in reversed(range(len(self.ax.bits.len))):
+            with m.If(alignment & (1 << i)):
+                m.d.comb += align1.eq((1 << i) - 1)
+
+        max_size1 = self.max_size1 & remain1 & align1
 
         fixed = self.ax.bits.burst == AXIBurst.FIXED
         narrow = self.ax.bits.size != lg_bytes
@@ -286,7 +300,7 @@ class _AXFragmenter(Elaboratable):
         beats1 = Signal(len(self.ax.bits.len))
         beats = Signal(len(self.ax.bits.len) + 1)
         m.d.comb += [
-            beats1.eq(Mux(bad, 0, self.max_size1)),
+            beats1.eq(Mux(bad, 0, max_size1)),
             beats.eq(beats1 + 1),
         ]
 
