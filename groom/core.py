@@ -26,6 +26,7 @@ class Core(HasCoreParams, Elaboratable):
         super().__init__(params)
 
         self.reset_vector = Signal(32)
+        self.busy = Signal()
 
         if self.use_raster:
             self.raster_req = Decoupled(RasterRequest, self.params)
@@ -66,7 +67,10 @@ class Core(HasCoreParams, Elaboratable):
         #
         if_stage = m.submodules.if_stage = IFStage(self.ibus, self.params)
         csr.add_csrs(if_stage.iter_csrs())
-        m.d.comb += if_stage.reset_vector.eq(self.reset_vector)
+        m.d.comb += [
+            if_stage.reset_vector.eq(self.reset_vector),
+            self.busy.eq(if_stage.busy),
+        ]
 
         #
         # Decoding

@@ -1533,7 +1533,7 @@ class IOMSHR(HasDCacheParams, Elaboratable):
 
         req = DCacheReq(self.params)
 
-        resp_data = Signal.like(self.resp.bits.data)
+        resp_data = Signal.like(self.mem_ack.bits.data)
 
         load_gen = m.submodules.load_gen = LoadGen(max_size=self.row_bits // 8)
         m.d.comb += [

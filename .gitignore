@@ -12,6 +12,7 @@ sim_build
 # Generated files
 build
 include/generated/
+include/groom/generated
 include/groom/config.h
 CMakeUserPresets.json
 

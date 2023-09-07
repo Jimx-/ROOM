@@ -1,6 +1,7 @@
 from amaranth import *
 
 from groom.core import Core
+from groom.ctrl import GroomController
 from groom.raster import RasterUnit
 
 from roomsoc.interconnect import tilelink as tl
@@ -35,6 +36,11 @@ class Cluster(HasClusterParams, Elaboratable):
         self.cluster_id = cluster_id
 
         self.reset_vector = Signal(32)
+        self.core_enable = Signal()
+        self.cache_enable = Signal()
+        self.raster_enable = Signal()
+
+        self.busy = Signal()
 
         self.dbus_mmio = tl.Interface(data_width=64,
                                       addr_width=32,
@@ -46,7 +52,8 @@ class Cluster(HasClusterParams, Elaboratable):
             (i, (self.make_source(True, i, Const(0, 8)),
                  self.make_source(True, i, Const(~0, 8))))
             for i in range(self.num_cores))
-        self.l2cache = L2Cache(self.l2cache_params)
+        l2cache = L2Cache(self.l2cache_params)
+        self.l2cache = ResetInserter(~self.cache_enable)(l2cache)
 
         self.periph_buses = [self.dbus_mmio, self.l2cache.out_bus]
 
@@ -92,7 +99,13 @@ class Cluster(HasClusterParams, Elaboratable):
             core_params = self.core_params.copy()
             core_params['core_id'] = self.num_cores * self.cluster_id + i
 
-            core = Core(core_params)
+            m.domains += ClockDomain(f'core{i}', local=True)
+            m.d.comb += [
+                ClockSignal(f'core{i}').eq(ClockSignal()),
+                ResetSignal(f'core{i}').eq(ResetSignal() | ~self.core_enable),
+            ]
+
+            core = DomainRenamer(f'core{i}')(Core(core_params))
             setattr(m.submodules, f'core{i}', core)
             cores.append(core)
 
@@ -155,8 +168,14 @@ class Cluster(HasClusterParams, Elaboratable):
             e_arbiter.add(core.dbus.e)
 
         if self.raster_params is not None:
-            raster_unit = m.submodules.raster_unit = RasterUnit(
-                self.num_cores, self.raster_params)
+            m.domains += ClockDomain(f'raster', local=True)
+            m.d.comb += [
+                ClockSignal(f'raster').eq(ClockSignal()),
+                ResetSignal(f'raster').eq(ResetSignal() | ~self.raster_enable),
+            ]
+
+            raster_unit = m.submodules.raster_unit = DomainRenamer('raster')(
+                RasterUnit(self.num_cores, self.raster_params))
 
             mem_bus_a = Decoupled(
                 tl.ChannelA,
@@ -228,6 +247,8 @@ class Cluster(HasClusterParams, Elaboratable):
                         core.dbus_mmio.d.bits.source.eq(mmio_d_source_id),
                     ]
 
+        m.d.comb += self.busy.eq(Cat(c.busy for c in cores).any())
+
         return m
 
 
@@ -241,6 +262,9 @@ class GroomWrapper(HasClusterParams, Elaboratable):
             self.cluster_bits = Shape.cast(range(self.num_clusters + 1)).width
 
         self.reset_vector = Signal(32)
+        self.busy = Signal()
+
+        self.ctrl = GroomController()
 
         self.dbus_mmio = tl.Interface(data_width=64,
                                       addr_width=32,
@@ -252,7 +276,8 @@ class GroomWrapper(HasClusterParams, Elaboratable):
             (i, (self.make_source(i, Const(0, 8)),
                  self.make_source(i, Const(~0, 8))))
             for i in range(self.num_clusters))
-        self.l3cache = L2Cache(self.l3cache_params)
+        l3cache = L2Cache(self.l3cache_params)
+        self.l3cache = ResetInserter(~self.ctrl.cache_enable)(l3cache)
 
         self.periph_buses = [self.dbus_mmio, self.l3cache.out_bus]
 
@@ -267,6 +292,7 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         m = Module()
 
         m.submodules.l3cache = self.l3cache
+        m.submodules.ctrl = self.ctrl
 
         clusters = []
 
@@ -300,7 +326,12 @@ class GroomWrapper(HasClusterParams, Elaboratable):
             setattr(m.submodules, f'cluster{i}', cluster)
             clusters.append(cluster)
 
-            m.d.comb += cluster.reset_vector.eq(self.reset_vector)
+            m.d.comb += [
+                cluster.reset_vector.eq(self.reset_vector),
+                cluster.core_enable.eq(self.ctrl.core_enable),
+                cluster.cache_enable.eq(self.ctrl.cache_enable),
+                cluster.raster_enable.eq(self.ctrl.raster_enable),
+            ]
 
             dbus_a = Decoupled(
                 tl.ChannelA,
@@ -415,5 +446,7 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                         self.dbus_mmio.d.connect(cluster.dbus_mmio.d),
                         cluster.dbus_mmio.d.bits.source.eq(d_mmio_source_id),
                     ]
+
+        m.d.comb += self.busy.eq(Cat(c.busy for c in clusters).any())
 
         return m

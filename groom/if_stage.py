@@ -163,6 +163,8 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                                [('value', self.n_threads, CSRAccess.RO)],
                                params)
 
+        self.busy = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -345,6 +347,8 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                             Mux(wspawn_valid[i], 1, thread_masks[i])),
                     ]
 
+        m.d.comb += self.busy.eq(active_warps.any())
+
         return m
 
 
@@ -386,6 +390,8 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
 
         self._warp_sched = WarpScheduler(self.params)
 
+        self.busy = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -398,6 +404,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
             warp_sched.br_res.eq(self.br_res),
             warp_sched.warp_ctrl.eq(self.warp_ctrl),
             warp_sched.join_req.eq(self.join_req),
+            self.busy.eq(warp_sched.busy),
         ]
 
         #
