@@ -309,7 +309,13 @@ class AXILiteUpConverter(Elaboratable):
         rd_word = Signal(range(ratio))
         rd_word_r = Signal.like(rd_word)
 
-        m.d.comb += master.connect(slave)
+        m.d.comb += [
+            master.connect(slave),
+            slave.aw.addr.eq(0),
+            slave.ar.addr.eq(0),
+            slave.w.strb.eq(0),
+            slave.w.data.eq(0),
+        ]
 
         m.d.comb += [
             slave.aw.addr[slave_align:].eq(master.aw.addr[slave_align:]),
@@ -343,10 +349,8 @@ class AXILiteUpConverter(Elaboratable):
         with m.Switch(rd_word):
             for i in range(ratio):
                 with m.Case(i):
-                    m.d.comb += [
-                        master.r.data[i * dw_from:(i + 1) * dw_from].eq(
-                            slave.r.data),
-                    ]
+                    m.d.comb += master.r.data.eq(
+                        slave.r.data[i * dw_from:(i + 1) * dw_from])
 
         return m
 
