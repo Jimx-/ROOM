@@ -427,7 +427,14 @@ class Directory(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        m.d.comb += self.ready.eq(1)
+        wipe_count = Signal(range(self.n_sets + 1))
+        wipe_done = wipe_count == self.n_sets
+        wipe_off = Signal(reset=1)
+        m.d.sync += wipe_off.eq(0)
+        with m.If(~wipe_done & ~wipe_off):
+            m.d.sync += wipe_count.eq(wipe_count + 1)
+
+        m.d.comb += self.ready.eq(wipe_done)
 
         dir_mem = Memory(width=self.n_ways * len(Directory.Entry(self.params)),
                          depth=self.n_sets)
@@ -448,16 +455,23 @@ class Directory(HasL2CacheParams, Elaboratable):
             write_entry.tag.eq(write_req.tag),
         ]
 
-        wen = write_q.r_rdy
+        wen = (~wipe_done & ~wipe_off) | write_q.r_rdy
 
         wport = m.submodules.wport = dir_mem.write_port(
             granularity=len(write_entry))
         with m.If(wen & ~self.read.valid):
-            m.d.comb += [
-                wport.addr.eq(write_req.set),
-                wport.data.eq(Repl(write_entry, self.n_ways)),
-                wport.en.eq(1 << write_req.way),
-            ]
+            with m.If(wipe_done):
+                m.d.comb += [
+                    wport.addr.eq(write_req.set),
+                    wport.data.eq(Repl(write_entry, self.n_ways)),
+                    wport.en.eq(1 << write_req.way),
+                ]
+            with m.Else():
+                m.d.comb += [
+                    wport.addr.eq(wipe_count),
+                    wport.data.eq(0),
+                    wport.en.eq(~0),
+                ]
 
         ren1 = Signal()
         tag = Signal.like(self.read.bits.tag)
