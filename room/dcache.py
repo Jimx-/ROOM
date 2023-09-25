@@ -426,6 +426,11 @@ class MetadataArray(HasDCacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        wipe_count = Signal(range(self.n_sets + 1))
+        wipe_done = wipe_count == self.n_sets
+        with m.If(~wipe_done):
+            m.d.sync += wipe_count.eq(wipe_count + 1)
+
         meta_bits = len(self.resp[0])
 
         tag_mem = Memory(width=self.n_ways * meta_bits, depth=self.n_sets)
@@ -443,18 +448,21 @@ class MetadataArray(HasDCacheParams, Elaboratable):
             w_data.tag.eq(self.write.bits.tag),
         ]
 
+        wen = ~wipe_done | self.write.valid
         tag_write = m.submodules.tag_write = tag_mem.write_port(
             granularity=meta_bits)
-        m.d.comb += [
-            tag_write.addr.eq(self.write.bits.idx),
-            tag_write.data.eq(Repl(w_data, self.n_ways)),
-            tag_write.en.eq(self.write.bits.way_en
-                            & Repl(self.write.valid, self.n_ways)),
-        ]
+        with m.If(wen):
+            m.d.comb += [
+                tag_write.addr.eq(
+                    Mux(wipe_done, self.write.bits.idx, wipe_count)),
+                tag_write.data.eq(Mux(wipe_done, Repl(w_data, self.n_ways),
+                                      0)),
+                tag_write.en.eq(Mux(wipe_done, self.write.bits.way_en, ~0)),
+            ]
 
         m.d.comb += [
-            self.read.ready.eq(~self.write.valid),
-            self.write.ready.eq(1),
+            self.read.ready.eq(~wen),
+            self.write.ready.eq(wipe_done),
         ]
 
         return m
