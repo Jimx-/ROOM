@@ -76,6 +76,7 @@ class FPPipeline(HasCoreParams, Elaboratable):
 
         m.d.comb += [
             fregread.dis_valid.eq(self.dis_valid & dis_is_fp
+                                  & (~dis_is_int | self.int_dis_ready)
                                   & sb_ready),
             fregread.dis_uop.eq(self.dis_uop),
             fregread.dis_wid.eq(self.dis_wid),
@@ -85,7 +86,8 @@ class FPPipeline(HasCoreParams, Elaboratable):
                                                           | fregread.dis_ready)
 
         m.d.comb += [
-            scoreboard.dis_valid.eq(self.dis_valid & dis_ready),
+            scoreboard.dis_valid.eq(self.dis_valid & dis_ready
+                                    & self.int_sb_ready),
             self.dis_ready.eq(sb_ready & dis_ready),
         ]
 

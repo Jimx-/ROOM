@@ -141,8 +141,10 @@ class Core(HasCoreParams, Elaboratable):
                       (IssueQueueType.INT | IssueQueueType.MEM)) != 0
 
         m.d.comb += [
-            iregread.dis_valid.eq(dispatcher.dis_valid & dis_is_int
-                                  & sb_ready),
+            iregread.dis_valid.eq(
+                dispatcher.dis_valid & dis_is_int
+                & ((~dis_is_fp | fp_pipeline.dis_ready) if self.use_fpu else 1)
+                & sb_ready),
             iregread.dis_uop.eq(dispatcher.dis_uop),
             iregread.dis_wid.eq(dispatcher.dis_wid),
         ]
@@ -152,7 +154,8 @@ class Core(HasCoreParams, Elaboratable):
             dis_ready &= ~dis_is_fp | fp_pipeline.dis_ready
 
         m.d.comb += [
-            scoreboard.dis_valid.eq(dispatcher.dis_valid & dis_ready),
+            scoreboard.dis_valid.eq(dispatcher.dis_valid & dis_ready & (
+                fp_pipeline.sb_ready if self.use_fpu else 1)),
             dispatcher.dis_ready.eq(sb_ready & dis_ready),
         ]
 

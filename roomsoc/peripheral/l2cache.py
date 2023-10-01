@@ -1777,7 +1777,9 @@ class MSHR(HasL2CacheParams, Elaboratable):
             self.status.bits.set.eq(request.set),
             self.status.bits.tag.eq(request.tag),
             self.status.bits.way.eq(meta.way),
-            self.status.bits.block_b.eq(~meta_valid),
+            self.status.bits.block_b.eq(~meta_valid | (
+                (~w_releaseack | ~w_rprobeacklast | ~w_pprobeacklast)
+                & ~w_grantfirst)),
             self.status.bits.nest_b.eq(meta_valid
                                        & w_releaseack & w_rprobeacklast
                                        & w_pprobeacklast

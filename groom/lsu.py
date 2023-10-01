@@ -345,10 +345,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         m.d.comb += self.fp_std.ready.eq(1)
         with m.If(self.fp_std.valid):
             m.d.comb += self.fp_std.ready.eq(
-                ~lsq[self.fp_std.bits.wid].valid
-                | (~lsq[self.exec_req.bits.wid].data_valid
-                   & ~(self.exec_req.valid & self.exec_req.bits.uop.is_std &
-                       (self.exec_req.bits.wid == self.fp_std.bits.wid))))
+                (lsq[self.fp_std.bits.wid].valid
+                 & lsq[self.fp_std.bits.wid].uop.fp_valid
+                 & lsq[self.fp_std.bits.wid].uop.uses_stq
+                 & ~lsq[self.fp_std.bits.wid].data_valid)
+                | (self.exec_req.fire & self.exec_req.bits.uop.fp_valid
+                   & self.exec_req.bits.uop.uses_stq
+                   & ~self.exec_req.bits.uop.is_std
+                   & (self.exec_req.bits.wid == self.fp_std.bits.wid)))
 
             with m.If(self.fp_std.fire):
                 m.d.sync += [
@@ -541,7 +545,11 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     ]
 
                 with m.If(lsq[w].uop.uses_stq):
-                    m.d.sync += lsq[w].valid.eq(0)
+                    m.d.sync += [
+                        lsq[w].valid.eq(0),
+                        lsq[w].addr_valid.eq(0),
+                        lsq[w].data_valid.eq(0),
+                    ]
 
         with m.If(self.exec_iresp.fire):
             m.d.sync += [
