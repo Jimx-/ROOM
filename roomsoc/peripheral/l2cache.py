@@ -728,6 +728,9 @@ class SourceC(HasL2CacheParams, Elaboratable):
 
         self.port = Decoupled(BankedStore.Port, params, write=False)
 
+        self.evict_req = SourceD.Hazard(params)
+        self.evict_safe = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -746,6 +749,11 @@ class SourceC(HasL2CacheParams, Elaboratable):
         with m.Else():
             m.d.comb += req.eq(req_reg)
 
+        m.d.comb += [
+            self.evict_req.set.eq(req.set),
+            self.evict_req.way.eq(req.way),
+        ]
+
         beat = Signal(range(beats))
         last = beat == Repl(1, len(beat))
         want_data = Signal()
@@ -753,7 +761,7 @@ class SourceC(HasL2CacheParams, Elaboratable):
         m.d.comb += self.req.ready.eq(~busy)
 
         m.d.comb += [
-            self.port.valid.eq(want_data),
+            self.port.valid.eq(((beat != 0) | self.evict_safe) & want_data),
             self.port.bits.way.eq(req.way),
             self.port.bits.set.eq(req.set),
             self.port.bits.beat.eq(beat),
@@ -846,6 +854,18 @@ class SourceD(HasL2CacheParams, Elaboratable):
         def as_value(self):
             return Cat(super().as_value(), self.sink, self.way, self.bad)
 
+    class Hazard(HasL2CacheParams, Record):
+
+        def __init__(self, params, name=None, src_loc_at=0):
+            HasL2CacheParams.__init__(self, params)
+
+            Record.__init__(self, [
+                ('set', self.index_bits),
+                ('way', range(self.n_ways)),
+            ],
+                            name=name,
+                            src_loc_at=1 + src_loc_at)
+
     def __init__(self, params):
         super().__init__(params=params)
 
@@ -865,6 +885,11 @@ class SourceD(HasL2CacheParams, Elaboratable):
 
         self.rel_pop = Decoupled(PutBufferPop, params)
         self.rel_entry = SinkC.PutBufferEntry(params)
+
+        self.evict_req = SourceD.Hazard(params)
+        self.evict_safe = Signal()
+        self.grant_req = SourceD.Hazard(params)
+        self.grant_safe = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -1122,6 +1147,24 @@ class SourceD(HasL2CacheParams, Elaboratable):
 
         m.d.comb += s4_ready.eq(~s4_full | self.bs_wport.ready | ~s4_need_wb)
 
+        m.d.comb += [
+            self.evict_safe.eq((~busy | (self.evict_req.way != s1_req_reg.way)
+                                | (self.evict_req.set != s1_req_reg.set))
+                               & (~s2_full | (self.evict_req.way != s2_req.way)
+                                  | (self.evict_req.set != s2_req.set))
+                               & (~s3_full | (self.evict_req.way != s3_req.way)
+                                  | (self.evict_req.set != s3_req.set))
+                               & (~s4_full | (self.evict_req.way != s4_req.way)
+                                  | (self.evict_req.set != s4_req.set))),
+            self.grant_safe.eq((~busy | (self.grant_req.way != s1_req_reg.way)
+                                | (self.grant_req.set != s1_req_reg.set))
+                               & (~s2_full | (self.grant_req.way != s2_req.way)
+                                  | (self.grant_req.set != s2_req.set))
+                               & (~s3_full | (self.grant_req.way != s3_req.way)
+                                  | (self.grant_req.set != s3_req.set))
+                               & (~s4_full | (self.grant_req.way != s4_req.way)
+                                  | (self.grant_req.set != s4_req.set))),
+        ]
         return m
 
 
@@ -1558,6 +1601,9 @@ class SinkD(HasL2CacheParams, Elaboratable):
         self.way = Signal(range(self.n_ways))
         self.set = Signal(self.index_bits)
 
+        self.grant_req = SourceD.Hazard(params)
+        self.grant_safe = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -1568,14 +1614,19 @@ class SinkD(HasL2CacheParams, Elaboratable):
             m.d.sync += source.eq(d.bits.source)
         m.d.comb += self.source.eq(Mux(d.valid, d.bits.source, source))
 
+        m.d.comb += [
+            self.grant_req.set.eq(self.set),
+            self.grant_req.way.eq(self.way),
+        ]
+
         first, last, _, beat = tl.Interface.count(m, d.bits, d.fire)
 
         has_data = tl.Interface.has_data(d.bits)
 
         m.d.comb += [
             self.resp.valid.eq((first | last) & d.fire),
-            d.ready.eq(self.port.ready),
-            self.port.valid.eq(d.valid),
+            d.ready.eq(self.port.ready & (~first | self.grant_safe)),
+            self.port.valid.eq(~first | (d.valid & self.grant_safe)),
         ]
 
         m.d.comb += [
@@ -1723,6 +1774,22 @@ class MSHR(HasL2CacheParams, Elaboratable):
                             name=name,
                             src_loc_at=1 + src_loc_at)
 
+    class NestedWriteback(HasL2CacheParams, Record):
+
+        def __init__(self, params, name=None, src_loc_at=0):
+            HasL2CacheParams.__init__(self, params)
+
+            Record.__init__(self, [
+                ('set', self.index_bits),
+                ('tag', self.tag_bits),
+                ('b_to_n', 1),
+                ('b_to_b', 1),
+                ('b_clr_dirty', 1),
+                ('c_set_dirty', 1),
+            ],
+                            name=name,
+                            src_loc_at=1 + src_loc_at)
+
     def __init__(self, params):
         super().__init__(params=params)
 
@@ -1733,6 +1800,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
         self.sinkc = Valid(SinkC.Response, params)
         self.sinkd = Valid(SinkD.Response, params)
         self.sinke = Valid(SinkE.Response, params)
+        self.nestedwb = MSHR.NestedWriteback(params)
 
     def elaborate(self, platform):
         m = Module()
@@ -1771,6 +1839,18 @@ class MSHR(HasL2CacheParams, Elaboratable):
         s_writeback = Signal(reset=1)
         s_probeack = Signal(reset=1)
         s_flush = Signal(reset=1)
+
+        with m.If(meta_valid & (meta.state != CacheState.INVALID)
+                  & (self.nestedwb.set == request.set)
+                  & (self.nestedwb.tag == meta.tag)):
+            with m.If(self.nestedwb.b_clr_dirty):
+                m.d.sync += meta.dirty.eq(0)
+            with m.If(self.nestedwb.c_set_dirty):
+                m.d.sync += meta.dirty.eq(1)
+            with m.If(self.nestedwb.b_to_b):
+                m.d.sync += meta.state.eq(CacheState.BRANCH)
+            with m.If(self.nestedwb.b_to_n):
+                m.d.sync += meta.hit.eq(0)
 
         m.d.comb += [
             self.status.valid.eq(request_valid),
@@ -1946,20 +2026,23 @@ class MSHR(HasL2CacheParams, Elaboratable):
             self.schedule.bits.c.bits.opcode.eq(
                 Mux(
                     request.prio[1],
-                    Mux(meta.dirty, tl.ChannelCOpcode.ProbeAckData,
+                    Mux(meta.hit & meta.dirty, tl.ChannelCOpcode.ProbeAckData,
                         tl.ChannelCOpcode.ProbeAck),
                     Mux(meta.dirty, tl.ChannelCOpcode.ReleaseData,
                         tl.ChannelCOpcode.Release))),
             self.schedule.bits.c.bits.param.eq(
                 Mux(
-                    request.prio[1], report_param,
+                    request.prio[1],
+                    Mux(meta.hit, report_param, tl.ShrinkReportParam.NtoN),
                     Mux(meta.state == CacheState.BRANCH,
                         tl.ShrinkReportParam.BtoN,
                         tl.ShrinkReportParam.TtoN))),
-            self.schedule.bits.c.bits.tag.eq(meta.tag),
+            self.schedule.bits.c.bits.tag.eq(
+                Mux(request.prio[1] & ~meta.hit, request.tag, meta.tag)),
             self.schedule.bits.c.bits.set.eq(request.set),
             self.schedule.bits.c.bits.way.eq(meta.way),
-            self.schedule.bits.c.bits.dirty.eq(meta.dirty),
+            self.schedule.bits.c.bits.dirty.eq(
+                Mux(meta.hit | ~request.prio[1], meta.dirty, 0)),
             # Channel D
             self.schedule.bits.d.bits.eq(request),
             self.schedule.bits.d.bits.param.eq(
@@ -2239,6 +2322,7 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             Cat(mshr_stall_abc, mshr_stall_bc, mshr_stall_c))
 
         mshr_request = Signal(self.n_mshrs)
+        nestedwb = MSHR.NestedWriteback(self.params)
         for i, mshr in enumerate(mshrs):
             m.d.comb += mshr_request[i].eq(mshr.schedule.valid
                                            & ~mshr_stall[i]
@@ -2267,6 +2351,7 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                 mshr.sinke.valid.eq(sink_e.resp.valid
                                     & (sink_e.resp.bits.sink == i)),
                 mshr.sinke.bits.eq(sink_e.resp.bits),
+                mshr.nestedwb.eq(nestedwb),
             ]
 
         mshr_grant = Signal(range(self.n_mshrs))
@@ -2322,6 +2407,27 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             source_x.req.bits.eq(schedule.x.bits),
             directory.write.valid.eq(schedule.dir.valid),
             directory.write.bits.eq(schedule.dir.bits),
+        ]
+
+        select_c = mshr_grant_mask[-1]
+        select_bc = mshr_grant_mask[-2]
+        m.d.comb += [
+            nestedwb.set.eq(
+                Mux(select_c, c_mshr.status.bits.set,
+                    bc_mshr.status.bits.set)),
+            nestedwb.tag.eq(
+                Mux(select_c, c_mshr.status.bits.tag,
+                    bc_mshr.status.bits.tag)),
+            nestedwb.b_to_n.
+            eq(select_bc & bc_mshr.schedule.bits.dir.valid
+               & (bc_mshr.schedule.bits.dir.bits.state == CacheState.INVALID)),
+            nestedwb.b_to_b.eq(
+                select_bc & bc_mshr.schedule.bits.dir.valid
+                & (bc_mshr.schedule.bits.dir.bits.state == CacheState.BRANCH)),
+            nestedwb.b_clr_dirty.eq(select_bc
+                                    & (bc_mshr.schedule.bits.dir.valid)),
+            nestedwb.c_set_dirty.eq(select_c & c_mshr.schedule.bits.dir.valid
+                                    & c_mshr.schedule.bits.dir.bits.dirty),
         ]
 
         request = Decoupled(FullRequest, self.params)
@@ -2552,6 +2658,13 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             source_c.port.connect(banked_store.sourcec_port),
             source_d.bs_rport.connect(banked_store.sourced_rport),
             source_d.bs_wport.connect(banked_store.sourced_wport),
+        ]
+
+        m.d.comb += [
+            source_d.evict_req.eq(source_c.evict_req),
+            source_c.evict_safe.eq(source_d.evict_safe),
+            source_d.grant_req.eq(sink_d.grant_req),
+            sink_d.grant_safe.eq(source_d.grant_safe),
         ]
 
         return m

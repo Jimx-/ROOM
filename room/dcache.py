@@ -962,6 +962,13 @@ class ProbeUnit(HasDCacheParams, Elaboratable):
             self.mshr_wb_rdy.eq(1),
         ]
 
+        m.d.comb += [
+            self.meta_write.bits.way_en.eq(way_en),
+            self.meta_write.bits.idx.eq(req_idx),
+            self.meta_write.bits.tag.eq(req_tag),
+            self.meta_write.bits.state.eq(new_state),
+        ]
+
         with m.FSM():
             with m.State('IDLE'):
                 m.d.comb += [
@@ -1025,14 +1032,9 @@ class ProbeUnit(HasDCacheParams, Elaboratable):
                     m.next = 'META_WRITE'
 
             with m.State('META_WRITE'):
-                m.d.comb += self.mshr_wb_rdy.eq(0)
-
                 m.d.comb += [
+                    self.mshr_wb_rdy.eq(0),
                     self.meta_write.valid.eq(1),
-                    self.meta_write.bits.way_en.eq(way_en),
-                    self.meta_write.bits.idx.eq(req_idx),
-                    self.meta_write.bits.tag.eq(req_tag),
-                    self.meta_write.bits.state.eq(new_state),
                 ]
 
                 with m.If(self.meta_write.fire):
