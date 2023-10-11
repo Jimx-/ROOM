@@ -136,9 +136,9 @@ class FetchUnit(HasRasterParams, Elaboratable):
 
         self.mem_bus = mem_bus
 
-        self.tilebuf_addr = Signal(32)
-        self.prim_addr = Signal(32)
-        self.prim_stride = Signal(4)
+        self.tilebuf_addr = Signal(32, reset=0x80000000)
+        self.prim_addr = Signal(32, reset=0x800002d8)
+        self.prim_stride = Signal(4, reset=7)
 
         self.req = Decoupled(FetchUnit.Request)
 

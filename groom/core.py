@@ -26,6 +26,7 @@ class Core(HasCoreParams, Elaboratable):
         super().__init__(params)
 
         self.reset_vector = Signal(32)
+        self.cache_enable = Signal()
         self.busy = Signal()
 
         if self.use_raster:
@@ -207,7 +208,10 @@ class Core(HasCoreParams, Elaboratable):
         #
         lsu = m.submodules.lsu = LoadStoreUnit(self.dbus, self.dbus_mmio,
                                                self.params)
-        m.d.comb += exec_unit.lsu_req.connect(lsu.exec_req)
+        m.d.comb += [
+            exec_unit.lsu_req.connect(lsu.exec_req),
+            lsu.cache_enable.eq(self.cache_enable),
+        ]
 
         if self.use_fpu:
             m.d.comb += [

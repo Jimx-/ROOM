@@ -735,10 +735,22 @@ class SourceC(HasL2CacheParams, Elaboratable):
         m = Module()
 
         beats = self.block_bytes // self.beat_bytes
-        queue = m.submodules.queue = SyncFIFO(depth=beats,
+        queue = m.submodules.queue = SyncFIFO(depth=beats + 4,
                                               width=len(self.c.bits))
 
         busy = Signal()
+
+        queue_count = Signal(range(beats + 4))
+        queue_ready = Signal(reset=1)
+        queue_enq = queue.w_en & queue.w_rdy
+        queue_deq = queue.r_en & queue.r_rdy
+        with m.If(queue_enq != queue_deq):
+            with m.If(queue_enq):
+                m.d.sync += queue_count.eq(queue_count + 1)
+            with m.Else():
+                m.d.sync += queue_count.eq(queue_count - 1)
+            m.d.sync += queue_ready.eq((queue_count == 0) | ((
+                (queue_count == 1) | (queue_count == 2)) & ~queue_enq))
 
         req_reg = SourceC.Request(self.params)
         req = SourceC.Request(self.params)
@@ -756,9 +768,9 @@ class SourceC(HasL2CacheParams, Elaboratable):
 
         beat = Signal(range(beats))
         last = beat == Repl(1, len(beat))
-        want_data = Signal()
+        want_data = busy | (self.req.valid & queue_ready & self.req.bits.dirty)
 
-        m.d.comb += self.req.ready.eq(~busy)
+        m.d.comb += self.req.ready.eq(~busy & queue_ready)
 
         m.d.comb += [
             self.port.valid.eq(((beat != 0) | self.evict_safe) & want_data),
@@ -768,18 +780,14 @@ class SourceC(HasL2CacheParams, Elaboratable):
             self.port.bits.mask.eq(~0),
         ]
 
-        with m.If(self.req.valid & self.req.bits.dirty):
-            m.d.sync += [
-                busy.eq(1),
-                want_data.eq(1),
-            ]
+        with m.If(self.req.valid & queue_ready & self.req.bits.dirty):
+            m.d.sync += busy.eq(1)
         with m.If(self.port.fire):
             with m.If(last):
-                m.d.sync += want_data.eq(0)
+                m.d.sync += busy.eq(0)
             m.d.sync += beat.eq(beat + 1)
 
-        s2_latch = Mux(want_data | (self.req.valid & self.req.bits.dirty),
-                       self.port.fire, self.req.fire)
+        s2_latch = Mux(want_data, self.port.fire, self.req.fire)
         s2_valid = Signal()
         s2_req = SourceC.Request(self.params)
         s2_beat = Signal.like(beat)
@@ -829,10 +837,6 @@ class SourceC(HasL2CacheParams, Elaboratable):
             self.c.bits.eq(queue.r_data),
             queue.r_en.eq(self.c.ready),
         ]
-
-        _, _, done, _ = tl.Interface.count(m, self.c.bits, self.c.fire)
-        with m.If(done):
-            m.d.sync += busy.eq(0)
 
         return m
 

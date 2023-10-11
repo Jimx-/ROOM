@@ -271,6 +271,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
     def __init__(self, dbus, dbus_mmio, params):
         super().__init__(params)
 
+        self.cache_enable = Signal()
+
         self.dbus = dbus
         self.dbus_mmio = dbus_mmio
 
@@ -285,8 +287,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        dcache = m.submodules.dcache = DCache(self.dbus, self.dbus_mmio,
-                                              self.params)
+        m.domains += ClockDomain('dcache', local=True)
+        m.d.comb += [
+            ClockSignal('dcache').eq(ClockSignal()),
+            ResetSignal('dcache').eq(~self.cache_enable),
+        ]
+
+        dcache = m.submodules.dcache = DomainRenamer('dcache')(DCache(
+            self.dbus, self.dbus_mmio, self.params))
         if self.use_smem:
             smem = m.submodules.smem = SharedMemory(self.params)
 

@@ -109,7 +109,10 @@ class Cluster(HasClusterParams, Elaboratable):
             setattr(m.submodules, f'core{i}', core)
             cores.append(core)
 
-            m.d.comb += core.reset_vector.eq(self.reset_vector)
+            m.d.comb += [
+                core.reset_vector.eq(self.reset_vector),
+                core.cache_enable.eq(self.cache_enable),
+            ]
 
             ibus_a = Decoupled(tl.ChannelA,
                                data_width=core.ibus.data_width,

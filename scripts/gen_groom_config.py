@@ -28,7 +28,9 @@ if __name__ == '__main__':
 
         f.write(f'#define USE_SMEM {int(core_params.use_smem)}\n')
         if core_params.use_smem:
-            f.write(f'#define SMEM_BASE {hex(core_params.smem_base)}\n')
+            f.write(
+                f'#define SMEM_BASE {hex(core_params.smem_base+core_params.smem_size)}\n'
+            )
             f.write(f'#define SMEM_SIZE {hex(core_params.smem_size)}\n')
         f.write('\n')
 
