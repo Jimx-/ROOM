@@ -1875,6 +1875,8 @@ class MSHR(HasL2CacheParams, Elaboratable):
         ]
 
         got_t = Signal()
+        probes_done = Signal(self.client_bits)
+        probes_to_n = Signal(self.client_bits)
         no_wait = w_rprobeacklast & w_releaseack & w_grantlast & w_pprobeacklast & w_grantack
 
         m.d.comb += [
@@ -1979,7 +1981,8 @@ class MSHR(HasL2CacheParams, Elaboratable):
                                         | ~request.opcode[2]),
                 meta_writeback.tag.eq(request.tag),
                 meta_writeback.clients.eq(
-                    Mux(req_acquire, self.client_bit(request.source), 0)),
+                    Mux(meta.hit, meta.clients & ~probes_to_n, 0)
+                    | Mux(req_acquire, self.client_bit(request.source), 0)),
                 meta_writeback.hit.eq(1),
             ]
 
@@ -2077,7 +2080,19 @@ class MSHR(HasL2CacheParams, Elaboratable):
         ]
 
         with m.If(self.sinkc.valid):
-            last_probe = 1
+            probe_bit = self.client_bit(self.sinkc.bits.source)
+            last_probe = (probe_bit | probes_done) == (meta.clients
+                                                       & ~excluded_clients)
+            probe_to_n = (
+                self.sinkc.bits.param == tl.ShrinkReportParam.TtoN) | (
+                    self.sinkc.bits.param == tl.ShrinkReportParam.BtoN) | (
+                        self.sinkc.bits.param == tl.ShrinkReportParam.NtoN)
+
+            m.d.sync += [
+                probes_done.eq(probes_done | probe_bit),
+                probes_to_n.eq(probes_to_n | Mux(probe_to_n, probe_bit, 0)),
+            ]
+
             m.d.sync += [
                 w_rprobeackfirst.eq(w_rprobeackfirst | last_probe),
                 w_rprobeacklast.eq(w_rprobeacklast
@@ -2132,6 +2147,8 @@ class MSHR(HasL2CacheParams, Elaboratable):
                 meta_valid.eq(1),
                 meta.eq(new_meta),
                 got_t.eq(0),
+                probes_done.eq(0),
+                probes_to_n.eq(0),
             ]
 
             m.d.sync += [
