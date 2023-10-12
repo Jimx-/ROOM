@@ -449,6 +449,16 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             dmem_req = Decoupled(DCacheReq, self.params, name=f'dmem_req{w}')
             dmem_is_smem = Signal()
 
+            store_data = Signal(self.xlen)
+            store_gen = StoreGen(max_size=self.xlen // 8)
+            setattr(m.submodules, f'store_gen{w}', store_gen)
+            m.d.comb += [
+                store_gen.typ.eq(dmem_req.bits.uop.mem_size),
+                store_gen.addr.eq(0),
+                store_gen.data_in.eq(store_data),
+                dmem_req.bits.data.eq(store_gen.data_out),
+            ]
+
             with m.If(will_fire_incoming):
                 m.d.comb += [
                     dmem_req.valid.eq(self.exec_req.bits.uop.tmask[w]),
@@ -456,7 +466,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     dmem_req.bits.uop.lsq_wid.eq(self.exec_req.bits.wid),
                     dmem_req.bits.uop.lsq_tid.eq(w),
                     dmem_req.bits.addr.eq(self.exec_req.bits.addr[w]),
-                    dmem_req.bits.data.eq(self.exec_req.bits.data[w]),
+                    store_data.eq(self.exec_req.bits.data[w]),
                     dmem_is_smem.eq(s0_addr_is_smem[w]),
                     s0_executing[self.exec_req.bits.wid][w].eq(dmem_req.fire),
                     s0_block_req[self.exec_req.bits.wid][w].eq(dmem_req.fire),
@@ -470,7 +480,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     dmem_req.bits.uop.eq(lsq_wakeup_e.uop),
                     dmem_req.bits.uop.lsq_tid.eq(w),
                     dmem_req.bits.addr.eq(lsq_wakeup_e.addr[w]),
-                    dmem_req.bits.data.eq(lsq_wakeup_e.data[w]),
+                    store_data.eq(lsq_wakeup_e.data[w]),
                     dmem_is_smem.eq(lsq_wakeup_e.addr_is_smem[w]),
                     s0_executing[lsq_wakeup_idx][w].eq(dmem_req.fire),
                     s0_block_req[lsq_wakeup_idx][w].eq(dmem_req.fire),
