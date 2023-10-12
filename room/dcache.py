@@ -641,6 +641,7 @@ class BankedDataArray(BaseDataArray):
             for i in range(self.mem_width)
         ]
         s0_read_valids = Cat(r.valid for r in self.read)
+        s0_write_valids = Cat(w.valid for w in self.write)
         s0_bank_conflicts = Signal(self.mem_width)
         s0_do_read = s0_read_valids & ~s0_bank_conflicts
         s0_bank_read_gnts = [
@@ -678,13 +679,22 @@ class BankedDataArray(BaseDataArray):
             Signal(bank_bits, name=f's1_rbank{i}')
             for i in range(self.mem_width)
         ]
+        s1_wbanks = [
+            Signal(bank_bits, name=f's1_wbank{i}')
+            for i in range(self.mem_width)
+        ]
         s1_ridxs = [
             Signal(bidx_bits, name=f's1_ridx{i}')
             for i in range(self.mem_width)
         ]
         s1_read_valids = Signal(self.mem_width)
-        s1_pipe_selection = [
-            Signal(self.mem_width, name=f's1_pipe_selection{i}')
+        s1_write_valids = Signal(self.mem_width)
+        s1_read_pipe_selection = [
+            Signal(self.mem_width, name=f's1_read_pipe_selection{i}')
+            for i in range(self.mem_width)
+        ]
+        s1_write_pipe_selection = [
+            Signal(self.mem_width, name=f's1_write_pipe_selection{i}')
             for i in range(self.mem_width)
         ]
         s1_ridx_match = [
@@ -697,27 +707,37 @@ class BankedDataArray(BaseDataArray):
         ]
         s1_nacks = Signal(self.mem_width)
 
-        m.d.sync += s1_read_valids.eq(s0_read_valids)
+        m.d.sync += [
+            s1_read_valids.eq(s0_read_valids),
+            s1_write_valids.eq(s0_write_valids),
+        ]
         for w in range(self.mem_width):
             m.d.sync += [
                 s1_rbanks[w].eq(s0_rbanks[w]),
                 s1_ridxs[w].eq(s0_ridxs[w]),
+                s1_wbanks[w].eq(s0_wbanks[w]),
             ]
 
             m.d.comb += [
-                s1_pipe_selection[w].eq(1 << w),
+                s1_read_pipe_selection[w].eq(1 << w),
+                s1_write_pipe_selection[w].eq(1 << w),
                 s1_ridx_match[w][w].eq(1),
             ]
             for i in reversed(range(w)):
                 with m.If(s1_read_valids[i] & (s1_rbanks[i] == s1_rbanks[w])):
-                    m.d.comb += s1_pipe_selection[w].eq(1 << i)
+                    m.d.comb += s1_read_pipe_selection[w].eq(1 << i)
                 m.d.comb += s1_ridx_match[w][i].eq(s1_ridxs[i] == s1_ridxs[w])
 
-            m.d.comb += s1_nacks[w].eq(s1_read_valids[w] & (
-                (s1_pipe_selection[w] & ~s1_ridx_match[w]) != 0))
+                with m.If(s1_write_valids[i] & (s1_wbanks[i] == s1_wbanks[w])):
+                    m.d.comb += s1_write_pipe_selection[w].eq(1 << i)
+
+            m.d.comb += s1_nacks[w].eq((s1_read_valids[w] & (
+                (s1_read_pipe_selection[w] & ~s1_ridx_match[w]) != 0))
+                                       | (s1_write_valids[w]
+                                          & ~s1_write_pipe_selection[w][w]))
 
             for i in reversed(range(self.mem_width)):
-                with m.If(s1_pipe_selection[w][i]):
+                with m.If(s1_read_pipe_selection[w][i]):
                     m.d.comb += s1_bank_selection[w].eq(s1_rbanks[i])
 
         #
