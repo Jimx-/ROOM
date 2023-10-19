@@ -136,9 +136,10 @@ class FetchUnit(HasRasterParams, Elaboratable):
 
         self.mem_bus = mem_bus
 
+        self.tile_count = Signal(16)
         self.tilebuf_addr = Signal(32)
         self.prim_addr = Signal(32)
-        self.prim_stride = Signal(4)
+        self.prim_stride = Signal(16)
 
         self.req = Decoupled(FetchUnit.Request)
 
@@ -148,7 +149,6 @@ class FetchUnit(HasRasterParams, Elaboratable):
         cache = m.submodules.cache = ICache(self.mem_bus, self.params)
 
         tile_addr = Signal(32)
-        tile_count = Signal(16)
 
         beat = Signal(4)
 
@@ -157,45 +157,20 @@ class FetchUnit(HasRasterParams, Elaboratable):
 
         prim_index = Signal(16)
         cur_pid = Signal(16)
-        cur_prim_addr = self.prim_addr + (cur_pid << self.prim_stride)
+        cur_prim_addr = Signal(32)
         cur_prim = Record(prim_layout)
         m.d.comb += cur_prim.pid.eq(cur_pid)
 
         with m.FSM():
             with m.State('IDLE'):
-                m.d.sync += tile_addr.eq(self.tilebuf_addr)
-                m.next = 'READ_TILE_COUNT'
-
-            with m.State('READ_TILE_COUNT'):
-                m.d.comb += [
-                    cache.req.valid.eq(1),
-                    cache.req.bits.addr.eq(tile_addr),
+                m.d.sync += [
+                    tile_addr.eq(self.tilebuf_addr),
+                    tile_index.eq(0),
                 ]
-
-                with m.If(cache.req.ready):
-                    m.next = 'READ_TILE_COUNT_1'
-
-            with m.State('READ_TILE_COUNT_1'):
-                m.d.comb += [
-                    cache.s1_paddr.eq(tile_addr),
-                ]
-                m.next = 'READ_TILE_COUNT_2'
-
-            with m.State('READ_TILE_COUNT_2'):
-                with m.If(cache.resp.valid):
-                    m.d.sync += [
-                        tile_count.eq(cache.resp.bits.data),
-                        tile_addr.eq(tile_addr + 4),
-                        tile_index.eq(0),
-                    ]
-
-                    m.next = 'READ_TILE'
-
-                with m.Else():
-                    m.next = 'READ_TILE_COUNT'
+                m.next = 'NEXT_TILE'
 
             with m.State('NEXT_TILE'):
-                with m.If(tile_index == tile_count):
+                with m.If(tile_index == self.tile_count):
                     m.next = 'DONE'
                 with m.Else():
                     m.next = 'READ_TILE'
@@ -210,9 +185,7 @@ class FetchUnit(HasRasterParams, Elaboratable):
                     m.next = 'READ_TILE_1'
 
             with m.State('READ_TILE_1'):
-                m.d.comb += [
-                    cache.s1_paddr.eq(tile_addr),
-                ]
+                m.d.comb += cache.s1_paddr.eq(tile_addr)
                 m.next = 'READ_TILE_2'
 
             with m.State('READ_TILE_2'):
@@ -276,10 +249,15 @@ class FetchUnit(HasRasterParams, Elaboratable):
                         tile_addr.eq(tile_addr + 4),
                     ]
 
-                    m.next = 'READ_PRIM'
+                    m.next = 'CALC_PRIM_ADDR'
 
                 with m.Else():
                     m.next = 'READ_PID'
+
+            with m.State('CALC_PRIM_ADDR'):
+                m.d.sync += cur_prim_addr.eq(self.prim_addr +
+                                             (cur_pid * self.prim_stride))
+                m.next = 'READ_PRIM'
 
             with m.State('READ_PRIM'):
                 m.d.comb += [
@@ -1078,6 +1056,11 @@ class RasterUnit(HasRasterParams, Elaboratable):
     def __init__(self, n_cores, params):
         super().__init__(params)
 
+        self.tile_count = Signal(16)
+        self.tilebuf_addr = Signal(32)
+        self.prim_addr = Signal(32)
+        self.prim_stride = Signal(16)
+
         self.mem_bus = tl.Interface(data_width=64, addr_width=32, size_width=3)
 
         self.req = [
@@ -1090,6 +1073,12 @@ class RasterUnit(HasRasterParams, Elaboratable):
 
         fetch_unit = m.submodules.fetch_unit = FetchUnit(
             self.mem_bus, self.params)
+        m.d.comb += [
+            fetch_unit.tile_count.eq(self.tile_count),
+            fetch_unit.tilebuf_addr.eq(self.tilebuf_addr),
+            fetch_unit.prim_addr.eq(self.prim_addr),
+            fetch_unit.prim_stride.eq(self.prim_stride),
+        ]
 
         raster_slice = m.submodules.raster_slice = RasterSlice(self.params)
         m.d.comb += fetch_unit.req.connect(raster_slice.req)

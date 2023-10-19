@@ -42,6 +42,11 @@ class Cluster(HasClusterParams, Elaboratable):
 
         self.busy = Signal()
 
+        self.raster_tile_count = Signal(16)
+        self.raster_tile_addr = Signal(32)
+        self.raster_prim_addr = Signal(32)
+        self.raster_prim_stride = Signal(16)
+
         self.dbus_mmio = tl.Interface(data_width=64,
                                       addr_width=32,
                                       size_width=3,
@@ -179,6 +184,12 @@ class Cluster(HasClusterParams, Elaboratable):
 
             raster_unit = m.submodules.raster_unit = DomainRenamer('raster')(
                 RasterUnit(self.num_cores, self.raster_params))
+            m.d.comb += [
+                raster_unit.tile_count.eq(self.raster_tile_count),
+                raster_unit.tilebuf_addr.eq(self.raster_tile_addr),
+                raster_unit.prim_addr.eq(self.raster_prim_addr),
+                raster_unit.prim_stride.eq(self.raster_prim_stride),
+            ]
 
             mem_bus_a = Decoupled(
                 tl.ChannelA,
@@ -334,6 +345,10 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                 cluster.core_enable.eq(self.ctrl.core_enable),
                 cluster.cache_enable.eq(self.ctrl.cache_enable),
                 cluster.raster_enable.eq(self.ctrl.raster_enable),
+                cluster.raster_tile_count.eq(self.ctrl.raster_tile_count),
+                cluster.raster_tile_addr.eq(self.ctrl.raster_tile_addr),
+                cluster.raster_prim_addr.eq(self.ctrl.raster_prim_addr),
+                cluster.raster_prim_stride.eq(self.ctrl.raster_prim_stride),
             ]
 
             dbus_a = Decoupled(

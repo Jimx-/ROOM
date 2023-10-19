@@ -12,9 +12,18 @@ class GroomController(Peripheral, Elaboratable):
         self.cache_enable = Signal()
         self.raster_enable = Signal()
 
+        self.raster_tile_count = Signal(16)
+        self.raster_tile_addr = Signal(32)
+        self.raster_prim_addr = Signal(32)
+        self.raster_prim_stride = Signal(16)
+
         bank = self.csr_bank()
         self._enable = bank.csr(3, 'rw')
         self._scratch = bank.csr(32, 'rw')
+        self._raster_tile_count = bank.csr(16, 'rw')
+        self._raster_tile_addr = bank.csr(32, 'rw')
+        self._raster_prim_addr = bank.csr(32, 'rw')
+        self._raster_prim_stride = bank.csr(16, 'rw')
 
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
@@ -32,5 +41,25 @@ class GroomController(Peripheral, Elaboratable):
         self._scratch.r_data.reset = 0x12345678
         with m.If(self._scratch.w_stb):
             m.d.sync += self._scratch.r_data.eq(self._scratch.w_data)
+
+        with m.If(self._raster_tile_count.w_stb):
+            m.d.sync += self._raster_tile_count.r_data.eq(
+                self._raster_tile_count.w_data)
+        m.d.comb += self.raster_tile_count.eq(self._raster_tile_count.r_data)
+
+        with m.If(self._raster_tile_addr.w_stb):
+            m.d.sync += self._raster_tile_addr.r_data.eq(
+                self._raster_tile_addr.w_data)
+        m.d.comb += self.raster_tile_addr.eq(self._raster_tile_addr.r_data)
+
+        with m.If(self._raster_prim_addr.w_stb):
+            m.d.sync += self._raster_prim_addr.r_data.eq(
+                self._raster_prim_addr.w_data)
+        m.d.comb += self.raster_prim_addr.eq(self._raster_prim_addr.r_data)
+
+        with m.If(self._raster_prim_stride.w_stb):
+            m.d.sync += self._raster_prim_stride.r_data.eq(
+                self._raster_prim_stride.w_data)
+        m.d.comb += self.raster_prim_stride.eq(self._raster_prim_stride.r_data)
 
         return m
