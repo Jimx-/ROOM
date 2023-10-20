@@ -316,6 +316,7 @@ class FPUExecUnit(ExecUnit):
 
         m.d.comb += [
             fp_stq.enq.bits.uop.eq(self.req.bits.uop),
+            fp_stq.enq.bits.wid.eq(self.req.bits.wid),
             Cat(*fp_stq.enq.bits.data).eq(Cat(*self.req.bits.rs2_data)),
             fp_stq.enq.valid.eq(self.req.valid & self.req.ready
                                 & (self.req.bits.uop.opcode == UOpCode.STA)),
@@ -341,6 +342,7 @@ class FPUExecUnit(ExecUnit):
                 m.d.comb += [
                     Cat(*self.fresp.bits.data).eq(Cat(*fu.resp.bits.data)),
                     self.fresp.bits.uop.eq(fu.resp.bits.uop),
+                    self.fresp.bits.wid.eq(fu.resp.bits.wid),
                 ]
 
         m.d.comb += self.fresp.valid.eq(
