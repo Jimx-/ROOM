@@ -917,8 +917,10 @@ class RasterSlice(HasRasterParams, Elaboratable):
         ]
         for i, s in enumerate(s1_samples):
             m.d.comb += [
-                s.x.eq(s1_tile.x + ((i % 3) << (s1_tile.level - 1))),
-                s.y.eq(s1_tile.y + ((i // 3) << (s1_tile.level - 1))),
+                s.x.eq(s1_tile.x +
+                       ((i % 3) << (s1_tile.level - 1).as_unsigned())),
+                s.y.eq(s1_tile.y +
+                       ((i // 3) << (s1_tile.level - 1).as_unsigned())),
             ]
 
         sample_evals = [SampleEvaluator() for _ in range(9)]

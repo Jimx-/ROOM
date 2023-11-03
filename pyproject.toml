@@ -1,0 +1,34 @@
+[project]
+name = ""
+version = ""
+description = ""
+authors = [
+    {name = "Jin Xue", email = "csjinxue@outlook.com"},
+]
+dependencies = [
+    "amaranth @ git+https://github.com/amaranth-lang/amaranth",
+    "riscv-model",
+    "amaranth-soc @ git+https://github.com/amaranth-lang/amaranth-soc@59223a8",
+    "amaranth-stdio @ git+https://github.com/amaranth-lang/amaranth-stdio",
+]
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "GPL"}
+
+[tool.pdm]
+[[tool.pdm.source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "pytest",
+    "rich",
+]
+
+
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"

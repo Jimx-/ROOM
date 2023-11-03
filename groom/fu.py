@@ -45,6 +45,9 @@ class ExecReq(HasCoreParams, ValueCastable):
         return Cat(self.wid, self.uop, *self.rs1_data, *self.rs2_data,
                    *self.rs3_data)
 
+    def shape(self):
+        return self.as_value().shape()
+
     def __len__(self):
         return len(Value.cast(self))
 
@@ -74,6 +77,9 @@ class ExecResp(HasCoreParams, ValueCastable):
     @ValueCastable.lowermethod
     def as_value(self):
         return Cat(self.wid, self.uop, *self.data, *self.addr)
+
+    def shape(self):
+        return self.as_value().shape()
 
     def __len__(self):
         return len(Value.cast(self))

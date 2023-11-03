@@ -410,6 +410,12 @@ class SoC(Elaboratable):
     def add_rom(self, name, origin, size, init=[], mode='r'):
         self.add_ram(name, origin, size, init, mode=mode)
 
+    def add_bus(self, name, bus, origin, size, mode='rw'):
+        bus.memory_map = MemoryMap(data_width=8, addr_width=log2_int(size))
+
+        self.bus.add_slave(name, bus,
+                           SoCRegion(origin=origin, size=size, mode=mode))
+
     def add_peripheral(self,
                        name,
                        periph,

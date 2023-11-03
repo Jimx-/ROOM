@@ -337,6 +337,9 @@ class BaseRequest(HasL2CacheParams, ValueCastable):
         return Cat(self.prio, self.control, self.opcode, self.param, self.size,
                    self.source, self.tag, self.offset, self.put)
 
+    def shape(self):
+        return self.as_value().shape()
+
     def __len__(self):
         return len(Value.cast(self))
 
