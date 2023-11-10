@@ -887,3 +887,55 @@ class TileLink2Wishbone(Elaboratable):
             ]
 
         return m
+
+
+class Serializer(Elaboratable):
+
+    def __init__(self, in_bus):
+        self.in_bus = in_bus
+        self.out_bus = Interface(addr_width=in_bus.addr_width,
+                                 data_width=in_bus.data_width,
+                                 size_width=in_bus.size_width,
+                                 source_id_width=in_bus.source_id_width,
+                                 sink_id_width=in_bus.sink_id_width,
+                                 has_bce=in_bus.has_bce)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_bus = self.in_bus
+        out_bus = self.out_bus
+
+        a_id = in_bus.a.bits.source
+        flight = Signal()
+        flight_id = Signal.like(a_id)
+
+        a_first, _, _, _ = Interface.count(m, in_bus.a.bits, in_bus.a.fire)
+        d_first, _, _, _ = Interface.count(m, in_bus.d.bits, in_bus.d.fire)
+        d_to_a = out_bus.d.bits.opcode != ChannelDOpcode.ReleaseAck
+
+        with m.If(a_first & in_bus.a.fire):
+            m.d.sync += flight.eq(1)
+        with m.If(d_first & d_to_a & in_bus.d.fire):
+            m.d.sync += flight.eq(0)
+
+        with m.If(in_bus.a.fire):
+            m.d.sync += flight_id.eq(a_id)
+
+        stall = a_first & flight & (flight_id != a_id)
+
+        m.d.comb += [
+            in_bus.a.connect(out_bus.a),
+            out_bus.d.connect(in_bus.d),
+            out_bus.a.valid.eq(in_bus.a.valid & ~stall),
+            in_bus.a.ready.eq(out_bus.a.ready & ~stall),
+        ]
+
+        if in_bus.has_bce:
+            m.d.comb += [
+                out_bus.b.connect(in_bus.b),
+                in_bus.c.connect(out_bus.c),
+                in_bus.e.connect(out_bus.e),
+            ]
+
+        return m
