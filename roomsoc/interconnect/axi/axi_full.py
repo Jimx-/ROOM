@@ -898,12 +898,16 @@ class AXIDecoder(Elaboratable):
             with m.If(rd_sel[i]):
                 m.d.comb += [
                     self.bus.ar.connect(sub_bus.ar),
+                    sub_bus.ar.valid.eq(self.bus.ar.valid & rd_sel_dec[i]),
+                    self.bus.ar.ready.eq(sub_bus.ar.ready & rd_sel_dec[i]),
                     self.bus.r.connect(sub_bus.r),
                 ]
 
             with m.If(wr_sel[i]):
                 m.d.comb += [
                     self.bus.aw.connect(sub_bus.aw),
+                    sub_bus.aw.valid.eq(self.bus.aw.valid & wr_sel_dec[i]),
+                    self.bus.aw.ready.eq(sub_bus.aw.ready & wr_sel_dec[i]),
                     self.bus.w.connect(sub_bus.w),
                     self.bus.b.connect(sub_bus.b),
                 ]
