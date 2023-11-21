@@ -143,6 +143,8 @@ class FetchUnit(HasRasterParams, Elaboratable):
 
         self.req = Decoupled(FetchUnit.Request)
 
+        self.done = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -307,7 +309,7 @@ class FetchUnit(HasRasterParams, Elaboratable):
                     m.next = 'NEXT_PRIM'
 
             with m.State('DONE'):
-                pass
+                m.d.comb += self.done.eq(1)
 
         return m
 
@@ -1112,9 +1114,10 @@ class RasterUnit(HasRasterParams, Elaboratable):
         with m.Switch(req_grant):
             for i, req in enumerate(self.req):
                 with m.Case(i):
-                    with m.If(req.valid & raster_slice.r_rdy & (
-                        ((req.bits.tmask & quad_valids) == req.bits.tmask)
-                            | raster_slice.done)):
+                    with m.If(req.valid & (
+                        (raster_slice.r_rdy & (
+                            (req.bits.tmask & quad_valids) == req.bits.tmask))
+                            | (fetch_unit.done & raster_slice.done))):
                         m.d.comb += [
                             req.ready.eq(1),
                             raster_slice.r_en.eq(1),

@@ -876,7 +876,7 @@ class FDivUnit(IterativeFunctionalUnit):
                                 (self.req.bits.uop.opcode == UOpCode.FSQRT_D)),
                 fdiv.fmt.eq(
                     Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
-                fdiv.in_valid.eq(self.req.valid & self.req.bits.uop.tmask[w]),
+                fdiv.in_valid.eq(self.req.fire & self.req.bits.uop.tmask[w]),
                 self.resp.bits.data[w].eq(fdiv.out.bits),
                 div_resp_valid[w].eq(fdiv.out.valid),
                 fdiv.out.ready.eq(~tmask_valid | self.resp.fire),
