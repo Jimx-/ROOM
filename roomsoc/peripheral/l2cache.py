@@ -494,17 +494,6 @@ class Directory(HasL2CacheParams, Elaboratable):
             for i in range(self.n_ways))
         m.d.comb += Cat(rways).eq(rport.data)
 
-        hits = Signal(self.n_ways)
-        m.d.comb += hits.eq(
-            Cat((w.tag == tag) & (w.state != CacheState.INVALID)
-                for w in rways))
-        hit = hits != 0
-
-        hit_way = Signal(range(self.n_ways))
-        for w in reversed(range(self.n_ways)):
-            with m.If(hits[w]):
-                m.d.comb += hit_way.eq(w)
-
         victim_way = Signal(range(self.n_ways))
         with m.If(ren1):
             m.d.sync += victim_way.eq(victim_way + 1)
@@ -512,6 +501,18 @@ class Directory(HasL2CacheParams, Elaboratable):
         set_match = wen & (write_req.set == set)
         tag_match = write_req.tag == tag
         way_match = write_req.way == victim_way
+
+        hits = Signal(self.n_ways)
+        m.d.comb += hits.eq(
+            Cat((w.tag == tag) & (w.state != CacheState.INVALID)
+                & (~set_match | (write_req.way != i))
+                for i, w in enumerate(rways)))
+        hit = hits != 0
+
+        hit_way = Signal(range(self.n_ways))
+        for w in reversed(range(self.n_ways)):
+            with m.If(hits[w]):
+                m.d.comb += hit_way.eq(w)
 
         m.d.comb += [
             self.result.valid.eq(ren1),
