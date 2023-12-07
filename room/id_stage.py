@@ -712,27 +712,39 @@ class DecodeUnit(HasCoreParams, Elaboratable):
 
             with m.Case(OPV('AMOADD')):
                 m.d.comb += [
-                    UOPC(UOpCode.AMO_AG),
                     uop.iq_type.eq(IssueQueueType.MEM),
                     uop.fu_type.eq(FUType.MEM),
                     uop.dst_rtype.eq(RegisterType.FIX),
                     uop.lrs1_rtype.eq(RegisterType.FIX),
-                    uop.lrs2_rtype.eq(RegisterType.FIX),
-                    uop.uses_stq.eq(1),
-                    uop.is_amo.eq(1),
                     uop.mem_size.eq(inuop.inst[12:14]),
                     uop.clear_pipeline.eq(1),
                     uop.flush_on_commit.eq(1),
                 ]
+                with m.If(inuop.inst[27:32] == F5('LR')):
+                    m.d.comb += [
+                        UOPC(UOpCode.LD),
+                        uop.uses_ldq.eq(1),
+                        uop.mem_cmd.eq(MemoryCommand.LR),
+                    ]
+                with m.Else():
+                    m.d.comb += [
+                        UOPC(UOpCode.AMO_AG),
+                        uop.lrs2_rtype.eq(RegisterType.FIX),
+                        uop.uses_stq.eq(1),
+                        uop.is_amo.eq(1),
+                    ]
 
-                for name in [
-                        'ADD', 'XOR', 'OR', 'AND', 'MIN', 'MAX', 'MINU',
-                        'MAXU', 'SWAP'
-                ]:
                     with m.Switch(inuop.inst[27:32]):
-                        with m.Case(F5('AMO' + name)):
-                            m.d.comb += uop.mem_cmd.eq(
-                                getattr(MemoryCommand, 'AMO_' + name))
+                        for name in [
+                                'ADD', 'XOR', 'OR', 'AND', 'MIN', 'MAX',
+                                'MINU', 'MAXU', 'SWAP'
+                        ]:
+                            with m.Case(F5('AMO' + name)):
+                                m.d.comb += uop.mem_cmd.eq(
+                                    getattr(MemoryCommand, 'AMO_' + name))
+
+                        with m.Case(F5('SC')):
+                            m.d.comb += uop.mem_cmd.eq(MemoryCommand.SC)
 
                 if self.xlen != 64:
                     with m.If(uop.mem_size == 3):

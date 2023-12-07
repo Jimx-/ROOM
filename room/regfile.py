@@ -348,7 +348,9 @@ class RegReadDecoder(Elaboratable):
                 & (self.iss_uop.lrs2_rtype == RegisterType.FIX))),
         ]
 
-        with m.If(self.rrd_uop.opcode == UOpCode.AMO_AG):
+        with m.If((self.rrd_uop.opcode == UOpCode.AMO_AG)
+                  | ((self.rrd_uop.opcode == UOpCode.LD)
+                     & (self.rrd_uop.mem_cmd == MemoryCommand.LR))):
             m.d.comb += self.rrd_uop.imm_packed.eq(0)
 
         return m

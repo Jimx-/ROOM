@@ -265,11 +265,13 @@ class MemoryCommand(IntEnum):
 
     @staticmethod
     def is_read(cmd):
-        return (cmd == MemoryCommand.READ) | MemoryCommand.is_amo(cmd)
+        return (cmd == MemoryCommand.READ) | (cmd == MemoryCommand.LR) | (
+            cmd == MemoryCommand.SC) | MemoryCommand.is_amo(cmd)
 
     @staticmethod
     def is_write(cmd):
-        return (cmd == MemoryCommand.WRITE) | MemoryCommand.is_amo(cmd)
+        return (cmd == MemoryCommand.WRITE) | (
+            cmd == MemoryCommand.SC) | MemoryCommand.is_amo(cmd)
 
     @staticmethod
     def is_amo_logical(cmd):

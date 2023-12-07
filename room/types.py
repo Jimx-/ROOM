@@ -28,6 +28,12 @@ class HasCoreParams:
 
         self.fma_latency = params['fma_latency']
 
+        #
+        # LR/SC
+        #
+
+        self.lrsc_cycles = params.get('lrsc_cycles', 80)
+
         if not self.is_groom:
             self.core_width = params['core_width']
 

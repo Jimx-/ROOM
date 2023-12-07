@@ -1350,7 +1350,8 @@ class MSHR(HasDCacheParams, Elaboratable):
 
                 drain_load = MemoryCommand.is_read(
                     rpq.r_data.uop.mem_cmd) & ~MemoryCommand.is_write(
-                        rpq.r_data.uop.mem_cmd)
+                        rpq.r_data.uop.mem_cmd) & (rpq.r_data.uop.mem_cmd
+                                                   != MemoryCommand.LR)
 
                 rp_addr = Cat(self.addr_block_offset(rpq.r_data.addr), req_idx,
                               req_tag)
@@ -2393,6 +2394,7 @@ class DCache(HasDCacheParams, Elaboratable):
         ]
         s2_state_is_hit = Signal(self.mem_width)
         s2_hit = Signal(self.mem_width)
+        s2_nack = Signal(self.mem_width)
         s2_wb_idx_matches = Signal.like(s1_wb_idx_matches)
 
         s2_metadata = [[
@@ -2456,6 +2458,46 @@ class DCache(HasDCacheParams, Elaboratable):
                 with m.If(s2_replace_way_en[w]):
                     m.d.comb += s2_replace_meta[i].eq(s2_metadata[i][w])
 
+        lrsc_count = Signal(range(self.lrsc_cycles))
+        lrsc_valid = lrsc_count > 3
+        lrsc_addr = Signal.like(s2_req[0].addr)
+        s2_lrsc_nack = Signal()
+        s2_do_lr = (s2_req[0].uop.mem_cmd
+                    == MemoryCommand.LR) & (~s2_lrsc_nack |
+                                            (s2_type == DCacheReqType.REPLAY))
+        s2_do_sc = (s2_req[0].uop.mem_cmd
+                    == MemoryCommand.SC) & (~s2_lrsc_nack |
+                                            (s2_type == DCacheReqType.REPLAY))
+        s2_do_debug_lr = Signal()
+        m.d.comb += s2_do_debug_lr.eq(
+            s2_req[0].uop.mem_cmd == MemoryCommand.LR)
+        s2_lrsc_addr_match = Cat(lrsc_valid
+                                 & (s2_req[w].addr[self.block_off_bits:] ==
+                                    lrsc_addr[self.block_off_bits:])
+                                 for w in range(self.mem_width))
+        s2_sc_fail = s2_do_sc & ~s2_lrsc_addr_match[0]
+
+        m.d.sync += s2_lrsc_nack.eq(s1_nack[0])
+        with m.If(lrsc_count > 0):
+            m.d.sync += lrsc_count.eq(lrsc_count - 1)
+
+        with m.If(s2_valid[0]
+                  & (((s2_type == DCacheReqType.LSU) & s2_hit[0] & ~s2_nack[0])
+                     | (s2_type == DCacheReqType.REPLAY))):
+            with m.If(s2_do_lr):
+                m.d.sync += [
+                    lrsc_count.eq(self.lrsc_cycles - 1),
+                    lrsc_addr.eq(s2_req[0].addr),
+                ]
+            with m.If(lrsc_count > 0):
+                m.d.sync += lrsc_count.eq(0)
+
+        for w in range(self.mem_width):
+            with m.If(s2_valid[w] & (s2_type == DCacheReqType.LSU) & ~s2_hit[w]
+                      & ~(s2_state_is_hit[w] & s2_tag_match[w])
+                      & s2_lrsc_addr_match[w] & ~s2_nack[w]):
+                m.d.sync += lrsc_count.eq(0)
+
         s2_data = [[
             Signal(self.row_bits, name=f's2_data{i}_way{w}')
             for w in range(self.n_ways)
@@ -2494,7 +2536,6 @@ class DCache(HasDCacheParams, Elaboratable):
                     for w in range(self.mem_width))),
         ]
 
-        s2_nack = Signal(self.mem_width)
         m.d.comb += s2_nack.eq(
             Cat((s2_nack_mshr[w] | s2_nack_probe[w] | s2_nack_victim[w]
                  | s2_nack_data[w] | s2_nack_wb[w])
@@ -2652,7 +2693,9 @@ class DCache(HasDCacheParams, Elaboratable):
             m.d.comb += [
                 cache_resp[w].valid.eq(s2_valid[w] & s2_send_resp[w]),
                 cache_resp[w].bits.uop.eq(s2_req[w].uop),
-                cache_resp[w].bits.data.eq(load_gen.data_out),
+                cache_resp[w].bits.data.eq(
+                    Mux((w == 0) & s2_do_sc, 0, load_gen.data_out)
+                    | s2_sc_fail),
             ]
 
         resp = [
@@ -2728,6 +2771,7 @@ class DCache(HasDCacheParams, Elaboratable):
                 s3_req[w].data.eq(amo_gen.out),
                 s3_valid[w].eq(s2_valid[w] & s2_hit[w]
                                & MemoryCommand.is_write(s2_req[w].uop.mem_cmd)
+                               & ~s2_sc_fail
                                & ~(s2_send_nack[w] & s2_nack[w])),
                 s3_way[w].eq(s2_tag_match_way[w]),
             ]
