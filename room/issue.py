@@ -237,8 +237,9 @@ class IssueUnit(HasCoreParams, Elaboratable):
 
             if self.iq_type == IssueQueueType.INT or self.iq_type == IssueQueueType.MEM:
                 # For integer stores, issue two micro-ops (STA + STD)
-                with m.If((uop.opcode == UOpCode.STA)
-                          & (uop.lrs2_rtype == RegisterType.FIX)):
+                with m.If(((uop.opcode == UOpCode.STA)
+                           & (uop.lrs2_rtype == RegisterType.FIX))
+                          | (uop.opcode == UOpCode.AMO_AG)):
                     m.d.comb += mux_uop.issue_uops.eq(2)
                 with m.Elif((uop.opcode == UOpCode.STA)
                             & (uop.lrs2_rtype != RegisterType.FIX)):

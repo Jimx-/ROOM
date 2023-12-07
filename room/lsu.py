@@ -396,11 +396,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                    & (~ldq_retry_e.addr_uncacheable
                       | (self.commit_load_at_head & (ldq_head == ldq_retry_idx)
                          & (ldq_retry_e.st_dep_mask == 0)))),
-                can_fire_store_commit[w].eq(stq_commit_e.valid
-                                            & ~stq_commit_e.uop.exception
-                                            & ~stq_commit_e.uop.is_fence
-                                            & (w == 0)
-                                            & stq_commit_e.committed),
+                can_fire_store_commit[w].eq(
+                    stq_commit_e.valid
+                    & ~stq_commit_e.uop.exception
+                    & ~stq_commit_e.uop.is_fence
+                    & (w == 0)
+                    & (stq_commit_e.committed
+                       | (stq_commit_e.uop.is_amo & stq_commit_e.addr_valid
+                          & stq_commit_e.data_valid))),
             ]
 
         will_fire_load_incoming = Signal(self.mem_width)
@@ -683,6 +686,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 m.d.sync += [
                     clr_bsy_valids[w].
                     eq(s1_stq_incoming_e[w].valid
+                       & ~s1_stq_incoming_e[w].uop.is_amo
                        & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
                     clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
@@ -694,6 +698,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     clr_bsy_valids[w].
                     eq(s1_stq_incoming_e[w].valid
                        & s1_stq_incoming_e[w].data_valid
+                       & ~s1_stq_incoming_e[w].uop.is_amo
                        & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
                     clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
@@ -705,6 +710,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     clr_bsy_valids[w].
                     eq(s1_stq_incoming_e[w].valid
                        & s1_stq_incoming_e[w].addr_valid
+                       & ~s1_stq_incoming_e[w].uop.is_amo
                        & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
                     clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
@@ -887,7 +893,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                             dcache.s1_kill[w].eq(dmem_req_fired[w]),
                             s1_set_executed[cam_ldq_idx[w]].eq(0),
                         ]
-                    with m.Elif(stq[i].uop.is_fence):
+                    with m.Elif(stq[i].uop.is_fence | stq[i].uop.is_amo):
                         m.d.comb += [
                             ldst_addr_matches[w][i].eq(1),
                             dcache.s1_kill[w].eq(dmem_req_fired[w]),
@@ -984,6 +990,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     stq_idx = dcache.resp[w].bits.uop.stq_idx
                     m.d.comb += dmem_resp_fire[w].eq(1)
                     m.d.sync += stq[stq_idx].succeeded.eq(1)
+
+                    with m.If(dcache.resp[w].bits.uop.is_amo):
+                        m.d.comb += [
+                            self.exec_iresps[w].valid.eq(1),
+                            self.exec_iresps[w].bits.uop.eq(stq[stq_idx].uop),
+                            self.exec_iresps[w].bits.data.eq(
+                                dcache.resp[w].bits.data),
+                        ]
 
             with m.If(~dmem_resp_fire[w] & s2_forward_valid[w]):
                 ldq_e = ldq[s2_forward_ldq_idx[w]]

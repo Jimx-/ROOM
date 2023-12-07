@@ -251,14 +251,43 @@ class MemoryCommand(IntEnum):
     X = 0
     READ = 1
     WRITE = 2
+    AMO_ADD = 3
+    AMO_XOR = 4
+    AMO_OR = 5
+    AMO_AND = 6
+    AMO_MIN = 7
+    AMO_MAX = 8
+    AMO_MINU = 9
+    AMO_MAXU = 10
+    AMO_SWAP = 11
+    LR = 12
+    SC = 13
 
     @staticmethod
     def is_read(cmd):
-        return cmd == MemoryCommand.READ
+        return (cmd == MemoryCommand.READ) | MemoryCommand.is_amo(cmd)
 
     @staticmethod
     def is_write(cmd):
-        return cmd == MemoryCommand.WRITE
+        return (cmd == MemoryCommand.WRITE) | MemoryCommand.is_amo(cmd)
+
+    @staticmethod
+    def is_amo_logical(cmd):
+        return (cmd == MemoryCommand.AMO_SWAP) | (
+            cmd == MemoryCommand.AMO_XOR) | (cmd == MemoryCommand.AMO_OR) | (
+                cmd == MemoryCommand.AMO_AND)
+
+    @staticmethod
+    def is_amo_arithmetic(cmd):
+        return (cmd == MemoryCommand.AMO_ADD) | (
+            cmd == MemoryCommand.AMO_MIN) | (cmd == MemoryCommand.AMO_MAX) | (
+                cmd == MemoryCommand.AMO_MINU) | (cmd
+                                                  == MemoryCommand.AMO_MAXU)
+
+    @staticmethod
+    def is_amo(cmd):
+        return MemoryCommand.is_amo_logical(
+            cmd) | MemoryCommand.is_amo_arithmetic(cmd)
 
 
 class CSRCommand(IntEnum):

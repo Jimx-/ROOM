@@ -103,6 +103,8 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                    ).field_opcode.value
         F3 = lambda name: getattr(insn, f'Instruction{name}'
                                   ).field_funct3.value
+        F5 = lambda name: getattr(insn, f'Instruction{name}'
+                                  ).field_funct5.value
         F7 = lambda name: getattr(insn, f'Instruction{name}'
                                   ).field_funct7.value
         OPIMM = lambda name: getattr(insn, f'Instruction{name}'
@@ -707,6 +709,34 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             m.d.comb += UOPC(
                                 Mux(uop.fp_single, UOpCode.FNMSUB_S,
                                     UOpCode.FNMSUB_D))
+
+            with m.Case(OPV('AMOADD')):
+                m.d.comb += [
+                    UOPC(UOpCode.AMO_AG),
+                    uop.iq_type.eq(IssueQueueType.MEM),
+                    uop.fu_type.eq(FUType.MEM),
+                    uop.dst_rtype.eq(RegisterType.FIX),
+                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                    uop.lrs2_rtype.eq(RegisterType.FIX),
+                    uop.uses_stq.eq(1),
+                    uop.is_amo.eq(1),
+                    uop.mem_size.eq(inuop.inst[12:14]),
+                    uop.clear_pipeline.eq(1),
+                    uop.flush_on_commit.eq(1),
+                ]
+
+                for name in [
+                        'ADD', 'XOR', 'OR', 'AND', 'MIN', 'MAX', 'MINU',
+                        'MAXU', 'SWAP'
+                ]:
+                    with m.Switch(inuop.inst[27:32]):
+                        with m.Case(F5('AMO' + name)):
+                            m.d.comb += uop.mem_cmd.eq(
+                                getattr(MemoryCommand, 'AMO_' + name))
+
+                if self.xlen != 64:
+                    with m.If(uop.mem_size == 3):
+                        m.d.comb += ILL_INSN
 
             with m.Default():
                 m.d.comb += ILL_INSN

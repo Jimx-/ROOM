@@ -341,11 +341,15 @@ class RegReadDecoder(Elaboratable):
 
         m.d.comb += [
             self.rrd_uop.is_load.eq(self.iss_uop.opcode == UOpCode.LD),
-            self.rrd_uop.is_sta.eq(self.iss_uop.opcode == UOpCode.STA),
+            self.rrd_uop.is_sta.eq((self.iss_uop.opcode == UOpCode.STA)
+                                   | (self.iss_uop.opcode == UOpCode.AMO_AG)),
             self.rrd_uop.is_std.eq((self.iss_uop.opcode == UOpCode.STD) | (
-                (self.iss_uop.opcode == UOpCode.STA)
+                self.rrd_uop.is_sta
                 & (self.iss_uop.lrs2_rtype == RegisterType.FIX))),
         ]
+
+        with m.If(self.rrd_uop.opcode == UOpCode.AMO_AG):
+            m.d.comb += self.rrd_uop.imm_packed.eq(0)
 
         return m
 

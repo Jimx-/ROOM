@@ -149,6 +149,7 @@ class MicroOp(HasCoreParams, Record):
             ('is_br', 1),
             ('is_jal', 1),
             ('is_jalr', 1),
+            ('is_amo', 1),
             ('br_mask', self.max_br_count),
             ('imm_packed', 20),
             ('mem_cmd', MemoryCommand),

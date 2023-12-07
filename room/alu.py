@@ -307,7 +307,33 @@ class AMODataGen(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        out = self.rhs
+        max = (self.cmd == MemoryCommand.AMO_MAX) | (self.cmd
+                                                     == MemoryCommand.AMO_MAXU)
+        min = (self.cmd == MemoryCommand.AMO_MIN) | (self.cmd
+                                                     == MemoryCommand.AMO_MINU)
+        add = self.cmd == MemoryCommand.AMO_ADD
+        logic_and = (self.cmd == MemoryCommand.AMO_AND) | (
+            self.cmd == MemoryCommand.AMO_OR)
+        logic_xor = (self.cmd == MemoryCommand.AMO_XOR) | (
+            self.cmd == MemoryCommand.AMO_OR)
+
+        adder_mask = ~((~self.mask[3]) << 31)
+        adder_out = (self.lhs & adder_mask) + (self.rhs & adder_mask)
+
+        signed = (self.cmd == MemoryCommand.AMO_MAX) | (
+            self.cmd == MemoryCommand.AMO_MIN)
+        less = Signal()
+        for w in (32, 64):
+            with m.If(self.mask[w // 8 // 2]):
+                ltu = (self.lhs[:w].as_unsigned() < self.rhs[:w].as_unsigned())
+                lt = (~(self.lhs[w - 1] ^ self.rhs[w - 1])
+                      & ltu) | (self.lhs[w - 1] & ~self.rhs[w - 1])
+                m.d.comb += less.eq(Mux(signed, lt, ltu))
+
+        minmax = Mux(Mux(less, min, max), self.lhs, self.rhs)
+        logic = Mux(logic_and, self.lhs & self.rhs, 0) | Mux(
+            logic_xor, self.lhs ^ self.rhs, 0)
+        out = Mux(add, adder_out, Mux(logic_and | logic_xor, logic, minmax))
 
         wmask = Signal(self.width)
         for i in range(len(self.mask)):
