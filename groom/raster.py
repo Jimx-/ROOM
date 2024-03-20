@@ -25,8 +25,8 @@ def vec3_layout(w, dir=DIR_FANOUT):
 
 
 edge_layout = [
-    ('a', 17, DIR_FANOUT),
-    ('b', 17, DIR_FANOUT),
+    ('a', 32, DIR_FANOUT),
+    ('b', 32, DIR_FANOUT),
     ('c', 32, DIR_FANOUT),
 ]
 
@@ -319,12 +319,12 @@ class EdgeEvaluator(Elaboratable):
     class MAC(Elaboratable):
 
         def __init__(self):
-            self.a = Signal(17)
+            self.a = Signal(32)
             self.b = Signal(15)
             self.c = Signal(32)
             self.enable = Signal()
 
-            self.out = Signal(32)
+            self.out = Signal(33)
 
         def elaborate(self, platform):
             m = Module()

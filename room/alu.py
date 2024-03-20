@@ -324,11 +324,13 @@ class AMODataGen(Elaboratable):
             self.cmd == MemoryCommand.AMO_MIN)
         less = Signal()
         for w in (32, 64):
-            with m.If(self.mask[w // 8 // 2]):
-                ltu = (self.lhs[:w].as_unsigned() < self.rhs[:w].as_unsigned())
-                lt = (~(self.lhs[w - 1] ^ self.rhs[w - 1])
-                      & ltu) | (self.lhs[w - 1] & ~self.rhs[w - 1])
-                m.d.comb += less.eq(Mux(signed, lt, ltu))
+            if w <= self.width:
+                with m.If(self.mask[w // 8 // 2]):
+                    ltu = (self.lhs[:w].as_unsigned()
+                           < self.rhs[:w].as_unsigned())
+                    lt = (~(self.lhs[w - 1] ^ self.rhs[w - 1])
+                          & ltu) | (self.lhs[w - 1] & ~self.rhs[w - 1])
+                    m.d.comb += less.eq(Mux(signed, lt, ltu))
 
         minmax = Mux(Mux(less, min, max), self.lhs, self.rhs)
         logic = Mux(logic_and, self.lhs & self.rhs, 0) | Mux(
