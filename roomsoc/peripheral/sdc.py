@@ -224,8 +224,8 @@ class SDCommandPHY(Elaboratable):
         self.long_response = Signal()
 
         self.cmd_i = Signal()
-        self.cmd_o = Signal()
-        self.cmd_oe = Signal()
+        self.cmd_o = Signal(reset=1)
+        self.cmd_oe = Signal(reset=1)
         self.finish = Signal()
         self.response = Signal(120)
         self.crc_err = Signal()
@@ -773,7 +773,7 @@ class SDController(SDControllerBase):
 
         self.sdio_clk = Signal()
         self.sdio_cmd_i = Signal()
-        self.sdio_cmd_o = Signal()
+        self.sdio_cmd_o = Signal(reset_less=True)
         self.sdio_cmd_t = Signal()
         self.sdio_data_i = Signal(4)
         self.sdio_data_o = Signal(4)
