@@ -2019,7 +2019,10 @@ class MSHR(HasL2CacheParams, Elaboratable):
             # Channel A
             self.schedule.bits.a.bits.tag.eq(request.tag),
             self.schedule.bits.a.bits.set.eq(request.set),
-            self.schedule.bits.a.bits.param.eq(tl.GrowParam.NtoB),
+            self.schedule.bits.a.bits.param.eq(
+                Mux(req_need_t,
+                    Mux(meta.hit, tl.GrowParam.BtoT, tl.GrowParam.NtoT),
+                    tl.GrowParam.NtoB)),
             self.schedule.bits.a.bits.block.eq(1),
             self.schedule.bits.a.bits.source.eq(0),
             # Channel B
