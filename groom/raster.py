@@ -321,7 +321,7 @@ class EdgeEvaluator(Elaboratable):
         def __init__(self):
             self.a = Signal(32)
             self.b = Signal(15)
-            self.c = Signal(32)
+            self.c = Signal(33)
             self.enable = Signal()
 
             self.out = Signal(33)
@@ -385,7 +385,7 @@ class EdgeEvaluator(Elaboratable):
         s2_out = Signal(32)
         m.d.comb += [
             s2_ready.eq(~s2_valid | s3_ready),
-            s2_out.eq(s1_mac.out.as_signed() + s2_edge.c.as_signed()),
+            s2_out.eq(s1_mac.out.as_signed() + s2_edge.c),
             s1_mac.enable.eq(s2_ready),
         ]
         with m.If(s2_ready):
@@ -511,9 +511,11 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
 
         s0_valid = Signal()
         s0_tile = Record(tile_layout)
+        s0_prim = Record(prim_layout)
         m.d.comb += [
             s0_valid.eq(self.req.valid),
             s0_tile.eq(self.req.bits),
+            s0_prim.eq(self.prim),
             self.req.ready.eq(s1_ready),
         ]
 
@@ -532,15 +534,16 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
             setattr(m.submodules, f'sample_eval{i}', ev)
             m.d.comb += [
                 ev.valid.eq(s0_valid),
-                ev.edge1.eq(self.prim.edge1),
-                ev.edge2.eq(self.prim.edge2),
-                ev.edge3.eq(self.prim.edge3),
+                ev.edge1.eq(s0_prim.edge1),
+                ev.edge2.eq(s0_prim.edge2),
+                ev.edge3.eq(s0_prim.edge3),
                 ev.p.eq(sample),
                 ev.out.ready.eq(s4_ready),
             ]
 
         s1_valid = Signal()
         s1_tile = Record(tile_layout)
+        s1_prim = Record(prim_layout)
         s1_samples = [
             Record(vec2_layout(15), name=f's1_sample{i}') for i in range(9)
         ]
@@ -548,10 +551,14 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         with m.If(s1_ready):
             m.d.sync += s1_valid.eq(s0_valid)
         with m.If(s0_valid & s1_ready):
-            m.d.sync += Cat(s1_tile, *s1_samples).eq(Cat(s0_tile, *s0_samples))
+            m.d.sync += [
+                Cat(s1_tile, *s1_samples).eq(Cat(s0_tile, *s0_samples)),
+                s1_prim.eq(s0_prim),
+            ]
 
         s2_valid = Signal()
         s2_tile = Record(tile_layout)
+        s2_prim = Record(prim_layout)
         s2_samples = [
             Record(vec2_layout(15), name=f's2_sample{i}') for i in range(9)
         ]
@@ -559,10 +566,14 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         with m.If(s2_ready):
             m.d.sync += s2_valid.eq(s1_valid)
         with m.If(s1_valid & s2_ready):
-            m.d.sync += Cat(s2_tile, *s2_samples).eq(Cat(s1_tile, *s1_samples))
+            m.d.sync += [
+                Cat(s2_tile, *s2_samples).eq(Cat(s1_tile, *s1_samples)),
+                s2_prim.eq(s1_prim),
+            ]
 
         s3_valid = Signal()
         s3_tile = Record(tile_layout)
+        s3_prim = Record(prim_layout)
         s3_samples = [
             Record(vec2_layout(15), name=f's3_sample{i}') for i in range(9)
         ]
@@ -571,7 +582,10 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         with m.If(s3_ready):
             m.d.sync += s3_valid.eq(s2_valid)
         with m.If(s2_valid & s3_ready):
-            m.d.sync += Cat(s3_tile, *s3_samples).eq(Cat(s2_tile, *s2_samples))
+            m.d.sync += [
+                Cat(s3_tile, *s3_samples).eq(Cat(s2_tile, *s2_samples)),
+                s3_prim.eq(s2_prim),
+            ]
 
         corners = [
             (0, 1, 4, 3),
@@ -586,7 +600,7 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
                 quad.bits.x.eq(s3_tile.x + 2 * (i & 1)),
                 quad.bits.y.eq(s3_tile.y + 2 * (i >> 1)),
                 quad.bits.barycentric.eq(sample_evals[start].out.bits),
-                quad.bits.pid.eq(self.prim.pid),
+                quad.bits.pid.eq(s3_prim.pid),
             ]
 
             tile_eval = TileEvaluator()
@@ -604,6 +618,7 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
 
         s4_valid = Signal()
         s4_tile = Record(tile_layout)
+        s4_prim = Record(prim_layout)
         s4_samples = [
             Record(vec2_layout(15), name=f's4_sample{i}') for i in range(9)
         ]
@@ -613,7 +628,10 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
         with m.If(s4_ready):
             m.d.sync += s4_valid.eq(s3_valid)
         with m.If(s3_valid & s4_ready):
-            m.d.sync += Cat(s4_tile, *s4_samples).eq(Cat(s3_tile, *s3_samples))
+            m.d.sync += [
+                Cat(s4_tile, *s4_samples).eq(Cat(s3_tile, *s3_samples)),
+                s4_prim.eq(s3_prim),
+            ]
             for s4_q, s3_q in zip(s4_quads, s3_quads):
                 m.d.sync += s4_q.eq(s3_q)
 
@@ -626,21 +644,21 @@ class QuadEvaluator(HasRasterParams, Elaboratable):
                 s = [Signal(signed(32)) for _ in range(3)]
                 m.d.comb += [
                     s[0].eq(quad.bits.barycentric.x.as_signed() +
-                            (self.prim.edge1.a.as_signed() if dx == 1 else 0) +
-                            (self.prim.edge1.b.as_signed() if dy == 1 else 0)),
+                            (s4_prim.edge1.a.as_signed() if dx == 1 else 0) +
+                            (s4_prim.edge1.b.as_signed() if dy == 1 else 0)),
                     s[1].eq(quad.bits.barycentric.y.as_signed() +
-                            (self.prim.edge2.a.as_signed() if dx == 1 else 0) +
-                            (self.prim.edge2.b.as_signed() if dy == 1 else 0)),
+                            (s4_prim.edge2.a.as_signed() if dx == 1 else 0) +
+                            (s4_prim.edge2.b.as_signed() if dy == 1 else 0)),
                     s[2].eq(quad.bits.barycentric.z.as_signed() +
-                            (self.prim.edge3.a.as_signed() if dx == 1 else 0) +
-                            (self.prim.edge3.b.as_signed() if dy == 1 else 0)),
+                            (s4_prim.edge3.a.as_signed() if dx == 1 else 0) +
+                            (s4_prim.edge3.b.as_signed() if dy == 1 else 0)),
                     s4_mask[i][j].eq(~Cat(x < 0 for x in s).any()),
                 ]
 
         for q, qq, mask in zip(self.quads, s4_quads, s4_mask):
             m.d.comb += [
                 q.eq(qq),
-                q.valid.eq(qq.valid & s4_valid),
+                q.valid.eq(qq.valid & s4_valid & (mask != 0)),
                 q.bits.mask.eq(mask),
             ]
 
