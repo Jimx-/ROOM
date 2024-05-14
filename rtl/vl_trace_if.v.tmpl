@@ -72,7 +72,7 @@ module vl_trace_if
    input wire                                  rst
 );
 
-   always @(posedge clk) begin
+   always @(posedge clk or negedge rst) begin
       if (~rst) begin
          // {% for i in range(core.fetch_width) %}
          if (if_debug{{i}}_valid) begin

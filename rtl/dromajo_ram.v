@@ -38,7 +38,7 @@ module dromajo_ram #
 
    assign dat_o = dat_r_reg[DATA_WIDTH-1:0];
 
-   always @(posedge clk_i) begin
+   always @(posedge clk_i or posedge rst_i) begin
       if (~rst_i) begin
          if (cyc_i & stb_i & we_i) begin
             dpi_memory_write(RAM_BASE + (adr_i << ADDR_LSB_WIDTH), sel_i, dat_i, LOG_SIZE);
@@ -46,7 +46,7 @@ module dromajo_ram #
       end
    end
 
-   always @(posedge clk_i) begin
+   always @(posedge clk_i or posedge rst_i) begin
       if (rst_i)
         ack_reg <= 0;
       else

@@ -6,7 +6,7 @@ authors = [
     {name = "Jin Xue", email = "csjinxue@outlook.com"},
 ]
 dependencies = [
-    "amaranth @ git+https://github.com/amaranth-lang/amaranth",
+    "amaranth==0.4.0",
     "riscv-model",
     "amaranth-soc @ git+https://github.com/amaranth-lang/amaranth-soc@59223a8",
     "amaranth-stdio @ git+https://github.com/amaranth-lang/amaranth-stdio",
