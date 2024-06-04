@@ -1,8 +1,9 @@
 from amaranth import *
 from amaranth.hdl.rec import *
 from amaranth.lib.cdc import FFSynchronizer
+from amaranth.utils import log2_int
 
-from roomsoc.interconnect.stream import Decoupled, ClockDomainCrossing, Gearbox
+from roomsoc.interconnect.stream import Decoupled, ClockDomainCrossing, Gearbox, SkidBuffer
 
 from .peripheral import Peripheral
 
@@ -472,6 +473,235 @@ class ColorBarsPattern(Elaboratable):
         return m
 
 
+def import_bdf_font(filename):
+    import csv
+    font = None
+    font_width = 0
+    font_height = 0
+
+    with open(filename) as f:
+        reader = csv.reader(f, delimiter=" ")
+        char = None
+        bitmap_enable = False
+        bitmap_index = 0
+        for l in reader:
+            if l[0] == "FONTBOUNDINGBOX":
+                font_width = int(l[1], 0)
+                font_height = int(l[2], 0)
+                font = [0] * font_height * 256
+            if l[0] == "ENCODING":
+                char = int(l[1], 0)
+            if l[0] == "ENDCHAR":
+                bitmap_enable = False
+            if bitmap_enable:
+                if char < 256:
+                    font[char * font_height + bitmap_index] = int(
+                        "0x" + l[0], 0)
+                bitmap_index += 1
+            if l[0] == "BITMAP":
+                bitmap_enable = True
+                bitmap_index = 0
+
+    return font, font_width, font_height
+
+
+class VideoTerminal(Peripheral, Elaboratable):
+
+    def __init__(self,
+                 bdf_font,
+                 *,
+                 name=None,
+                 hres=800,
+                 vres=600,
+                 with_attrib=True,
+                 clock_domain="sync",
+                 clock_freq=25e6):
+        super().__init__(name=name)
+
+        self.bdf_font = bdf_font
+        self.hres = hres
+        self.vres = vres
+        self.with_attrib = with_attrib
+        self.clock_domain = clock_domain
+        self.clock_freq = clock_freq
+
+        self.char_width = 16 if with_attrib else 8
+
+        self.font, self.font_width, self.font_height = import_bdf_font(
+            self.bdf_font)
+        self.term_cols = 128
+        self.term_lines = self.vres // self.font_height // 2
+        self.term_depth = self.term_cols * self.term_lines
+
+        self.vtg = Decoupled(Record, video_timing_layout)
+        self.source = Decoupled(Record, video_data_layout)
+
+        self._term_bus = self.window(addr_width=Shape.cast(
+            range(self.term_depth)).width,
+                                     data_width=self.char_width,
+                                     granularity=8)
+
+        self._bridge = self.bridge(data_width=self.char_width,
+                                   granularity=8,
+                                   alignment=2)
+        self.bus = self._bridge.bus
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.bridge = self._bridge
+
+        font_mem = Memory(width=self.font_width,
+                          depth=self.font_height * 256,
+                          init=self.font)
+        font_rport = m.submodules.font_rport = font_mem.read_port(
+            transparent=False, domain=self.clock_domain)
+
+        term_init = [ord(" ")] * self.term_depth
+        term_mem = Memory(width=self.char_width,
+                          depth=self.term_depth,
+                          init=term_init)
+        term_rport = m.submodules.term_rport = term_mem.read_port(
+            transparent=False, domain=self.clock_domain)
+
+        #
+        # Terminal memory access
+        #
+
+        term_bus_rport = m.submodules.term_bus_rport = term_mem.read_port(
+            transparent=False)
+        term_bus_wport = m.submodules.term_bus_wport = term_mem.write_port(
+            granularity=8)
+
+        m.d.comb += [
+            term_bus_rport.addr.eq(self._term_bus.adr),
+            self._term_bus.dat_r.eq(term_bus_rport.data),
+        ]
+
+        m.d.comb += [
+            term_bus_wport.addr.eq(self._term_bus.adr),
+            term_bus_wport.data.eq(self._term_bus.dat_w),
+        ]
+
+        m.d.comb += [
+            term_bus_wport.en[i].eq(self._term_bus.cyc & self._term_bus.stb
+                                    & self._term_bus.we
+                                    & self._term_bus.sel[i])
+            for i in range(self._term_bus.data_width // 8)
+        ]
+
+        m.d.sync += [
+            self._term_bus.ack.eq(self._term_bus.cyc & self._term_bus.stb
+                                  & ~self._term_bus.ack)
+        ]
+
+        #
+        # Terminal display
+        #
+
+        timing_bufs = [
+            DomainRenamer(self.clock_domain)(SkidBuffer(Record,
+                                                        video_timing_layout,
+                                                        pipe=False))
+            for _ in range(2)
+        ]
+        m.d.comb += self.vtg.connect(timing_bufs[0].enq)
+        for i in range(len(timing_bufs) - 1):
+            m.d.comb += timing_bufs[i].deq.connect(timing_bufs[i + 1].enq)
+        m.submodules += timing_bufs
+
+        m.d.comb += [
+            self.source.valid.eq(timing_bufs[-1].deq.valid),
+            self.source.bits.de.eq(timing_bufs[-1].deq.bits.de),
+            self.source.bits.hsync.eq(timing_bufs[-1].deq.bits.hsync),
+            self.source.bits.vsync.eq(timing_bufs[-1].deq.bits.vsync),
+            timing_bufs[-1].deq.ready.eq(self.source.ready),
+        ]
+
+        x = self.vtg.bits.hcount[log2_int(self.font_width):]
+        y = self.vtg.bits.vcount[log2_int(self.font_height):]
+
+        term_rdata = Signal(self.char_width)
+        m.d.comb += [
+            term_rport.addr.eq(x + y * self.term_cols),
+            term_rdata.eq(
+                Mux((x >= 80) | (y >= self.term_lines), ord(" "),
+                    term_rport.data)),
+        ]
+
+        if self.with_attrib:
+            term_attrib = Signal(8)
+            m.d.sync += term_attrib.eq(term_rdata[8:])
+
+        m.d.comb += font_rport.addr.eq(
+            term_rdata[:8] * self.font_height +
+            timing_bufs[0].deq.bits.vcount[:log2_int(self.font_height)])
+        font_bit = Signal()
+        with m.Switch(
+                timing_bufs[1].deq.bits.hcount[:log2_int(self.font_width)]):
+            for i in range(self.font_width):
+                with m.Case(i):
+                    m.d.comb += font_bit.eq(font_rport.data[self.font_width -
+                                                            1 - i])
+
+        fg_color = Signal(32)
+        bg_color = Signal(32)
+
+        if self.with_attrib:
+            blink_counter = Signal(range(int(self.clock_freq // 2)))
+            blink = Signal()
+            m.d.sync += blink_counter.eq(blink_counter + 1)
+            with m.If(blink_counter == int(self.clock_freq // 2) - 1):
+                m.d.sync += [
+                    blink_counter.eq(0),
+                    blink.eq(~blink),
+                ]
+
+            fg_attrib = term_attrib[:4]
+            bg_attrib = term_attrib[4:7]
+
+            palette = {
+                0x0: 0x000000,
+                0x1: 0x800000,
+                0x2: 0x008000,
+                0x3: 0x808000,
+                0x4: 0x000080,
+                0x5: 0x800080,
+                0x6: 0x008080,
+                0x7: 0xc0c0c0,
+                0x8: 0x808080,
+                0x9: 0xff0000,
+                0xa: 0x00ff00,
+                0xb: 0xffff00,
+                0xc: 0x0000ff,
+                0xd: 0xff00ff,
+                0xe: 0x00ffff,
+                0xf: 0xffffff,
+            }
+
+            with m.Switch(fg_attrib):
+                for k, v in palette.items():
+                    with m.Case(k):
+                        m.d.comb += fg_color.eq(v)
+            with m.If(~blink & term_attrib[7]):
+                m.d.comb += fg_color.eq(bg_color)
+
+            with m.Switch(Cat(bg_attrib, 0)):
+                for k, v in palette.items():
+                    with m.Case(k):
+                        m.d.comb += bg_color.eq(v)
+        else:
+            m.d.comb += [
+                fg_color.eq(0xffffff),
+                bg_color.eq(0),
+            ]
+
+        m.d.comb += Cat(self.source.bits.r, self.source.bits.g,
+                        self.source.bits.b).eq(
+                            Mux(font_bit, fg_color, bg_color))
+
+        return m
+
+
 class VideoFrameBuffer(Elaboratable):
 
     def __init__(self,
@@ -544,6 +774,48 @@ class VideoFrameBuffer(Elaboratable):
             ]
 
         m.d.comb += self.underflow.eq(~self.source.valid)
+
+        return m
+
+
+class VideoHDMI10to1Serializer(Elaboratable):
+
+    def __init__(self, clock_domain):
+        self.clock_domain = clock_domain
+
+        self.i = Signal(10)
+        self.o = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        cdc = m.submodules.cdc = ClockDomainCrossing(
+            Signal,
+            10,
+            from_domain=self.clock_domain,
+            to_domain=self.clock_domain + "5x")
+        m.d.comb += [
+            cdc.sink.valid.eq(1),
+            cdc.sink.bits.eq(self.i),
+        ]
+
+        gearbox = m.submodules.gearbox = DomainRenamer(self.clock_domain +
+                                                       "5x")(Gearbox(
+                                                           i_dw=10,
+                                                           o_dw=2,
+                                                           msb_first=False))
+        m.d.comb += [
+            cdc.source.connect(gearbox.sink),
+            gearbox.source.ready.eq(1),
+        ]
+
+        oddr = m.submodules.oddr = DomainRenamer(self.clock_domain + "5x")(
+            platform.get_ddr_output())
+        m.d.comb += [
+            oddr.i1.eq(gearbox.source.bits[0]),
+            oddr.i2.eq(gearbox.source.bits[1]),
+            self.o.eq(oddr.o),
+        ]
 
         return m
 
@@ -647,6 +919,63 @@ class VideoUSHDMI10to1Serializer(Elaboratable):
             ###
             o_OQ=self.o,
         )
+
+        return m
+
+
+class VideoHDMIPHY(Elaboratable):
+
+    def __init__(self, clock_domain='sync'):
+        self.clock_domain = clock_domain
+
+        self.sink = Decoupled(Record, video_data_layout)
+
+        self.tmds_clk_p = Signal()
+        self.tmds_clk_n = Signal()
+        self.tmds_data_p = Signal(3)
+        self.tmds_data_n = Signal(3)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += self.sink.ready.eq(1)
+
+        for pol in ["p", "n"]:
+            oddr = DomainRenamer(self.clock_domain)(platform.get_ddr_output())
+            m.d.comb += [
+                oddr.i1.eq({
+                    "p": 1,
+                    "n": 0
+                }[pol]),
+                oddr.i2.eq({
+                    "p": 0,
+                    "n": 1
+                }[pol]),
+                getattr(self, f"tmds_clk_{pol}").eq(oddr.o),
+            ]
+            m.submodules += oddr
+
+        for pol in ["p", "n"]:
+            for color, channel in _dvi_c2d.items():
+                enc = DomainRenamer(self.clock_domain)(TMDSEncoder())
+                setattr(m.submodules, f'encoder_{color}_{pol}', enc)
+
+                m.d.comb += [
+                    enc.d.eq(getattr(self.sink.bits, color)),
+                    enc.c.eq(
+                        Cat(self.sink.bits.hsync, self.sink.bits.vsync
+                            ) if channel == 0 else 0),
+                    enc.de.eq(self.sink.bits.de),
+                ]
+
+                serializer = VideoHDMI10to1Serializer(self.clock_domain)
+                setattr(m.submodules, f'serializer_{color}_{pol}', serializer)
+
+                m.d.comb += [
+                    serializer.i.eq(enc.out),
+                    getattr(self,
+                            f"tmds_data_{pol}")[channel].eq(serializer.o),
+                ]
 
         return m
 
