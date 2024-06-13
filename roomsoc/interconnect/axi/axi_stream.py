@@ -58,3 +58,128 @@ class AXIStreamInterface(Decoupled):
                          layout,
                          name=name,
                          src_loc_at=1)
+
+
+class AXIStreamDepacketizer(Elaboratable):
+
+    def __init__(self, cls, *args, data_width=0, **kwargs):
+        self.data_width = data_width
+
+        self.sink = AXIStreamInterface(data_width=data_width)
+        self.source = AXIStreamInterface(data_width=data_width)
+        self.header = cls(*args, **kwargs)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        data_width = len(self.sink.bits.data)
+        beat_bytes = data_width // 8
+        header_beats = len(self.header) // data_width
+        header_leftover = (len(self.header) // 8) % beat_bytes
+        aligned = header_leftover == 0
+
+        sr = Signal(len(self.header), reset_less=True)
+        sr_shift = Signal()
+        sr_shift_leftover = Signal()
+        count = Signal(range(max(header_beats, 2)))
+
+        m.d.comb += self.header.eq(sr)
+        if header_beats == 1 and header_leftover == 0:
+            with m.If(sr_shift):
+                m.d.sync += sr.eq(self.sink.bits.data)
+        else:
+            with m.If(sr_shift):
+                m.d.sync += sr.eq(Cat(sr[beat_bytes * 8:],
+                                      self.sink.bits.data))
+            with m.If(sr_shift_leftover):
+                m.d.sync += sr.eq(
+                    Cat(sr[header_leftover * 8:], self.sink.bits.data))
+
+        if not aligned:
+            sink_d = _AXIStreamLayout(data_width=data_width,
+                                      keep_width=data_width // 8,
+                                      id_width=0,
+                                      dest_width=0,
+                                      user_width=0)
+
+            with m.If(self.sink.fire):
+                m.d.sync += sink_d.eq(self.sink.bits)
+
+        from_idle = Signal()
+
+        with m.FSM():
+            with m.State("IDLE"):
+                m.d.comb += self.sink.ready.eq(1)
+                m.d.sync += [
+                    count.eq(1),
+                    from_idle.eq(1),
+                ]
+
+                with m.If(self.sink.fire):
+                    m.d.comb += sr_shift.eq(1)
+
+                    if header_beats <= 1:
+                        m.next = "ALIGNED-DATA-COPY" if aligned else "UNALIGNED-DATA-COPY"
+                    else:
+                        m.next = "HEADER-RECEIVE"
+
+            if header_beats > 1:
+                with m.State("HEADER-RECEIVE"):
+                    m.d.comb += self.sink.ready.eq(1)
+
+                    with m.If(self.sink.fire):
+                        m.d.comb += sr_shift.eq(1)
+                        m.d.sync += count.eq(count + 1)
+
+                        with m.If(count == (header_beats - 1)):
+                            m.next = "ALIGNED-DATA-COPY" if aligned else "UNALIGNED-DATA-COPY"
+
+            if aligned:
+                with m.State("ALIGNED-DATA-COPY"):
+                    m.d.comb += [
+                        self.source.valid.eq(self.sink.valid
+                                             | sink_d.last),
+                        self.source.bits.last.eq(self.sink.bits.last
+                                                 | sink_d.last),
+                        self.sink.ready.eq(self.source.ready),
+                        self.source.bits.data.eq(self.sink.bits.data),
+                        self.source.bits.keep.eq(self.sink.bits.keep),
+                    ]
+
+                    with m.If(self.source.fire & self.source.bits.last):
+                        m.next = "IDLE"
+
+            else:
+                with m.State("UNALIGNED-DATA-COPY"):
+                    m.d.comb += [
+                        self.source.valid.eq(self.sink.valid
+                                             | sink_d.last),
+                        self.source.bits.last.eq(self.sink.bits.last
+                                                 | sink_d.last),
+                        self.sink.ready.eq(self.source.ready),
+                        self.source.bits.data.eq(sink_d.data[header_leftover *
+                                                             8:]),
+                        self.source.bits.data[min((beat_bytes -
+                                                   header_leftover) *
+                                                  8, data_width - 1):].eq(
+                                                      self.sink.bits.data),
+                        self.source.bits.keep.eq(
+                            sink_d.keep[header_leftover:]),
+                        self.source.bits.keep[min((
+                            beat_bytes - header_leftover), data_width // 8 -
+                                                  1):].eq(self.sink.bits.keep),
+                    ]
+
+                    with m.If(from_idle):
+                        m.d.comb += [
+                            self.source.valid.eq(0),
+                            self.sink.ready.eq(1),
+                        ]
+                        with m.If(self.sink.fire):
+                            m.d.sync += from_idle.eq(0)
+                            m.d.comb += sr_shift_leftover.eq(1)
+
+                    with m.If(self.source.fire & self.source.bits.last):
+                        m.next = "IDLE"
+
+        return m
