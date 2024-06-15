@@ -2,9 +2,10 @@ from amaranth import *
 from amaranth.hdl.rec import Direction
 
 from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer
-from roomsoc.interconnect.stream import Decoupled, Queue
+from roomsoc.interconnect.stream import Decoupled, Queue, SkidBuffer
 
 from .common import *
+from .ip import IpProtocol
 
 __all__ = ("Ipv4Handler", )
 
@@ -278,6 +279,65 @@ class Ipv4Dropper(Elaboratable):
         return m
 
 
+class Ipv4Dispatcher(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.data_in = AXIStreamInterface(data_width=data_width)
+
+        self.tcp_data_out = AXIStreamInterface(data_width=data_width)
+        self.udp_data_out = AXIStreamInterface(data_width=data_width)
+
+        self._protocol = SkidBuffer(Signal, 16)
+
+    def handle_header(self, m, header):
+        m.d.comb += [
+            self._protocol.enq.bits.eq(header.bits.protocol),
+            self._protocol.enq.valid.eq(header.valid),
+            header.ready.eq(self._protocol.enq.ready),
+        ]
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.submodules.protocol = self._protocol
+
+        header_extract = m.submodules.header_extract = Ipv4HeaderExtract(
+            data_width=self.data_width, handler=self.handle_header)
+
+        header_beats = 160 // self.data_width
+
+        q_in = m.submodules.q_in = Queue(header_beats + 2, Record,
+                                         make_data_layout(self.data_width))
+        m.d.comb += stream2queue(self.data_in, q_in)
+
+        m.d.comb += [
+            self.data_in.connect(header_extract.data_in),
+            stream2queue(header_extract.data_out, q_in),
+        ]
+
+        protocol = Signal(16)
+        with m.FSM():
+            with m.State("IDLE"):
+                with m.If(self._protocol.deq.valid):
+                    m.d.sync += protocol.eq(self._protocol.deq.bits)
+                    m.d.comb += self._protocol.deq.ready.eq(1)
+                    m.next = "FORWARD"
+
+            with m.State("FORWARD"):
+                with m.Switch(protocol):
+                    with m.Case(IpProtocol.TCP):
+                        m.d.comb += queue2stream(q_in, self.tcp_data_out)
+                    with m.Case(IpProtocol.UDP):
+                        m.d.comb += queue2stream(q_in, self.udp_data_out)
+
+                with m.If(q_in.deq.fire & q_in.deq.bits.last):
+                    m.next = "IDLE"
+
+        return m
+
+
 class Ipv4Handler(Elaboratable):
 
     def __init__(self, data_width):
@@ -286,7 +346,10 @@ class Ipv4Handler(Elaboratable):
         self.my_ip_addr = Signal(32)
 
         self.data_in = AXIStreamInterface(data_width=data_width)
-        self.data_out = AXIStreamInterface(data_width=data_width)
+
+        self.tcp_data_out = AXIStreamInterface(data_width=data_width)
+        self.udp_data_out = AXIStreamInterface(data_width=data_width)
+        self.roce_data_out = AXIStreamInterface(data_width=data_width)
 
     def elaborate(self, platform):
         m = Module()
@@ -304,12 +367,31 @@ class Ipv4Handler(Elaboratable):
             checksum.checksum.connect(dropper.checksum),
         ]
 
+        dispatcher = m.submodules.dispatcher = Ipv4Dispatcher(
+            data_width=self.data_width)
+
+        udp_queue = m.submodules.udp_queue = Queue(
+            2, Record, make_data_layout(self.data_width))
+        m.d.comb += queue2stream(udp_queue, self.udp_data_out)
+        roce_queue = m.submodules.roce_queue = Queue(
+            2, Record, make_data_layout(self.data_width))
+        m.d.comb += queue2stream(roce_queue, self.roce_data_out)
+
         m.d.comb += [
             addr_check.my_ip_addr.eq(self.my_ip_addr),
             self.data_in.connect(addr_check.data_in),
             addr_check.data_out.connect(checksum.data_in),
             checksum.data_out.connect(dropper.data_in),
-            dropper.data_out.connect(self.data_out),
+            dropper.data_out.connect(dispatcher.data_in),
+            dispatcher.tcp_data_out.connect(self.tcp_data_out),
+            stream2queue(dispatcher.udp_data_out, udp_queue),
+            stream2queue(dispatcher.udp_data_out, roce_queue),
+            dispatcher.udp_data_out.ready.eq(udp_queue.enq.ready
+                                             & roce_queue.enq.ready),
+            udp_queue.enq.valid.eq(dispatcher.udp_data_out.valid
+                                   & roce_queue.enq.ready),
+            roce_queue.enq.valid.eq(dispatcher.udp_data_out.valid
+                                    & udp_queue.enq.ready),
         ]
 
         return m
