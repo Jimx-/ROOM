@@ -7,7 +7,7 @@ from roomsoc.interconnect.stream import Decoupled, Queue, SkidBuffer
 from .common import *
 from .ip import IpProtocol
 
-__all__ = ("Ipv4Handler", )
+__all__ = ("Ipv4Metadata", "Ipv4Handler", "Ipv4")
 
 IPv4_HEADER_LAYOUT = [
     ("ihl", 4, Direction.FANOUT),
@@ -15,14 +15,25 @@ IPv4_HEADER_LAYOUT = [
     ("tos", 8, Direction.FANOUT),
     ("total_len", 16, Direction.FANOUT),
     ("identification", 16, Direction.FANOUT),
-    ("flags", 3, Direction.FANOUT),
     ("frag_offset", 13, Direction.FANOUT),
+    ("flags", 3, Direction.FANOUT),
     ("ttl", 8, Direction.FANOUT),
     ("protocol", 8, Direction.FANOUT),
     ("checksum", 16, Direction.FANOUT),
     ("src_addr", 32, Direction.FANOUT),
     ("dst_addr", 32, Direction.FANOUT),
 ]
+
+
+class Ipv4Metadata(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('peer_addr', 32, Direction.FANOUT),
+            ('length', 16, Direction.FANOUT),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class Ipv4HeaderExtract(Elaboratable):
@@ -392,6 +403,77 @@ class Ipv4Handler(Elaboratable):
                                    & roce_queue.enq.ready),
             roce_queue.enq.valid.eq(dispatcher.udp_data_out.valid
                                     & udp_queue.enq.ready),
+        ]
+
+        return m
+
+
+class Ipv4Depacketizer(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.data_in = AXIStreamInterface(data_width=data_width)
+        self.data_out = AXIStreamInterface(data_width=data_width)
+        self.meta_out = Decoupled(Ipv4Metadata)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        depacketizer = m.submodules.depacketizer = AXIStreamDepacketizer(
+            Record, IPv4_HEADER_LAYOUT, data_width=self.data_width)
+        m.d.comb += self.data_in.connect(depacketizer.sink)
+
+        with m.FSM():
+            with m.State("IDLE"):
+                with m.If(depacketizer.source.valid):
+                    m.d.comb += [
+                        self.meta_out.bits.peer_addr.eq(
+                            depacketizer.header.src_addr),
+                        self.meta_out.bits.length.eq(
+                            Cat(depacketizer.header.total_len[8:],
+                                depacketizer.header.total_len[:8])),
+                        self.meta_out.valid.eq(1),
+                    ]
+
+                    with m.If(self.meta_out.ready):
+                        m.next = "FORWARD"
+
+            with m.State("FORWARD"):
+                m.d.comb += depacketizer.source.connect(self.data_out)
+
+                with m.If(self.data_out.fire & self.data_out.bits.last):
+                    m.next = "IDLE"
+
+        return m
+
+
+class Ipv4(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.rx_data_in = AXIStreamInterface(data_width=data_width)
+        self.rx_data_out = AXIStreamInterface(data_width=data_width)
+        self.rx_meta_out = Decoupled(Ipv4Metadata)
+
+        self.tx_data_in = AXIStreamInterface(data_width=data_width)
+        self.tx_data_out = AXIStreamInterface(data_width=data_width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        depacketizer = m.submodules.depacketizer = Ipv4Depacketizer(
+            data_width=self.data_width)
+        m.d.comb += [
+            self.rx_data_in.connect(depacketizer.data_in),
+            depacketizer.data_out.connect(self.rx_data_out),
+        ]
+
+        rx_meta_queue = m.submodules.rx_meta_queue = Queue(2, Ipv4Metadata)
+        m.d.comb += [
+            depacketizer.meta_out.connect(rx_meta_queue.enq),
+            rx_meta_queue.deq.connect(self.rx_meta_out),
         ]
 
         return m

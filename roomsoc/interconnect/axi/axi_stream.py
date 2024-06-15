@@ -137,10 +137,8 @@ class AXIStreamDepacketizer(Elaboratable):
             if aligned:
                 with m.State("ALIGNED-DATA-COPY"):
                     m.d.comb += [
-                        self.source.valid.eq(self.sink.valid
-                                             | sink_d.last),
-                        self.source.bits.last.eq(self.sink.bits.last
-                                                 | sink_d.last),
+                        self.source.valid.eq(self.sink.valid),
+                        self.source.bits.last.eq(self.sink.bits.last),
                         self.sink.ready.eq(self.source.ready),
                         self.source.bits.data.eq(self.sink.bits.data),
                         self.source.bits.keep.eq(self.sink.bits.keep),
@@ -154,7 +152,9 @@ class AXIStreamDepacketizer(Elaboratable):
                     m.d.comb += [
                         self.source.valid.eq(self.sink.valid
                                              | sink_d.last),
-                        self.source.bits.last.eq(self.sink.bits.last
+                        self.source.bits.last.eq((
+                            self.sink.bits.last
+                            & ~self.sink.bits.keep[header_leftover:].any())
                                                  | sink_d.last),
                         self.sink.ready.eq(self.source.ready),
                         self.source.bits.data.eq(sink_d.data[header_leftover *
@@ -167,7 +167,11 @@ class AXIStreamDepacketizer(Elaboratable):
                             sink_d.keep[header_leftover:]),
                         self.source.bits.keep[min((
                             beat_bytes - header_leftover), data_width // 8 -
-                                                  1):].eq(self.sink.bits.keep),
+                                                  1):].eq(
+                                                      Mux(
+                                                          self.sink.valid,
+                                                          self.sink.bits.keep,
+                                                          0)),
                     ]
 
                     with m.If(from_idle):
