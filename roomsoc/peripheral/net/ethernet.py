@@ -2,9 +2,9 @@ from enum import IntEnum
 from amaranth import *
 from amaranth.hdl.rec import Direction
 
-from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer
+from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer, AXIStreamPacketizer
 
-__all__ = ("EthernetRouter", )
+__all__ = ("EthernetRouter", "MacIpEncoder")
 
 ETH_HEADER_LAYOUT = [
     ("dst_addr", 48, Direction.FANOUT),
@@ -46,5 +46,30 @@ class EthernetRouter(Elaboratable):
                 m.d.comb += depacketizer.source.connect(self.arp_data_out)
             with m.Case(EtherType.IPv6):
                 m.d.comb += depacketizer.source.connect(self.ipv6_data_out)
+
+        return m
+
+
+class MacIpEncoder(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.my_mac_addr = Signal(48)
+
+        self.data_in = AXIStreamInterface(data_width=data_width)
+        self.data_out = AXIStreamInterface(data_width=data_width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        packetizer = m.submodules.packetizer = AXIStreamPacketizer(
+            Record, ETH_HEADER_LAYOUT, data_width=self.data_width)
+        m.d.comb += [
+            packetizer.header.src_addr.eq(self.my_mac_addr),
+            packetizer.header.type.eq(0x0008),
+            self.data_in.connect(packetizer.sink),
+            packetizer.source.connect(self.data_out),
+        ]
 
         return m

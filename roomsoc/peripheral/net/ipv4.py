@@ -1,7 +1,7 @@
 from amaranth import *
 from amaranth.hdl.rec import Direction
 
-from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer
+from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer, AXIStreamPacketizer
 from roomsoc.interconnect.stream import Decoupled, Queue, SkidBuffer
 
 from .common import *
@@ -15,8 +15,9 @@ IPv4_HEADER_LAYOUT = [
     ("tos", 8, Direction.FANOUT),
     ("total_len", 16, Direction.FANOUT),
     ("identification", 16, Direction.FANOUT),
-    ("frag_offset", 13, Direction.FANOUT),
+    ("frag_offset_h", 5, Direction.FANOUT),
     ("flags", 3, Direction.FANOUT),
+    ("frag_offset_l", 8, Direction.FANOUT),
     ("ttl", 8, Direction.FANOUT),
     ("protocol", 8, Direction.FANOUT),
     ("checksum", 16, Direction.FANOUT),
@@ -227,8 +228,10 @@ class Ipv4Checksum(Elaboratable):
             csum_queue.enq.bits.eq((csum + (csum >> 16)) & 0xffff),
             csum_queue.enq.valid.eq(~done & self.data_in.valid
                                     & self.data_out.ready
-                                    & (count == header_words - 1)),
+                                    & ((count == header_words - 1)
+                                       | self.data_in.bits.last)),
             csum_queue.deq.connect(self.checksum),
+            self.checksum.bits.eq(~csum_queue.deq.bits),
         ]
 
         with m.If(~done & (count == header_words - 1)):
@@ -271,7 +274,7 @@ class Ipv4Dropper(Elaboratable):
                     ]
 
                     with m.If(self.addr_valid.bits
-                              & (~self.checksum.bits == 0)):
+                              & (self.checksum.bits == 0)):
                         m.next = "FORWARD"
                     with m.Else():
                         m.next = "DROP"
@@ -448,20 +451,109 @@ class Ipv4Depacketizer(Elaboratable):
         return m
 
 
+class Ipv4Packetizer(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.my_ip_addr = Signal(32)
+        self.protocol = Signal(8)
+
+        self.meta_in = Decoupled(Ipv4Metadata)
+        self.data_in = AXIStreamInterface(data_width=data_width)
+        self.data_out = AXIStreamInterface(data_width=data_width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        header = Record(IPv4_HEADER_LAYOUT)
+        sr = Signal(len(header))
+        packetizer = m.submodules.packetizer = AXIStreamPacketizer(
+            Record, IPv4_HEADER_LAYOUT, data_width=self.data_width)
+        m.d.comb += [
+            packetizer.header.eq(sr),
+            packetizer.source.connect(self.data_out),
+        ]
+
+        meta_queue = m.submodules.meta_queue = Queue(2, Ipv4Metadata)
+        m.d.comb += self.meta_in.connect(meta_queue.enq)
+
+        packet_len = Signal.like(meta_queue.deq.bits.length)
+        m.d.comb += packet_len.eq(meta_queue.deq.bits.length + 20)
+
+        m.d.comb += [
+            header.version.eq(0x4),
+            header.ihl.eq(0x5),
+            header.ttl.eq(0x40),
+            header.total_len.eq(Cat(packet_len[8:], packet_len[:8])),
+            header.flags.eq(0b010),
+            header.dst_addr.eq(meta_queue.deq.bits.peer_addr),
+            header.src_addr.eq(self.my_ip_addr),
+            header.protocol.eq(self.protocol),
+        ]
+
+        checksum = m.submodules.checksum = Ipv4Checksum(data_width=len(header),
+                                                        skip_checksum=True)
+        m.d.comb += [
+            checksum.data_in.bits.data.eq(header),
+            checksum.data_in.bits.keep.eq(~0),
+            checksum.data_in.bits.last.eq(1),
+            checksum.data_out.ready.eq(1),
+        ]
+
+        with m.FSM():
+            with m.State("IDLE"):
+                m.d.comb += [
+                    meta_queue.deq.ready.eq(checksum.data_in.ready),
+                    checksum.data_in.valid.eq(meta_queue.deq.valid),
+                ]
+
+                with m.If(meta_queue.deq.fire):
+                    m.d.sync += sr.eq(header)
+
+                    m.next = "CHECKSUM"
+
+            with m.State("CHECKSUM"):
+                m.d.comb += checksum.checksum.ready.eq(1)
+
+                with m.If(checksum.checksum.fire):
+                    m.d.comb += [
+                        header.eq(sr),
+                        header.checksum.eq(checksum.checksum.bits),
+                    ]
+                    m.d.sync += sr.eq(header)
+
+                    m.next = "FORWARD"
+
+            with m.State("FORWARD"):
+                m.d.comb += self.data_in.connect(packetizer.sink)
+
+                with m.If(self.data_out.fire & self.data_out.bits.last):
+                    m.next = "IDLE"
+
+        return m
+
+
 class Ipv4(Elaboratable):
 
     def __init__(self, data_width):
         self.data_width = data_width
+
+        self.my_ip_addr = Signal(32)
+        self.protocol = Signal(8)
 
         self.rx_data_in = AXIStreamInterface(data_width=data_width)
         self.rx_data_out = AXIStreamInterface(data_width=data_width)
         self.rx_meta_out = Decoupled(Ipv4Metadata)
 
         self.tx_data_in = AXIStreamInterface(data_width=data_width)
+        self.tx_meta_in = Decoupled(Ipv4Metadata)
         self.tx_data_out = AXIStreamInterface(data_width=data_width)
 
     def elaborate(self, platform):
         m = Module()
+
+        # RX
 
         depacketizer = m.submodules.depacketizer = Ipv4Depacketizer(
             data_width=self.data_width)
@@ -474,6 +566,18 @@ class Ipv4(Elaboratable):
         m.d.comb += [
             depacketizer.meta_out.connect(rx_meta_queue.enq),
             rx_meta_queue.deq.connect(self.rx_meta_out),
+        ]
+
+        # TX
+
+        packetizer = m.submodules.packetizer = Ipv4Packetizer(
+            data_width=self.data_width)
+        m.d.comb += [
+            packetizer.my_ip_addr.eq(self.my_ip_addr),
+            packetizer.protocol.eq(self.protocol),
+            self.tx_data_in.connect(packetizer.data_in),
+            self.tx_meta_in.connect(packetizer.meta_in),
+            packetizer.data_out.connect(self.tx_data_out),
         ]
 
         return m
