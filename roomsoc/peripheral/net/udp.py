@@ -189,7 +189,8 @@ class UdpStack(Elaboratable):
 
         self.tx_data_in = AXIStreamInterface(data_width=data_width)
         self.tx_meta_in = Decoupled(UdpIpMetadata)
-        self.tx_data_out = AXIStreamInterface(data_width=data_width)
+        self.tx_data_out = AXIStreamInterface(data_width=data_width,
+                                              user_width=128)
 
     def elaborate(self, platform):
         m = Module()

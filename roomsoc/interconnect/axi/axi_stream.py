@@ -1,7 +1,7 @@
 from amaranth import *
 from amaranth.hdl.rec import Direction
 
-from roomsoc.interconnect.stream import Decoupled
+from roomsoc.interconnect.stream import Decoupled, Valid
 
 
 class _AXIStreamLayout(Record):
@@ -133,8 +133,8 @@ class AXIStreamPacketizer(Elaboratable):
                         self.source.valid.eq(1),
                         self.source.bits.last.eq(0),
                         self.source.bits.data.eq(
-                            self.header[min(self.data_width,
-                                            len(sr) - 1):]),
+                            sr[min(self.data_width,
+                                   len(sr) - 1):]),
                         self.source.bits.keep.eq(~0),
                     ]
 
@@ -330,5 +330,72 @@ class AXIStreamDepacketizer(Elaboratable):
 
                     with m.If(self.source.fire & self.source.bits.last):
                         m.next = "IDLE"
+
+        return m
+
+
+class AXIStreamArbiter(Elaboratable):
+
+    def __init__(self,
+                 n,
+                 *,
+                 data_width=0,
+                 keep_width=None,
+                 id_width=0,
+                 dest_width=0,
+                 user_width=0,
+                 layout=None):
+        self.n = n
+
+        self.inp = [
+            AXIStreamInterface(data_width=data_width,
+                               keep_width=keep_width,
+                               id_width=id_width,
+                               dest_width=dest_width,
+                               user_width=user_width,
+                               layout=layout,
+                               name=f'in{i}') for i in range(n)
+        ]
+
+        self.out = AXIStreamInterface(data_width=data_width,
+                                      keep_width=keep_width,
+                                      id_width=id_width,
+                                      dest_width=dest_width,
+                                      user_width=user_width,
+                                      layout=layout)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        req = Cat(inp.valid for inp in self.inp)
+
+        grant = Valid(Signal, range(self.n))
+        grant_next = Signal.like(grant.bits)
+        m.d.comb += grant_next.eq(grant.bits)
+        with m.Switch(grant.bits):
+            for i in range(len(req)):
+                with m.Case(i):
+                    for pred in reversed(range(i)):
+                        with m.If(req[pred]):
+                            m.d.comb += grant_next.eq(pred)
+                    for succ in reversed(range(i + 1, len(req))):
+                        with m.If(req[succ]):
+                            m.d.comb += grant_next.eq(succ)
+
+        with m.If(req.any() & ~grant.valid):
+            m.d.sync += [
+                grant.bits.eq(grant_next),
+                grant.valid.eq(1),
+            ]
+        with m.If(self.out.fire & self.out.bits.last):
+            m.d.sync += grant.valid.eq(0)
+
+        sel = Signal.like(grant.bits)
+        m.d.comb += sel.eq(Mux(grant.valid, grant.bits, grant_next))
+
+        with m.Switch(sel):
+            for i in range(self.n):
+                with m.Case(i):
+                    m.d.comb += self.inp[i].connect(self.out)
 
         return m

@@ -345,6 +345,8 @@ class Ipv4Dispatcher(Elaboratable):
                         m.d.comb += queue2stream(q_in, self.tcp_data_out)
                     with m.Case(IpProtocol.UDP):
                         m.d.comb += queue2stream(q_in, self.udp_data_out)
+                    with m.Default():
+                        m.d.comb += q_in.deq.ready.eq(1)
 
                 with m.If(q_in.deq.fire & q_in.deq.bits.last):
                     m.next = "IDLE"
@@ -461,7 +463,8 @@ class Ipv4Packetizer(Elaboratable):
 
         self.meta_in = Decoupled(Ipv4Metadata)
         self.data_in = AXIStreamInterface(data_width=data_width)
-        self.data_out = AXIStreamInterface(data_width=data_width)
+        self.data_out = AXIStreamInterface(data_width=data_width,
+                                           user_width=128)
 
     def elaborate(self, platform):
         m = Module()
@@ -473,6 +476,7 @@ class Ipv4Packetizer(Elaboratable):
         m.d.comb += [
             packetizer.header.eq(sr),
             packetizer.source.connect(self.data_out),
+            self.data_out.bits.user[-32:].eq(packetizer.header.dst_addr),
         ]
 
         meta_queue = m.submodules.meta_queue = Queue(2, Ipv4Metadata)
@@ -548,7 +552,8 @@ class Ipv4(Elaboratable):
 
         self.tx_data_in = AXIStreamInterface(data_width=data_width)
         self.tx_meta_in = Decoupled(Ipv4Metadata)
-        self.tx_data_out = AXIStreamInterface(data_width=data_width)
+        self.tx_data_out = AXIStreamInterface(data_width=data_width,
+                                              user_width=128)
 
     def elaborate(self, platform):
         m = Module()
