@@ -148,10 +148,15 @@ class EthernetFramePadding(Elaboratable):
 
                 m.d.comb += [
                     self.data_in.connect(self.data_out),
+                    self.data_out.bits.data.eq(
+                        Mux(done, 0, self.data_in.bits.data)),
+                    self.data_out.bits.keep.eq(
+                        Mux(done, 0, self.data_in.bits.keep)),
                     self.data_out.bits.last.eq(last_padding
                                                & (done
                                                   | self.data_in.bits.last)),
                     self.data_out.valid.eq(self.data_in.valid | done),
+                    self.data_in.ready.eq(~done),
                 ]
 
                 with m.If(self.data_in.fire & self.data_in.bits.last):
@@ -162,7 +167,7 @@ class EthernetFramePadding(Elaboratable):
                         m.d.sync += count.eq(count + 1)
 
                         for i in range(self.data_width // 8):
-                            with m.If(~self.data_in.bits.keep[i]):
+                            with m.If(~self.data_in.bits.keep[i] | done):
                                 m.d.comb += [
                                     self.data_out.bits.data[i * 8:(i + 1) *
                                                             8].eq(0),
@@ -172,7 +177,7 @@ class EthernetFramePadding(Elaboratable):
                     if leftover != 0:
                         with m.If(count == min_beats):
                             for i in range(leftover):
-                                with m.If(~self.data_in.bits.keep[i]):
+                                with m.If(~self.data_in.bits.keep[i] | done):
                                     m.d.comb += [
                                         self.data_out.bits.data[i * 8:(i + 1) *
                                                                 8].eq(0),

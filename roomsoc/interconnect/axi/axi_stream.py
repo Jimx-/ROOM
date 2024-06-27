@@ -193,13 +193,15 @@ class AXIStreamPacketizer(Elaboratable):
                         self.source.bits.data[header_leftover * 8:].eq(
                             self.sink.bits.data),
                         self.source.bits.keep[header_leftover:].eq(
-                            Mux(self.sink.valid, self.sink.bits.keep, 0)),
+                            Mux(self.sink.valid & ~sink_d.last,
+                                self.sink.bits.keep, 0)),
                     ]
 
                     with m.If(self.source.fire):
                         m.d.comb += self.sink.ready.eq(~sink_d.last)
                         m.d.sync += from_idle.eq(0)
                         with m.If(self.source.bits.last):
+                            m.d.sync += sink_d.last.eq(0)
                             m.next = "IDLE"
 
         return m

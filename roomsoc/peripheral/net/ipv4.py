@@ -479,7 +479,9 @@ class Ipv4Packetizer(Elaboratable):
             self.data_out.bits.user[-32:].eq(packetizer.header.dst_addr),
         ]
 
-        meta_queue = m.submodules.meta_queue = Queue(2, Ipv4Metadata)
+        meta_queue = m.submodules.meta_queue = Queue(2,
+                                                     Ipv4Metadata,
+                                                     flow=False)
         m.d.comb += self.meta_in.connect(meta_queue.enq)
 
         packet_len = Signal.like(meta_queue.deq.bits.length)
@@ -496,28 +498,49 @@ class Ipv4Packetizer(Elaboratable):
             header.protocol.eq(self.protocol),
         ]
 
-        checksum = m.submodules.checksum = Ipv4Checksum(data_width=len(header),
+        csum_latency = 5
+        checksum = m.submodules.checksum = Ipv4Checksum(data_width=32,
                                                         skip_checksum=True)
-        m.d.comb += [
-            checksum.data_in.bits.data.eq(header),
-            checksum.data_in.bits.keep.eq(~0),
-            checksum.data_in.bits.last.eq(1),
-            checksum.data_out.ready.eq(1),
-        ]
+        csum_count = Signal(range(csum_latency))
+        m.d.comb += checksum.data_out.ready.eq(1)
 
         with m.FSM():
             with m.State("IDLE"):
                 m.d.comb += [
                     meta_queue.deq.ready.eq(checksum.data_in.ready),
+                    checksum.data_in.bits.data.eq(header),
+                    checksum.data_in.bits.keep.eq(~0),
                     checksum.data_in.valid.eq(meta_queue.deq.valid),
                 ]
 
                 with m.If(meta_queue.deq.fire):
-                    m.d.sync += sr.eq(header)
+                    m.d.sync += [
+                        sr.eq(header),
+                        csum_count.eq(0),
+                    ]
 
-                    m.next = "CHECKSUM"
+                    m.next = "CHECKSUM_REQ"
 
-            with m.State("CHECKSUM"):
+            with m.State("CHECKSUM_REQ"):
+                with m.Switch(csum_count):
+                    for i in range(5):
+                        with m.Case(i):
+                            m.d.comb += [
+                                checksum.data_in.bits.data.eq(
+                                    sr[(i + 1) * 32:(i + 2) * 32]),
+                                checksum.data_in.bits.keep.eq(~0),
+                                checksum.data_in.bits.last.eq(
+                                    i == csum_latency - 2),
+                                checksum.data_in.valid.eq(1),
+                            ]
+
+                with m.If(checksum.data_in.fire):
+                    m.d.sync += csum_count.eq(csum_count + 1)
+
+                    with m.If(checksum.data_in.bits.last):
+                        m.next = "CHECKSUM_RESP"
+
+            with m.State("CHECKSUM_RESP"):
                 m.d.comb += checksum.checksum.ready.eq(1)
 
                 with m.If(checksum.checksum.fire):

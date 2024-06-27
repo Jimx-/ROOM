@@ -137,7 +137,9 @@ class UdpPacketizer(Elaboratable):
             packetizer.source.connect(self.data_out),
         ]
 
-        meta_queue = m.submodules.meta_queue = Queue(2, UdpIpMetadata)
+        meta_queue = m.submodules.meta_queue = Queue(2,
+                                                     UdpIpMetadata,
+                                                     flow=False)
         m.d.comb += self.meta_in.connect(meta_queue.enq)
 
         packet_len = Signal.like(meta_queue.deq.bits.length)
