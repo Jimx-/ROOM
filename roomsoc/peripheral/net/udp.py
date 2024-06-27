@@ -24,6 +24,7 @@ class UdpMetadata(Record):
             ('peer_port', 16, Direction.FANOUT),
             ('my_port', 16, Direction.FANOUT),
             ('length', 16, Direction.FANOUT),
+            ('valid', 1, Direction.FANOUT),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -44,8 +45,9 @@ class UdpIpMetadata(Record):
 
 class UdpDepacketizer(Elaboratable):
 
-    def __init__(self, data_width):
+    def __init__(self, data_width, port):
         self.data_width = data_width
+        self.port = port
 
         self.data_in = AXIStreamInterface(data_width=data_width)
         self.data_out = AXIStreamInterface(data_width=data_width)
@@ -71,16 +73,28 @@ class UdpDepacketizer(Elaboratable):
                         self.meta_out.bits.length.eq(
                             Cat(depacketizer.header.length[8:],
                                 depacketizer.header.length[:8])),
+                        self.meta_out.bits.valid.eq(
+                            self.meta_out.bits.my_port == self.port),
                         self.meta_out.valid.eq(1),
                     ]
 
                     with m.If(self.meta_out.ready):
-                        m.next = "FORWARD"
+                        with m.If(self.meta_out.bits.valid):
+                            m.next = "FORWARD"
+                        with m.Else():
+                            m.next = "DROP"
 
             with m.State("FORWARD"):
                 m.d.comb += depacketizer.source.connect(self.data_out)
 
                 with m.If(self.data_out.fire & self.data_out.bits.last):
+                    m.next = "IDLE"
+
+            with m.State("DROP"):
+                m.d.comb += depacketizer.source.ready.eq(1)
+
+                with m.If(depacketizer.source.fire
+                          & depacketizer.source.bits.last):
                     m.next = "IDLE"
 
         return m
@@ -104,10 +118,10 @@ class UdpMetaMerger(Elaboratable):
                     self.udp_meta.bits.peer_port),
                 self.udp_ip_meta.bits.my_port.eq(self.udp_meta.bits.my_port),
                 self.udp_ip_meta.bits.length.eq(self.udp_meta.bits.length),
-                self.udp_ip_meta.valid.eq(1),
+                self.udp_ip_meta.valid.eq(self.udp_meta.bits.valid),
             ]
 
-            with m.If(self.udp_ip_meta.ready):
+            with m.If(self.udp_ip_meta.ready | ~self.udp_meta.bits.valid):
                 m.d.comb += [
                     self.ip_meta.ready.eq(1),
                     self.udp_meta.ready.eq(1),
@@ -180,8 +194,9 @@ class UdpPacketizer(Elaboratable):
 
 class UdpStack(Elaboratable):
 
-    def __init__(self, data_width):
+    def __init__(self, data_width, port):
         self.data_width = data_width
+        self.port = port
 
         self.my_ip_addr = Signal(32)
 
@@ -208,7 +223,7 @@ class UdpStack(Elaboratable):
         # RX
 
         depacketizer = m.submodules.depacketizer = UdpDepacketizer(
-            data_width=self.data_width)
+            data_width=self.data_width, port=self.port)
         m.d.comb += [
             ipv4.rx_data_out.connect(depacketizer.data_in),
             depacketizer.data_out.connect(self.rx_data_out),
