@@ -253,6 +253,7 @@ class AXIStreamDepacketizer(Elaboratable):
                 m.d.sync += sink_d.eq(self.sink.bits)
 
         from_idle = Signal()
+        seen_last = Signal()
 
         with m.FSM():
             with m.State("IDLE"):
@@ -260,10 +261,12 @@ class AXIStreamDepacketizer(Elaboratable):
                 m.d.sync += [
                     count.eq(1),
                     from_idle.eq(1),
+                    seen_last.eq(0),
                 ]
 
                 with m.If(self.sink.fire):
                     m.d.comb += sr_shift.eq(1)
+                    m.d.sync += seen_last.eq(self.sink.bits.last)
 
                     if header_beats <= 1:
                         m.next = "ALIGNED-DATA-COPY" if aligned else "UNALIGNED-DATA-COPY"
@@ -276,7 +279,10 @@ class AXIStreamDepacketizer(Elaboratable):
 
                     with m.If(self.sink.fire):
                         m.d.comb += sr_shift.eq(1)
-                        m.d.sync += count.eq(count + 1)
+                        m.d.sync += [
+                            count.eq(count + 1),
+                            seen_last.eq(self.sink.bits.last),
+                        ]
 
                         with m.If(count == (header_beats - 1)):
                             m.next = "ALIGNED-DATA-COPY" if aligned else "UNALIGNED-DATA-COPY"
@@ -284,11 +290,13 @@ class AXIStreamDepacketizer(Elaboratable):
             if aligned:
                 with m.State("ALIGNED-DATA-COPY"):
                     m.d.comb += [
-                        self.source.valid.eq(self.sink.valid),
-                        self.source.bits.last.eq(self.sink.bits.last),
-                        self.sink.ready.eq(self.source.ready),
+                        self.source.valid.eq(self.sink.valid | seen_last),
+                        self.source.bits.last.eq(self.sink.bits.last
+                                                 | seen_last),
+                        self.sink.ready.eq(self.source.ready & ~seen_last),
                         self.source.bits.data.eq(self.sink.bits.data),
-                        self.source.bits.keep.eq(self.sink.bits.keep),
+                        self.source.bits.keep.eq(
+                            Mux(seen_last, 0, self.sink.bits.keep)),
                     ]
 
                     with m.If(self.source.fire & self.source.bits.last):
