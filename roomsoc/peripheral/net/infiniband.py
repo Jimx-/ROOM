@@ -144,7 +144,7 @@ IB_BTH_LAYOUT = [
 ]
 
 IB_RETH_LAYOUT = [
-    ("va", 64, Direction.FANOUT),
+    ("vaddr", 64, Direction.FANOUT),
     ("r_key", 32, Direction.FANOUT),
     ("dmalen", 32, Direction.FANOUT),
 ]
@@ -153,6 +153,19 @@ IB_AETH_LAYOUT = [
     ("syndrome", 8, Direction.FANOUT),
     ("msn", 24, Direction.FANOUT),
 ]
+
+
+class _MemoryCommandInternal(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('opcode', 8, Direction.FANOUT),
+            ('qpn', 24, Direction.FANOUT),
+            ('addr', 64, Direction.FANOUT),
+            ('len', 32, Direction.FANOUT),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
 
 
 class InfiniBandMetadata(Record):
@@ -288,9 +301,9 @@ class InfiniBandDepacketizer(Elaboratable):
                     for i in range(len(aeth.msn) // 8 - 1, -1, -1))),
             self.aeth.valid.eq(eth_q.deq.valid
                                & (eth_q.deq.bits[0] == 1)),
-            self.reth.bits.va.eq(
-                Cat(reth.va[i * 8:(i + 1) * 8]
-                    for i in range(len(reth.va) // 8 - 1, -1, -1))),
+            self.reth.bits.vaddr.eq(
+                Cat(reth.vaddr[i * 8:(i + 1) * 8]
+                    for i in range(len(reth.vaddr) // 8 - 1, -1, -1))),
             self.reth.bits.r_key.eq(
                 Cat(reth.r_key[i * 8:(i + 1) * 8]
                     for i in range(len(reth.r_key) // 8 - 1, -1, -1))),
@@ -470,13 +483,124 @@ class InfiniBandDropper(Elaboratable):
         return m
 
 
+class RxHandler(Elaboratable):
+
+    class ReadRequest(Record):
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__([
+                ('qpn', 24, Direction.FANOUT),
+                ('vaddr', 64, Direction.FANOUT),
+                ('dmalen', 32, Direction.FANOUT),
+                ('psn', 24, Direction.FANOUT),
+            ],
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.meta_in = Decoupled(InfiniBandMetadata)
+
+        self.aeth_in = Decoupled(Record, IB_AETH_LAYOUT)
+        self.reth_in = Decoupled(Record, IB_RETH_LAYOUT)
+
+        self.data_in = AXIStreamInterface(data_width=data_width)
+        self.data_out = AXIStreamInterface(data_width=data_width)
+
+        self.read_req = Decoupled(RxHandler.ReadRequest)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        meta = InfiniBandMetadata()
+        aeth = Record(IB_AETH_LAYOUT)
+        reth = Record(IB_RETH_LAYOUT)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(self.meta_in.valid):
+                    with m.If((_opcode_is_aeth(self.meta_in.bits.opcode)
+                               & self.aeth_in.valid)
+                              | (_opcode_is_reth(self.meta_in.bits.opcode)
+                                 & self.reth_in.valid)):
+                        m.d.sync += meta.eq(self.meta_in.bits)
+                        m.d.comb += self.meta_in.ready.eq(1)
+
+                        with m.If(_opcode_is_aeth(self.meta_in.bits.opcode)):
+                            m.d.sync += aeth.eq(self.aeth_in.bits)
+                            m.d.comb += self.aeth_in.ready.eq(1)
+
+                        with m.If(_opcode_is_reth(self.meta_in.bits.opcode)):
+                            m.d.sync += reth.eq(self.reth_in.bits)
+                            m.d.comb += self.reth_in.ready.eq(1)
+
+                        m.next = 'PROCESS'
+
+            with m.State('PROCESS'):
+                with m.Switch(meta.opcode):
+                    with m.Case(BthOpcode.RC_RDMA_READ_REQUEST):
+                        m.d.comb += [
+                            self.read_req.bits.qpn.eq(meta.dest_qp),
+                            self.read_req.bits.vaddr.eq(reth.vaddr),
+                            self.read_req.bits.dmalen.eq(reth.dmalen),
+                            self.read_req.bits.psn.eq(meta.psn),
+                            self.read_req.valid.eq(1),
+                        ]
+
+                        with m.If(self.read_req.fire):
+                            m.next = 'IDLE'
+
+                    with m.Default():
+                        m.next = 'IDLE'
+
+        return m
+
+
+class ReadFragmenter(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.req = Decoupled(RxHandler.ReadRequest)
+        self.mem_cmd = Decoupled(_MemoryCommandInternal)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += [
+            self.mem_cmd.bits.opcode.eq(BthOpcode.RC_RDMA_READ_RESPONSE_ONLY),
+            self.mem_cmd.bits.qpn.eq(self.req.bits.qpn),
+            self.mem_cmd.bits.addr.eq(self.req.bits.vaddr),
+            self.mem_cmd.bits.len.eq(self.req.bits.dmalen),
+            self.mem_cmd.valid.eq(self.req.valid),
+            self.req.ready.eq(self.mem_cmd.ready),
+        ]
+
+        return m
+
+
 class InfiniBandTransportProtocol(Elaboratable):
+
+    class MemoryCommand(Record):
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__([
+                ('addr', 64, Direction.FANOUT),
+                ('len', 32, Direction.FANOUT),
+            ],
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
 
     def __init__(self, data_width, max_qps=64):
         self.data_width = data_width
         self.max_qps = max_qps
 
         self.rx_data_in = AXIStreamInterface(data_width=data_width)
+
+        self.mem_read_cmd = Decoupled(
+            InfiniBandTransportProtocol.MemoryCommand)
+        self.mem_read_data = AXIStreamInterface(data_width=data_width)
 
     def elaborate(self, platform):
         m = Module()
@@ -499,6 +623,25 @@ class InfiniBandTransportProtocol(Elaboratable):
             dropper.state_resp.eq(state_table.resp[0]),
         ]
 
-        m.d.comb += dropper.data_out.ready.eq(1)
+        rx_handler = m.submodules.rx_handler = RxHandler(
+            data_width=self.data_width)
+        m.d.comb += [
+            dropper.meta_out.connect(rx_handler.meta_in),
+            dropper.aeth_out.connect(rx_handler.aeth_in),
+            dropper.reth_out.connect(rx_handler.reth_in),
+            dropper.data_out.connect(rx_handler.data_in),
+        ]
+
+        read_fragmenter = m.submodules.read_fragmenter = ReadFragmenter(
+            data_width=self.data_width)
+        m.d.comb += [
+            rx_handler.read_req.connect(read_fragmenter.req),
+            self.mem_read_cmd.bits.addr.eq(read_fragmenter.mem_cmd.bits.addr),
+            self.mem_read_cmd.bits.len.eq(read_fragmenter.mem_cmd.bits.len),
+            self.mem_read_cmd.valid.eq(read_fragmenter.mem_cmd.valid),
+            read_fragmenter.mem_cmd.ready.eq(self.mem_read_cmd.ready),
+        ]
+
+        m.d.comb += rx_handler.data_out.ready.eq(1)
 
         return m

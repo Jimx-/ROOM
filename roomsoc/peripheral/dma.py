@@ -45,7 +45,8 @@ class WishboneDMAReader(Peripheral, Elaboratable):
 
         self.sink = Decoupled(Record, [("address", bus.addr_width),
                                        ("last", 1)])
-        self.source = Decoupled(Signal, bus.data_width)
+        self.source = Decoupled(Record, [("data", bus.data_width),
+                                         ("last", 1)])
 
     def elaborate(self, platform):
         m = Module()
@@ -54,7 +55,7 @@ class WishboneDMAReader(Peripheral, Elaboratable):
             m.submodules.bridge = self._bridge
 
         fifo = m.submodules.fifo = SyncFIFO(depth=self.fifo_depth,
-                                            width=self.wb_bus.data_width)
+                                            width=self.wb_bus.data_width + 1)
 
         m.d.comb += [
             self.wb_bus.stb.eq(self.sink.valid & fifo.w_rdy),
@@ -62,7 +63,7 @@ class WishboneDMAReader(Peripheral, Elaboratable):
             self.wb_bus.we.eq(0),
             self.wb_bus.sel.eq(2**(self.wb_bus.data_width // 8) - 1),
             self.wb_bus.adr.eq(self.sink.bits.address),
-            fifo.w_data.eq(self.wb_bus.dat_r),
+            fifo.w_data.eq(Cat(self.wb_bus.dat_r, self.sink.bits.last)),
         ]
 
         with m.If(self.wb_bus.stb & self.wb_bus.ack):
