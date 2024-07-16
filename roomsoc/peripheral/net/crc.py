@@ -99,11 +99,14 @@ class CrcExtract(Elaboratable):
 
 class CrcCalculate(Elaboratable):
 
-    def __init__(self, data_width):
+    def __init__(self, data_width, user_width=1):
         self.data_width = data_width
+        self.user_width = user_width
 
-        self.data_in = AXIStreamInterface(data_width=data_width)
-        self.data_out = AXIStreamInterface(data_width=data_width)
+        self.data_in = AXIStreamInterface(data_width=data_width,
+                                          user_width=user_width)
+        self.data_out = AXIStreamInterface(data_width=data_width,
+                                           user_width=user_width)
 
         self.crc = Decoupled(Signal, 32)
 
@@ -114,13 +117,16 @@ class CrcCalculate(Elaboratable):
 
         q_in = m.submodules.q_in = Queue(2,
                                          Record,
-                                         make_data_layout(self.data_width),
+                                         make_data_layout(
+                                             self.data_width, self.user_width),
                                          flow=False)
         m.d.comb += stream2queue(self.data_in, q_in)
 
         q_out = m.submodules.q_out = Queue(2,
                                            Record,
-                                           make_data_layout(self.data_width),
+                                           make_data_layout(
+                                               self.data_width,
+                                               self.user_width),
                                            flow=False)
         m.d.comb += queue2stream(q_out, self.data_out)
 
@@ -169,17 +175,20 @@ class CrcCalculate(Elaboratable):
 
 class CrcInsert(Elaboratable):
 
-    def __init__(self, data_width):
+    def __init__(self, data_width, user_width):
         self.data_width = data_width
+        self.user_width = user_width
 
-        self.data_in = AXIStreamInterface(data_width=data_width)
-        self.data_out = AXIStreamInterface(data_width=data_width)
+        self.data_in = AXIStreamInterface(data_width=data_width,
+                                          user_width=user_width)
+        self.data_out = AXIStreamInterface(data_width=data_width,
+                                           user_width=user_width)
 
     def elaborate(self, platform):
         m = Module()
 
         crc_calc = m.submodules.crc_calc = CrcCalculate(
-            data_width=self.data_width)
+            data_width=self.data_width, user_width=self.user_width)
         m.d.comb += self.data_in.connect(crc_calc.data_in)
 
         with m.FSM():
@@ -223,14 +232,17 @@ class CrcInsert(Elaboratable):
 
 class Crc(Elaboratable):
 
-    def __init__(self, data_width):
+    def __init__(self, data_width, user_width=128):
         self.data_width = data_width
+        self.user_width = user_width
 
         self.rx_data_in = AXIStreamInterface(data_width=data_width)
         self.rx_data_out = AXIStreamInterface(data_width=data_width)
 
-        self.tx_data_in = AXIStreamInterface(data_width=data_width)
-        self.tx_data_out = AXIStreamInterface(data_width=data_width)
+        self.tx_data_in = AXIStreamInterface(data_width=data_width,
+                                             user_width=user_width)
+        self.tx_data_out = AXIStreamInterface(data_width=data_width,
+                                              user_width=user_width)
 
         self.crc_packet_drops = Signal(32)
 
@@ -263,7 +275,7 @@ class Crc(Elaboratable):
         # TX
 
         tx_crc_insert = m.submodules.tx_crc_insert = CrcInsert(
-            data_width=self.data_width)
+            data_width=self.data_width, user_width=self.user_width)
 
         m.d.comb += [
             self.tx_data_in.connect(tx_crc_insert.data_in),

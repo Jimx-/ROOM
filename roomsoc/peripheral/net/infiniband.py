@@ -1,11 +1,14 @@
 from enum import IntEnum
 from amaranth import *
 from amaranth.hdl.rec import Direction
+from amaranth.utils import log2_int
 
 from room.utils import Arbiter
 
 from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer, AXIStreamPacketizer
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
+
+from .udp import UdpIpMetadata
 
 _transports = {
     'RC': 0x00,
@@ -131,10 +134,10 @@ def _opcode_no_data(opcode):
 
 IB_BTH_LAYOUT = [
     ("opcode", 8, Direction.FANOUT),
-    ("se", 1, Direction.FANOUT),
-    ("m", 1, Direction.FANOUT),
-    ("pad_cnt", 2, Direction.FANOUT),
     ("version", 4, Direction.FANOUT),
+    ("pad_cnt", 2, Direction.FANOUT),
+    ("m", 1, Direction.FANOUT),
+    ("se", 1, Direction.FANOUT),
     ("partition", 16, Direction.FANOUT),
     ("_rsvd0", 8, Direction.FANOUT),
     ("dest_qp", 24, Direction.FANOUT),
@@ -163,6 +166,37 @@ class _MemoryCommandInternal(Record):
             ('qpn', 24, Direction.FANOUT),
             ('addr', 64, Direction.FANOUT),
             ('len', 32, Direction.FANOUT),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
+class _PacketType(IntEnum):
+    AETH = 0
+    RETH = 1
+    RAW = 2
+
+
+class _PacketMetadata(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('type', _PacketType, Direction.FANOUT),
+            ('words', 29, Direction.FANOUT),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
+class _EventMetadata(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('opcode', 8, Direction.FANOUT),
+            ('qpn', 24, Direction.FANOUT),
+            ('addr', 64, Direction.FANOUT),
+            ('len', 32, Direction.FANOUT),
+            ('psn', 24, Direction.FANOUT),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -564,17 +598,257 @@ class ReadFragmenter(Elaboratable):
 
         self.req = Decoupled(RxHandler.ReadRequest)
         self.mem_cmd = Decoupled(_MemoryCommandInternal)
+        self.event = Decoupled(_EventMetadata)
 
     def elaborate(self, platform):
         m = Module()
 
+        cmd_q = m.submodules.cmd_q = Queue(4, _MemoryCommandInternal)
+        m.d.comb += cmd_q.deq.connect(self.mem_cmd)
+
+        event_q = m.submodules.event_q = Queue(4, _EventMetadata)
+        m.d.comb += event_q.deq.connect(self.event)
+
         m.d.comb += [
-            self.mem_cmd.bits.opcode.eq(BthOpcode.RC_RDMA_READ_RESPONSE_ONLY),
-            self.mem_cmd.bits.qpn.eq(self.req.bits.qpn),
-            self.mem_cmd.bits.addr.eq(self.req.bits.vaddr),
-            self.mem_cmd.bits.len.eq(self.req.bits.dmalen),
-            self.mem_cmd.valid.eq(self.req.valid),
-            self.req.ready.eq(self.mem_cmd.ready),
+            cmd_q.enq.bits.opcode.eq(BthOpcode.RC_RDMA_READ_RESPONSE_ONLY),
+            cmd_q.enq.bits.qpn.eq(self.req.bits.qpn),
+            cmd_q.enq.bits.addr.eq(self.req.bits.vaddr),
+            cmd_q.enq.bits.len.eq(self.req.bits.dmalen),
+            cmd_q.enq.valid.eq(self.req.valid & event_q.enq.ready),
+            event_q.enq.bits.opcode.eq(BthOpcode.RC_RDMA_READ_RESPONSE_ONLY),
+            event_q.enq.bits.qpn.eq(self.req.bits.qpn),
+            event_q.enq.bits.addr.eq(self.req.bits.vaddr),
+            event_q.enq.bits.len.eq(self.req.bits.dmalen),
+            event_q.enq.valid.eq(self.req.valid & cmd_q.enq.ready),
+            self.req.ready.eq(cmd_q.enq.ready & event_q.enq.ready),
+        ]
+
+        return m
+
+
+class CommandMerger(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.remote_cmd = Decoupled(_MemoryCommandInternal)
+
+        self.cmd_out = Decoupled(InfiniBandTransportProtocol.MemoryCommand)
+        self.pkg_out = Decoupled(_PacketMetadata)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        cmd_q = m.submodules.cmd_q = Queue(
+            4, InfiniBandTransportProtocol.MemoryCommand)
+        m.d.comb += cmd_q.deq.connect(self.cmd_out)
+
+        pkg_q = m.submodules.pkg_q = Queue(4, _PacketMetadata)
+        m.d.comb += pkg_q.deq.connect(self.pkg_out)
+
+        with m.If(self.remote_cmd.valid):
+            m.d.comb += [
+                cmd_q.enq.valid.eq(pkg_q.enq.ready),
+                pkg_q.enq.valid.eq(cmd_q.enq.ready),
+                self.remote_cmd.ready.eq(cmd_q.enq.fire & pkg_q.enq.fire)
+            ]
+
+        with m.If(self.remote_cmd.valid):
+            with m.Switch(self.remote_cmd.bits.opcode):
+                num_words = (cmd_q.enq.bits.len + self.data_width -
+                             1) >> log2_int(self.data_width // 8)
+
+                with m.Case(BthOpcode.RC_RDMA_READ_RESPONSE_ONLY):
+                    m.d.comb += [
+                        cmd_q.enq.bits.addr.eq(self.remote_cmd.bits.addr),
+                        cmd_q.enq.bits.len.eq(self.remote_cmd.bits.len),
+                        pkg_q.enq.bits.type.eq(_PacketType.AETH),
+                        pkg_q.enq.bits.words.eq(num_words),
+                    ]
+
+                with m.Default():
+                    m.d.comb += [
+                        cmd_q.enq.valid.eq(0),
+                        pkg_q.enq.valid.eq(0),
+                        self.remote_cmd.ready.eq(1),
+                    ]
+
+        return m
+
+
+class MetadataMerger(Elaboratable):
+
+    def __init__(self):
+        self.read_event = Decoupled(_EventMetadata)
+
+        self.bth_out = Decoupled(Record, IB_BTH_LAYOUT)
+        self.exh_out = Decoupled(_EventMetadata)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        bth_q = m.submodules.bth_q = Queue(4, Record, IB_BTH_LAYOUT)
+        m.d.comb += bth_q.deq.connect(self.bth_out)
+
+        exh_q = m.submodules.exh_q = Queue(4, _EventMetadata)
+        m.d.comb += exh_q.deq.connect(self.exh_out)
+
+        with m.If(self.read_event.valid):
+            m.d.comb += [
+                bth_q.enq.bits.opcode.eq(self.read_event.bits.opcode),
+                bth_q.enq.bits.dest_qp.eq(self.read_event.bits.qpn),
+                bth_q.enq.bits.psn.eq(self.read_event.bits.psn),
+                bth_q.enq.bits.partition.eq(0xffff),
+                exh_q.enq.bits.eq(self.read_event.bits),
+                bth_q.enq.valid.eq(exh_q.enq.ready),
+                exh_q.enq.valid.eq(bth_q.enq.ready),
+                self.read_event.ready.eq(exh_q.enq.ready & bth_q.enq.ready),
+            ]
+
+        return m
+
+
+class ExtendedPacketizer(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.pkg_in = Decoupled(_PacketMetadata)
+        self.meta_in = Decoupled(_EventMetadata)
+
+        self.mem_read_data = AXIStreamInterface(data_width=data_width)
+
+        self.data_out = AXIStreamInterface(data_width=data_width)
+        self.udp_len_out = Decoupled(Signal, 16)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        meta = _EventMetadata()
+
+        aeth = Record(IB_AETH_LAYOUT)
+        aeth_packetizer = m.submodules.aeth_packetizer = AXIStreamPacketizer(
+            Record, IB_AETH_LAYOUT, data_width=self.data_width)
+        m.d.comb += aeth_packetizer.header.eq(aeth)
+
+        aeth_seen_last = Signal()
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(self.pkg_in.valid & self.meta_in.valid):
+                    m.d.comb += [
+                        self.pkg_in.ready.eq(1),
+                        self.meta_in.ready.eq(1),
+                    ]
+
+                    m.d.sync += meta.eq(self.meta_in.bits)
+
+                    with m.Switch(self.pkg_in.bits.type):
+                        with m.Case(_PacketType.AETH):
+                            m.next = 'AETH_HEADER'
+
+            with m.State('AETH_HEADER'):
+                m.d.sync += aeth_seen_last.eq(0)
+
+                with m.Switch(meta.opcode):
+                    with m.Case(BthOpcode.RC_RDMA_READ_RESPONSE_ONLY):
+                        m.d.comb += [
+                            self.udp_len_out.bits.eq(12 + 4 + meta.len + 4),
+                            self.udp_len_out.valid.eq(1),
+                        ]
+
+                        with m.If(self.udp_len_out.fire):
+                            m.next = 'FORWARD_AETH'
+
+                    with m.Default():
+                        m.next = 'FORWARD_AETH'
+
+            with m.State('FORWARD_AETH'):
+                with m.If(~aeth_seen_last):
+                    m.d.comb += self.mem_read_data.connect(
+                        aeth_packetizer.sink)
+
+                with m.If(aeth_packetizer.sink.fire
+                          & aeth_packetizer.sink.bits.last):
+                    m.d.sync += aeth_seen_last.eq(1)
+
+                m.d.comb += aeth_packetizer.source.connect(self.data_out)
+                with m.If(self.data_out.fire & self.data_out.bits.last):
+                    m.next = 'IDLE'
+
+        return m
+
+
+class BasePacketizer(Elaboratable):
+
+    def __init__(self, data_width):
+        self.data_width = data_width
+
+        self.meta_in = Decoupled(Record, IB_BTH_LAYOUT)
+
+        self.data_in = AXIStreamInterface(data_width=data_width)
+        self.data_out = AXIStreamInterface(data_width=data_width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        bth = Record(IB_BTH_LAYOUT)
+        bth_packetizer = m.submodules.bth_packetizer = AXIStreamPacketizer(
+            Record, IB_BTH_LAYOUT, data_width=self.data_width)
+        m.d.comb += bth_packetizer.header.eq(bth)
+        m.d.comb += bth.partition.eq(0xffff)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.comb += self.meta_in.ready.eq(1)
+
+                m.d.sync += [
+                    bth.opcode.eq(self.meta_in.bits.opcode),
+                    bth.psn.eq(
+                        Cat(self.meta_in.bits.psn[i * 8:(i + 1) * 8]
+                            for i in range(len(bth.psn) // 8, -1, -1))),
+                    bth.dest_qp.eq(
+                        Cat(self.meta_in.bits.dest_qp[i * 8:(i + 1) * 8]
+                            for i in range(len(bth.dest_qp) // 8, -1, -1))),
+                ]
+
+                with m.If(self.meta_in.fire):
+                    m.next = 'DATA'
+
+            with m.State('DATA'):
+                m.d.comb += [
+                    self.data_in.connect(bth_packetizer.sink),
+                    bth_packetizer.source.connect(self.data_out),
+                ]
+
+                with m.If(self.data_out.fire & self.data_out.bits.last):
+                    m.next = 'IDLE'
+
+        return m
+
+
+class UdpIpMetadataMerger(Elaboratable):
+
+    def __init__(self, port):
+        self.port = port
+
+        self.udp_len = Decoupled(Signal, 16)
+
+        self.meta_out = Decoupled(UdpIpMetadata)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        meta_q = m.submodules.meta_q = Queue(4, UdpIpMetadata)
+        m.d.comb += meta_q.deq.connect(self.meta_out)
+
+        m.d.comb += [
+            meta_q.enq.bits.peer_addr.eq(0x0102a8c0),
+            meta_q.enq.bits.peer_port.eq(8000),
+            meta_q.enq.bits.my_port.eq(self.port),
+            meta_q.enq.bits.length.eq(self.udp_len.bits),
+            meta_q.enq.valid.eq(self.udp_len.valid),
+            self.udp_len.ready.eq(meta_q.enq.ready),
         ]
 
         return m
@@ -592,15 +866,19 @@ class InfiniBandTransportProtocol(Elaboratable):
                              name=name,
                              src_loc_at=1 + src_loc_at)
 
-    def __init__(self, data_width, max_qps=64):
+    def __init__(self, data_width, max_qps=64, port=4791):
         self.data_width = data_width
         self.max_qps = max_qps
-
-        self.rx_data_in = AXIStreamInterface(data_width=data_width)
+        self.port = port
 
         self.mem_read_cmd = Decoupled(
             InfiniBandTransportProtocol.MemoryCommand)
         self.mem_read_data = AXIStreamInterface(data_width=data_width)
+
+        self.rx_data_in = AXIStreamInterface(data_width=data_width)
+
+        self.tx_data_out = AXIStreamInterface(data_width=data_width)
+        self.tx_meta_out = Decoupled(UdpIpMetadata)
 
     def elaborate(self, platform):
         m = Module()
@@ -634,14 +912,39 @@ class InfiniBandTransportProtocol(Elaboratable):
 
         read_fragmenter = m.submodules.read_fragmenter = ReadFragmenter(
             data_width=self.data_width)
+        m.d.comb += rx_handler.read_req.connect(read_fragmenter.req)
+
+        cmd_merger = m.submodules.cmd_merger = CommandMerger(
+            data_width=self.data_width)
         m.d.comb += [
-            rx_handler.read_req.connect(read_fragmenter.req),
-            self.mem_read_cmd.bits.addr.eq(read_fragmenter.mem_cmd.bits.addr),
-            self.mem_read_cmd.bits.len.eq(read_fragmenter.mem_cmd.bits.len),
-            self.mem_read_cmd.valid.eq(read_fragmenter.mem_cmd.valid),
-            read_fragmenter.mem_cmd.ready.eq(self.mem_read_cmd.ready),
+            read_fragmenter.mem_cmd.connect(cmd_merger.remote_cmd),
+            cmd_merger.cmd_out.connect(self.mem_read_cmd),
         ]
 
-        m.d.comb += rx_handler.data_out.ready.eq(1)
+        meta_merger = m.submodules.meta_merger = MetadataMerger()
+        m.d.comb += read_fragmenter.event.connect(meta_merger.read_event)
+
+        exh_packetizer = m.submodules.exh_packetizer = ExtendedPacketizer(
+            data_width=self.data_width)
+        m.d.comb += [
+            cmd_merger.pkg_out.connect(exh_packetizer.pkg_in),
+            meta_merger.exh_out.connect(exh_packetizer.meta_in),
+            self.mem_read_data.connect(exh_packetizer.mem_read_data),
+        ]
+
+        bth_packetizer = m.submodules.bth_packetizer = BasePacketizer(
+            data_width=self.data_width)
+        m.d.comb += [
+            meta_merger.bth_out.connect(bth_packetizer.meta_in),
+            exh_packetizer.data_out.connect(bth_packetizer.data_in),
+            bth_packetizer.data_out.connect(self.tx_data_out),
+        ]
+
+        udp_meta_merger = m.submodules.udp_meta_merger = UdpIpMetadataMerger(
+            port=self.port)
+        m.d.comb += [
+            exh_packetizer.udp_len_out.connect(udp_meta_merger.udp_len),
+            udp_meta_merger.meta_out.connect(self.tx_meta_out),
+        ]
 
         return m

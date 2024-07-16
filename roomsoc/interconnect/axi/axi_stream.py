@@ -110,22 +110,34 @@ class AXIStreamPacketizer(Elaboratable):
                 ]
 
                 with m.If(self.sink.valid):
-                    m.d.comb += [
-                        self.sink.ready.eq(0),
-                        self.source.valid.eq(1),
-                        self.source.bits.last.eq(0),
-                        self.source.bits.data.eq(
-                            self.header[:self.data_width]),
-                        self.source.bits.keep.eq(~0),
-                    ]
+                    m.d.comb += self.sink.ready.eq(0)
 
-                    with m.If(self.source.fire):
-                        m.d.comb += sr_load.eq(1)
+                    if header_beats > 0:
+                        m.d.comb += [
+                            self.source.valid.eq(1),
+                            self.source.bits.last.eq(0),
+                            self.source.bits.data.eq(
+                                self.header[:self.data_width]),
+                            self.source.bits.keep.eq(~0),
+                        ]
 
-                        if header_beats <= 1:
-                            m.next = "ALIGNED-DATA-COPY" if aligned else "UNALIGNED-DATA-COPY"
-                        else:
-                            m.next = "HEADER-SEND"
+                        with m.If(self.source.fire):
+                            m.d.comb += sr_load.eq(1)
+
+                            if header_beats <= 1:
+                                m.next = "ALIGNED-DATA-COPY" if aligned else "UNALIGNED-DATA-COPY"
+                            else:
+                                m.next = "HEADER-SEND"
+
+                    else:
+                        m.d.sync += [
+                            from_idle.eq(0),
+                            sink_d.data[(beat_bytes - header_leftover) *
+                                        8:].eq(self.header),
+                            sink_d.keep[beat_bytes - header_leftover:].eq(~0),
+                        ]
+
+                        m.next = "UNALIGNED-DATA-COPY"
 
             if header_beats > 1:
                 with m.State("HEADER-SEND"):
@@ -321,12 +333,10 @@ class AXIStreamDepacketizer(Elaboratable):
                         self.source.bits.keep.eq(
                             sink_d.keep[header_leftover:]),
                         self.source.bits.keep[min((
-                            beat_bytes - header_leftover), data_width // 8 -
-                                                  1):].eq(
-                                                      Mux(
-                                                          self.sink.valid,
-                                                          self.sink.bits.keep,
-                                                          0)),
+                            beat_bytes -
+                            header_leftover), data_width // 8 - 1):].eq(
+                                Mux(self.sink.valid & ~sink_d.last,
+                                    self.sink.bits.keep, 0)),
                     ]
 
                     with m.If(from_idle):
