@@ -8,6 +8,7 @@ from room.utils import Arbiter
 from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer, AXIStreamPacketizer
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
+from .common import *
 from .udp import UdpIpMetadata
 
 _transports = {
@@ -166,23 +167,6 @@ class _MemoryCommandInternal(Record):
             ('qpn', 24, Direction.FANOUT),
             ('addr', 64, Direction.FANOUT),
             ('len', 32, Direction.FANOUT),
-        ],
-                         name=name,
-                         src_loc_at=1 + src_loc_at)
-
-
-class _PacketType(IntEnum):
-    AETH = 0
-    RETH = 1
-    RAW = 2
-
-
-class _PacketMetadata(Record):
-
-    def __init__(self, name=None, src_loc_at=0):
-        super().__init__([
-            ('type', _PacketType, Direction.FANOUT),
-            ('words', 29, Direction.FANOUT),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -544,8 +528,18 @@ class RxHandler(Elaboratable):
 
         self.read_req = Decoupled(RxHandler.ReadRequest)
 
+        self.write_cmd = Decoupled(InfiniBandTransportProtocol.MemoryCommand)
+        self.ack_event = Decoupled(_EventMetadata)
+
     def elaborate(self, platform):
         m = Module()
+
+        write_cmd_q = m.submodules.write_cmd_q = Queue(
+            4, InfiniBandTransportProtocol.MemoryCommand)
+        m.d.comb += write_cmd_q.deq.connect(self.write_cmd)
+
+        ack_q = m.submodules.ack_q = Queue(4, _EventMetadata)
+        m.d.comb += ack_q.deq.connect(self.ack_event)
 
         meta = InfiniBandMetadata()
         aeth = Record(IB_AETH_LAYOUT)
@@ -585,8 +579,28 @@ class RxHandler(Elaboratable):
                         with m.If(self.read_req.fire):
                             m.next = 'IDLE'
 
+                    with m.Case(BthOpcode.RC_RDMA_WRITE_ONLY):
+                        m.d.comb += [
+                            write_cmd_q.enq.bits.addr.eq(reth.vaddr),
+                            write_cmd_q.enq.bits.len.eq(reth.dmalen),
+                            write_cmd_q.enq.valid.eq(ack_q.enq.ready),
+                            ack_q.enq.bits.opcode.eq(BthOpcode.RC_ACKNOWLEDGE),
+                            ack_q.enq.bits.qpn.eq(meta.dest_qp),
+                            ack_q.enq.bits.psn.eq(meta.psn),
+                            ack_q.enq.valid.eq(write_cmd_q.enq.ready),
+                        ]
+
+                        with m.If(write_cmd_q.enq.fire & ack_q.enq.fire):
+                            m.next = 'FORWARD'
+
                     with m.Default():
                         m.next = 'IDLE'
+
+            with m.State('FORWARD'):
+                m.d.comb += self.data_in.connect(self.data_out)
+
+                with m.If(self.data_out.fire & self.data_out.bits.last):
+                    m.next = 'IDLE'
 
         return m
 
@@ -628,13 +642,10 @@ class ReadFragmenter(Elaboratable):
 
 class CommandMerger(Elaboratable):
 
-    def __init__(self, data_width):
-        self.data_width = data_width
-
+    def __init__(self):
         self.remote_cmd = Decoupled(_MemoryCommandInternal)
 
         self.cmd_out = Decoupled(InfiniBandTransportProtocol.MemoryCommand)
-        self.pkg_out = Decoupled(_PacketMetadata)
 
     def elaborate(self, platform):
         m = Module()
@@ -643,33 +654,22 @@ class CommandMerger(Elaboratable):
             4, InfiniBandTransportProtocol.MemoryCommand)
         m.d.comb += cmd_q.deq.connect(self.cmd_out)
 
-        pkg_q = m.submodules.pkg_q = Queue(4, _PacketMetadata)
-        m.d.comb += pkg_q.deq.connect(self.pkg_out)
-
         with m.If(self.remote_cmd.valid):
             m.d.comb += [
-                cmd_q.enq.valid.eq(pkg_q.enq.ready),
-                pkg_q.enq.valid.eq(cmd_q.enq.ready),
-                self.remote_cmd.ready.eq(cmd_q.enq.fire & pkg_q.enq.fire)
+                cmd_q.enq.valid.eq(1),
+                self.remote_cmd.ready.eq(cmd_q.enq.ready),
             ]
 
-        with m.If(self.remote_cmd.valid):
             with m.Switch(self.remote_cmd.bits.opcode):
-                num_words = (cmd_q.enq.bits.len + self.data_width -
-                             1) >> log2_int(self.data_width // 8)
-
                 with m.Case(BthOpcode.RC_RDMA_READ_RESPONSE_ONLY):
                     m.d.comb += [
                         cmd_q.enq.bits.addr.eq(self.remote_cmd.bits.addr),
                         cmd_q.enq.bits.len.eq(self.remote_cmd.bits.len),
-                        pkg_q.enq.bits.type.eq(_PacketType.AETH),
-                        pkg_q.enq.bits.words.eq(num_words),
                     ]
 
                 with m.Default():
                     m.d.comb += [
                         cmd_q.enq.valid.eq(0),
-                        pkg_q.enq.valid.eq(0),
                         self.remote_cmd.ready.eq(1),
                     ]
 
@@ -679,6 +679,7 @@ class CommandMerger(Elaboratable):
 class MetadataMerger(Elaboratable):
 
     def __init__(self):
+        self.ack_event = Decoupled(_EventMetadata)
         self.read_event = Decoupled(_EventMetadata)
 
         self.bth_out = Decoupled(Record, IB_BTH_LAYOUT)
@@ -693,7 +694,18 @@ class MetadataMerger(Elaboratable):
         exh_q = m.submodules.exh_q = Queue(4, _EventMetadata)
         m.d.comb += exh_q.deq.connect(self.exh_out)
 
-        with m.If(self.read_event.valid):
+        with m.If(self.ack_event.valid):
+            m.d.comb += [
+                bth_q.enq.bits.opcode.eq(BthOpcode.RC_ACKNOWLEDGE),
+                bth_q.enq.bits.dest_qp.eq(self.ack_event.bits.qpn),
+                bth_q.enq.bits.psn.eq(self.ack_event.bits.psn),
+                bth_q.enq.bits.partition.eq(0xffff),
+                exh_q.enq.bits.eq(self.ack_event.bits),
+                bth_q.enq.valid.eq(exh_q.enq.ready),
+                exh_q.enq.valid.eq(bth_q.enq.ready),
+                self.ack_event.ready.eq(exh_q.enq.ready & bth_q.enq.ready),
+            ]
+        with m.Elif(self.read_event.valid):
             m.d.comb += [
                 bth_q.enq.bits.opcode.eq(self.read_event.bits.opcode),
                 bth_q.enq.bits.dest_qp.eq(self.read_event.bits.qpn),
@@ -713,7 +725,6 @@ class ExtendedPacketizer(Elaboratable):
     def __init__(self, data_width):
         self.data_width = data_width
 
-        self.pkg_in = Decoupled(_PacketMetadata)
         self.meta_in = Decoupled(_EventMetadata)
 
         self.mem_read_data = AXIStreamInterface(data_width=data_width)
@@ -731,21 +742,23 @@ class ExtendedPacketizer(Elaboratable):
             Record, IB_AETH_LAYOUT, data_width=self.data_width)
         m.d.comb += aeth_packetizer.header.eq(aeth)
 
+        empty_payload_q = m.submodules.empty_payload_q = Queue(
+            4, Record, make_data_layout(data_width=self.data_width))
+        m.d.comb += [
+            empty_payload_q.enq.bits.keep.eq(0),
+            empty_payload_q.enq.bits.last.eq(1),
+        ]
+
         aeth_seen_last = Signal()
 
         with m.FSM():
             with m.State('IDLE'):
-                with m.If(self.pkg_in.valid & self.meta_in.valid):
-                    m.d.comb += [
-                        self.pkg_in.ready.eq(1),
-                        self.meta_in.ready.eq(1),
-                    ]
-
+                with m.If(self.meta_in.valid):
+                    m.d.comb += self.meta_in.ready.eq(1)
                     m.d.sync += meta.eq(self.meta_in.bits)
 
-                    with m.Switch(self.pkg_in.bits.type):
-                        with m.Case(_PacketType.AETH):
-                            m.next = 'AETH_HEADER'
+                    with m.If(_opcode_is_aeth(self.meta_in.bits.opcode)):
+                        m.next = 'AETH_HEADER'
 
             with m.State('AETH_HEADER'):
                 m.d.sync += aeth_seen_last.eq(0)
@@ -760,13 +773,30 @@ class ExtendedPacketizer(Elaboratable):
                         with m.If(self.udp_len_out.fire):
                             m.next = 'FORWARD_AETH'
 
+                    with m.Case(BthOpcode.RC_ACKNOWLEDGE):
+                        m.d.comb += [
+                            self.udp_len_out.bits.eq(12 + 4 + 4),
+                            self.udp_len_out.valid.eq(
+                                empty_payload_q.enq.ready),
+                            empty_payload_q.enq.valid.eq(
+                                self.udp_len_out.ready),
+                        ]
+
+                        with m.If(empty_payload_q.enq.fire
+                                  & self.udp_len_out.fire):
+                            m.next = 'FORWARD_AETH'
+
                     with m.Default():
                         m.next = 'FORWARD_AETH'
 
             with m.State('FORWARD_AETH'):
                 with m.If(~aeth_seen_last):
-                    m.d.comb += self.mem_read_data.connect(
-                        aeth_packetizer.sink)
+                    with m.If(_opcode_no_data(meta.opcode)):
+                        m.d.comb += queue2stream(empty_payload_q,
+                                                 aeth_packetizer.sink)
+                    with m.Else():
+                        m.d.comb += self.mem_read_data.connect(
+                            aeth_packetizer.sink)
 
                 with m.If(aeth_packetizer.sink.fire
                           & aeth_packetizer.sink.bits.last):
@@ -875,6 +905,10 @@ class InfiniBandTransportProtocol(Elaboratable):
             InfiniBandTransportProtocol.MemoryCommand)
         self.mem_read_data = AXIStreamInterface(data_width=data_width)
 
+        self.mem_write_cmd = Decoupled(
+            InfiniBandTransportProtocol.MemoryCommand)
+        self.mem_write_data = AXIStreamInterface(data_width=data_width)
+
         self.rx_data_in = AXIStreamInterface(data_width=data_width)
 
         self.tx_data_out = AXIStreamInterface(data_width=data_width)
@@ -908,26 +942,29 @@ class InfiniBandTransportProtocol(Elaboratable):
             dropper.aeth_out.connect(rx_handler.aeth_in),
             dropper.reth_out.connect(rx_handler.reth_in),
             dropper.data_out.connect(rx_handler.data_in),
+            rx_handler.write_cmd.connect(self.mem_write_cmd),
+            rx_handler.data_out.connect(self.mem_write_data),
         ]
 
         read_fragmenter = m.submodules.read_fragmenter = ReadFragmenter(
             data_width=self.data_width)
         m.d.comb += rx_handler.read_req.connect(read_fragmenter.req)
 
-        cmd_merger = m.submodules.cmd_merger = CommandMerger(
-            data_width=self.data_width)
+        cmd_merger = m.submodules.cmd_merger = CommandMerger()
         m.d.comb += [
             read_fragmenter.mem_cmd.connect(cmd_merger.remote_cmd),
             cmd_merger.cmd_out.connect(self.mem_read_cmd),
         ]
 
         meta_merger = m.submodules.meta_merger = MetadataMerger()
-        m.d.comb += read_fragmenter.event.connect(meta_merger.read_event)
+        m.d.comb += [
+            rx_handler.ack_event.connect(meta_merger.ack_event),
+            read_fragmenter.event.connect(meta_merger.read_event),
+        ]
 
         exh_packetizer = m.submodules.exh_packetizer = ExtendedPacketizer(
             data_width=self.data_width)
         m.d.comb += [
-            cmd_merger.pkg_out.connect(exh_packetizer.pkg_in),
             meta_merger.exh_out.connect(exh_packetizer.meta_in),
             self.mem_read_data.connect(exh_packetizer.mem_read_data),
         ]

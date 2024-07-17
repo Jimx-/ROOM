@@ -323,7 +323,7 @@ class AXIStreamDepacketizer(Elaboratable):
                             self.sink.bits.last
                             & ~self.sink.bits.keep[header_leftover:].any())
                                                  | sink_d.last),
-                        self.sink.ready.eq(self.source.ready),
+                        self.sink.ready.eq(self.source.ready & ~sink_d.last),
                         self.source.bits.data.eq(sink_d.data[header_leftover *
                                                              8:]),
                         self.source.bits.data[min((beat_bytes -

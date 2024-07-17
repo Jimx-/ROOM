@@ -22,6 +22,9 @@ class Rocev2Stack(Elaboratable):
         self.mem_read_cmd = Decoupled(Rocev2Stack.MemoryCommand)
         self.mem_read_data = AXIStreamInterface(data_width=data_width)
 
+        self.mem_write_cmd = Decoupled(Rocev2Stack.MemoryCommand)
+        self.mem_write_data = AXIStreamInterface(data_width=data_width)
+
         self.rx_data_in = AXIStreamInterface(data_width=data_width)
         self.tx_data_out = AXIStreamInterface(data_width=data_width,
                                               user_width=128)
@@ -49,6 +52,8 @@ class Rocev2Stack(Elaboratable):
             udp_stack.rx_data_out.connect(ib_stack.rx_data_in),
             ib_stack.mem_read_cmd.connect(self.mem_read_cmd),
             self.mem_read_data.connect(ib_stack.mem_read_data),
+            ib_stack.mem_write_cmd.connect(self.mem_write_cmd),
+            ib_stack.mem_write_data.connect(self.mem_write_data),
             ib_stack.tx_data_out.connect(udp_stack.tx_data_in),
             ib_stack.tx_meta_out.connect(udp_stack.tx_meta_in),
         ]
