@@ -8,6 +8,8 @@ class GroomController(Peripheral, Elaboratable):
     def __init__(self, name=None):
         super().__init__(name=name)
 
+        self.core_busy = Signal()
+
         self.core_enable = Signal()
         self.cache_enable = Signal()
         self.raster_enable = Signal()
@@ -18,7 +20,7 @@ class GroomController(Peripheral, Elaboratable):
         self.raster_prim_stride = Signal(16)
 
         bank = self.csr_bank()
-        self._enable = bank.csr(3, 'rw')
+        self._enable = bank.csr(32, 'rw')
         self._scratch = bank.csr(32, 'rw')
         self._raster_tile_count = bank.csr(16, 'rw')
         self._raster_tile_addr = bank.csr(32, 'rw')
@@ -33,7 +35,8 @@ class GroomController(Peripheral, Elaboratable):
         m.submodules.bridge = self._bridge
 
         m.d.comb += self._enable.r_data.eq(
-            Cat(self.core_enable, self.cache_enable, self.raster_enable))
+            Cat(self.core_busy, Const(0, 28), self.core_enable,
+                self.cache_enable, self.raster_enable))
         with m.If(self._enable.w_stb):
             m.d.sync += Cat(self.core_enable, self.cache_enable,
                             self.raster_enable).eq(self._enable.w_data)
