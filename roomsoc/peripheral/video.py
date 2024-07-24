@@ -740,7 +740,8 @@ class VideoFrameBuffer(Elaboratable):
             default_enable=1)
 
         cdc = m.submodules.cdc = ClockDomainCrossing(
-            Signal, self.depth, to_domain=self.clock_domain)
+            Record, [("data", self.depth), ("last", 1)],
+            to_domain=self.clock_domain)
         m.d.comb += dma.source.connect(cdc.sink)
 
         video_data = cdc.source
@@ -761,16 +762,18 @@ class VideoFrameBuffer(Elaboratable):
 
         if self.depth == 32:
             m.d.comb += [
-                self.source.bits.r.eq(video_data.bits[0:8]),
-                self.source.bits.g.eq(video_data.bits[8:16]),
-                self.source.bits.b.eq(video_data.bits[16:24]),
+                self.source.bits.r.eq(video_data.bits.data[0:8]),
+                self.source.bits.g.eq(video_data.bits.data[8:16]),
+                self.source.bits.b.eq(video_data.bits.data[16:24]),
             ]
         elif self.depth == 16:
             m.d.comb += [
-                self.source.bits.r.eq(Cat(Const(0, 3),
-                                          video_data.bits[11:16])),
-                self.source.bits.g.eq(Cat(Const(0, 2), video_data.bits[5:11])),
-                self.source.bits.b.eq(Cat(Const(0, 3), video_data.bits[0:5])),
+                self.source.bits.r.eq(
+                    Cat(Const(0, 3), video_data.bits.data[11:16])),
+                self.source.bits.g.eq(
+                    Cat(Const(0, 2), video_data.bits.data[5:11])),
+                self.source.bits.b.eq(
+                    Cat(Const(0, 3), video_data.bits.data[0:5])),
             ]
 
         m.d.comb += self.underflow.eq(~self.source.valid)

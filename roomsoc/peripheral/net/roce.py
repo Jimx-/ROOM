@@ -44,6 +44,7 @@ class Rocev2Stack(Elaboratable):
             udp_stack.my_ip_addr.eq(self.my_ip_addr),
             icrc.rx_data_out.connect(udp_stack.rx_data_in),
             udp_stack.tx_data_out.connect(icrc.tx_data_in),
+            udp_stack.rx_meta_out.ready.eq(1),
         ]
 
         ib_stack = m.submodules.ib_stack = InfiniBandTransportProtocol(

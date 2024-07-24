@@ -1,6 +1,7 @@
 from amaranth import *
 from amaranth.lib.fifo import SyncFIFO
 from amaranth.utils import log2_int
+from amaranth.hdl.rec import Direction
 
 from .peripheral import Peripheral
 from roomsoc.interconnect.stream import Decoupled
@@ -45,8 +46,9 @@ class WishboneDMAReader(Peripheral, Elaboratable):
 
         self.sink = Decoupled(Record, [("address", bus.addr_width),
                                        ("last", 1)])
-        self.source = Decoupled(Record, [("data", bus.data_width),
-                                         ("last", 1)])
+        self.source = Decoupled(Record,
+                                [("data", bus.data_width, Direction.FANOUT),
+                                 ("last", 1, Direction.FANOUT)])
 
     def elaborate(self, platform):
         m = Module()
