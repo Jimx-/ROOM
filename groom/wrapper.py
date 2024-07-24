@@ -465,6 +465,9 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                         cluster.dbus_mmio.d.bits.source.eq(d_mmio_source_id),
                     ]
 
-        m.d.comb += self.busy.eq(Cat(c.busy for c in clusters).any())
+        m.d.comb += [
+            self.busy.eq(Cat(c.busy for c in clusters).any()),
+            self.ctrl.core_busy.eq(self.busy),
+        ]
 
         return m
