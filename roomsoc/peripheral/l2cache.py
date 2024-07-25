@@ -597,25 +597,20 @@ class SourceA(HasL2CacheParams, Elaboratable):
             a.mask.eq(~0),
         ]
 
-        queue = m.submodules.queue = SyncFIFO(depth=1, width=len(a))
+        queue = m.submodules.queue = Queue(
+            1,
+            tl.ChannelA,
+            addr_width=32,
+            data_width=self.beat_bytes * 8,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=self.out_source_id_width,
+            flow=False)
         m.d.comb += [
-            queue.w_data.eq(a),
-            queue.w_en.eq(self.req.valid),
-            self.req.ready.eq(queue.w_rdy),
-            self.a.bits.eq(queue.r_data),
-            self.a.valid.eq(queue.r_rdy),
-            queue.r_en.eq(self.a.ready),
+            queue.enq.bits.eq(a),
+            queue.enq.valid.eq(self.req.valid),
+            self.req.ready.eq(queue.enq.ready),
+            queue.deq.connect(self.a),
         ]
-
-        with m.If(self.req.valid):
-            m.d.comb += self.a.valid.eq(1)
-        with m.If(queue.w_rdy):
-            m.d.comb += [
-                self.a.bits.eq(a),
-                queue.r_en.eq(0),
-            ]
-            with m.If(self.a.ready):
-                m.d.comb += queue.w_en.eq(0)
 
         return m
 
@@ -666,7 +661,23 @@ class SourceB(HasL2CacheParams, Elaboratable):
         with m.If(self.req.fire):
             m.d.comb += remain_set.eq(self.req.bits.clients)
 
-        b = self.b
+        b = Decoupled(tl.ChannelB,
+                      addr_width=32,
+                      data_width=self.beat_bytes * 8,
+                      size_width=bits_for(self.lg_block_bytes),
+                      source_id_width=self.in_source_id_width)
+        queue = m.submodules.queue = Queue(
+            1,
+            tl.ChannelB,
+            addr_width=32,
+            data_width=self.beat_bytes * 8,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=self.in_source_id_width,
+            flow=False)
+        m.d.comb += [
+            b.connect(queue.enq),
+            queue.deq.connect(self.b),
+        ]
 
         m.d.comb += b.valid.eq(busy | self.req.valid)
         with m.If(b.fire):
@@ -1075,7 +1086,23 @@ class SourceD(HasL2CacheParams, Elaboratable):
             with m.Case(tl.ChannelAOpcode.AcquirePerm):
                 m.d.comb += resp_opcode.eq(tl.ChannelDOpcode.Grant)
 
-        d = self.d
+        d = Decoupled(tl.ChannelD,
+                      data_width=self.beat_bytes * 8,
+                      size_width=bits_for(self.lg_block_bytes),
+                      source_id_width=self.in_source_id_width,
+                      sink_id_width=self.in_sink_id_width)
+        queue = m.submodules.queue = Queue(
+            1,
+            tl.ChannelD,
+            data_width=self.beat_bytes * 8,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=self.in_source_id_width,
+            sink_id_width=self.in_sink_id_width,
+            flow=False)
+        m.d.comb += [
+            d.connect(queue.enq),
+            queue.deq.connect(self.d),
+        ]
 
         m.d.comb += [
             d.valid.eq(s3_valid_d),
@@ -1199,31 +1226,13 @@ class SourceE(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        e = tl.ChannelE()
-
+        queue = m.submodules.queue = Queue(1, tl.ChannelE, flow=False)
         m.d.comb += [
-            e.sink.eq(self.req.bits.sink),
+            queue.enq.bits.sink.eq(self.req.bits.sink),
+            queue.enq.valid.eq(self.req.valid),
+            self.req.ready.eq(queue.enq.ready),
+            queue.deq.connect(self.e),
         ]
-
-        queue = m.submodules.queue = SyncFIFO(depth=1, width=len(e))
-        m.d.comb += [
-            queue.w_data.eq(e),
-            queue.w_en.eq(self.req.valid),
-            self.req.ready.eq(queue.w_rdy),
-            self.e.bits.eq(queue.r_data),
-            self.e.valid.eq(queue.r_rdy),
-            queue.r_en.eq(self.e.ready),
-        ]
-
-        with m.If(self.req.valid):
-            m.d.comb += self.e.valid.eq(1)
-        with m.If(queue.w_rdy):
-            m.d.comb += [
-                self.e.bits.eq(e),
-                queue.r_en.eq(0),
-            ]
-            with m.If(self.e.ready):
-                m.d.comb += queue.w_en.eq(0)
 
         return m
 
@@ -1466,7 +1475,16 @@ class SinkC(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        c = self.c
+        queue = m.submodules.queue = Queue(
+            1,
+            tl.ChannelC,
+            addr_width=32,
+            data_width=self.beat_bytes * 8,
+            size_width=self.in_size_width,
+            source_id_width=self.in_source_id_width,
+            flow=False)
+        m.d.comb += self.c.connect(queue.enq)
+        c = queue.deq
 
         tag, set, offset = self.parse_addr(c.bits.address)
         first, last, _, beat = tl.Interface.count(m, c.bits, c.fire)
