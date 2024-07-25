@@ -1097,8 +1097,7 @@ class SourceD(HasL2CacheParams, Elaboratable):
             data_width=self.beat_bytes * 8,
             size_width=bits_for(self.lg_block_bytes),
             source_id_width=self.in_source_id_width,
-            sink_id_width=self.in_sink_id_width,
-            flow=False)
+            sink_id_width=self.in_sink_id_width)
         m.d.comb += [
             d.connect(queue.enq),
             queue.deq.connect(self.d),
@@ -1306,7 +1305,15 @@ class SinkA(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        a = self.a
+        queue = m.submodules.queue = Queue(
+            1,
+            tl.ChannelA,
+            addr_width=32,
+            data_width=self.beat_bytes * 8,
+            size_width=self.in_size_width,
+            source_id_width=self.in_source_id_width)
+        m.d.comb += self.a.connect(queue.enq)
+        a = queue.deq
 
         first, _, _, _ = tl.Interface.count(m, a.bits, a.fire)
         has_data = tl.Interface.has_data(a.bits)
@@ -1399,7 +1406,16 @@ class SinkB(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        b = self.b
+        queue = m.submodules.queue = Queue(
+            1,
+            tl.ChannelB,
+            addr_width=32,
+            data_width=self.beat_bytes * 8,
+            size_width=self.in_size_width,
+            source_id_width=self.out_source_id_width,
+            flow=False)
+        m.d.comb += self.b.connect(queue.enq)
+        b = queue.deq
 
         m.d.comb += [
             b.ready.eq(self.req.ready),
@@ -1633,7 +1649,15 @@ class SinkD(HasL2CacheParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        d = self.d
+        queue = m.submodules.queue = Queue(
+            1,
+            tl.ChannelD,
+            data_width=self.beat_bytes * 8,
+            size_width=bits_for(self.lg_block_bytes),
+            source_id_width=self.out_source_id_width,
+            flow=False)
+        m.d.comb += self.d.connect(queue.enq)
+        d = queue.deq
 
         source = Signal.like(self.source)
         with m.If(d.valid):
