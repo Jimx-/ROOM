@@ -35,8 +35,8 @@ class GroomController(Peripheral, Elaboratable):
         m.submodules.bridge = self._bridge
 
         m.d.comb += self._enable.r_data.eq(
-            Cat(self.core_busy, Const(0, 28), self.core_enable,
-                self.cache_enable, self.raster_enable))
+            Cat(self.core_enable, self.cache_enable, self.raster_enable,
+                Const(0, 28), self.core_busy))
         with m.If(self._enable.w_stb):
             m.d.sync += Cat(self.core_enable, self.cache_enable,
                             self.raster_enable).eq(self._enable.w_data)
