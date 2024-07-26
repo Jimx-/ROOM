@@ -11,6 +11,7 @@ from .infiniband import InfiniBandTransportProtocol
 
 class Rocev2Stack(Elaboratable):
 
+    ConnectionRequest = InfiniBandTransportProtocol.ConnectionRequest
     MemoryCommand = InfiniBandTransportProtocol.MemoryCommand
 
     def __init__(self, data_width, port=4791):
@@ -18,6 +19,8 @@ class Rocev2Stack(Elaboratable):
         self.port = port
 
         self.my_ip_addr = Signal(32)
+
+        self.conn_req = Decoupled(Rocev2Stack.ConnectionRequest)
 
         self.mem_read_cmd = Decoupled(Rocev2Stack.MemoryCommand)
         self.mem_read_data = AXIStreamInterface(data_width=data_width)
@@ -50,6 +53,7 @@ class Rocev2Stack(Elaboratable):
         ib_stack = m.submodules.ib_stack = InfiniBandTransportProtocol(
             data_width=self.data_width, port=self.port)
         m.d.comb += [
+            self.conn_req.connect(ib_stack.conn_req),
             udp_stack.rx_data_out.connect(ib_stack.rx_data_in),
             ib_stack.mem_read_cmd.connect(self.mem_read_cmd),
             self.mem_read_data.connect(ib_stack.mem_read_data),

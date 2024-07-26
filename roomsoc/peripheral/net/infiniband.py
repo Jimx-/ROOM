@@ -382,6 +382,69 @@ class StateTable(Elaboratable):
         return m
 
 
+class ConnectionTable(Elaboratable):
+
+    class Entry(Record):
+
+        _layout = [
+            ('remote_qpn', 24, Direction.FANOUT),
+            ('remote_ip', 128, Direction.FANOUT),
+            ('remote_port', 16, Direction.FANOUT),
+        ]
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__(self._layout,
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
+
+    class WriteRequest(Record):
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__([
+                ('local_qpn', 24, Direction.FANOUT),
+            ] + ConnectionTable.Entry._layout,
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
+
+    def __init__(self, max_qps):
+        self.max_qps = max_qps
+
+        self.read = Decoupled(Signal, 24)
+        self.resp = Valid(ConnectionTable.Entry)
+
+        self.write = Decoupled(ConnectionTable.WriteRequest)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        mem = Memory(width=len(self.resp.bits), depth=self.max_qps)
+        mem_rport = m.submodules.mem_rport = mem.read_port(transparent=False)
+
+        m.d.comb += [
+            mem_rport.addr.eq(self.read.bits),
+            self.read.ready.eq(1),
+            self.resp.bits.eq(mem_rport.data),
+        ]
+
+        m.d.sync += self.resp.valid.eq(0)
+        with m.If(self.read.fire):
+            m.d.sync += self.resp.valid.eq(1)
+
+        mem_wport = m.submodules.mem_wport = mem.write_port()
+        write_entry = ConnectionTable.Entry()
+        m.d.comb += [
+            write_entry.remote_qpn.eq(self.write.bits.remote_qpn),
+            write_entry.remote_ip.eq(self.write.bits.remote_ip),
+            write_entry.remote_port.eq(self.write.bits.remote_port),
+            mem_wport.addr.eq(self.write.bits.local_qpn),
+            mem_wport.data.eq(write_entry),
+            mem_wport.en.eq(self.write.valid),
+            self.write.ready.eq(1),
+        ]
+
+        return m
+
+
 class InfiniBandDropper(Elaboratable):
 
     def __init__(self, data_width):
@@ -730,7 +793,7 @@ class ExtendedPacketizer(Elaboratable):
         self.mem_read_data = AXIStreamInterface(data_width=data_width)
 
         self.data_out = AXIStreamInterface(data_width=data_width)
-        self.udp_len_out = Decoupled(Signal, 16)
+        self.udp_meta_out = Decoupled(UdpIpMetadataMerger.Metadata)
 
     def elaborate(self, platform):
         m = Module()
@@ -766,24 +829,27 @@ class ExtendedPacketizer(Elaboratable):
                 with m.Switch(meta.opcode):
                     with m.Case(BthOpcode.RC_RDMA_READ_RESPONSE_ONLY):
                         m.d.comb += [
-                            self.udp_len_out.bits.eq(12 + 4 + meta.len + 4),
-                            self.udp_len_out.valid.eq(1),
+                            self.udp_meta_out.bits.local_qpn.eq(meta.qpn),
+                            self.udp_meta_out.bits.udp_len.eq(12 + 4 +
+                                                              meta.len + 4),
+                            self.udp_meta_out.valid.eq(1),
                         ]
 
-                        with m.If(self.udp_len_out.fire):
+                        with m.If(self.udp_meta_out.fire):
                             m.next = 'FORWARD_AETH'
 
                     with m.Case(BthOpcode.RC_ACKNOWLEDGE):
                         m.d.comb += [
-                            self.udp_len_out.bits.eq(12 + 4 + 4),
-                            self.udp_len_out.valid.eq(
+                            self.udp_meta_out.bits.local_qpn.eq(meta.qpn),
+                            self.udp_meta_out.bits.udp_len.eq(12 + 4 + 4),
+                            self.udp_meta_out.valid.eq(
                                 empty_payload_q.enq.ready),
                             empty_payload_q.enq.valid.eq(
-                                self.udp_len_out.ready),
+                                self.udp_meta_out.ready),
                         ]
 
                         with m.If(empty_payload_q.enq.fire
-                                  & self.udp_len_out.fire):
+                                  & self.udp_meta_out.fire):
                             m.next = 'FORWARD_AETH'
 
                     with m.Default():
@@ -859,10 +925,23 @@ class BasePacketizer(Elaboratable):
 
 class UdpIpMetadataMerger(Elaboratable):
 
+    class Metadata(Record):
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__([
+                ('local_qpn', 24, Direction.FANOUT),
+                ('udp_len', 16, Direction.FANOUT),
+            ],
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
+
     def __init__(self, port):
         self.port = port
 
-        self.udp_len = Decoupled(Signal, 16)
+        self.conn_read = Decoupled(Signal, 24)
+        self.conn_resp = Valid(ConnectionTable.Entry)
+
+        self.meta_in = Decoupled(UdpIpMetadataMerger.Metadata)
 
         self.meta_out = Decoupled(UdpIpMetadata)
 
@@ -872,19 +951,50 @@ class UdpIpMetadataMerger(Elaboratable):
         meta_q = m.submodules.meta_q = Queue(4, UdpIpMetadata)
         m.d.comb += meta_q.deq.connect(self.meta_out)
 
-        m.d.comb += [
-            meta_q.enq.bits.peer_addr.eq(0x0102a8c0),
-            meta_q.enq.bits.peer_port.eq(8000),
-            meta_q.enq.bits.my_port.eq(self.port),
-            meta_q.enq.bits.length.eq(self.udp_len.bits),
-            meta_q.enq.valid.eq(self.udp_len.valid),
-            self.udp_len.ready.eq(meta_q.enq.ready),
-        ]
+        meta = UdpIpMetadataMerger.Metadata()
+        peer_addr = Signal(128)
+        peer_port = Signal(16)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(self.meta_in.valid):
+                    m.d.comb += [
+                        self.conn_read.bits.eq(self.meta_in.bits.local_qpn),
+                        self.conn_read.valid.eq(1),
+                    ]
+
+                    with m.If(self.conn_read.fire):
+                        m.d.comb += self.meta_in.ready.eq(1)
+                        m.d.sync += meta.eq(self.meta_in.bits)
+
+                        m.next = 'RESP'
+
+            with m.State('RESP'):
+                with m.If(self.conn_resp.valid):
+                    m.d.sync += [
+                        peer_addr.eq(self.conn_resp.bits.remote_ip),
+                        peer_port.eq(self.conn_resp.bits.remote_port),
+                    ]
+                    m.next = 'WRITE'
+
+            with m.State('WRITE'):
+                m.d.comb += [
+                    meta_q.enq.bits.peer_addr.eq(peer_addr),
+                    meta_q.enq.bits.peer_port.eq(peer_port),
+                    meta_q.enq.bits.my_port.eq(self.port),
+                    meta_q.enq.bits.length.eq(meta.udp_len),
+                    meta_q.enq.valid.eq(1),
+                ]
+
+                with m.If(meta_q.enq.fire):
+                    m.next = 'IDLE'
 
         return m
 
 
 class InfiniBandTransportProtocol(Elaboratable):
+
+    ConnectionRequest = ConnectionTable.WriteRequest
 
     class MemoryCommand(Record):
 
@@ -900,6 +1010,9 @@ class InfiniBandTransportProtocol(Elaboratable):
         self.data_width = data_width
         self.max_qps = max_qps
         self.port = port
+
+        self.conn_req = Decoupled(
+            InfiniBandTransportProtocol.ConnectionRequest)
 
         self.mem_read_cmd = Decoupled(
             InfiniBandTransportProtocol.MemoryCommand)
@@ -919,6 +1032,10 @@ class InfiniBandTransportProtocol(Elaboratable):
 
         state_table = m.submodules.state_table = StateTable(
             max_qps=self.max_qps)
+
+        conn_table = m.submodules.conn_table = ConnectionTable(
+            max_qps=self.max_qps)
+        m.d.comb += self.conn_req.connect(conn_table.write)
 
         depacketizer = m.submodules.depacketizer = InfiniBandDepacketizer(
             data_width=self.data_width)
@@ -980,7 +1097,9 @@ class InfiniBandTransportProtocol(Elaboratable):
         udp_meta_merger = m.submodules.udp_meta_merger = UdpIpMetadataMerger(
             port=self.port)
         m.d.comb += [
-            exh_packetizer.udp_len_out.connect(udp_meta_merger.udp_len),
+            udp_meta_merger.conn_read.connect(conn_table.read),
+            udp_meta_merger.conn_resp.eq(conn_table.resp),
+            exh_packetizer.udp_meta_out.connect(udp_meta_merger.meta_in),
             udp_meta_merger.meta_out.connect(self.tx_meta_out),
         ]
 
