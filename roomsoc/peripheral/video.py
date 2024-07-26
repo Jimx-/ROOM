@@ -884,6 +884,16 @@ class VideoUSHDMI10to1Serializer(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        clk_pixel5x_bufg = Signal()
+        m.submodules += Instance(
+            'BUFGCE',
+            ###
+            i_I=ClockSignal(self.clock_domain + '5x'),
+            i_CE=1,
+            ###
+            o_O=clk_pixel5x_bufg,
+        )
+
         cdc = m.submodules.cdc = ClockDomainCrossing(
             Signal,
             10,
@@ -914,7 +924,7 @@ class VideoUSHDMI10to1Serializer(Elaboratable):
             p_IS_RST_INVERTED=0,
             p_SIM_DEVICE=self.sim_device,
             ###
-            i_CLK=ClockSignal(self.clock_domain + "5x"),
+            i_CLK=clk_pixel5x_bufg,
             i_CLKDIV=ClockSignal(self.clock_domain + "1_25x"),
             i_D=gearbox.source.bits,
             i_RST=ResetSignal(self.clock_domain),
@@ -1049,6 +1059,30 @@ class VideoUSHDMIPHY(Elaboratable):
         m = Module()
 
         m.d.comb += self.sink.ready.eq(1)
+
+        m.domains += ClockDomain(self.clock_domain + '1_25x', local=True)
+
+        m.submodules += Instance(
+            'xpm_cdc_async_rst',
+            ###
+            p_RST_ACTIVE_HIGH=1,
+            ###
+            i_src_arst=ResetSignal(self.clock_domain),
+            i_dest_clk=ClockSignal(self.clock_domain + '1_25x'),
+            ###
+            o_dest_arst=ResetSignal(self.clock_domain + '1_25x'),
+        )
+
+        m.submodules += Instance(
+            'BUFGCE_DIV',
+            ###
+            p_BUFGCE_DIVIDE=4,
+            ###
+            i_I=ClockSignal(self.clock_domain + '5x'),
+            i_CLR=0,
+            i_CE=1,
+            ###
+            o_O=ClockSignal(self.clock_domain + '1_25x'))
 
         clk_serializer = m.submodules.clk_serializer = VideoUSHDMI10to1Serializer(
             self.clock_domain, sim_device=self.sim_device)
