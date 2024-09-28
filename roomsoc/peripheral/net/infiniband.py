@@ -1,7 +1,6 @@
 from enum import IntEnum
 from amaranth import *
 from amaranth.hdl.rec import Direction
-from amaranth.utils import log2_int
 
 from room.utils import Arbiter
 
