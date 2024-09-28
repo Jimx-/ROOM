@@ -18,6 +18,8 @@ class OhciReg(IntEnum):
     HCINTERRUPTSTATUS = 0x0c
     HCINTERRUPTENABLE = 0x10
     HCINTERRUPTDISABLE = 0x14
+    HCCONTROLHEADED = 0x20
+    HCCONTROLCURRENTED = 0x24
     HCBULKHEADED = 0x28
     HCBULKCURRENTED = 0x2c
     HCDONEHEAD = 0x30
@@ -737,6 +739,39 @@ class OhciEndpointHandler(Elaboratable):
         return m
 
 
+class OhciPriorityCounter(Elaboratable):
+
+    def __init__(self):
+        self.cbsr = Signal(2)
+        self.tick = Signal()
+        self.skip = Signal()
+        self.flush = Signal()
+
+        self.bulk = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        counter = Signal(2)
+        with m.If(self.tick):
+            m.d.sync += counter.eq(counter + 1)
+
+        with m.If(self.skip
+                  | (self.tick & (self.bulk | (counter == self.cbsr)))):
+            m.d.sync += [
+                self.bulk.eq(~self.bulk),
+                counter.eq(0),
+            ]
+
+        with m.If(self.flush):
+            m.d.sync += [
+                self.bulk.eq(0),
+                counter.eq(0),
+            ]
+
+        return m
+
+
 class OhciController(Peripheral, Elaboratable):
 
     class MemoryCommand(Record):
@@ -785,6 +820,12 @@ class OhciController(Peripheral, Elaboratable):
         self._hcinterruptdisable = bank.csr(32,
                                             'rw',
                                             addr=OhciReg.HCINTERRUPTDISABLE)
+        self._hccontrolheaded = bank.csr(32,
+                                         'rw',
+                                         addr=OhciReg.HCCONTROLHEADED)
+        self._hccontrolcurrented = bank.csr(32,
+                                            'rw',
+                                            addr=OhciReg.HCCONTROLCURRENTED)
         self._hcbulkheaded = bank.csr(32, 'rw', addr=OhciReg.HCBULKHEADED)
         self._hcbulkcurrented = bank.csr(32,
                                          'rw',
@@ -799,7 +840,7 @@ class OhciController(Peripheral, Elaboratable):
 
         self.irq = Signal()
 
-        self._hcbulkheaded.r_data.reset = 0x10
+        self._hccontrolheaded.r_data.reset = 0x10
 
     def elaborate(self, platform):
         m = Module()
@@ -832,6 +873,7 @@ class OhciController(Peripheral, Elaboratable):
         m.d.comb += self._hccommandstatus.r_data.eq(hccommandstatus)
 
         hccommandstatus.blf.reset = 1
+        hccommandstatus.clf.reset = 1
 
         irq_status = Record(_hcinterrupt_layout)
         irq_enable = Record(_hcinterrupt_layout)
@@ -880,6 +922,11 @@ class OhciController(Peripheral, Elaboratable):
                     hcfmnumber.fn.eq(hcfmnumber.fn + 1),
                 ]
 
+        priority = m.submodules.priority = OhciPriorityCounter()
+        m.d.comb += priority.cbsr.eq(hccontrol.cbsr)
+
+        hccontrolheaded = self._hccontrolheaded.r_data
+        hccontrolcurrented = self._hccontrolcurrented.r_data
         hcbulkheaded = self._hcbulkheaded.r_data
         hcbulkcurrented = self._hcbulkcurrented.r_data
 
@@ -895,11 +942,15 @@ class OhciController(Peripheral, Elaboratable):
             with m.Switch(ed_handler.flow_type):
                 with m.Case(OhciFlowType.BULK):
                     m.d.sync += hcbulkcurrented.eq(ed_handler.next_ed.bits)
+                with m.Case(OhciFlowType.CONTROL):
+                    m.d.sync += hccontrolcurrented.eq(ed_handler.next_ed.bits)
 
         with m.If(ed_handler.fill_list):
             with m.Switch(ed_handler.flow_type):
                 with m.Case(OhciFlowType.BULK):
                     m.d.sync += hccommandstatus.blf.eq(1)
+                with m.Case(OhciFlowType.CONTROL):
+                    m.d.sync += hccommandstatus.clf.eq(1)
 
         reset_counter = Signal(range(481))
 
@@ -930,6 +981,7 @@ class OhciController(Peripheral, Elaboratable):
                 ]
 
                 with m.If(token_tx.token.fire):
+                    m.d.comb += priority.flush.eq(1)
                     m.next = 'WRITE_FM_NUMBER'
 
             with m.State('WRITE_FM_NUMBER'):
@@ -937,24 +989,48 @@ class OhciController(Peripheral, Elaboratable):
 
             with m.State('ARBITER'):
 
-                with m.If(hccontrol.ble):
-                    with m.If(hcbulkcurrented == 0):
-                        with m.If(hccommandstatus.blf):
+                m.d.comb += priority.skip.eq(1)
+
+                with m.If(priority.bulk):
+                    with m.If(hccontrol.ble):
+                        with m.If(hcbulkcurrented == 0):
+                            with m.If(hccommandstatus.blf):
+                                m.d.sync += [
+                                    hcbulkcurrented.eq(hcbulkheaded),
+                                    hccommandstatus.blf.eq(0),
+                                ]
+                                m.d.comb += priority.skip.eq(0)
+
+                        with m.Else():
                             m.d.sync += [
-                                hcbulkcurrented.eq(hcbulkheaded),
-                                hccommandstatus.blf.eq(0),
+                                ed_handler.flow_type.eq(OhciFlowType.BULK),
+                                ed_handler.ed_addr.eq(hcbulkcurrented),
                             ]
+                            m.d.comb += [
+                                priority.skip.eq(0),
+                                ed_handler.start.eq(1),
+                            ]
+                            m.next = 'ENDPOINT'
+
+                with m.Elif(hccontrol.cle):
+                    with m.If(hccontrolcurrented == 0):
+                        with m.If(hccommandstatus.clf):
+                            m.d.sync += [
+                                hccontrolcurrented.eq(hccontrolheaded),
+                                hccommandstatus.clf.eq(0),
+                            ]
+                            m.d.comb += priority.skip.eq(0)
 
                     with m.Else():
                         m.d.sync += [
-                            ed_handler.flow_type.eq(OhciFlowType.BULK),
-                            ed_handler.ed_addr.eq(hcbulkcurrented),
+                            ed_handler.flow_type.eq(OhciFlowType.CONTROL),
+                            ed_handler.ed_addr.eq(hccontrolcurrented),
                         ]
-                        m.d.comb += ed_handler.start.eq(1)
+                        m.d.comb += [
+                            priority.skip.eq(0),
+                            ed_handler.start.eq(1),
+                        ]
                         m.next = 'ENDPOINT'
-
-                with m.Elif(hccontrol.cle):
-                    pass
 
             with m.State('ENDPOINT'):
                 m.d.comb += [
@@ -976,6 +1052,9 @@ class OhciController(Peripheral, Elaboratable):
                     m.d.comb += token_tx.tx_data.connect(phy.tx_data)
 
                 with m.If(ed_handler.done):
+                    with m.If(ed_handler.flow_type != OhciFlowType.PERIODIC):
+                        m.d.comb += priority.tick.eq(1)
+
                     m.next = 'ARBITER'
 
         return m
