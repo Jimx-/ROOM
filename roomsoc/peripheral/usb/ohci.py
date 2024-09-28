@@ -15,6 +15,9 @@ class OhciReg(IntEnum):
     HCREVISION = 0x00
     HCCONTROL = 0x04
     HCCOMMANDSTATUS = 0x08
+    HCINTERRUPTSTATUS = 0x0c
+    HCINTERRUPTENABLE = 0x10
+    HCINTERRUPTDISABLE = 0x14
     HCBULKHEADED = 0x28
     HCBULKCURRENTED = 0x2c
     HCDONEHEAD = 0x30
@@ -44,6 +47,19 @@ _hccommandstatus_layout = [
     ('_rsvd0', 12),
     ('soc', 2),
     ('_rsvd1', 14),
+]
+
+_hcinterrupt_layout = [
+    ('so', 1),
+    ('wdh', 1),
+    ('sf', 1),
+    ('rd', 1),
+    ('ue', 1),
+    ('fno', 1),
+    ('rhsc', 1),
+    ('_rsvd0', 23),
+    ('oc', 1),
+    ('mie', 1),
 ]
 
 _hcdonehead_layout = [
@@ -760,6 +776,15 @@ class OhciController(Peripheral, Elaboratable):
         self._hccommandstatus = bank.csr(32,
                                          'rw',
                                          addr=OhciReg.HCCOMMANDSTATUS)
+        self._hcinterruptstatus = bank.csr(32,
+                                           'rw',
+                                           addr=OhciReg.HCINTERRUPTSTATUS)
+        self._hcinterruptenable = bank.csr(32,
+                                           'rw',
+                                           addr=OhciReg.HCINTERRUPTENABLE)
+        self._hcinterruptdisable = bank.csr(32,
+                                            'rw',
+                                            addr=OhciReg.HCINTERRUPTDISABLE)
         self._hcbulkheaded = bank.csr(32, 'rw', addr=OhciReg.HCBULKHEADED)
         self._hcbulkcurrented = bank.csr(32,
                                          'rw',
@@ -771,6 +796,8 @@ class OhciController(Peripheral, Elaboratable):
 
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
+
+        self.irq = Signal()
 
         self._hcbulkheaded.r_data.reset = 0x10
 
@@ -805,6 +832,29 @@ class OhciController(Peripheral, Elaboratable):
         m.d.comb += self._hccommandstatus.r_data.eq(hccommandstatus)
 
         hccommandstatus.blf.reset = 1
+
+        irq_status = Record(_hcinterrupt_layout)
+        irq_enable = Record(_hcinterrupt_layout)
+        m.d.comb += [
+            self._hcinterruptstatus.r_data.eq(irq_status),
+            self._hcinterruptenable.r_data.eq(irq_enable),
+            self._hcinterruptdisable.r_data.eq(irq_enable),
+        ]
+        with m.If(self._hcinterruptstatus.w_stb):
+            m.d.sync += irq_status.eq(irq_status
+                                      & ~self._hcinterruptstatus.w_data)
+        with m.If(self._hcinterruptenable.w_stb):
+            m.d.sync += [
+                irq_enable.eq(self._hcinterruptenable.w_data),
+                irq_enable._rsvd0.eq(0),
+            ]
+        with m.If(self._hcinterruptdisable.w_stb):
+            m.d.sync += irq_enable.eq(irq_enable
+                                      & ~self._hcinterruptdisable.w_data)
+
+        irq_pending = irq_status & irq_enable
+        do_irq = irq_pending.any() & irq_enable.mie
+        m.d.comb += self.irq.eq(do_irq & ~hccontrol.ir)
 
         hcfminterval = Record(_hcfminterval_layout)
         hcfmremaining = Record(_hcfmremaining_layout)
