@@ -298,6 +298,8 @@ class OhciEndpointHandler(Elaboratable):
         self.flow_type = Signal(OhciFlowType)
         self.ed_addr = Signal(32)
         self.next_ed = Valid(Signal, 32)
+        self.packet_time = Signal(15)
+        self.frame_time_hit = Signal()
 
         self.start = Signal()
         self.done = Signal()
@@ -409,6 +411,10 @@ class OhciEndpointHandler(Elaboratable):
         update_data_phase = Signal()
         skip_td_update = Signal()
 
+        fs_time_check = Mux(zero_len, self.packet_time == 0, (txn_len << 3)
+                            >= self.packet_time)
+        time_check = (~ed.s & fs_time_check)
+
         rx_pid_ok = self.rx_data.bits.data[:4] == ~self.rx_data.bits.data[4:]
         ack_rx_fired = Signal()
         ack_rx_pid = Signal(4)
@@ -426,6 +432,7 @@ class OhciEndpointHandler(Elaboratable):
                 m.d.comb += self.done.eq(1)
 
                 with m.If(self.start):
+                    m.d.sync += self.frame_time_hit.eq(0)
                     m.next = 'ED_READ_CMD'
 
             with m.State('ED_READ_CMD'):
@@ -491,10 +498,17 @@ class OhciEndpointHandler(Elaboratable):
             with m.State('TD_CHECK'):
                 m.d.comb += self.fill_list.eq(1)
 
-                with m.If(is_in | zero_len):
-                    m.next = 'TOKEN'
+                m.next = 'TD_CHECK_TIME'
+
+            with m.State('TD_CHECK_TIME'):
+                with m.If(time_check):
+                    m.d.sync += self.frame_time_hit.eq(1)
+                    m.next = 'IDLE'
                 with m.Else():
-                    m.next = 'BUF_READ_CMD'
+                    with m.If(is_in | zero_len):
+                        m.next = 'TOKEN'
+                    with m.Else():
+                        m.next = 'BUF_READ_CMD'
 
             with m.State('BUF_READ_CMD'):
                 m.d.comb += [
@@ -910,9 +924,24 @@ class OhciController(Peripheral, Elaboratable):
         with m.If(self._hcfminterval.w_stb):
             m.d.sync += hcfminterval.eq(self._hcfminterval.w_data)
 
+        hcfminterval.fsmps.reset = 0x2778  # TODO: Remove
+
+        decrement_counter = Signal(3)
+        skip_decrement = decrement_counter == 6
+        m.d.sync += decrement_counter.eq(decrement_counter + 1)
+        with m.If(skip_decrement):
+            m.d.sync += decrement_counter.eq(0)
+
         frame_start = Signal()
+        packet_counter = Signal(15)
+        fmnumber_overflow = Signal()
+        fmnumberp1 = Signal.like(hcfmnumber.fn)
+        m.d.comb += fmnumberp1.eq(hcfmnumber.fn + 1)
         with m.If(usb_operational & phy.clock_posedge):
             m.d.sync += hcfmremaining.fr.eq(hcfmremaining.fr - 1)
+
+            with m.If(packet_counter.any() & ~skip_decrement):
+                m.d.sync += packet_counter.eq(packet_counter - 1)
 
             with m.If(hcfmremaining.fr == 0):
                 m.d.comb += frame_start.eq(1)
@@ -920,6 +949,9 @@ class OhciController(Peripheral, Elaboratable):
                     hcfmremaining.fr.eq(hcfminterval.fi),
                     hcfmremaining.frt.eq(hcfminterval.fit),
                     hcfmnumber.fn.eq(hcfmnumber.fn + 1),
+                    fmnumber_overflow.eq(fmnumberp1[-1] ^ hcfmnumber.fn[-1]),
+                    packet_counter.eq(hcfminterval.fsmps),
+                    decrement_counter.eq(0),
                 ]
 
         priority = m.submodules.priority = OhciPriorityCounter()
@@ -933,6 +965,7 @@ class OhciController(Peripheral, Elaboratable):
         ed_handler = m.submodules.ed_handler = OhciEndpointHandler(
             data_width=self.data_width, fifo_depth=self.fifo_depth)
         m.d.comb += [
+            ed_handler.packet_time.eq(packet_counter),
             ed_handler.rx_active.eq(phy.rx_active),
             ed_handler.rx_data.eq(phy.rx_data),
             self._hcdonehead.r_data.eq(ed_handler.done_head),
@@ -985,26 +1018,54 @@ class OhciController(Peripheral, Elaboratable):
                     m.next = 'WRITE_FM_NUMBER'
 
             with m.State('WRITE_FM_NUMBER'):
+                m.d.comb += hccontrol.hcfs.eq(
+                    OhciFunctionalState.USB_OPERATIONAL)
+
                 m.next = 'ARBITER'
 
             with m.State('ARBITER'):
+                m.d.comb += hccontrol.hcfs.eq(
+                    OhciFunctionalState.USB_OPERATIONAL)
 
-                m.d.comb += priority.skip.eq(1)
+                with m.If(packet_counter == 0):
+                    m.next = 'WAIT_SOF'
+                with m.Else():
+                    m.d.comb += priority.skip.eq(1)
 
-                with m.If(priority.bulk):
-                    with m.If(hccontrol.ble):
-                        with m.If(hcbulkcurrented == 0):
-                            with m.If(hccommandstatus.blf):
+                    with m.If(priority.bulk):
+                        with m.If(hccontrol.ble):
+                            with m.If(hcbulkcurrented == 0):
+                                with m.If(hccommandstatus.blf):
+                                    m.d.sync += [
+                                        hcbulkcurrented.eq(hcbulkheaded),
+                                        hccommandstatus.blf.eq(0),
+                                    ]
+                                    m.d.comb += priority.skip.eq(0)
+
+                            with m.Else():
                                 m.d.sync += [
-                                    hcbulkcurrented.eq(hcbulkheaded),
-                                    hccommandstatus.blf.eq(0),
+                                    ed_handler.flow_type.eq(OhciFlowType.BULK),
+                                    ed_handler.ed_addr.eq(hcbulkcurrented),
+                                ]
+                                m.d.comb += [
+                                    priority.skip.eq(0),
+                                    ed_handler.start.eq(1),
+                                ]
+                                m.next = 'ENDPOINT'
+
+                    with m.Elif(hccontrol.cle):
+                        with m.If(hccontrolcurrented == 0):
+                            with m.If(hccommandstatus.clf):
+                                m.d.sync += [
+                                    hccontrolcurrented.eq(hccontrolheaded),
+                                    hccommandstatus.clf.eq(0),
                                 ]
                                 m.d.comb += priority.skip.eq(0)
 
                         with m.Else():
                             m.d.sync += [
-                                ed_handler.flow_type.eq(OhciFlowType.BULK),
-                                ed_handler.ed_addr.eq(hcbulkcurrented),
+                                ed_handler.flow_type.eq(OhciFlowType.CONTROL),
+                                ed_handler.ed_addr.eq(hccontrolcurrented),
                             ]
                             m.d.comb += [
                                 priority.skip.eq(0),
@@ -1012,28 +1073,9 @@ class OhciController(Peripheral, Elaboratable):
                             ]
                             m.next = 'ENDPOINT'
 
-                with m.Elif(hccontrol.cle):
-                    with m.If(hccontrolcurrented == 0):
-                        with m.If(hccommandstatus.clf):
-                            m.d.sync += [
-                                hccontrolcurrented.eq(hccontrolheaded),
-                                hccommandstatus.clf.eq(0),
-                            ]
-                            m.d.comb += priority.skip.eq(0)
-
-                    with m.Else():
-                        m.d.sync += [
-                            ed_handler.flow_type.eq(OhciFlowType.CONTROL),
-                            ed_handler.ed_addr.eq(hccontrolcurrented),
-                        ]
-                        m.d.comb += [
-                            priority.skip.eq(0),
-                            ed_handler.start.eq(1),
-                        ]
-                        m.next = 'ENDPOINT'
-
             with m.State('ENDPOINT'):
                 m.d.comb += [
+                    hccontrol.hcfs.eq(OhciFunctionalState.USB_OPERATIONAL),
                     ed_handler.tx_token.connect(token_tx.token),
                     ed_handler.tx_req.connect(data_tx.req),
                     ed_handler.tx_data.connect(data_tx.data),
@@ -1055,6 +1097,9 @@ class OhciController(Peripheral, Elaboratable):
                     with m.If(ed_handler.flow_type != OhciFlowType.PERIODIC):
                         m.d.comb += priority.tick.eq(1)
 
-                    m.next = 'ARBITER'
+                    with m.If(ed_handler.frame_time_hit):
+                        m.next = 'WAIT_SOF'
+                    with m.Else():
+                        m.next = 'ARBITER'
 
         return m
