@@ -4,7 +4,7 @@ from amaranth.lib.fifo import SyncFIFO
 from enum import IntEnum, Enum
 
 from roomsoc.peripheral import Peripheral
-from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer, AXIStreamPacketizer
+from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer, AXIStreamConverter
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
 from .phy import UsbLowSpeedFullSpeedPhy, UsbRxData
@@ -18,6 +18,7 @@ class OhciReg(IntEnum):
     HCINTERRUPTSTATUS = 0x0c
     HCINTERRUPTENABLE = 0x10
     HCINTERRUPTDISABLE = 0x14
+    HCHCCA = 0x18
     HCCONTROLHEADED = 0x20
     HCCONTROLCURRENTED = 0x24
     HCBULKHEADED = 0x28
@@ -305,6 +306,7 @@ class OhciEndpointHandler(Elaboratable):
         self.done = Signal()
 
         self.fill_list = Signal()
+        self.load_intr_delay = Valid(Signal, 3)
 
         self.done_head = Signal(32)
         self.clear_done_head = Signal()
@@ -393,9 +395,16 @@ class OhciEndpointHandler(Elaboratable):
         td_depacketizer = m.submodules.td_depacketizer = AXIStreamDepacketizer(
             Record, _td_layout, data_width=self.data_width)
         td = Record(_td_layout)
+        td_write = Record(_td_layout)
+        m.d.comb += td_write.eq(td)
 
-        td_packetizer = m.submodules.td_packetizer = AXIStreamPacketizer(
-            Record, _td_layout, data_width=self.data_width)
+        td_converter = m.submodules.td_converter = AXIStreamConverter(
+            dw_from=len(td), dw_to=self.data_width)
+        m.d.comb += [
+            td_converter.sink.bits.data.eq(td_write),
+            td_converter.sink.bits.keep.eq(~0),
+            td_converter.sink.bits.last.eq(1),
+        ]
 
         td_addr = ed.headp << 4
 
@@ -700,19 +709,12 @@ class OhciEndpointHandler(Elaboratable):
 
             with m.State('UPDATE_TD_DATA'):
                 m.d.comb += [
-                    td_packetizer.header.eq(td),
-                    td_packetizer.header.nexttd.eq(done_head.dh),
-                    td_packetizer.sink.valid.eq(1),
-                    td_packetizer.sink.bits.keep.eq(0),
-                    td_packetizer.sink.bits.last.eq(1),
-                    td_packetizer.source.connect(self.mem_write_data),
+                    td_write.nexttd.eq(done_head.dh),
+                    td_converter.sink.valid.eq(1),
+                    td_converter.source.connect(self.mem_write_data),
                 ]
 
-                with m.If(td_packetizer.source.valid
-                          & ~td_packetizer.source.bits.keep.any()):
-                    m.d.comb += td_packetizer.source.ready.eq(1)
-
-                with m.If(td_packetizer.sink.fire):
+                with m.If(td_converter.sink.fire):
                     m.next = 'UPDATE_ED_CMD'
 
             with m.State('UPDATE_ED_CMD'):
@@ -746,6 +748,11 @@ class OhciEndpointHandler(Elaboratable):
                 m.d.comb += self.next_ed.valid.eq(1)
 
                 with m.If(td_retire):
+                    m.d.comb += [
+                        self.load_intr_delay.valid.eq(1),
+                        self.load_intr_delay.bits.eq(td.di),
+                    ]
+
                     m.d.sync += done_head.dh.eq(ed.headp)
 
                 m.next = 'IDLE'
@@ -782,6 +789,32 @@ class OhciPriorityCounter(Elaboratable):
                 self.bulk.eq(0),
                 counter.eq(0),
             ]
+
+        return m
+
+
+class InterruptDelayCounter(Elaboratable):
+
+    def __init__(self):
+        self.tick = Signal()
+        self.disable = Signal()
+        self.done = Signal()
+
+        self.load = Valid(Signal, 3)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        counter = Signal(3, reset=0b111)
+
+        with m.If(self.tick & counter.any() & ~counter.all()):
+            m.d.sync += counter.eq(counter - 1)
+
+        with m.If(self.load.valid & (self.load.bits < counter)):
+            m.d.sync += counter.eq(self.load.bits)
+
+        with m.If(self.disable):
+            m.d.sync += counter.eq(0b111)
 
         return m
 
@@ -834,6 +867,7 @@ class OhciController(Peripheral, Elaboratable):
         self._hcinterruptdisable = bank.csr(32,
                                             'rw',
                                             addr=OhciReg.HCINTERRUPTDISABLE)
+        self._hchcca = bank.csr(32, 'rw', addr=OhciReg.HCHCCA)
         self._hccontrolheaded = bank.csr(32,
                                          'rw',
                                          addr=OhciReg.HCCONTROLHEADED)
@@ -854,6 +888,7 @@ class OhciController(Peripheral, Elaboratable):
 
         self.irq = Signal()
 
+        self._hchcca.r_data.reset = 0x100
         self._hccontrolheaded.r_data.reset = 0x10
 
     def elaborate(self, platform):
@@ -912,6 +947,10 @@ class OhciController(Peripheral, Elaboratable):
         do_irq = irq_pending.any() & irq_enable.mie
         m.d.comb += self.irq.eq(do_irq & ~hccontrol.ir)
 
+        with m.If(self._hchcca.w_stb):
+            m.d.sync += self._hchcca.r_data.eq(
+                Cat(Const(0, 8), self._hchcca.w_data[8:]))
+
         hcfminterval = Record(_hcfminterval_layout)
         hcfmremaining = Record(_hcfmremaining_layout)
         hcfmnumber = Record(_hcfmnumber_layout)
@@ -957,6 +996,8 @@ class OhciController(Peripheral, Elaboratable):
         priority = m.submodules.priority = OhciPriorityCounter()
         m.d.comb += priority.cbsr.eq(hccontrol.cbsr)
 
+        intr_delay = m.submodules.intr_delay = InterruptDelayCounter()
+
         hccontrolheaded = self._hccontrolheaded.r_data
         hccontrolcurrented = self._hccontrolcurrented.r_data
         hcbulkheaded = self._hcbulkheaded.r_data
@@ -968,6 +1009,7 @@ class OhciController(Peripheral, Elaboratable):
             ed_handler.packet_time.eq(packet_counter),
             ed_handler.rx_active.eq(phy.rx_active),
             ed_handler.rx_data.eq(phy.rx_data),
+            intr_delay.load.eq(ed_handler.load_intr_delay),
             self._hcdonehead.r_data.eq(ed_handler.done_head),
         ]
 
@@ -984,6 +1026,9 @@ class OhciController(Peripheral, Elaboratable):
                     m.d.sync += hccommandstatus.blf.eq(1)
                 with m.Case(OhciFlowType.CONTROL):
                     m.d.sync += hccommandstatus.clf.eq(1)
+
+        fmnumber_converter = m.submodules.fmnumber_converter = AXIStreamConverter(
+            dw_from=64, dw_to=self.data_width)
 
         reset_counter = Signal(range(481))
 
@@ -1004,6 +1049,8 @@ class OhciController(Peripheral, Elaboratable):
                     m.next = 'SOF_TOKEN'
 
             with m.State('SOF_TOKEN'):
+                write_done_head = Signal()
+
                 m.d.comb += [
                     hccontrol.hcfs.eq(OhciFunctionalState.USB_OPERATIONAL),
                     token_tx.token.bits.pid.eq(UsbPid.SOF),
@@ -1012,16 +1059,64 @@ class OhciController(Peripheral, Elaboratable):
                     token_tx.tx_data.connect(phy.tx_data),
                     token_tx.tx_eop.eq(phy.tx_eop),
                 ]
+                m.d.sync += write_done_head.eq(intr_delay.done
+                                               & ~irq_status.wdh)
 
                 with m.If(token_tx.token.fire):
                     m.d.comb += priority.flush.eq(1)
-                    m.next = 'WRITE_FM_NUMBER'
+                    m.next = 'WRITE_FM_NUMBER_CMD'
 
-            with m.State('WRITE_FM_NUMBER'):
+            with m.State('WRITE_FM_NUMBER_CMD'):
                 m.d.comb += hccontrol.hcfs.eq(
                     OhciFunctionalState.USB_OPERATIONAL)
 
-                m.next = 'ARBITER'
+                m.d.comb += [
+                    self.mem_write_cmd.valid.eq(1),
+                    self.mem_write_cmd.bits.addr.eq(self._hchcca.r_data
+                                                    | 0x80),
+                    self.mem_write_cmd.bits.len.eq(8),
+                ]
+
+                with m.If(self.mem_write_cmd.fire):
+                    m.next = 'WRITE_FM_NUMBER_DATA'
+
+            with m.State('WRITE_FM_NUMBER_DATA'):
+                m.d.comb += hccontrol.hcfs.eq(
+                    OhciFunctionalState.USB_OPERATIONAL)
+
+                m.d.comb += [
+                    fmnumber_converter.sink.valid.eq(1),
+                    fmnumber_converter.sink.bits.data[:32].eq(
+                        Cat(hcfmnumber.fn, Const(0, 16))),
+                    fmnumber_converter.sink.bits.keep[:4].eq(~0),
+                    fmnumber_converter.sink.bits.last.eq(1),
+                    fmnumber_converter.source.connect(self.mem_write_data),
+                ]
+
+                with m.If(write_done_head):
+                    m.d.comb += [
+                        fmnumber_converter.sink.bits.data[32:].eq(
+                            Cat(irq_pending.any(),
+                                self._hcdonehead.r_data[1:])),
+                        fmnumber_converter.sink.bits.keep[4:].eq(~0),
+                    ]
+
+                with m.If(fmnumber_converter.sink.fire):
+                    m.d.sync += [
+                        irq_status.sf.eq(1),
+                        irq_status.fno.eq(fmnumber_overflow),
+                        fmnumber_overflow.eq(0),
+                    ]
+                    m.d.comb += intr_delay.tick.eq(1)
+
+                    with m.If(write_done_head):
+                        m.d.sync += irq_status.wdh.eq(1)
+                        m.d.comb += [
+                            ed_handler.clear_done_head.eq(1),
+                            intr_delay.disable.eq(1),
+                        ]
+
+                    m.next = 'ARBITER'
 
             with m.State('ARBITER'):
                 m.d.comb += hccontrol.hcfs.eq(

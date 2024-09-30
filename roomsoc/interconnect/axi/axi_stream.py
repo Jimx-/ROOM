@@ -419,3 +419,155 @@ class AXIStreamArbiter(Elaboratable):
                     m.d.comb += self.inp[i].connect(self.out)
 
         return m
+
+
+class _DownConverter(Elaboratable):
+
+    def __init__(self, dw_from, dw_to, ratio, reverse):
+        self.dw_from = dw_from
+        self.dw_to = dw_to
+        self.ratio = ratio
+        self.reverse = reverse
+
+        self.sink = AXIStreamInterface(data_width=dw_from)
+        self.source = AXIStreamInterface(data_width=dw_to)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        bytes_to = self.dw_to // 8
+        sel = Signal(range(self.ratio))
+
+        m.d.comb += [
+            self.source.valid.eq(self.sink.valid),
+            self.source.bits.last.eq(self.sink.bits.last
+                                     & (self == (self.ratio - 1))),
+        ]
+
+        with m.Switch(sel):
+            for i in range(self.ratio):
+                with m.Case(i):
+                    n = self.ratio - i - 1 if self.reverse else i
+
+                    m.d.comb += [
+                        self.source.bits.data.eq(
+                            self.sink.bits.data[n * self.dw_to:(n + 1) *
+                                                self.dw_to]),
+                        self.source.bits.keep.eq(
+                            self.sink.bits.keep[n * bytes_to:(n + 1) *
+                                                bytes_to]),
+                    ]
+
+        with m.If(self.source.fire):
+            m.d.sync += sel.eq(sel + 1)
+
+            with m.If(sel == self.ratio - 1):
+                m.d.comb += self.sink.ready.eq(1)
+                m.d.sync += sel.eq(0)
+
+        return m
+
+
+class _UpConverter(Elaboratable):
+
+    def __init__(self, dw_from, dw_to, ratio, reverse):
+        self.dw_from = dw_from
+        self.dw_to = dw_to
+        self.ratio = ratio
+        self.reverse = reverse
+
+        self.sink = AXIStreamInterface(data_width=dw_from)
+        self.source = AXIStreamInterface(data_width=dw_to)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        bytes_from = self.dw_from // 8
+        sel = Signal(range(self.ratio))
+
+        m.d.comb += self.sink.ready.eq(~self.source.valid | self.source.ready)
+
+        with m.If(self.source.ready):
+            m.d.sync += self.source.valid.eq(0)
+
+        with m.If(self.sink.fire):
+            with m.If((sel == (self.ratio - 1)) | self.sink.last):
+                m.d.sync += [
+                    self.source.valid.eq(1),
+                    sel.eq(0),
+                ]
+            with m.Else():
+                m.d.sync += sel.eq(sel + 1)
+
+        with m.If(self.source.fire):
+            with m.If(self.sink.fire):
+                m.d.sync += self.source.bits.last(self.sink.bits.last)
+            with m.Else():
+                m.d.sync += self.source.bits.last(0)
+        with m.If(self.sink.fire):
+            m.d.sync += self.source.bits.last.eq(self.source.bits.last
+                                                 | self.sink.bits.last)
+
+        with m.Switch(sel):
+            for i in range(self.ratio):
+                with m.Case(i):
+                    n = self.ratio - i - 1 if self.reverse else i
+
+                    with m.If(self.sink.fire):
+                        m.d.sync += [
+                            self.source.bits.data[n * self.dw_from:(n + 1) *
+                                                  self.dw_from].eq(
+                                                      self.sink.bits.data),
+                            self.source.bits.keep[n * bytes_from:(n + 1) *
+                                                  bytes_from].eq(
+                                                      self.sink.bits.keep),
+                        ]
+
+        return m
+
+
+class AXIStreamConverter(Elaboratable):
+
+    def __init__(self, dw_from, dw_to, reverse=False):
+        self.dw_from = dw_from
+        self.dw_to = dw_to
+        self.reverse = reverse
+
+        self.sink = AXIStreamInterface(data_width=dw_from)
+        self.source = AXIStreamInterface(data_width=dw_to)
+
+    def _get_converter_ratio(self):
+        converter_cls = None
+        ratio = 1
+
+        if self.dw_from > self.dw_to:
+            converter_cls = _DownConverter
+            if self.dw_from % self.dw_to:
+                raise ValueError("Ratio must be an int")
+            ratio = self.dw_from // self.dw_to
+        elif self.dw_from < self.dw_to:
+            converter_cls = _UpConverter
+            if self.dw_to % self.dw_from:
+                raise ValueError("Ratio must be an int")
+            ratio = self.dw_to // self.dw_from
+
+        return converter_cls, ratio
+
+    def elaborate(self, platform):
+        m = Module()
+
+        if self.dw_from == self.dw_to:
+            m.d.comb += self.sink.connect(self.source)
+        else:
+            cls, ratio = self._get_converter_ratio()
+            converter = m.submodules.converter = cls(dw_from=self.dw_from,
+                                                     dw_to=self.dw_to,
+                                                     ratio=ratio,
+                                                     reverse=self.reverse)
+
+            m.d.comb += [
+                self.sink.connect(converter.sink),
+                converter.source.connect(self.source),
+            ]
+
+        return m
