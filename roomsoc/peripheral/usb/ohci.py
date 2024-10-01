@@ -19,6 +19,7 @@ class OhciReg(IntEnum):
     HCINTERRUPTENABLE = 0x10
     HCINTERRUPTDISABLE = 0x14
     HCHCCA = 0x18
+    HCPERIODCURRENTED = 0x1c
     HCCONTROLHEADED = 0x20
     HCCONTROLCURRENTED = 0x24
     HCBULKHEADED = 0x28
@@ -27,6 +28,8 @@ class OhciReg(IntEnum):
     HCFMINTERVAL = 0x34
     HCFMREMAINING = 0x38
     HCFMNUMBER = 0x3c
+    HCPERIODICSTART = 0x40
+    HCLSTHRESHOLD = 0x44
 
 
 _hccontrol_layout = [
@@ -86,6 +89,11 @@ _hcfmremaining_layout = [
 _hcfmnumber_layout = [
     ('fn', 16),
     ('_rsvd0', 16),
+]
+
+_hcperiodicstart_layout = [
+    ('ps', 14),
+    ('_rsvd0', 18),
 ]
 
 
@@ -301,6 +309,7 @@ class OhciEndpointHandler(Elaboratable):
         self.next_ed = Valid(Signal, 32)
         self.packet_time = Signal(15)
         self.frame_time_hit = Signal()
+        self.ls_threshold_hit = Signal(12)
 
         self.start = Signal()
         self.done = Signal()
@@ -422,7 +431,7 @@ class OhciEndpointHandler(Elaboratable):
 
         fs_time_check = Mux(zero_len, self.packet_time == 0, (txn_len << 3)
                             >= self.packet_time)
-        time_check = (~ed.s & fs_time_check)
+        time_check = (~ed.s & fs_time_check) | (ed.s & self.ls_threshold_hit)
 
         rx_pid_ok = self.rx_data.bits.data[:4] == ~self.rx_data.bits.data[4:]
         ack_rx_fired = Signal()
@@ -868,6 +877,9 @@ class OhciController(Peripheral, Elaboratable):
                                             'rw',
                                             addr=OhciReg.HCINTERRUPTDISABLE)
         self._hchcca = bank.csr(32, 'rw', addr=OhciReg.HCHCCA)
+        self._hcperiodcurrented = bank.csr(32,
+                                           'rw',
+                                           addr=OhciReg.HCPERIODCURRENTED)
         self._hccontrolheaded = bank.csr(32,
                                          'rw',
                                          addr=OhciReg.HCCONTROLHEADED)
@@ -882,6 +894,10 @@ class OhciController(Peripheral, Elaboratable):
         self._hcfminterval = bank.csr(32, 'rw', addr=OhciReg.HCFMINTERVAL)
         self._hcfmremaining = bank.csr(32, 'r', addr=OhciReg.HCFMREMAINING)
         self._hcfmnumber = bank.csr(32, 'r', addr=OhciReg.HCFMNUMBER)
+        self._hcperiodicstart = bank.csr(32,
+                                         'rw',
+                                         addr=OhciReg.HCPERIODICSTART)
+        self._hclsthreshold = bank.csr(32, 'rw', addr=OhciReg.HCLSTHRESHOLD)
 
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
@@ -915,6 +931,7 @@ class OhciController(Peripheral, Elaboratable):
         m.d.comb += self._hccontrol.r_data.eq(hccontrol)
         usb_operational = hccontrol.hcfs == OhciFunctionalState.USB_OPERATIONAL
 
+        hccontrol.ple.reset = 1
         hccontrol.ble.reset = 1
         hccontrol.cle.reset = 1
 
@@ -1002,6 +1019,19 @@ class OhciController(Peripheral, Elaboratable):
         hccontrolcurrented = self._hccontrolcurrented.r_data
         hcbulkheaded = self._hcbulkheaded.r_data
         hcbulkcurrented = self._hcbulkcurrented.r_data
+        hcperiodcurrented = self._hcperiodcurrented.r_data
+
+        with m.If(self._hccontrolheaded.w_stb):
+            m.d.sync += hccontrolheaded.eq(
+                Cat(Const(0, 4), self._hccontrolheaded.w_data[4:]))
+        with m.If(self._hcbulkheaded.w_stb):
+            m.d.sync += hcbulkheaded.eq(
+                Cat(Const(0, 4), self._hcbulkheaded.w_data[4:]))
+
+        ls_threshold = Signal(12, reset=0x628)
+        m.d.comb += self._hclsthreshold.r_data.eq(ls_threshold)
+        with m.If(self._hclsthreshold.w_stb):
+            m.d.sync += ls_threshold.eq(self._hclsthreshold.w_data)
 
         ed_handler = m.submodules.ed_handler = OhciEndpointHandler(
             data_width=self.data_width, fifo_depth=self.fifo_depth)
@@ -1009,6 +1039,7 @@ class OhciController(Peripheral, Elaboratable):
             ed_handler.packet_time.eq(packet_counter),
             ed_handler.rx_active.eq(phy.rx_active),
             ed_handler.rx_data.eq(phy.rx_data),
+            ed_handler.ls_threshold_hit.eq(hcfmremaining.fr < ls_threshold),
             intr_delay.load.eq(ed_handler.load_intr_delay),
             self._hcdonehead.r_data.eq(ed_handler.done_head),
         ]
@@ -1019,6 +1050,8 @@ class OhciController(Peripheral, Elaboratable):
                     m.d.sync += hcbulkcurrented.eq(ed_handler.next_ed.bits)
                 with m.Case(OhciFlowType.CONTROL):
                     m.d.sync += hccontrolcurrented.eq(ed_handler.next_ed.bits)
+                with m.Case(OhciFlowType.PERIODIC):
+                    m.d.sync += hcperiodcurrented.eq(ed_handler.next_ed.bits)
 
         with m.If(ed_handler.fill_list):
             with m.Switch(ed_handler.flow_type):
@@ -1030,13 +1063,30 @@ class OhciController(Peripheral, Elaboratable):
         fmnumber_converter = m.submodules.fmnumber_converter = AXIStreamConverter(
             dw_from=64, dw_to=self.data_width)
 
+        hcperiodicstart = Record(_hcperiodicstart_layout)
+        m.d.comb += self._hcperiodicstart.r_data.eq(hcperiodicstart)
+        hcperiodicstart.ps.reset = 0x2edf  # TODO: Remove
+        with m.If(self._hcperiodicstart.w_stb):
+            m.d.sync += hcperiodicstart.eq(self._hcperiodicstart.w_data)
+
         reset_counter = Signal(range(481))
+
+        allow_bulk = Signal()
+        allow_control = Signal()
+        allow_periodic = Signal()
+        allow_isochronous = Signal()
+
+        periodic_fetched = Signal()
+        periodic_done = Signal()
 
         with m.FSM():
             with m.State('RESET'):
                 m.d.comb += hccontrol.hcfs.eq(OhciFunctionalState.USB_RESET)
 
-                m.d.sync += reset_counter.eq(reset_counter + 1)
+                m.d.sync += [
+                    allow_periodic.eq(0),
+                    reset_counter.eq(reset_counter + 1),
+                ]
 
                 with m.If(reset_counter == 480):
                     m.next = 'WAIT_SOF'
@@ -1063,7 +1113,6 @@ class OhciController(Peripheral, Elaboratable):
                                                & ~irq_status.wdh)
 
                 with m.If(token_tx.token.fire):
-                    m.d.comb += priority.flush.eq(1)
                     m.next = 'WRITE_FM_NUMBER_CMD'
 
             with m.State('WRITE_FM_NUMBER_CMD'):
@@ -1107,7 +1156,10 @@ class OhciController(Peripheral, Elaboratable):
                         irq_status.fno.eq(fmnumber_overflow),
                         fmnumber_overflow.eq(0),
                     ]
-                    m.d.comb += intr_delay.tick.eq(1)
+                    m.d.comb += [
+                        priority.flush.eq(1),
+                        intr_delay.tick.eq(1),
+                    ]
 
                     with m.If(write_done_head):
                         m.d.sync += irq_status.wdh.eq(1)
@@ -1116,19 +1168,49 @@ class OhciController(Peripheral, Elaboratable):
                             intr_delay.disable.eq(1),
                         ]
 
+                    m.d.sync += [
+                        allow_bulk.eq(hccontrol.ble),
+                        allow_control.eq(hccontrol.cle),
+                        allow_periodic.eq(hccontrol.ple),
+                        allow_isochronous.eq(hccontrol.ie),
+                        #
+                        periodic_fetched.eq(0),
+                        periodic_done.eq(0),
+                    ]
+
                     m.next = 'ARBITER'
 
             with m.State('ARBITER'):
                 m.d.comb += hccontrol.hcfs.eq(
                     OhciFunctionalState.USB_OPERATIONAL)
 
+                with m.If(hccontrol.ble):
+                    m.d.sync += allow_bulk.eq(1)
+                with m.If(hccontrol.cle):
+                    m.d.sync += allow_control.eq(1)
+
                 with m.If(packet_counter == 0):
                     m.next = 'WAIT_SOF'
+                with m.Elif(allow_periodic & ~periodic_done
+                            & (hcfmremaining.fr <= hcperiodicstart.ps)):
+                    with m.If(~periodic_fetched):
+                        m.next = 'PERIODIC_HEAD_CMD'
+                    with m.Else():
+                        with m.If(hcperiodcurrented == 0):
+                            m.d.sync += periodic_done.eq(1)
+                        with m.Else():
+                            m.d.sync += [
+                                ed_handler.flow_type.eq(OhciFlowType.PERIODIC),
+                                ed_handler.ed_addr.eq(hcperiodcurrented),
+                            ]
+                            m.d.comb += ed_handler.start.eq(1)
+                            m.next = 'ENDPOINT'
+
                 with m.Else():
                     m.d.comb += priority.skip.eq(1)
 
                     with m.If(priority.bulk):
-                        with m.If(hccontrol.ble):
+                        with m.If(allow_bulk):
                             with m.If(hcbulkcurrented == 0):
                                 with m.If(hccommandstatus.blf):
                                     m.d.sync += [
@@ -1148,7 +1230,7 @@ class OhciController(Peripheral, Elaboratable):
                                 ]
                                 m.next = 'ENDPOINT'
 
-                    with m.Elif(hccontrol.cle):
+                    with m.Elif(allow_control):
                         with m.If(hccontrolcurrented == 0):
                             with m.If(hccommandstatus.clf):
                                 m.d.sync += [
@@ -1169,8 +1251,10 @@ class OhciController(Peripheral, Elaboratable):
                             m.next = 'ENDPOINT'
 
             with m.State('ENDPOINT'):
+                m.d.comb += hccontrol.hcfs.eq(
+                    OhciFunctionalState.USB_OPERATIONAL)
+
                 m.d.comb += [
-                    hccontrol.hcfs.eq(OhciFunctionalState.USB_OPERATIONAL),
                     ed_handler.tx_token.connect(token_tx.token),
                     ed_handler.tx_req.connect(data_tx.req),
                     ed_handler.tx_data.connect(data_tx.data),
@@ -1196,5 +1280,38 @@ class OhciController(Peripheral, Elaboratable):
                         m.next = 'WAIT_SOF'
                     with m.Else():
                         m.next = 'ARBITER'
+
+            with m.State('PERIODIC_HEAD_CMD'):
+                m.d.comb += hccontrol.hcfs.eq(
+                    OhciFunctionalState.USB_OPERATIONAL)
+
+                m.d.comb += [
+                    self.mem_read_cmd.valid.eq(1),
+                    self.mem_read_cmd.bits.addr.eq(self._hchcca.r_data
+                                                   | (hcfmnumber.fn[:4] << 2)),
+                    self.mem_read_cmd.bits.len.eq(4),
+                ]
+
+                with m.If(self.mem_read_cmd.fire):
+                    m.next = 'PERIODIC_HEAD_RESP'
+
+            with m.State('PERIODIC_HEAD_RESP'):
+                m.d.comb += hccontrol.hcfs.eq(
+                    OhciFunctionalState.USB_OPERATIONAL)
+
+                ph_converter = m.submodules.ph_converter = AXIStreamConverter(
+                    dw_from=self.data_width, dw_to=32)
+
+                m.d.comb += [
+                    self.mem_read_data.connect(ph_converter.sink),
+                    ph_converter.source.ready.eq(1),
+                ]
+
+                with m.If(ph_converter.source.fire):
+                    m.d.sync += [
+                        periodic_fetched.eq(1),
+                        hcperiodcurrented.eq(ph_converter.source.bits),
+                    ]
+                    m.next = 'ARBITER'
 
         return m
