@@ -158,6 +158,21 @@ _td_layout = [
     ('be', 32),
 ]
 
+_itd_layout = [
+    ('sf', 16),
+    ('_rsvd0', 5),
+    ('di', 3),
+    ('fc', 3),
+    ('_rsvd1', 1),
+    ('cc', 4),
+    ('_rsvd2', 12),
+    ('bp0', 20),
+    ('_rsvd3', 5),
+    ('nexttd', 27),
+    ('be', 32),
+    ('offset', 128),
+]
+
 
 class DirectionPid(IntEnum):
     SETUP = 0
@@ -307,6 +322,7 @@ class OhciEndpointHandler(Elaboratable):
         self.flow_type = Signal(OhciFlowType)
         self.ed_addr = Signal(32)
         self.next_ed = Valid(Signal, 32)
+        self.frame_number = Signal(16)
         self.packet_time = Signal(15)
         self.frame_time_hit = Signal()
         self.ls_threshold_hit = Signal(12)
@@ -401,9 +417,16 @@ class OhciEndpointHandler(Elaboratable):
         ed = Record(_ed_layout)
         m.d.comb += self.next_ed.bits.eq(ed.nexted)
 
+        td_addr = ed.headp << 4
+
         td_depacketizer = m.submodules.td_depacketizer = AXIStreamDepacketizer(
             Record, _td_layout, data_width=self.data_width)
         td = Record(_td_layout)
+        td_cbp = Mux(td_depacketizer.source.valid, td_depacketizer.header.cbp,
+                     td.cbp)
+        td_be = Mux(td_depacketizer.source.valid, td_depacketizer.header.be,
+                    td.be)
+
         td_write = Record(_td_layout)
         m.d.comb += td_write.eq(td)
 
@@ -415,16 +438,59 @@ class OhciEndpointHandler(Elaboratable):
             td_converter.sink.bits.last.eq(1),
         ]
 
-        td_addr = ed.headp << 4
-
         token_type = Mux(ed.d[0] ^ ed.d[1], ed.d, td.dp)
         is_in = token_type == DirectionPid.IN
 
-        buf_addr = td.cbp
-        last_addr = td.be
-        txn_len = last_addr - buf_addr + 1
-        zero_len = td.cbp == 0
-        data_phase = Mux(td.t[1], td.t[0], ed.c)
+        itd_depacketizer = m.submodules.itd_depacketizer = AXIStreamDepacketizer(
+            Record, _itd_layout, data_width=self.data_width)
+        itd = Record(_itd_layout)
+        itd_sf = Mux(itd_depacketizer.source.valid, itd_depacketizer.header.sf,
+                     itd.sf)
+        itd_fc = Mux(itd_depacketizer.source.valid, itd_depacketizer.header.fc,
+                     itd.fc)
+        itd_cbp = Mux(itd_depacketizer.source.valid,
+                      itd_depacketizer.header.bp0, itd.bp0)
+        itd_be = Mux(itd_depacketizer.source.valid, itd_depacketizer.header.be,
+                     itd.be)
+
+        itd_write = Record(_itd_layout)
+        m.d.comb += itd_write.eq(itd)
+
+        itd_converter = m.submodules.itd_converter = AXIStreamConverter(
+            dw_from=len(itd), dw_to=self.data_width)
+        m.d.comb += [
+            itd_converter.sink.bits.data.eq(itd_write),
+            itd_converter.sink.bits.keep.eq(~0),
+            itd_converter.sink.bits.last.eq(1),
+        ]
+
+        iso_rel_fn = Signal.like(self.frame_number)
+        m.d.comb += iso_rel_fn.eq(self.frame_number - itd_sf)
+        iso_fn = iso_rel_fn[:len(itd_fc)]
+        iso_too_early = iso_rel_fn[-1]
+        iso_overrun = ~iso_too_early & (iso_rel_fn > itd_fc)
+        iso_last = ~iso_too_early & ~iso_overrun & (iso_fn == itd_fc)
+        iso_base = Signal(13)
+        iso_base_next = Signal(13)
+        iso_zero_len = Mux(iso_last, iso_base_next < iso_base,
+                           iso_base_next == iso_base)
+
+        xtd_cbp = Mux(ed.f, itd_cbp, td_cbp)
+        xtd_be = Mux(ed.f, itd_be, td_be)
+        xtd_cc = Signal(OhciConditionCode)
+
+        xtd_single_page = xtd_cbp[12:] == xtd_be[12:]
+        xtd_first_offset = Mux(ed.f, iso_base, td_cbp[:12])
+        xtd_last_offset = Mux(ed.f, iso_base_next - Mux(iso_last, 0, 1),
+                              Cat(td_be[:12], ~xtd_single_page))
+
+        buf_offset = Signal(14)
+        buf_addr = Cat(buf_offset[:12],
+                       Mux(buf_offset[12], xtd_be[12:], xtd_cbp[12:]))
+        last_addr = Signal(13)
+        txn_len = last_addr - buf_offset + 1
+        zero_len = Mux(ed.f, iso_zero_len, td.cbp == 0)
+        data_phase = Mux(ed.f, 0, Mux(td.t[1], td.t[0], ed.c))
         td_retire = Signal()
         update_data_phase = Signal()
         skip_td_update = Signal()
@@ -488,7 +554,8 @@ class OhciEndpointHandler(Elaboratable):
                 m.d.comb += [
                     self.mem_read_cmd.valid.eq(1),
                     self.mem_read_cmd.bits.addr.eq(td_addr),
-                    self.mem_read_cmd.bits.len.eq(len(td) // 8),
+                    self.mem_read_cmd.bits.len.eq(
+                        Mux(ed.f, len(itd), len(td)) >> 3),
                     tx_fifo.w_en.eq(0),
                 ]
 
@@ -502,21 +569,60 @@ class OhciEndpointHandler(Elaboratable):
                     m.next = 'TD_READ_RESP'
 
             with m.State('TD_READ_RESP'):
-                m.d.comb += [
-                    self.mem_read_data.connect(td_depacketizer.sink),
-                    tx_fifo.w_en.eq(0),
-                ]
+                m.d.comb += tx_fifo.w_en.eq(0)
 
-                with m.If(td_depacketizer.source.valid):
-                    m.d.comb += td_depacketizer.source.ready.eq(1)
-                    m.d.sync += td.eq(td_depacketizer.header)
+                with m.If(ed.f):
+                    m.d.comb += self.mem_read_data.connect(
+                        itd_depacketizer.sink)
 
-                    m.next = 'TD_CHECK'
+                    with m.If(itd_depacketizer.source.valid):
+                        m.d.comb += itd_depacketizer.source.ready.eq(1)
+                        m.d.sync += itd.eq(itd_depacketizer.header)
+
+                        with m.Switch(iso_fn):
+                            for i in range(8):
+                                with m.Case(i):
+                                    m.d.sync += iso_base.eq(
+                                        itd_depacketizer.header.offset[i *
+                                                                       16:(i +
+                                                                           1) *
+                                                                       16])
+
+                                    if i != 7:
+                                        m.d.sync += iso_base_next.eq(
+                                            itd_depacketizer.header.offset[
+                                                (i + 1) * 16:(i + 2) * 16])
+                                    else:
+                                        m.d.sync += iso_base_next.eq(
+                                            Cat(
+                                                itd_depacketizer.header.
+                                                be[:12], xtd_single_page))
+
+                        m.next = 'TD_CHECK'
+
+                with m.Else():
+                    m.d.comb += self.mem_read_data.connect(
+                        td_depacketizer.sink)
+
+                    with m.If(td_depacketizer.source.valid):
+                        m.d.comb += td_depacketizer.source.ready.eq(1)
+                        m.d.sync += td.eq(td_depacketizer.header)
+
+                        m.next = 'TD_CHECK'
 
             with m.State('TD_CHECK'):
                 m.d.comb += self.fill_list.eq(1)
 
+                m.d.sync += [
+                    buf_offset.eq(xtd_first_offset),
+                    last_addr.eq(xtd_last_offset),
+                ]
+
                 m.next = 'TD_CHECK_TIME'
+
+                with m.If(ed.f):
+                    with m.If(iso_too_early):
+                        m.next = 'FINISH'
 
             with m.State('TD_CHECK_TIME'):
                 with m.If(time_check):
@@ -581,32 +687,44 @@ class OhciEndpointHandler(Elaboratable):
 
                 pid_mismatched = data_rx.pid == Mux(data_phase, UsbPid.DATA0,
                                                     UsbPid.DATA1)
-                pid_ok = ((data_rx.pid == UsbPid.DATA0) |
-                          (data_rx.pid == UsbPid.DATA1)) & ~pid_mismatched
+                pid_ok = (
+                    (data_rx.pid == UsbPid.DATA0) |
+                    (data_rx.pid == UsbPid.DATA1)) & (ed.f | ~pid_mismatched)
 
-                m.d.sync += td.cc.eq(OhciConditionCode.NO_ERROR)
+                m.d.sync += xtd_cc.eq(OhciConditionCode.NO_ERROR)
                 with m.If(data_rx.stuffing_error):
-                    m.d.sync += td.cc.eq(OhciConditionCode.BIT_STUFFING)
+                    m.d.sync += xtd_cc.eq(OhciConditionCode.BIT_STUFFING)
                 with m.Elif(data_rx.pid_error):
-                    m.d.sync += td.cc.eq(OhciConditionCode.PID_CHECK_FAIL)
+                    m.d.sync += xtd_cc.eq(OhciConditionCode.PID_CHECK_FAIL)
                 with m.Else():
-                    with m.Switch(data_rx.pid):
-                        with m.Case(UsbPid.NAK):
-                            m.d.sync += skip_td_update.eq(1)
-                        with m.Case(UsbPid.STALL):
-                            m.d.sync += td.cc.eq(OhciConditionCode.STALL)
-                        with m.Case(UsbPid.DATA0, UsbPid.DATA1):
-                            with m.If(pid_mismatched):
-                                m.d.sync += td.cc.eq(
-                                    OhciConditionCode.DATA_TOGGLE_MISMATCH)
-                            m.next = 'ACK_TX0'
-                        with m.Default():
-                            m.d.sync += td.cc.eq(
-                                OhciConditionCode.UNEXPECTED_PID)
+                    with m.If(ed.f):
+                        with m.Switch(data_rx.pid):
+                            with m.Case(UsbPid.STALL, UsbPid.NAK):
+                                m.d.sync += xtd_cc.eq(OhciConditionCode.STALL)
+                            with m.Case(UsbPid.DATA0, UsbPid.DATA1):
+                                m.next = 'DATA_RX_WAIT_DMA'
+                            with m.Default():
+                                m.d.sync += xtd_cc.eq(
+                                    OhciConditionCode.UNEXPECTED_PID)
+
+                    with m.Else():
+                        with m.Switch(data_rx.pid):
+                            with m.Case(UsbPid.NAK):
+                                m.d.sync += skip_td_update.eq(1)
+                            with m.Case(UsbPid.STALL):
+                                m.d.sync += xtd_cc.eq(OhciConditionCode.STALL)
+                            with m.Case(UsbPid.DATA0, UsbPid.DATA1):
+                                with m.If(pid_mismatched):
+                                    m.d.sync += xtd_cc.eq(
+                                        OhciConditionCode.DATA_TOGGLE_MISMATCH)
+                                m.next = 'ACK_TX0'
+                            with m.Default():
+                                m.d.sync += xtd_cc.eq(
+                                    OhciConditionCode.UNEXPECTED_PID)
 
                 with m.If(pid_ok):
                     with m.If(data_rx.crc_error):
-                        m.d.sync += td.cc.eq(OhciConditionCode.CRC)
+                        m.d.sync += xtd_cc.eq(OhciConditionCode.CRC)
 
             with m.State('DATA_RX_ABORT'):
                 m.d.comb += [
@@ -651,7 +769,11 @@ class OhciEndpointHandler(Elaboratable):
                         ack_rx_stuffing_error.eq(0),
                         ack_rx_pid_error.eq(0),
                     ]
-                    m.next = 'ACK_RX'
+
+                    with m.If(ed.f):
+                        m.next = 'UPDATE_TD'
+                    with m.Else():
+                        m.next = 'ACK_RX'
 
             with m.State('ACK_RX'):
 
@@ -694,13 +816,16 @@ class OhciEndpointHandler(Elaboratable):
             with m.State('UPDATE_TD'):
                 m.next = 'UPDATE_TD_CMD'
 
-                m.d.sync += td.ec.eq(0)
-                with m.Switch(td.cc):
-                    with m.Case(OhciConditionCode.NO_ERROR):
-                        m.d.sync += [
-                            td_retire.eq(1),
-                            update_data_phase.eq(1),
-                        ]
+                with m.If(ed.f):
+                    m.d.sync += td_retire.eq(iso_last)
+                with m.Else():
+                    m.d.sync += td.ec.eq(0)
+                    with m.Switch(xtd_cc):
+                        with m.Case(OhciConditionCode.NO_ERROR):
+                            m.d.sync += [
+                                td_retire.eq(1),
+                                update_data_phase.eq(1),
+                            ]
 
                 with m.If(skip_td_update):
                     m.d.sync += td_retire.eq(0)
@@ -710,21 +835,59 @@ class OhciEndpointHandler(Elaboratable):
                 m.d.comb += [
                     self.mem_write_cmd.valid.eq(1),
                     self.mem_write_cmd.bits.addr.eq(td_addr),
-                    self.mem_write_cmd.bits.len.eq(len(td) // 8),
+                    self.mem_write_cmd.bits.len.eq(
+                        Mux(ed.f, len(itd), len(td)) >> 3),
                 ]
 
                 with m.If(self.mem_write_cmd.fire):
                     m.next = 'UPDATE_TD_DATA'
 
             with m.State('UPDATE_TD_DATA'):
-                m.d.comb += [
-                    td_write.nexttd.eq(done_head.dh),
-                    td_converter.sink.valid.eq(1),
-                    td_converter.source.connect(self.mem_write_data),
-                ]
+                m.d.sync += ed.h.eq(~ed.f
+                                    & (xtd_cc != OhciConditionCode.NO_ERROR))
 
-                with m.If(td_converter.sink.fire):
-                    m.next = 'UPDATE_ED_CMD'
+                with m.If(ed.f):
+                    with m.If(iso_overrun):
+                        m.d.comb += itd_write.cc.eq(
+                            OhciConditionCode.DATA_OVERRUN)
+                    with m.Else():
+                        with m.If(iso_last):
+                            m.d.comb += itd_write.cc.eq(
+                                OhciConditionCode.NO_ERROR)
+
+                        psw_count = Mux(ed.d[0], 0, txn_len)[:12]
+                        psw = Cat(psw_count, xtd_cc)
+
+                        with m.Switch(iso_fn):
+                            for i in range(8):
+                                with m.Case(i):
+                                    m.d.comb += itd_write.offset[i *
+                                                                 16:(i + 1) *
+                                                                 16].eq(psw)
+
+                        with m.If(td_retire):
+                            m.d.comb += itd_write.nexttd.eq(done_head.dh)
+
+                        m.d.comb += [
+                            itd_converter.sink.valid.eq(1),
+                            itd_converter.source.connect(self.mem_write_data),
+                        ]
+
+                        with m.If(itd_converter.sink.fire):
+                            m.next = 'UPDATE_ED_CMD'
+
+                with m.Else():
+                    m.d.comb += [
+                        td_write.cc.eq(xtd_cc),
+                        td_converter.sink.valid.eq(1),
+                        td_converter.source.connect(self.mem_write_data),
+                    ]
+
+                    with m.If(td_retire):
+                        m.d.comb += td_write.nexttd.eq(done_head.dh)
+
+                    with m.If(td_converter.sink.fire):
+                        m.next = 'UPDATE_ED_CMD'
 
             with m.State('UPDATE_ED_CMD'):
                 m.d.comb += [
@@ -754,7 +917,8 @@ class OhciEndpointHandler(Elaboratable):
                     m.next = 'FINISH'
 
             with m.State('FINISH'):
-                m.d.comb += self.next_ed.valid.eq(1)
+                with m.If(~(ed.f & iso_overrun)):
+                    m.d.comb += self.next_ed.valid.eq(1)
 
                 with m.If(td_retire):
                     m.d.comb += [
@@ -854,6 +1018,8 @@ class OhciController(Peripheral, Elaboratable):
         self.mem_write_data = AXIStreamInterface(data_width=data_width)
         self.mem_write_done = Signal()
 
+        self.irq = Signal()
+
         self.dp_i = Signal()
         self.dp_o = Signal()
         self.dp_t = Signal()
@@ -901,8 +1067,6 @@ class OhciController(Peripheral, Elaboratable):
 
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
-
-        self.irq = Signal()
 
         self._hchcca.r_data.reset = 0x100
         self._hccontrolheaded.r_data.reset = 0x10
@@ -1036,6 +1200,7 @@ class OhciController(Peripheral, Elaboratable):
         ed_handler = m.submodules.ed_handler = OhciEndpointHandler(
             data_width=self.data_width, fifo_depth=self.fifo_depth)
         m.d.comb += [
+            ed_handler.frame_number.eq(hcfmnumber.fn),
             ed_handler.packet_time.eq(packet_counter),
             ed_handler.rx_active.eq(phy.rx_active),
             ed_handler.rx_data.eq(phy.rx_data),
@@ -1104,7 +1269,7 @@ class OhciController(Peripheral, Elaboratable):
                 m.d.comb += [
                     hccontrol.hcfs.eq(OhciFunctionalState.USB_OPERATIONAL),
                     token_tx.token.bits.pid.eq(UsbPid.SOF),
-                    token_tx.token.bits.data.eq(self._hcfmnumber.r_data),
+                    token_tx.token.bits.data.eq(hcfmnumber.fn),
                     token_tx.token.valid.eq(1),
                     token_tx.tx_data.connect(phy.tx_data),
                     token_tx.tx_eop.eq(phy.tx_eop),
