@@ -362,6 +362,12 @@ class OhciEndpointHandler(Elaboratable):
                                    & self.rx_data.bits.stuffing_error),
         ]
 
+        rx_bytes = Signal(11)
+        with m.If(data_rx.start):
+            m.d.sync += rx_bytes.eq(0)
+        with m.Elif(data_rx.data.valid):
+            m.d.sync += rx_bytes.eq(rx_bytes + ~rx_bytes[-1])
+
         rx_fifo_flush = Signal()
         rx_fifo = m.submodules.rx_fifo = ResetInserter(rx_fifo_flush)(SyncFIFO(
             depth=self.fifo_depth // 2,
@@ -510,6 +516,10 @@ class OhciEndpointHandler(Elaboratable):
         m.d.comb += self.done_head.eq(done_head)
         with m.If(self.clear_done_head):
             m.d.sync += done_head.eq(0)
+
+        rx_overflow = Signal()
+        rx_underflow = Signal()
+        rx_underflow_err = rx_underflow & ~td.r
 
         with m.FSM():
             with m.State('IDLE'):
@@ -666,6 +676,10 @@ class OhciEndpointHandler(Elaboratable):
 
             with m.State('DATA_RX'):
                 m.d.comb += data_rx.start.eq(1)
+                m.d.sync += [
+                    rx_overflow.eq(0),
+                    rx_underflow.eq(0),
+                ]
                 m.next = 'DATA_RX_CMD'
 
             with m.State('DATA_RX_CMD'):
@@ -680,6 +694,21 @@ class OhciEndpointHandler(Elaboratable):
 
             with m.State('DATA_RX_WAIT'):
                 with m.If(data_rx.done):
+                    underflow = rx_bytes < txn_len
+                    m.d.sync += [
+                        rx_underflow.eq(underflow),
+                        rx_overflow.eq(~underflow & (rx_bytes != txn_len)),
+                    ]
+
+                    with m.If(zero_len):
+                        m.d.sync += [
+                            rx_underflow.eq(0),
+                            rx_overflow.eq(rx_bytes.any()),
+                        ]
+
+                    with m.If(underflow):
+                        m.d.sync += last_addr.eq(buf_offset + rx_bytes - 1)
+
                     m.next = 'DATA_RX_VALIDATE'
 
             with m.State('DATA_RX_VALIDATE'):
@@ -725,6 +754,13 @@ class OhciEndpointHandler(Elaboratable):
                 with m.If(pid_ok):
                     with m.If(data_rx.crc_error):
                         m.d.sync += xtd_cc.eq(OhciConditionCode.CRC)
+                    with m.Else():
+                        with m.If(rx_underflow_err):
+                            m.d.sync += xtd_cc.eq(
+                                OhciConditionCode.DATA_UNDERRUN)
+                        with m.Elif(rx_overflow):
+                            m.d.sync += xtd_cc.eq(
+                                OhciConditionCode.DATA_OVERRUN)
 
             with m.State('DATA_RX_ABORT'):
                 m.d.comb += [
