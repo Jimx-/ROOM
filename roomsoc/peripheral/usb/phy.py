@@ -6,6 +6,21 @@ from room.utils import Decoupled, Valid
 from .usb import UsbDataStream
 
 
+class UsbLsFsPhyIo(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('dp_i', 1, Direction.FANIN),
+            ('dp_o', 1, Direction.FANOUT),
+            ('dp_t', 1, Direction.FANOUT),
+            ('dm_i', 1, Direction.FANIN),
+            ('dm_o', 1, Direction.FANOUT),
+            ('dm_t', 1, Direction.FANOUT),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class UsbCtrlPort(Record):
 
     def __init__(self, name=None, src_loc_at=0):
@@ -456,32 +471,26 @@ class UsbPhyRx(Elaboratable):
         return m
 
 
-class UsbLowSpeedFullSpeedPhy(Elaboratable):
+class UsbLsFsPhyPort(Elaboratable):
 
-    def __init__(self, clk_freq):
+    def __init__(self, clk_freq, fs_divisor):
         self.clk_freq = clk_freq
-
-        self.low_speed = Signal()
-
-        self.tx_data = Decoupled(UsbDataStream)
-        self.tx_eop = Signal()
+        self.fs_divisor = fs_divisor
 
         self.rx_active = Signal()
         self.rx_data = Valid(UsbRxData)
-
-        self.clock_posedge = Signal()
+        self.tx = Valid(UsbTxData)
 
         self.ctrl = UsbCtrlPort()
-
-        self.dp_i = Signal()
-        self.dp_o = Signal(reset_less=True)
-        self.dp_t = Signal(reset_less=True)
-        self.dm_i = Signal()
-        self.dm_o = Signal(reset_less=True)
-        self.dm_t = Signal(reset_less=True)
+        self.usb = UsbLsFsPhyIo()
 
     def elaborate(self, platform):
         m = Module()
+
+        self.usb.dp_o.reset_less = True
+        self.usb.dp_t.reset_less = True
+        self.usb.dm_o.reset_less = True
+        self.usb.dm_t.reset_less = True
 
         dp_i = Signal()
         dp_o = Signal()
@@ -492,12 +501,12 @@ class UsbLowSpeedFullSpeedPhy(Elaboratable):
         se0_i = Signal()
 
         m.d.sync += [
-            dp_i.eq(self.dp_i),
-            dm_i.eq(self.dm_i),
-            self.dp_o.eq(dp_o),
-            self.dp_t.eq(~dp_oe),
-            self.dm_o.eq(dm_o),
-            self.dm_t.eq(~dm_oe),
+            dp_i.eq(self.usb.dp_i),
+            dm_i.eq(self.usb.dm_i),
+            self.usb.dp_o.eq(dp_o),
+            self.usb.dp_t.eq(~dp_oe),
+            self.usb.dm_o.eq(dm_o),
+            self.usb.dm_t.eq(~dm_oe),
         ]
         m.d.comb += se0_i.eq(~dp_i & ~dm_i)
 
@@ -510,6 +519,61 @@ class UsbLowSpeedFullSpeedPhy(Elaboratable):
             dp_o.eq(~tx_se0 & tx_data),
             dm_o.eq(~tx_se0 & ~tx_data),
         ]
+
+        filter = m.submodules.filter = UsbRxFilter(clk_freq=self.clk_freq)
+        m.d.comb += [
+            filter.dp_i.eq(dp_i),
+            filter.dm_i.eq(dm_i),
+        ]
+
+        rx = m.submodules.rx = UsbPhyRx(fs_divisor=self.fs_divisor)
+        m.d.comb += [
+            rx.clock_data_in.eq(filter.clock_data_in),
+            rx.tx_valid.eq(self.tx.valid),
+            rx.dp.eq(filter.dp),
+            rx.dm.eq(filter.dm),
+            rx.se0.eq(filter.se0),
+            self.rx_active.eq(rx.rx_active),
+            self.rx_data.eq(rx.rx_data),
+        ]
+
+        with m.FSM():
+            with m.State('ENABLED'):
+                m.d.comb += [
+                    tx_enable.eq(self.tx.valid),
+                    tx_data.eq(self.tx.bits.data),
+                    tx_se0.eq(self.tx.bits.se0),
+                    rx.enable.eq(1),
+                ]
+
+        return m
+
+
+class UsbLsFsPhy(Elaboratable):
+
+    def __init__(self, clk_freq, port_count):
+        self.clk_freq = clk_freq
+        self.port_count = port_count
+
+        self.low_speed = Signal()
+
+        self.tx_data = Decoupled(UsbDataStream)
+        self.tx_eop = Signal()
+
+        self.rx_active = Signal()
+        self.rx_data = Valid(UsbRxData)
+
+        self.clock_posedge = Signal()
+
+        self.usb_reset = Signal()
+        self.ctrl = [
+            UsbCtrlPort(name=f'ctrl_port{i}') for i in range(port_count)
+        ]
+
+        self.usb = [UsbLsFsPhyIo(name=f'usb{i}') for i in range(port_count)]
+
+    def elaborate(self, platform):
+        m = Module()
 
         fs_divisor = int(self.clk_freq // 12e6)
         ls_divisor = fs_divisor * 8
@@ -539,30 +603,23 @@ class UsbLowSpeedFullSpeedPhy(Elaboratable):
             self.tx_eop.eq(tx.tx_eop),
         ]
 
-        filter = m.submodules.filter = UsbRxFilter(clk_freq=self.clk_freq)
-        m.d.comb += [
-            filter.dp_i.eq(dp_i),
-            filter.dm_i.eq(dm_i),
-        ]
+        ports = []
+        for i, (ctrl, usb) in enumerate(zip(self.ctrl, self.usb)):
+            port = UsbLsFsPhyPort(clk_freq=self.clk_freq,
+                                  fs_divisor=fs_divisor)
+            setattr(m.submodules, f'port{i}', port)
+            ports.append(port)
 
-        rx = m.submodules.rx = UsbPhyRx(fs_divisor=fs_divisor)
-        m.d.comb += [
-            rx.clock_data_in.eq(filter.clock_data_in),
-            rx.tx_valid.eq(tx.out.valid),
-            rx.dp.eq(filter.dp),
-            rx.dm.eq(filter.dm),
-            rx.se0.eq(filter.se0),
-            self.rx_active.eq(rx.rx_active),
-            self.rx_data.eq(rx.rx_data),
-        ]
+            m.d.comb += [
+                ctrl.connect(port.ctrl),
+                port.usb.connect(usb),
+                port.tx.eq(tx.out),
+            ]
 
-        with m.FSM():
-            with m.State('ENABLED'):
-                m.d.comb += [
-                    tx_enable.eq(tx.out.valid),
-                    tx_data.eq(tx.out.bits.data),
-                    tx_se0.eq(tx.out.bits.se0),
-                    rx.enable.eq(1),
-                ]
+        rx_active = Cat(port.rx_active for port in ports)
+        m.d.comb += self.rx_active.eq(rx_active.any())
+        for i in reversed(range(len(rx_active))):
+            with m.If(rx_active[i]):
+                m.d.comb += self.rx_data.eq(ports[i].rx_data)
 
         return m

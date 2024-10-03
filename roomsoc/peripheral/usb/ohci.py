@@ -7,7 +7,7 @@ from roomsoc.peripheral import Peripheral
 from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer, AXIStreamConverter
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
-from .phy import UsbLowSpeedFullSpeedPhy, UsbRxData
+from .phy import UsbLsFsPhyIo, UsbLsFsPhy, UsbRxData
 from .usb import UsbPid, UsbToken, UsbDataStream, UsbTokenTx, UsbDataTx, UsbDataRx
 
 
@@ -30,6 +30,10 @@ class OhciReg(IntEnum):
     HCFMNUMBER = 0x3c
     HCPERIODICSTART = 0x40
     HCLSTHRESHOLD = 0x44
+    HCRHDESCRIPTORA = 0x48
+    HCRHDESCRIPTORB = 0x4c
+    HCRHSTATUS = 0x50
+    HCRHPORTSTATUS = 0x54
 
 
 _hccontrol_layout = [
@@ -94,6 +98,24 @@ _hcfmnumber_layout = [
 _hcperiodicstart_layout = [
     ('ps', 14),
     ('_rsvd0', 18),
+]
+
+_hcrhportstatus_layout = [
+    ('ccs', 1),
+    ('pes', 1),
+    ('pss', 1),
+    ('poci', 1),
+    ('prs', 1),
+    ('_rsvd0', 3),
+    ('pps', 1),
+    ('lsda', 1),
+    ('_rsvd1', 6),
+    ('csc', 1),
+    ('pesc', 1),
+    ('pssc', 1),
+    ('ocic', 1),
+    ('prsc', 1),
+    ('_rsvd2', 11),
 ]
 
 
@@ -1040,12 +1062,19 @@ class OhciController(Peripheral, Elaboratable):
                              name=name,
                              src_loc_at=1 + src_loc_at)
 
-    def __init__(self, data_width, clk_freq, *, name=None, fifo_depth=16):
+    def __init__(self,
+                 data_width,
+                 clk_freq,
+                 *,
+                 name=None,
+                 fifo_depth=16,
+                 port_count=1):
         super().__init__(name=name)
 
         self.clk_freq = clk_freq
         self.data_width = data_width
         self.fifo_depth = fifo_depth
+        self.port_count = port_count
 
         self.mem_read_cmd = Decoupled(OhciController.MemoryCommand)
         self.mem_read_data = AXIStreamInterface(data_width=data_width)
@@ -1056,12 +1085,7 @@ class OhciController(Peripheral, Elaboratable):
 
         self.irq = Signal()
 
-        self.dp_i = Signal()
-        self.dp_o = Signal()
-        self.dp_t = Signal()
-        self.dm_i = Signal()
-        self.dm_o = Signal()
-        self.dm_t = Signal()
+        self.usb = [UsbLsFsPhyIo(name=f'usb{i}') for i in range(port_count)]
 
         bank = self.csr_bank()
         self._hcrevision = bank.csr(32, 'r', addr=OhciReg.HCREVISION)
@@ -1100,6 +1124,19 @@ class OhciController(Peripheral, Elaboratable):
                                          'rw',
                                          addr=OhciReg.HCPERIODICSTART)
         self._hclsthreshold = bank.csr(32, 'rw', addr=OhciReg.HCLSTHRESHOLD)
+        self._hcrhdescriptora = bank.csr(32,
+                                         'rw',
+                                         addr=OhciReg.HCRHDESCRIPTORA)
+        self._hcrhdescriptorb = bank.csr(32,
+                                         'rw',
+                                         addr=OhciReg.HCRHDESCRIPTORB)
+        self._hcrhstatus = bank.csr(32, 'rw', addr=OhciReg.HCRHSTATUS)
+        self._hcrhportstatus = [
+            bank.csr(32,
+                     'rw',
+                     addr=OhciReg.HCRHPORTSTATUS + i * 4,
+                     name=f'hcrhportstatus{i}') for i in range(port_count)
+        ]
 
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
@@ -1111,16 +1148,10 @@ class OhciController(Peripheral, Elaboratable):
         m = Module()
         m.submodules.bridge = self._bridge
 
-        phy = m.submodules.phy = UsbLowSpeedFullSpeedPhy(
-            clk_freq=self.clk_freq)
-        m.d.comb += [
-            phy.dp_i.eq(self.dp_i),
-            self.dp_o.eq(phy.dp_o),
-            self.dp_t.eq(phy.dp_t),
-            phy.dm_i.eq(self.dm_i),
-            self.dm_o.eq(phy.dm_o),
-            self.dm_t.eq(phy.dm_t),
-        ]
+        phy = m.submodules.phy = UsbLsFsPhy(clk_freq=self.clk_freq,
+                                            port_count=self.port_count)
+        for usb, phy_usb in zip(self.usb, phy.usb):
+            m.d.comb += phy_usb.connect(usb)
 
         token_tx = m.submodules.token_tx = UsbTokenTx()
         data_tx = m.submodules.data_tx = UsbDataTx()
@@ -1128,7 +1159,11 @@ class OhciController(Peripheral, Elaboratable):
         m.d.comb += self._hcrevision.r_data.eq(0x110)
 
         hccontrol = Record(_hccontrol_layout)
-        m.d.comb += self._hccontrol.r_data.eq(hccontrol)
+        hccontrol_write = Record(_hccontrol_layout)
+        m.d.comb += [
+            self._hccontrol.r_data.eq(hccontrol),
+            hccontrol_write.eq(self._hccontrol.w_data),
+        ]
         usb_operational = hccontrol.hcfs == OhciFunctionalState.USB_OPERATIONAL
 
         hccontrol.ple.reset = 1
@@ -1270,8 +1305,6 @@ class OhciController(Peripheral, Elaboratable):
         with m.If(self._hcperiodicstart.w_stb):
             m.d.sync += hcperiodicstart.eq(self._hcperiodicstart.w_data)
 
-        reset_counter = Signal(range(481))
-
         allow_bulk = Signal()
         allow_control = Signal()
         allow_periodic = Signal()
@@ -1280,14 +1313,22 @@ class OhciController(Peripheral, Elaboratable):
         periodic_fetched = Signal()
         periodic_done = Signal()
 
+        reset_counter = Signal(range(481))
+
         with m.FSM():
             with m.State('RESET'):
-                m.d.comb += hccontrol.hcfs.eq(OhciFunctionalState.USB_RESET)
-
-                m.d.sync += [
-                    allow_periodic.eq(0),
-                    reset_counter.eq(reset_counter + 1),
+                m.d.comb += [
+                    hccontrol.hcfs.eq(OhciFunctionalState.USB_RESET),
+                    phy.usb_reset.eq(1),
                 ]
+                m.d.sync += allow_periodic.eq(0)
+
+                m.d.sync += reset_counter.eq(reset_counter + 1)
+
+                with m.If(self._hccontrol.w_stb):
+                    with m.Switch(hccontrol_write.hcfs):
+                        with m.Case(OhciFunctionalState.USB_OPERATIONAL):
+                            m.next = 'WAIT_SOF'
 
                 with m.If(reset_counter == 480):
                     m.next = 'WAIT_SOF'
@@ -1514,5 +1555,25 @@ class OhciController(Peripheral, Elaboratable):
                         hcperiodcurrented.eq(ph_converter.source.bits),
                     ]
                     m.next = 'ARBITER'
+
+        for i, (port_status,
+                port) in enumerate(zip(self._hcrhportstatus, phy.ctrl)):
+            port_status_r = Record(_hcrhportstatus_layout,
+                                   name=f'port_status_r{i}')
+            port_status_w = Record(_hcrhportstatus_layout,
+                                   name=f'port_status_w{i}')
+            m.d.comb += [
+                port_status.r_data.eq(port_status_r),
+                port_status_w.eq(port_status.w_data),
+            ]
+
+            with m.If(port_status.w_stb):
+                m.d.sync += [
+                    port_status_r.prs.eq(port_status_w.prs),
+                ]
+
+            m.d.comb += port.reset.valid.eq(port_status_r.prs)
+            with m.If(port.reset.valid & port.reset.ready):
+                m.d.sync += port_status_r.prs.eq(0)
 
         return m
