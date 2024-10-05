@@ -100,6 +100,33 @@ _hcperiodicstart_layout = [
     ('_rsvd0', 18),
 ]
 
+_hcrhdescriptora_layout = [
+    ('ndp', 8),
+    ('psm', 1),
+    ('nps', 1),
+    ('dt', 1),
+    ('ocpm', 1),
+    ('nocp', 1),
+    ('_rsvd0', 11),
+    ('potpgt', 8),
+]
+
+_hcrhdescriptorb_layout = [
+    ('dr', 16),
+    ('ppcm', 16),
+]
+
+_hcrhstatus_layout = [
+    ('lps', 1),
+    ('oci', 1),
+    ('_rsvd0', 13),
+    ('drwe', 1),
+    ('lpsc', 1),
+    ('ocic', 1),
+    ('_rsvd1', 13),
+    ('crwe', 1),
+]
+
 _hcrhportstatus_layout = [
     ('ccs', 1),
     ('pes', 1),
@@ -1141,9 +1168,6 @@ class OhciController(Peripheral, Elaboratable):
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
 
-        self._hchcca.r_data.reset = 0x100
-        self._hccontrolheaded.r_data.reset = 0x10
-
     def elaborate(self, platform):
         m = Module()
         m.submodules.bridge = self._bridge
@@ -1166,15 +1190,25 @@ class OhciController(Peripheral, Elaboratable):
         ]
         usb_operational = hccontrol.hcfs == OhciFunctionalState.USB_OPERATIONAL
 
-        hccontrol.ple.reset = 1
-        hccontrol.ble.reset = 1
-        hccontrol.cle.reset = 1
+        with m.If(self._hccontrol.w_stb):
+            m.d.sync += [
+                hccontrol.ple.eq(hccontrol_write.ple),
+                hccontrol.ble.eq(hccontrol_write.ble),
+                hccontrol.cle.eq(hccontrol_write.cle),
+            ]
 
         hccommandstatus = Record(_hccommandstatus_layout)
-        m.d.comb += self._hccommandstatus.r_data.eq(hccommandstatus)
-
-        hccommandstatus.blf.reset = 1
-        hccommandstatus.clf.reset = 1
+        hccommandstatus_write = Record(_hccommandstatus_layout)
+        m.d.comb += [
+            self._hccommandstatus.r_data.eq(hccommandstatus),
+            hccommandstatus_write.eq(self._hccommandstatus.w_data),
+        ]
+        with m.If(self._hccommandstatus.w_stb):
+            m.d.sync += [
+                hccommandstatus.clf.eq(hccommandstatus_write.clf),
+                hccommandstatus.blf.eq(hccommandstatus_write.blf),
+                hccommandstatus.ocr.eq(hccommandstatus_write.ocr),
+            ]
 
         irq_status = Record(_hcinterrupt_layout)
         irq_enable = Record(_hcinterrupt_layout)
@@ -1204,18 +1238,22 @@ class OhciController(Peripheral, Elaboratable):
                 Cat(Const(0, 8), self._hchcca.w_data[8:]))
 
         hcfminterval = Record(_hcfminterval_layout)
+        hcfminterval_write = Record(_hcfminterval_layout)
         hcfmremaining = Record(_hcfmremaining_layout)
         hcfmnumber = Record(_hcfmnumber_layout)
         hcfminterval.fi.reset = 0x2edf
         m.d.comb += [
             self._hcfminterval.r_data.eq(hcfminterval),
+            hcfminterval_write.eq(self._hcfminterval.w_data),
             self._hcfmremaining.r_data.eq(hcfmremaining),
             self._hcfmnumber.r_data.eq(hcfmnumber),
         ]
         with m.If(self._hcfminterval.w_stb):
-            m.d.sync += hcfminterval.eq(self._hcfminterval.w_data)
-
-        hcfminterval.fsmps.reset = 0x2778  # TODO: Remove
+            m.d.sync += [
+                hcfminterval.fi.eq(hcfminterval_write.fi),
+                hcfminterval.fsmps.eq(hcfminterval_write.fsmps),
+                hcfminterval.fit.eq(hcfminterval_write.fit),
+            ]
 
         decrement_counter = Signal(3)
         skip_decrement = decrement_counter == 6
@@ -1303,7 +1341,7 @@ class OhciController(Peripheral, Elaboratable):
         m.d.comb += self._hcperiodicstart.r_data.eq(hcperiodicstart)
         hcperiodicstart.ps.reset = 0x2edf  # TODO: Remove
         with m.If(self._hcperiodicstart.w_stb):
-            m.d.sync += hcperiodicstart.eq(self._hcperiodicstart.w_data)
+            m.d.sync += hcperiodicstart.ps.eq(self._hcperiodicstart.w_data)
 
         allow_bulk = Signal()
         allow_control = Signal()
@@ -1313,8 +1351,6 @@ class OhciController(Peripheral, Elaboratable):
         periodic_fetched = Signal()
         periodic_done = Signal()
 
-        reset_counter = Signal(range(481))
-
         with m.FSM():
             with m.State('RESET'):
                 m.d.comb += [
@@ -1323,15 +1359,10 @@ class OhciController(Peripheral, Elaboratable):
                 ]
                 m.d.sync += allow_periodic.eq(0)
 
-                m.d.sync += reset_counter.eq(reset_counter + 1)
-
                 with m.If(self._hccontrol.w_stb):
                     with m.Switch(hccontrol_write.hcfs):
                         with m.Case(OhciFunctionalState.USB_OPERATIONAL):
                             m.next = 'WAIT_SOF'
-
-                with m.If(reset_counter == 480):
-                    m.next = 'WAIT_SOF'
 
             with m.State('WAIT_SOF'):
                 m.d.comb += hccontrol.hcfs.eq(
@@ -1556,6 +1587,40 @@ class OhciController(Peripheral, Elaboratable):
                     ]
                     m.next = 'ARBITER'
 
+        hcrhdescriptora_r = Record(_hcrhdescriptora_layout)
+        hcrhdescriptora_w = Record(_hcrhdescriptora_layout)
+        hcrhdescriptorb_r = Record(_hcrhdescriptorb_layout)
+        hcrhdescriptorb_w = Record(_hcrhdescriptorb_layout)
+        hcrhstatus_r = Record(_hcrhstatus_layout)
+        hcrhstatus_w = Record(_hcrhstatus_layout)
+        m.d.comb += [
+            self._hcrhdescriptora.r_data.eq(hcrhdescriptora_r),
+            hcrhdescriptora_w.eq(self._hcrhdescriptora.w_data),
+            self._hcrhdescriptorb.r_data.eq(hcrhdescriptorb_r),
+            hcrhdescriptorb_w.eq(self._hcrhdescriptorb.w_data),
+            self._hcrhstatus.r_data.eq(hcrhstatus_r),
+            hcrhstatus_w.eq(self._hcrhstatus.w_data),
+        ]
+
+        m.d.comb += [
+            hcrhdescriptora_r.ndp.eq(self.port_count),
+        ]
+
+        with m.If(self._hcrhdescriptora.w_stb):
+            m.d.sync += [
+                hcrhdescriptora_r.nps.eq(hcrhdescriptora_w.nps),
+                hcrhdescriptora_r.psm.eq(hcrhdescriptora_w.psm),
+                hcrhdescriptora_r.ocpm.eq(hcrhdescriptora_w.ocpm),
+                hcrhdescriptora_r.nocp.eq(hcrhdescriptora_w.nocp),
+                hcrhdescriptora_r.potpgt.eq(hcrhdescriptora_w.potpgt),
+            ]
+
+        with m.If(self._hcrhdescriptorb.w_stb):
+            m.d.sync += hcrhdescriptorb_r.eq(hcrhdescriptorb_w)
+
+        with m.If(self._hcrhstatus.w_stb):
+            m.d.sync += hcrhstatus_r.drwe.eq(hcrhstatus_w.drwe)
+
         for i, (port_status,
                 port) in enumerate(zip(self._hcrhportstatus, phy.ctrl)):
             port_status_r = Record(_hcrhportstatus_layout,
@@ -1567,13 +1632,74 @@ class OhciController(Peripheral, Elaboratable):
                 port_status_w.eq(port_status.w_data),
             ]
 
+            clear_port_enable = Signal(name=f'clear_port_enable{i}')
+            set_port_enable = Signal(name=f'set_port_enable{i}')
+            set_port_suspend = Signal(name=f'set_port_suspend{i}')
+            clear_suspend_status = Signal(name=f'clear_suspend_status{i}')
+            set_port_reset = Signal(name=f'set_port_reset{i}')
+            set_port_power = Signal(name=f'set_port_power{i}')
+            clear_port_power = Signal(name=f'clear_port_power{i}')
             with m.If(port_status.w_stb):
-                m.d.sync += [
-                    port_status_r.prs.eq(port_status_w.prs),
+                m.d.comb += [
+                    clear_port_enable.eq(port_status_w.ccs),
+                    set_port_enable.eq(port_status_w.pes),
+                    set_port_suspend.eq(port_status_w.pss),
+                    clear_suspend_status.eq(port_status_w.poci),
+                    set_port_reset.eq(port_status_w.prs),
+                    set_port_power.eq(port_status_w.pps),
+                    clear_port_power.eq(port_status_w.lsda),
                 ]
 
+            pps = Signal()
+            with m.If(hcrhdescriptora_r.nps):
+                m.d.sync += pps.eq(1)
+            with m.Else():
+                with m.If(hcrhdescriptora_r.psm & hcrhdescriptorb_r.ppcm[i]):
+                    with m.If(set_port_power):
+                        m.d.sync += pps.eq(1)
+                    with m.Elif(clear_port_power):
+                        m.d.sync += pps.eq(0)
+                with m.Else():
+                    with m.If(self._hcrhstatus.w_stb):
+                        with m.If(hcrhstatus_w.lpsc):
+                            m.d.sync += pps.eq(1)
+                        with m.Elif(hcrhstatus_w.lps):
+                            m.d.sync += pps.eq(0)
+            m.d.comb += port.power.eq(pps)
+
+            connected = Signal(name=f'connected{i}')
+            ccs = Signal()
+            ccs_last = Signal()
+            m.d.sync += ccs_last.eq(ccs)
+            with m.If(port.disconnect):
+                m.d.sync += connected.eq(0)
+            with m.Elif(port.connect_):
+                m.d.sync += connected.eq(1)
+            m.d.comb += [
+                ccs.eq((connected | hcrhdescriptorb_r.dr[i])
+                       & pps),
+                port_status_r.ccs.eq(ccs),
+            ]
+
+            with m.If(set_port_reset & ccs):
+                m.d.sync += port_status_r.prs.eq(1)
             m.d.comb += port.reset.valid.eq(port_status_r.prs)
             with m.If(port.reset.valid & port.reset.ready):
                 m.d.sync += port_status_r.prs.eq(0)
+
+            def create_status_change(name, set_, clear=False):
+                with m.If(set_):
+                    m.d.sync += [
+                        irq_status.rhsc.eq(1),
+                        getattr(port_status_r, name).eq(1),
+                    ]
+
+                with m.If(clear | (port_status.w_stb
+                                   & getattr(port_status_w, name))):
+                    m.d.sync += getattr(port_status_r, name).eq(0)
+
+            create_status_change(
+                'csc', (ccs ^ ccs_last) |
+                ((set_port_enable | set_port_suspend | set_port_reset) & ~ccs))
 
         return m

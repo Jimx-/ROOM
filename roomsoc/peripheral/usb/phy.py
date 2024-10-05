@@ -1,5 +1,6 @@
 from amaranth import *
 from amaranth.hdl.rec import Direction
+import math
 
 from room.utils import Decoupled, Valid
 
@@ -26,6 +27,8 @@ class UsbCtrlPort(Record):
     def __init__(self, name=None, src_loc_at=0):
         super().__init__([
             ('power', 1, Direction.FANOUT),
+            ('connect_', 1, Direction.FANIN),
+            ('disconnect', 1, Direction.FANIN),
             ('reset', [
                 ('valid', 1, Direction.FANOUT),
                 ('ready', 1, Direction.FANIN),
@@ -473,9 +476,17 @@ class UsbPhyRx(Elaboratable):
 
 class UsbLsFsPhyPort(Elaboratable):
 
-    def __init__(self, clk_freq, fs_divisor):
+    def __init__(self,
+                 clk_freq,
+                 fs_divisor,
+                 t_DISCONNECT=2000.0,
+                 t_CONNECT=2500.0,
+                 t_RESET=2500.0):
         self.clk_freq = clk_freq
         self.fs_divisor = fs_divisor
+        self.t_DISCONNECT = t_DISCONNECT
+        self.t_CONNECT = t_CONNECT
+        self.t_RESET = t_RESET
 
         self.rx_active = Signal()
         self.rx_data = Valid(UsbRxData)
@@ -520,6 +531,8 @@ class UsbLsFsPhyPort(Elaboratable):
             dm_o.eq(~tx_se0 & ~tx_data),
         ]
 
+        low_speed_port = Signal()
+
         filter = m.submodules.filter = UsbRxFilter(clk_freq=self.clk_freq)
         m.d.comb += [
             filter.dp_i.eq(dp_i),
@@ -537,7 +550,62 @@ class UsbLsFsPhyPort(Elaboratable):
             self.rx_data.eq(rx.rx_data),
         ]
 
+        tck = 1.0 / self.clk_freq * 1e9
+
+        disconnect_cycles = math.ceil(self.t_DISCONNECT / tck)
+        connect_cycles = math.ceil(self.t_CONNECT / tck)
+        reset_cycles = math.ceil(self.t_RESET / tck)
+
+        wait_counter = Signal(
+            range(max(
+                disconnect_cycles,
+                connect_cycles,
+                reset_cycles,
+            )))
+
         with m.FSM():
+            with m.State('POWER_OFF'):
+                m.d.comb += [
+                    tx_enable.eq(1),
+                    tx_se0.eq(1),
+                ]
+
+                with m.If(self.ctrl.power):
+                    m.d.sync += wait_counter.eq(0)
+                    m.next = 'DISCONNECTED'
+
+            with m.State('DISCONNECTED'):
+                m.d.sync += wait_counter.eq(wait_counter + 1)
+                with m.If(~filter.dp & ~filter.dm):
+                    m.d.sync += wait_counter.eq(0)
+
+                with m.If(wait_counter == connect_cycles - 1):
+                    m.d.comb += self.ctrl.connect_.eq(1)
+                    m.next = 'DISABLED'
+
+            with m.State('DISABLED'):
+                with m.If(self.ctrl.reset.valid):
+                    with m.If(filter.dp ^ filter.dm):
+                        m.d.sync += [
+                            low_speed_port.eq(~filter.dp),
+                            wait_counter.eq(0),
+                        ]
+                        m.next = 'RESET'
+
+            with m.State('RESET'):
+                m.d.comb += [
+                    tx_enable.eq(1),
+                    tx_se0.eq(1),
+                ]
+
+                with m.If(wait_counter == reset_cycles - 1):
+                    with m.If(~self.tx.valid):
+                        m.d.comb += self.ctrl.reset.ready.eq(1)
+                        m.next = 'ENABLED'
+
+                with m.Else():
+                    m.d.sync += wait_counter.eq(wait_counter + 1)
+
             with m.State('ENABLED'):
                 m.d.comb += [
                     tx_enable.eq(self.tx.valid),

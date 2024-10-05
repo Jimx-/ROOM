@@ -244,8 +244,10 @@ class UsbDataRx(Elaboratable):
                         self.pid_error.eq(
                             self.rx_data.bits[:4] != self.rx_data.bits[4:]),
                     ]
-
                     m.next = 'DATA'
+
+                with m.Elif(~self.rx_active):
+                    m.next = 'IDLE'
 
             with m.State('DATA'):
                 with m.If(~self.rx_active):
