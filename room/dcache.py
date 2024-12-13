@@ -159,8 +159,10 @@ class DCacheReq(HasCoreParams):
         self.addr = Signal(self.vaddr_bits, name=f'{name}_addr')
         self.data = Signal(self.xlen, name=f'{name}_data')
 
+        self.from_core = Signal(name=f'{name}_from_core')
+
     def eq(self, rhs):
-        attrs = ['uop', 'addr', 'data']
+        attrs = ['uop', 'addr', 'data', 'from_core']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
@@ -176,8 +178,10 @@ class DCacheResp(HasCoreParams):
 
         self.data = Signal(self.xlen, name=f'{name}_data')
 
+        self.from_core = Signal(name=f'{name}_from_core')
+
     def eq(self, rhs):
-        attrs = ['uop', 'data']
+        attrs = ['uop', 'data', 'from_core']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
@@ -1385,6 +1389,7 @@ class MSHR(HasDCacheParams, Elaboratable):
                     self.resp.bits.uop.eq(rpq.r_data.uop),
                     self.resp.bits.uop.br_mask.eq(rpq.r_br_mask),
                     self.resp.bits.data.eq(load_gen.data_out),
+                    self.resp.bits.from_core.eq(rpq.r_data.from_core),
                 ]
 
                 with m.If(rpq.r_en & rpq.r_rdy):
@@ -2176,6 +2181,7 @@ class DCache(HasDCacheParams, Elaboratable):
             mshr_replay_req[0].uop.eq(mshrs.replay.bits.uop),
             mshr_replay_req[0].addr.eq(mshrs.replay.bits.addr),
             mshr_replay_req[0].data.eq(mshrs.replay.bits.data),
+            mshr_replay_req[0].from_core.eq(mshrs.replay.bits.from_core),
             mshrs.replay.ready.eq(meta_read_arb.inp[0].ready
                                   & data_read_arb.inp[0].ready),
             meta_read_arb.inp[0].valid.eq(mshrs.replay.valid),
@@ -2582,6 +2588,7 @@ class DCache(HasDCacheParams, Elaboratable):
                     self.br_update.get_new_br_mask(s2_req[w].uop.br_mask)),
                 mshrs.req[w].bits.addr.eq(s2_req[w].addr),
                 mshrs.req[w].bits.data.eq(s2_req[w].data),
+                mshrs.req[w].bits.from_core.eq(s2_req[w].from_core),
                 mshrs.req[w].bits.tag_match.eq(s2_tag_match[w]),
                 mshrs.req[w].bits.way_en.eq(
                     Mux(s2_tag_match[w], s2_tag_match_way[w],
@@ -2696,6 +2703,7 @@ class DCache(HasDCacheParams, Elaboratable):
                 cache_resp[w].bits.data.eq(
                     Mux((w == 0) & s2_do_sc, 0, load_gen.data_out)
                     | s2_sc_fail),
+                cache_resp[w].bits.from_core.eq(s2_req[w].from_core),
             ]
 
         resp = [

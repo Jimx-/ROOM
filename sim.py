@@ -14,8 +14,6 @@ from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 import argparse
 import struct
 
-from room.dcache import MSHRReq
-
 
 def read_mem_image(filename, word_len=32):
     image = []
