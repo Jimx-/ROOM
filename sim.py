@@ -36,6 +36,7 @@ def read_mem_image(filename, word_len=32):
 core_params = dict(
     xlen=64,
     vaddr_bits=32,
+    paddr_bits=36,
     fetch_width=4,
     fetch_buffer_size=16,
     core_width=4,
@@ -77,6 +78,10 @@ core_params = dict(
     flen=64,
     fma_latency=4,
     io_regions={0xC0000000: 0x40000000},
+    use_vm=True,
+    use_user=True,
+    use_supervisor=True,
+    pg_levels=3,
 )
 
 l2cache_params = dict(
@@ -208,6 +213,8 @@ class Top(Elaboratable):
             soc.bus.add_master(name='l2c_dbus', master=l2cache.out_bus)
             soc.bus.add_master(name='cpu_mmio_bus', master=mmio_bus)
             soc.add_peripheral('l2cache', l2cache)
+        elif core.core_bus is not None:
+            soc.bus.add_master(name='cpu_bus', master=core.core_bus)
         else:
             soc.bus.add_master(name='cpu_ibus', master=core.ibus)
             soc.bus.add_master(name='cpu_dbus', master=core.dbus)

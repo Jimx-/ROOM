@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth.utils import log2_int
 
 from room.consts import *
 
@@ -13,8 +14,8 @@ class HasCoreParams:
         self.core_id = params.get('core_id', 0)
 
         self.xlen = params['xlen']
-        self.flen = self.params['flen']
-        self.use_fpu = self.params['use_fpu']
+        self.flen = params['flen']
+        self.use_fpu = params['use_fpu']
 
         self.vaddr_bits = params['vaddr_bits']
         self.vaddr_bits_extended = self.vaddr_bits + (self.vaddr_bits
@@ -36,6 +37,12 @@ class HasCoreParams:
 
         if not self.is_groom:
             self.core_width = params['core_width']
+
+            self.use_vm = params['use_vm']
+            self.use_user = params['use_user']
+            self.use_supervisor = params['use_supervisor']
+
+            self.paddr_bits = params['paddr_bits']
 
             #
             # Instruction fetch
@@ -82,6 +89,18 @@ class HasCoreParams:
 
             self.ldq_size = params['ldq_size']
             self.stq_size = params['stq_size']
+
+            #
+            # Virtual memory
+            #
+
+            self.pg_offset_bits = params.get('pg_offset_bits', 12)
+            self.pg_level_bits = 10 - log2_int(self.xlen // 32)
+            self.pg_levels = params['pg_levels']
+
+            self.sv_addr_bits = self.pg_offset_bits + self.pg_level_bits * self.pg_levels
+            self.vpn_bits = self.vaddr_bits - self.pg_offset_bits
+            self.ppn_bits = self.paddr_bits - self.pg_offset_bits
 
         #
         # GROOM

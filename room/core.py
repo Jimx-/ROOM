@@ -19,6 +19,7 @@ from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts
 from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
+from room.mmu import PageTableWalker
 from room.utils import Arbiter
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -1019,6 +1020,19 @@ class Core(HasCoreParams, Elaboratable):
             exc_unit.exception.eq(rob.commit_exc.valid),
             exc_unit.cause.eq(rob.commit_exc.cause),
         ]
+
+        #
+        # Virtual memory
+        #
+
+        if self.use_vm:
+            ptw = m.submodules.ptw = PageTableWalker(self.params)
+            csr.add_csrs(ptw.iter_csrs())
+            m.d.comb += [
+                ptw.mem_req.connect(lsu.core_req),
+                ptw.mem_nack.eq(lsu.core_nack),
+                ptw.mem_resp.eq(lsu.core_resp),
+            ]
 
         #
         # I-D bus

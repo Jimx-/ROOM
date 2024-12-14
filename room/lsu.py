@@ -1,6 +1,5 @@
 from amaranth import *
 from amaranth import tracer
-from amaranth.utils import log2_int
 from amaranth.hdl.rec import Direction
 
 from room.consts import *
@@ -169,6 +168,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 ('cmd', MemoryCommand, Direction.FANOUT),
                 ('size', 2, Direction.FANOUT),
                 ('signed', 1, Direction.FANOUT),
+                ('phys', 1, Direction.FANOUT),
             ],
                             name=name,
                             src_loc_at=1 + src_loc_at)
