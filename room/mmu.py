@@ -21,6 +21,14 @@ def xatp_layout(xlen):
     ]
 
 
+class PTBR(CSRRecord):
+
+    def __init__(self, xlen, name=None, src_loc_at=0):
+        super().__init__(xatp_layout(xlen),
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class PTE(Record):
 
     _layout = [
@@ -215,6 +223,8 @@ class PageTableWalker(HasCoreParams, Elaboratable, AutoCSR):
                         with m.If(count == (self.pg_levels - 1)):
                             m.d.sync += self.resp.valid.eq(1)
                             m.next = 'IDLE'
+                        with m.Else():
+                            m.next = 'SUPERPAGE'
 
                         m.d.sync += [
                             resp_ae_ptw.eq(ae
@@ -223,6 +233,21 @@ class PageTableWalker(HasCoreParams, Elaboratable, AutoCSR):
                             resp_ae_leaf.eq(ae & pte.leaf()),
                             resp_pf.eq(pf),
                         ]
+
+            with m.State('SUPERPAGE'):
+                m.d.sync += self.resp.valid.eq(1)
+
+                # with m.Switch(count):
+                #     for i in range(1, self.pg_levels):
+                #         with m.Case(i):
+                #             ppn_lsb = Signal(i * self.pg_level_bits)
+                #             m.d.comb += ppn_lsb.eq(
+                #                 r_req.vpn[:i * self.pg_level_bits])
+                #             m.d.sync += r_pte.ppn.eq(
+                #                 Cat(ppn_lsb, r_pte.ppn >>
+                #                     (i * self.pg_level_bits)))
+
+                m.next = 'IDLE'
 
         with m.If(mem_resp_valid):
             m.d.sync += r_pte.eq(pte)

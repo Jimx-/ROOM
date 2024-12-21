@@ -307,3 +307,10 @@ class RoundingMode(IntEnum):
     RDN = 2
     RUP = 3
     RMM = 4
+
+
+class PrivilegeMode(IntEnum):
+    U = 0
+    S = 1
+    H = 2
+    M = 3

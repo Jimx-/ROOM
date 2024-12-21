@@ -8,7 +8,7 @@ from amaranth.utils import bits_for, log2_int
 from room.consts import *
 from room.types import HasCoreParams
 
-__all__ = ["CSRAccess", "CSR", "AutoCSR", "CSRFile"]
+__all__ = ["CSRAccess", "CSR", "AutoCSR", "CSRRecord", "CSRFile"]
 
 
 class CSRAccess(Enum):
@@ -52,6 +52,18 @@ class AutoCSR:
                 yield v
             elif hasattr(v, "iter_csrs"):
                 yield from v.iter_csrs()
+
+
+class CSRRecord(Record):
+
+    def __init__(self, csr_layout, name=None, src_loc_at=0):
+        fields = []
+        for fname, shape, _ in csr_layout:
+            if isinstance(shape, int):
+                shape = unsigned(shape)
+            fields.append((fname, shape))
+
+        super().__init__(fields, name=name, src_loc_at=1 + src_loc_at)
 
 
 def misa_layout(xlen):

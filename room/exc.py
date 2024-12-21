@@ -143,6 +143,14 @@ dcsr_layout = [
 ]
 
 
+class MStatus(CSRRecord):
+
+    def __init__(self, xlen, name=None, src_loc_at=0):
+        super().__init__(mstatus_layout(xlen),
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
     def __init__(self, params):

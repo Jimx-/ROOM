@@ -226,6 +226,8 @@ class Arbiter(Elaboratable):
 
         self.out = Decoupled(cls, *args, **kwargs)
 
+        self.chosen = Signal(range(n))
+
     def elaborate(self, platform):
         m = Module()
 
@@ -236,6 +238,7 @@ class Arbiter(Elaboratable):
                 m.d.comb += [
                     self.out.valid.eq(1),
                     self.out.bits.eq(self.inp[i].bits),
+                    self.chosen.eq(i),
                 ]
 
         ready = 1
