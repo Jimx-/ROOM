@@ -773,6 +773,16 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                 uop.exception.eq(1),
                 uop.exc_cause.eq(Cause.BREAKPOINT),
             ]
+        with m.Elif(inuop.exc_pf_if):
+            m.d.comb += [
+                uop.exception.eq(1),
+                uop.exc_cause.eq(Cause.FETCH_PAGE_FAULT),
+            ]
+        with m.Elif(inuop.exc_ae_if):
+            m.d.comb += [
+                uop.exception.eq(1),
+                uop.exc_cause.eq(Cause.FETCH_ACCESS_FAULT),
+            ]
         with m.Elif(insn_illegal):
             m.d.comb += [
                 uop.exception.eq(1),

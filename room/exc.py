@@ -152,6 +152,22 @@ class MStatus(CSRRecord):
                          src_loc_at=1 + src_loc_at)
 
 
+class MCause(CSRRecord):
+
+    def __init__(self, xlen, name=None, src_loc_at=0):
+        super().__init__(mcause_layout(xlen),
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
+class MTVec(CSRRecord):
+
+    def __init__(self, xlen, name=None, src_loc_at=0):
+        super().__init__(mtvec_layout(xlen),
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
     def __init__(self, params):
@@ -183,6 +199,14 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.mepc = CSR(csrnames.mepc, [('value', self.xlen, CSRAccess.RW)])
         self.mtvec = CSR(csrnames.mtvec, mtvec_layout(self.xlen))
         self.mtval = CSR(csrnames.mtval, [('value', self.xlen, CSRAccess.RW)])
+        self.mideleg = CSR(csrnames.mideleg,
+                           [('value', self.xlen, CSRAccess.RW)])
+        self.medeleg = CSR(csrnames.medeleg,
+                           [('value', self.xlen, CSRAccess.RW)])
+
+        self.scause = CSR(csrnames.scause, mcause_layout(self.xlen))
+        self.sepc = CSR(csrnames.sepc, [('value', self.xlen, CSRAccess.RW)])
+        self.stvec = CSR(csrnames.stvec, mtvec_layout(self.xlen))
 
         self.dcsr = CSR(csrnames.dcsr, dcsr_layout)
         self.dpc = CSR(csrnames.dpc, [('value', self.xlen, CSRAccess.RW)])
@@ -251,7 +275,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                 with m.Case(0x7b2):  # DRET
                     m.d.comb += insn_dret.eq(1)
 
-        cause = Record([l[:2] for l in mcause_layout(self.xlen)])
+        cause = MCause(self.xlen)
         m.d.comb += cause.eq(self.cause)
 
         single_stepped = Signal()
@@ -278,7 +302,35 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                     self.mcause.w.ecode[:log2_int(self.xlen)]),
             ]
 
-        tvec_csr = self.mtvec.r
+        delegatable_exceptions = sum([
+            1 << e for e in (
+                Cause.FETCH_MISALIGNED,
+                Cause.FETCH_PAGE_FAULT,
+                Cause.BREAKPOINT,
+                Cause.LOAD_PAGE_FAULT,
+                Cause.STORE_PAGE_FAULT,
+                Cause.LOAD_MISALIGNED,
+                Cause.STORE_MISALIGNED,
+                Cause.ILLEGAL_INSTRUCTION,
+                Cause.ECALL_FROM_U,
+            )
+        ])
+
+        with m.If(self.medeleg.we):
+            m.d.sync += self.medeleg.r.eq(self.medeleg.w
+                                          & delegatable_exceptions)
+
+        delegate = Signal()
+        with m.Switch(cause.ecode):
+            for i in range(self.xlen):
+                with m.Case(i):
+                    m.d.comb += delegate.eq(self.use_supervisor
+                                            & (self.prv <= PrivilegeMode.S)
+                                            & Mux(cause.interrupt, self.mideleg
+                                                  .r, self.medeleg.r)[i])
+
+        tvec_csr = MTVec(self.xlen)
+        m.d.comb += tvec_csr.eq(Mux(delegate, self.stvec.r, self.mtvec.r))
         int_vector = Cat(0b00, cause.ecode, tvec_csr.base >>
                          (log2_int(self.xlen) + 2))
         vector_mode = tvec_csr.mode[0] & cause.interrupt
@@ -307,11 +359,20 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                         self.dpc.r.eq(self.epc),
                     ]
 
+            with m.Elif(delegate):
+                m.d.sync += [
+                    self.sepc.r.eq(self.epc),
+                    self.scause.r.eq(self.cause),
+                    self.mstatus.r.spie.eq(self.mstatus.r.sie),
+                    self.mstatus.r.spp.eq(self.prv),
+                    self.mstatus.r.sie.eq(0),
+                ]
             with m.Else():
                 m.d.sync += [
                     self.mepc.r.eq(self.epc),
                     self.mcause.r.eq(self.cause),
                     self.mstatus.r.mpie.eq(self.mstatus.r.mie),
+                    self.mstatus.r.mpp.eq(self.prv),
                     self.mstatus.r.mie.eq(0),
                 ]
 
@@ -324,7 +385,56 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                 m.d.sync += [
                     self.mstatus.r.mie.eq(self.mstatus.r.mpie),
                     self.mstatus.r.mpie.eq(1),
+                    self.mstatus.r.mpp.eq(PrivilegeMode.U),
+                    self.prv.eq(self.mstatus.r.mpp),
                 ]
                 m.d.comb += self.exc_vector.eq(self.mepc.r)
+
+        with m.If(self.mstatus.we):
+            m.d.sync += [
+                self.mstatus.r.mie.eq(self.mstatus.w.mie),
+                self.mstatus.r.mpie.eq(self.mstatus.w.mpie),
+            ]
+
+            if self.use_user:
+                m.d.sync += [
+                    self.mstatus.r.mprv.eq(self.mstatus.w.mprv),
+                    self.mstatus.r.mpp.eq(self.mstatus.w.mpp),
+                ]
+
+                if self.use_supervisor:
+                    m.d.sync += [
+                        self.mstatus.r.spp.eq(self.mstatus.w.spp),
+                        self.mstatus.r.spie.eq(self.mstatus.w.spie),
+                        self.mstatus.r.sie.eq(self.mstatus.w.sie),
+                        self.mstatus.r.tw.eq(self.mstatus.w.tw),
+                        self.mstatus.r.tsr.eq(self.mstatus.w.tsr),
+                    ]
+
+                if self.use_vm:
+                    m.d.sync += [
+                        self.mstatus.r.mxr.eq(self.mstatus.w.mxr),
+                        self.mstatus.r.sum.eq(self.mstatus.w.sum),
+                        self.mstatus.r.tvm.eq(self.mstatus.w.tvm),
+                    ]
+
+                if self.use_supervisor and self.use_fpu:
+                    m.d.sync += self.mstatus.r.fs.eq(self.mstatus.w.fs)
+
+        with m.If(self.stvec.we):
+            m.d.sync += [
+                self.stvec.r.mode.eq(self.stvec.w.mode & 1),
+                self.stvec.r.base.eq(self.stvec.w.base),
+            ]
+
+        with m.If(self.sepc.we):
+            m.d.sync += self.sepc.r.eq(self.sepc.w)
+
+        with m.If(self.scause.we):
+            m.d.sync += [
+                self.scause.r.interrupt.eq(self.scause.w.interrupt),
+                self.scause.r.ecode.eq(
+                    self.scause.w.ecode[:log2_int(self.xlen)]),
+            ]
 
         return m

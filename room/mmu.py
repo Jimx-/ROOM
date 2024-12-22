@@ -123,6 +123,12 @@ class PageTableWalker(HasCoreParams, Elaboratable, AutoCSR):
 
         min_pg_levels = 2 if self.xlen == 32 else 3
 
+        with m.If(self.satp.we):
+            m.d.sync += [
+                self.satp.r.mode.eq(self.satp.w.mode),
+                self.satp.r.ppn.eq(self.satp.w.ppn[:self.ppn_bits]),
+            ]
+
         r_req = PageTableWalker.Request(self.params)
         r_pte = PTE()
         count = Signal(range(self.pg_levels))

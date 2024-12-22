@@ -414,8 +414,12 @@ class TLB(HasCoreParams, Elaboratable):
         # Refill
         #
 
+        refill_done_d1 = Signal()
+        m.d.sync += refill_done_d1.eq(refill_done)
+
         for w in range(self.req_width):
-            with m.If(s1_valid[w] & s1_tlb_miss[w] & ~refill_valid):
+            with m.If(s1_valid[w] & s1_tlb_miss[w] & ~refill_valid
+                      & ~refill_done_d1):
                 m.d.comb += [
                     self.ptw_req.valid.eq(1),
                     self.ptw_req.bits.vpn.eq(s1_vpn[w]),

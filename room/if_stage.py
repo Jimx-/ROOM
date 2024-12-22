@@ -55,6 +55,9 @@ class FetchBundle(HasCoreParams):
 
         self.ftq_idx = Signal(range(self.ftq_size), name=f'{name}_ftq_size')
 
+        self.exc_pf_if = Signal(name=f'{name}_exc_pf_if')
+        self.exc_ae_if = Signal(name=f'{name}_exc_ae_if')
+
         self.bp_exc_if = Signal(self.fetch_width, name=f'{name}_bp_exc_if')
         self.bp_debug_if = Signal(self.fetch_width, name=f'{name}_bp_debug_if')
 
@@ -67,6 +70,8 @@ class FetchBundle(HasCoreParams):
             self.cfi_idx.eq(rhs.cfi_idx),
             self.cfi_type.eq(rhs.cfi_type),
             self.ftq_idx.eq(rhs.ftq_idx),
+            self.exc_pf_if.eq(rhs.exc_pf_if),
+            self.exc_ae_if.eq(rhs.exc_ae_if),
             self.bp_exc_if.eq(rhs.bp_exc_if),
             self.bp_debug_if.eq(rhs.bp_debug_if),
         ]
@@ -134,6 +139,8 @@ class FetchBuffer(HasCoreParams, Elaboratable):
                 in_uops[w].is_rvc.eq(in_uops[w].inst[0:2] != 3),
                 in_uops[w].taken.eq((self.w_data.cfi_idx == w)
                                     & self.w_data.cfi_valid),
+                in_uops[w].exc_ae_if.eq(self.w_data.exc_ae_if),
+                in_uops[w].exc_pf_if.eq(self.w_data.exc_pf_if),
                 in_uops[w].bp_exc_if.eq(self.w_data.bp_exc_if[w]),
                 in_uops[w].bp_debug_if.eq(self.w_data.bp_debug_if[w]),
             ]
@@ -555,17 +562,19 @@ class IFStage(HasCoreParams, Elaboratable):
 
         f3_clear = Signal()
 
-        f3_pipe_reg = Signal(self.fetch_bytes * 8 + 32)
+        f3_pipe_reg = Signal(self.fetch_bytes * 8 + 2 + len(s2_vpc))
         f3_empty = Signal(reset=1)
 
         f4_ready = Signal()
 
         if self.enable_icache:
-            f3_w_en = s2_valid & ~f2_clear & icache.resp.valid
-            f3_w_data = Cat(s2_vpc, icache.resp.bits.data)
+            f3_w_en = s2_valid & ~f2_clear & (icache.resp.valid | (
+                (s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst) & ~s2_tlb_miss))
+            f3_w_data = Cat(icache.resp.bits.data, s2_tlb_resp.ae.inst,
+                            s2_tlb_resp.pf.inst, s2_vpc)
         else:
             f3_w_en = s2_valid & ~f2_clear & self.ibus.ack
-            f3_w_data = Cat(s2_vpc, self.ibus.dat_r)
+            f3_w_data = Cat(self.ibus.dat_r, Const(0, 2), s2_vpc)
 
         m.d.comb += f3_ready.eq(f3_empty)
 
@@ -585,10 +594,11 @@ class IFStage(HasCoreParams, Elaboratable):
         s3_valid = Signal()
         s3_pc = Signal(32)
         s3_data = Signal(self.fetch_bytes * 8)
+        s3_exc_ae = Signal()
+        s3_exc_pf = Signal()
         m.d.comb += [
             s3_valid.eq(~f3_empty),
-            s3_pc.eq(f3_pipe_reg[:32]),
-            s3_data.eq(f3_pipe_reg[32:]),
+            Cat(s3_data, s3_exc_ae, s3_exc_pf, s3_pc).eq(f3_pipe_reg),
         ]
 
         f3_prev_half = Signal(16)
@@ -618,6 +628,8 @@ class IFStage(HasCoreParams, Elaboratable):
         m.d.comb += [
             f3_fetch_bundle.mask.eq(f3_mask),
             f3_fetch_bundle.pc.eq(f3_aligned_pc),
+            f3_fetch_bundle.exc_ae_if.eq(s3_exc_ae),
+            f3_fetch_bundle.exc_pf_if.eq(s3_exc_pf),
         ]
 
         redirects_found = 0
@@ -772,7 +784,8 @@ class IFStage(HasCoreParams, Elaboratable):
                 m.d.comb += [
                     f1_clear.eq(s1_valid),
                     f2_clear.eq(s2_valid),
-                    s0_valid.eq(1),
+                    s0_valid.eq(~(f3_fetch_bundle.exc_ae_if
+                                  | f3_fetch_bundle.exc_pf_if)),
                     s0_vpc.eq(f3_predicted_target),
                 ]
 

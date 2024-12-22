@@ -109,7 +109,10 @@ class Instruction:
         if opcode == OPV('ADDI'):
             opstr = ''
 
-            for name in ['addi', 'slti', 'sltiu', 'xori', 'ori', 'andi']:
+            for name in [
+                    'addi', 'slti', 'sltiu', 'xori', 'ori', 'andi', 'slli',
+                    'srli'
+            ]:
                 if funct3 == F3(name.upper()):
                     opstr = name
 
@@ -137,7 +140,10 @@ class Instruction:
         elif opcode == OPV('ADD'):
             opstr = ''
 
-            for name in ['add', 'slt', 'sltu', 'xor', 'or', 'and']:
+            for name in [
+                    'add', 'slt', 'sltu', 'xor', 'or', 'and', 'sll', 'srl',
+                    'sra'
+            ]:
                 if funct3 == F3(name.upper()):
                     opstr = name
 

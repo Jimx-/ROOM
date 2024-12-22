@@ -159,7 +159,7 @@ class CSRFile(HasCoreParams, Elaboratable):
                             p.r_data.eq(csr.r),
                         ]
 
-                        m.d.comb += csr.we.eq(p.cmd[2])
+                        m.d.comb += csr.we.eq(p.cmd[2] & p.cmd[:2].any())
                         for i in range(min(self.width, len(csr.w))):
                             rw = (1 << i) & csr.mask
                             m.d.comb += csr.w[i].eq(

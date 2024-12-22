@@ -187,6 +187,8 @@ class MicroOp(HasCoreParams, Record):
             ('is_ecall', 1),
             ('clear_pipeline', 1),
             ('flush_on_commit', 1),
+            ('exc_ae_if', 1),
+            ('exc_pf_if', 1),
             ('bp_debug_if', 1),
             ('bp_exc_if', 1),
             ('exception', 1),
