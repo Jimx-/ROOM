@@ -1,29 +1,21 @@
 from amaranth import *
 from amaranth import tracer
 from amaranth.lib.coding import PriorityEncoder
+from amaranth.utils import log2_int
 
 from room.consts import *
 from room.rvc import RVCDecoder
 from room.id_stage import BranchDecoder
 from room.types import HasCoreParams, MicroOp
+from room.fu import GetPCResp
 from room.breakpoint import Breakpoint, BreakpointMatcher
+from room.exc import MStatus
 from room.icache import ICache
 from room.utils import wrap_incr
+from room.mmu import PTBR, PageTableWalker
+from room.tlb import TLB, TLBResp
 
-from roomsoc.interconnect.stream import Valid
-
-
-class GetPCResp(Record):
-
-    def __init__(self, name=None, src_loc_at=0):
-        super().__init__([
-            ('pc', 32),
-            ('commit_pc', 32),
-            ('next_pc', 32),
-            ('next_valid', 1),
-        ],
-                         name=name,
-                         src_loc_at=src_loc_at + 1)
+from roomsoc.interconnect.stream import Decoupled, Valid
 
 
 class IFDebug(Record):
@@ -360,6 +352,13 @@ class IFStage(HasCoreParams, Elaboratable):
             for i in range(self.num_breakpoints)
         ]
 
+        self.prv = Signal(PrivilegeMode)
+        self.status = MStatus(self.xlen)
+        self.ptbr = PTBR(self.xlen)
+
+        self.ptw_req = Decoupled(PageTableWalker.Request, params)
+        self.ptw_resp = Valid(PageTableWalker.Response, params)
+
         if self.sim_debug:
             self.if_debug = [
                 Valid(IFDebug, name=f'if_debug{i}')
@@ -384,12 +383,30 @@ class IFStage(HasCoreParams, Elaboratable):
             icache = m.submodules.icache = ICache(self.ibus, self.params)
             m.d.comb += icache.invalidate.eq(self.flush_icache)
 
+            icache_params = self.params['icache_params']
+            n_tlb_sets = icache_params['n_tlb_sets']
+            n_tlb_ways = icache_params['n_tlb_ways']
+            tlb = m.submodules.tlb = TLB(req_width=1,
+                                         params=self.params,
+                                         log_max_size=log2_int(
+                                             self.fetch_bytes),
+                                         n_sets=n_tlb_sets,
+                                         n_ways=n_tlb_ways,
+                                         n_banks=1)
+            m.d.comb += [
+                tlb.ptw_req.connect(self.ptw_req),
+                tlb.ptw_resp.eq(self.ptw_resp),
+            ]
+
         #
         # F0 - Next PC select
         #
 
         s0_vpc = Signal(32)
         s0_valid = Signal()
+        s0_is_replay = Signal()
+        s0_replay_ppc = Signal(self.paddr_bits)
+        s0_replay_resp = TLBResp(log2_int(self.fetch_bytes), self.params)
 
         reset = Signal(reset=1)
         reset_d1 = Signal(reset_less=True)
@@ -408,6 +425,12 @@ class IFStage(HasCoreParams, Elaboratable):
             m.d.comb += [
                 icache.req.bits.addr.eq(s0_vpc),
                 icache.req.valid.eq(s0_valid),
+                tlb.prv.eq(self.prv),
+                tlb.status.eq(self.status),
+                tlb.ptbr.eq(self.ptbr),
+                tlb.req[0].bits.vaddr.eq(s0_vpc),
+                tlb.req[0].bits.size.eq(log2_int(self.fetch_bytes)),
+                tlb.req[0].valid.eq(s0_valid),
             ]
 
         #
@@ -416,27 +439,40 @@ class IFStage(HasCoreParams, Elaboratable):
 
         s1_vpc = Signal.like(s0_vpc)
         s1_valid = Signal()
+        s1_is_replay = Signal()
+        s1_replay_ppc = Signal.like(s0_replay_ppc)
+        s1_replay_resp = TLBResp(log2_int(self.fetch_bytes), self.params)
+        s1_tlb_resp = TLBResp(log2_int(self.fetch_bytes), self.params)
         f1_clear = Signal()
 
         m.d.sync += [
             s1_vpc.eq(s0_vpc),
             s1_valid.eq(s0_valid),
+            s1_is_replay.eq(s0_is_replay),
+            s1_replay_ppc.eq(s0_replay_ppc),
+            s1_replay_resp.eq(s0_replay_resp),
         ]
 
-        s1_ppc = s1_vpc
+        s1_ppc = Signal(self.paddr_bits)
 
         if self.enable_icache:
+            s1_tlb_miss = ~s1_is_replay & tlb.resp[0].bits.miss
+
             m.d.comb += [
+                s1_ppc.eq(
+                    Mux(s1_is_replay, s1_replay_ppc, tlb.resp[0].bits.paddr)),
+                s1_tlb_resp.eq(
+                    Mux(s1_is_replay, s1_replay_resp, tlb.resp[0].bits)),
                 icache.s1_paddr.eq(s1_ppc),
-                icache.s1_kill.eq(f1_clear),
+                icache.s1_kill.eq(tlb.resp[0].bits.miss | f1_clear),
             ]
 
             f1_predicted_target = Signal(32)
             m.d.comb += f1_predicted_target.eq(next_fetch(s1_vpc))
 
-            with m.If(s1_valid):
+            with m.If(s1_valid & ~s1_tlb_miss):
                 m.d.comb += [
-                    s0_valid.eq(1),
+                    s0_valid.eq(~(s1_tlb_resp.ae.inst | s1_tlb_resp.pf.inst)),
                     s0_vpc.eq(f1_predicted_target),
                 ]
 
@@ -447,14 +483,24 @@ class IFStage(HasCoreParams, Elaboratable):
         s2_vpc = Signal.like(s1_vpc)
         s2_valid = Signal()
         s2_ppc = Signal.like(s1_ppc)
+        s2_is_replay_reg = Signal()
+        s2_is_replay = s2_is_replay_reg & s2_valid
+        s2_tlb_resp = TLBResp(log2_int(self.fetch_bytes), self.params)
+        s2_tlb_miss = Signal()
+        s2_exception = s2_valid & (s2_tlb_resp.ae.inst
+                                   | s2_tlb_resp.pf.inst) & ~s2_is_replay
         f2_clear = Signal()
         f3_ready = Signal()
 
         if self.enable_icache:
+            m.d.comb += icache.s2_kill.eq(s2_exception)
             m.d.sync += [
                 s2_vpc.eq(s1_vpc),
                 s2_valid.eq(s1_valid & ~f1_clear),
                 s2_ppc.eq(s1_ppc),
+                s2_is_replay_reg.eq(s1_is_replay),
+                s2_tlb_resp.eq(s1_tlb_resp),
+                s2_tlb_miss.eq(s1_tlb_miss),
             ]
 
             f2_predicted_target = Signal(32)
@@ -463,8 +509,10 @@ class IFStage(HasCoreParams, Elaboratable):
             with m.If((s2_valid & ~icache.resp.valid)
                       | (s2_valid & icache.resp.valid & ~f3_ready)):
                 m.d.comb += [
-                    s0_valid.eq(1),
+                    s0_valid.eq(~(s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst)
+                                | s2_is_replay | s2_tlb_miss),
                     s0_vpc.eq(s2_vpc),
+                    s0_is_replay.eq(s2_valid & icache.resp.valid),
                     f1_clear.eq(1),
                 ]
 
@@ -473,9 +521,16 @@ class IFStage(HasCoreParams, Elaboratable):
                           | ~s1_valid):
                     m.d.comb += [
                         f1_clear.eq(1),
-                        s0_valid.eq(1),
+                        s0_valid.eq(~(
+                            (s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst)
+                            & ~s2_is_replay)),
                         s0_vpc.eq(f2_predicted_target),
                     ]
+
+            m.d.comb += [
+                s0_replay_resp.eq(s2_tlb_resp),
+                s0_replay_ppc.eq(s2_ppc),
+            ]
 
         else:
             ibus_addr = Mux(s1_valid & ~f1_clear, s1_vpc, s2_vpc)

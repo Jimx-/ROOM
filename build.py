@@ -69,6 +69,8 @@ core_params = dict(
         n_sets=64,
         n_ways=4,
         block_bytes=64,
+        n_tlb_sets=16,
+        n_tlb_ways=4,
     ),
     dcache_params=dict(
         n_sets=64,

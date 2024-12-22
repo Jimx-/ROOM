@@ -5,6 +5,7 @@ import riscvmodel.insn as insn
 import riscvmodel.csrnames as csrnames
 from enum import IntEnum
 
+from room.consts import PrivilegeMode
 from room.csr import *
 from room.types import HasCoreParams
 
@@ -172,6 +173,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.exception = Signal()
         self.cause = Signal(self.xlen)
         self.epc = Signal(32)
+        self.prv = Signal(PrivilegeMode, reset=PrivilegeMode.M)
 
         self.single_step = Signal()
 

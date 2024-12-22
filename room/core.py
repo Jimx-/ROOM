@@ -230,7 +230,11 @@ class Core(HasCoreParams, Elaboratable):
                                                    self.params,
                                                    sim_debug=self.sim_debug)
 
-        m.d.comb += if_stage.reset_vector.eq(self.reset_vector)
+        m.d.comb += [
+            if_stage.reset_vector.eq(self.reset_vector),
+            if_stage.prv.eq(exc_unit.prv),
+            if_stage.status.eq(exc_unit.mstatus.r),
+        ]
 
         for if_bp, bp in zip(if_stage.bp, bp_unit.bp):
             m.d.comb += if_bp.eq(bp)
@@ -1032,6 +1036,9 @@ class Core(HasCoreParams, Elaboratable):
                 ptw.mem_req.connect(lsu.core_req),
                 ptw.mem_nack.eq(lsu.core_nack),
                 ptw.mem_resp.eq(lsu.core_resp),
+                if_stage.ptbr.eq(ptw.satp.r),
+                if_stage.ptw_req.connect(ptw.req),
+                if_stage.ptw_resp.eq(ptw.resp),
             ]
 
         #
