@@ -1,0 +1,10 @@
+diff -rupN old/pyproject.toml new/pyproject.toml
+--- old/pyproject.toml	2024-12-23 23:19:19.286612247 +0800
++++ new/pyproject.toml	2024-12-23 23:18:29.123961316 +0800
+@@ -1,5 +1,5 @@
+ [build-system]
+-requires = ["wheel", "setuptools~=67.0", "setuptools_scm[toml]>=6.2"]
++requires = ["wheel", "setuptools~=67.0", "setuptools_scm[toml]>=6.2,<=7.1.0"]
+ build-backend = "setuptools.build_meta"
+ 
+ [project]
