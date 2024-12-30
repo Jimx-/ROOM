@@ -1,15 +1,17 @@
 from amaranth import *
 from amaranth import tracer
-from amaranth.hdl.rec import Direction
+from amaranth.utils import log2_int
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.fu import ExecResp
 from room.branch import BranchUpdate
 from room.rob import CommitReq, Exception
-from room.exc import Cause
+from room.exc import Cause, MStatus
 from room.utils import wrap_incr
 from room.dcache import LoadGen, StoreGen, DCache, SimpleDCache
+from room.mmu import PTBR, PageTableWalker, CoreMemRequest, CoreMemResponse
+from room.tlb import TLB
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -77,8 +79,9 @@ class LDQEntry(HasCoreParams):
         self.valid = Signal(name=f'{name}_valid')
         self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.addr = Signal(self.vaddr_bits_extended, name=f'{name}_addr')
+        self.addr = Signal(self.core_max_addr_bits, name=f'{name}_addr')
         self.addr_valid = Signal(name=f'{name}_addr_valid')
+        self.is_vaddr = Signal(name=f'{name}_is_vaddr')
         self.addr_uncacheable = Signal(name=f'{name}_addr_uncacheable')
 
         self.executed = Signal(name=f'{name}_executed')
@@ -99,6 +102,7 @@ class LDQEntry(HasCoreParams):
             'uop',
             'addr',
             'addr_valid',
+            'is_vaddr',
             'executed',
             'succeeded',
             'st_dep_mask',
@@ -117,8 +121,9 @@ class STQEntry(HasCoreParams):
         self.valid = Signal(name=f'{name}_valid')
         self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.addr = Signal(self.vaddr_bits_extended, name=f'{name}_addr')
+        self.addr = Signal(self.core_max_addr_bits, name=f'{name}_addr')
         self.addr_valid = Signal(name=f'{name}_addr_valid')
+        self.is_vaddr = Signal(name=f'{name}_is_vaddr')
         self.data = Signal(self.xlen, name=f'{name}_data')
         self.data_valid = Signal(name=f'{name}_data_valid')
 
@@ -131,6 +136,7 @@ class STQEntry(HasCoreParams):
             'uop',
             'addr',
             'addr_valid',
+            'is_vaddr',
             'data',
             'data_valid',
             'committed',
@@ -157,33 +163,6 @@ class _CoreRequestState(IntEnum):
 
 
 class LoadStoreUnit(HasCoreParams, Elaboratable):
-
-    class CoreRequest(HasCoreParams, Record):
-
-        def __init__(self, params, name=None, src_loc_at=0):
-            HasCoreParams.__init__(self, params)
-
-            Record.__init__(self, [
-                ('addr', self.vaddr_bits, Direction.FANOUT),
-                ('cmd', MemoryCommand, Direction.FANOUT),
-                ('size', 2, Direction.FANOUT),
-                ('signed', 1, Direction.FANOUT),
-                ('phys', 1, Direction.FANOUT),
-            ],
-                            name=name,
-                            src_loc_at=1 + src_loc_at)
-
-    class CoreResponse(HasCoreParams, Record):
-
-        def __init__(self, params, name=None, src_loc_at=0):
-            HasCoreParams.__init__(self, params)
-
-            Record.__init__(self, [
-                ('has_data', 1, Direction.FANOUT),
-                ('data', self.xlen, Direction.FANOUT),
-            ],
-                            name=name,
-                            src_loc_at=1 + src_loc_at)
 
     def __init__(self, dbus, dbus_mmio, params, sim_debug=False):
         super().__init__(params)
@@ -228,9 +207,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             for i in range(self.mem_width)
         ]
 
-        self.core_req = Decoupled(LoadStoreUnit.CoreRequest, params)
+        self.core_req = Decoupled(CoreMemRequest, params)
         self.core_nack = Signal()
-        self.core_resp = Valid(LoadStoreUnit.CoreResponse, params)
+        self.core_resp = Valid(CoreMemResponse, params)
 
         self.clear_busy = [
             Valid(Signal,
@@ -246,6 +225,13 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         self.br_update = BranchUpdate(params)
 
         self.lsu_exc = Exception(params, name='lsu_exc')
+
+        self.prv = Signal(PrivilegeMode)
+        self.status = MStatus(self.xlen)
+        self.ptbr = PTBR(self.xlen)
+
+        self.ptw_req = Decoupled(PageTableWalker.Request, params)
+        self.ptw_resp = Valid(PageTableWalker.Response, params)
 
         if self.sim_debug:
             self.lsu_debug = [
@@ -267,6 +253,22 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         dcache = m.submodules.dcache = dcache_cls(self.dbus, self.dbus_mmio,
                                                   self.params)
 
+        tlb = m.submodules.tlb = TLB(req_width=self.mem_width,
+                                     params=self.params,
+                                     log_max_size=log2_int(self.fetch_bytes),
+                                     n_sets=self.n_dtlb_sets,
+                                     n_ways=self.n_dtlb_ways,
+                                     n_banks=self.mem_width)
+        m.d.comb += [
+            tlb.prv.eq(self.prv),
+            tlb.status.eq(self.status),
+            tlb.ptbr.eq(self.ptbr),
+            tlb.ptw_req.connect(self.ptw_req),
+            tlb.ptw_resp.eq(self.ptw_resp),
+        ]
+        tlb_miss_ready = Signal()
+        m.d.sync += tlb_miss_ready.eq(tlb.miss_ready)
+
         ldq = Array(
             LDQEntry(self.params, name=f'ldq{i}')
             for i in range(self.ldq_size))
@@ -283,7 +285,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         core_req_state = Signal(_CoreRequestState,
                                 reset=_CoreRequestState.READY)
-        core_req = LoadStoreUnit.CoreRequest(self.params)
+        core_req = CoreMemRequest(self.params)
 
         clear_store = Signal()
         live_store_mask = Signal(self.stq_size)
@@ -376,12 +378,20 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             Cat(*s2_block_load_mask).eq(Cat(*s1_block_load_mask)),
         ]
 
+        s0_block_stq_retry_mask = Array(
+            Signal(name=f's0_block_stq_retry_mask{i}')
+            for i in range(self.stq_size))
+        s1_block_stq_retry_mask = Array(
+            Signal(name=f's1_block_stq_retry_mask{i}')
+            for i in range(self.stq_size))
+        m.d.sync += Cat(*s1_block_stq_retry_mask).eq(
+            Cat(*s0_block_stq_retry_mask))
+
         ldq_retry_enc = RRPriorityEncoder(self.ldq_size)
         m.submodules += ldq_retry_enc
         for i in range(self.ldq_size):
             m.d.comb += ldq_retry_enc.i[i].eq(ldq[i].addr_valid
-                                              & ~ldq[i].executed
-                                              & ~ldq[i].succeeded
+                                              & ldq[i].is_vaddr
                                               & ~s0_block_load_mask[i]
                                               & ~s1_block_load_mask[i])
         m.d.comb += ldq_retry_enc.head_or_tail.eq(ldq_head)
@@ -390,6 +400,35 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         ldq_retry_e = ldq[ldq_retry_idx]
         s1_ldq_retry_idx = Signal(range(self.ldq_size))
         m.d.sync += s1_ldq_retry_idx.eq(ldq_retry_idx)
+
+        ldq_wakeup_enc = RRPriorityEncoder(self.ldq_size)
+        m.submodules += ldq_wakeup_enc
+        for i in range(self.ldq_size):
+            m.d.comb += ldq_wakeup_enc.i[i].eq(ldq[i].addr_valid
+                                               & ~ldq[i].executed
+                                               & ~ldq[i].succeeded
+                                               & ~ldq[i].is_vaddr
+                                               & ~s0_block_load_mask[i]
+                                               & ~s1_block_load_mask[i])
+        m.d.comb += ldq_wakeup_enc.head_or_tail.eq(ldq_head)
+        ldq_wakeup_idx = Signal(range(self.ldq_size))
+        m.d.sync += ldq_wakeup_idx.eq(ldq_wakeup_enc.o)
+        ldq_wakeup_e = ldq[ldq_wakeup_idx]
+        s1_ldq_wakeup_idx = Signal(range(self.ldq_size))
+        m.d.sync += s1_ldq_wakeup_idx.eq(ldq_wakeup_idx)
+
+        stq_retry_enc = RRPriorityEncoder(self.stq_size)
+        m.submodules += stq_retry_enc
+        for i in range(self.stq_size):
+            m.d.comb += stq_retry_enc.i[i].eq(stq[i].addr_valid
+                                              & stq[i].is_vaddr
+                                              & ~s0_block_stq_retry_mask[i])
+        m.d.comb += stq_retry_enc.head_or_tail.eq(stq_commit_head)
+        stq_retry_idx = Signal(range(self.stq_size))
+        m.d.sync += stq_retry_idx.eq(stq_retry_enc.o)
+        stq_retry_e = stq[stq_retry_idx]
+        s1_stq_retry_idx = Signal(range(self.stq_size))
+        m.d.sync += s1_stq_retry_idx.eq(stq_retry_idx)
 
         stq_commit_e = stq[stq_execute_head]
 
@@ -400,6 +439,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         can_fire_core_incoming = Signal(self.mem_width)
         can_fire_core_retry = Signal(self.mem_width)
         can_fire_load_retry = Signal(self.mem_width)
+        can_fire_load_wakeup = Signal(self.mem_width)
+        can_fire_sta_retry = Signal(self.mem_width)
         can_fire_store_commit = Signal(self.mem_width)
 
         s0_executing_loads = Array(
@@ -430,19 +471,40 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     self.exec_reqs[w].valid
                     & self.exec_reqs[w].bits.uop.is_sta
                     & self.exec_reqs[w].bits.uop.is_std),
-                can_fire_load_retry[w].
-                eq(ldq_retry_e.valid
-                   & ldq_retry_e.addr_valid
-                   & ~ldq_retry_e.executed
-                   & ~ldq_retry_e.succeeded
-                   & ~s1_executing_loads[ldq_retry_idx]
-                   & ~ldq_retry_e.order_fail
-                   & ~s1_block_load_mask[ldq_retry_idx]
-                   & ~s2_block_load_mask[ldq_retry_idx]
-                   & (w == self.mem_width - 1)
-                   & (~ldq_retry_e.addr_uncacheable
-                      | (self.commit_load_at_head & (ldq_head == ldq_retry_idx)
-                         & (ldq_retry_e.st_dep_mask == 0)))),
+                can_fire_load_retry[w].eq(ldq_retry_e.valid
+                                          & ldq_retry_e.addr_valid
+                                          & ldq_retry_e.is_vaddr
+                                          & ~s1_block_load_mask[ldq_retry_idx]
+                                          & ~s2_block_load_mask[ldq_retry_idx]
+                                          & ~ldq_retry_e.order_fail
+                                          & (w == self.mem_width - 1)
+                                          & tlb_miss_ready),
+                can_fire_load_wakeup[w].eq(
+                    ldq_wakeup_e.valid
+                    & ldq_wakeup_e.addr_valid
+                    & ~ldq_wakeup_e.executed
+                    & ~ldq_wakeup_e.succeeded
+                    & ~ldq_wakeup_e.is_vaddr
+                    & ~s1_executing_loads[ldq_wakeup_idx]
+                    & ~ldq_wakeup_e.order_fail
+                    & ~s1_block_load_mask[ldq_wakeup_idx]
+                    & ~s2_block_load_mask[ldq_wakeup_idx]
+                    & (w == self.mem_width - 1)
+                    & (~ldq_wakeup_e.addr_uncacheable
+                       | (self.commit_load_at_head &
+                          (ldq_head == ldq_wakeup_idx)
+                          & (ldq_wakeup_e.st_dep_mask == 0)))),
+                can_fire_sta_retry[w].eq(
+                    stq_retry_e.valid
+                    & stq_retry_e.addr_valid
+                    & stq_retry_e.is_vaddr
+                    & ~s1_block_stq_retry_mask[stq_retry_idx]
+                    & (w == self.mem_width - 1)
+                    & tlb_miss_ready
+                    & ~Cat(
+                        (i != w) & can_fire_std_incoming[i] &
+                        (self.exec_reqs[i].bits.uop.stq_idx == stq_retry_idx)
+                        for i in range(self.mem_width)).any()),
                 can_fire_store_commit[w].eq(
                     stq_commit_e.valid
                     & ~stq_commit_e.uop.exception
@@ -460,53 +522,110 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         will_fire_core_incoming = Signal(self.mem_width)
         will_fire_core_retry = Signal(self.mem_width)
         will_fire_load_retry = Signal(self.mem_width)
+        will_fire_sta_retry = Signal(self.mem_width)
+        will_fire_load_wakeup = Signal(self.mem_width)
         will_fire_store_commit = Signal(self.mem_width)
 
+        exec_tlb_valid = Signal(self.mem_width)
         for w in range(self.mem_width):
-            dc_avail = 1
-            cam_avail = 1
+            # Cat(tlb_avail, dc_avail, cam_avail)
+            avail_flags = Const(0b111, 3)
 
-            def sched(can_fire, uses_dc, uses_cam, dc_avail, cam_avail):
-                will_fire = can_fire & ~(uses_dc & ~dc_avail) & ~(uses_cam
-                                                                  & ~cam_avail)
-                dc_avail &= ~(will_fire & uses_dc)
-                cam_avail &= ~(will_fire & uses_cam)
-                return will_fire, dc_avail, cam_avail
+            def sched(can_fire, use_flags, avail_flags, will_fire):
+                m.d.comb += will_fire.eq((can_fire.replicate(len(avail_flags))
+                                          & ~(use_flags & ~avail_flags)).all())
+                new_avail_flags = Signal.like(
+                    avail_flags,
+                    name=f'{can_fire.value.name}_avail{can_fire.start}')
+                m.d.comb += new_avail_flags.eq(
+                    avail_flags
+                    & ~(will_fire.replicate(len(avail_flags)) & use_flags))
+                return new_avail_flags
 
-            will_fire_load_incoming_, dc_avail, cam_avail = sched(
-                can_fire_load_incoming[w], 1, 1, dc_avail, cam_avail)
-            will_fire_stad_incoming_, dc_avail, cam_avail = sched(
-                can_fire_stad_incoming[w], 0, 1, dc_avail, cam_avail)
-            will_fire_sta_incoming_, dc_avail, cam_avail = sched(
-                can_fire_sta_incoming[w], 0, 1, dc_avail, cam_avail)
-            will_fire_std_incoming_, dc_avail, cam_avail = sched(
-                can_fire_std_incoming[w], 0, 0, dc_avail, cam_avail)
-            will_fire_core_incoming_, dc_avail, cam_avail = sched(
-                can_fire_core_incoming[w], 1, 0, dc_avail, cam_avail)
-            will_fire_core_retry_, dc_avail, cam_avail = sched(
-                can_fire_core_retry[w], 1, 0, dc_avail, cam_avail)
-            will_fire_load_retry_, dc_avail, cam_avail = sched(
-                can_fire_load_retry[w], 1, 1, dc_avail, cam_avail)
-            will_fire_store_commit_, _, _ = sched(can_fire_store_commit[w], 1,
-                                                  0, dc_avail, cam_avail)
+            avail_flags = sched(can_fire_load_incoming[w], Const(0b111, 3),
+                                avail_flags, will_fire_load_incoming[w])
+            avail_flags = sched(can_fire_stad_incoming[w], Const(0b101, 3),
+                                avail_flags, will_fire_stad_incoming[w])
+            avail_flags = sched(can_fire_sta_incoming[w], Const(0b101, 3),
+                                avail_flags, will_fire_sta_incoming[w])
+            avail_flags = sched(can_fire_std_incoming[w], Const(0b000, 3),
+                                avail_flags, will_fire_std_incoming[w])
+            avail_flags = sched(can_fire_core_incoming[w], Const(0b011, 3),
+                                avail_flags, will_fire_core_incoming[w])
+            avail_flags = sched(can_fire_core_retry[w], Const(0b011, 3),
+                                avail_flags, will_fire_core_retry[w])
+            avail_flags = sched(can_fire_load_retry[w], Const(0b111, 3),
+                                avail_flags, will_fire_load_retry[w])
+            avail_flags = sched(can_fire_sta_retry[w], Const(0b101, 3),
+                                avail_flags, will_fire_sta_retry[w])
+            avail_flags = sched(can_fire_load_wakeup[w], Const(0b110, 3),
+                                avail_flags, will_fire_load_wakeup[w])
+            avail_flags = sched(can_fire_store_commit[w], Const(0b010, 3),
+                                avail_flags, will_fire_store_commit[w])
 
+            m.d.comb += exec_tlb_valid[w].eq(~avail_flags[0])
+
+        #
+        # TLB request
+        #
+
+        exec_tlb_uop = [
+            MicroOp(self.params, name=f'exec_tlb_uop{w}')
+            for w in range(self.mem_width)
+        ]
+        exec_tlb_vaddr = [
+            Signal.like(self.exec_reqs[0].bits.addr, name=f'exec_tlb_vaddr{w}')
+            for w in range(self.mem_width)
+        ]
+        exec_tlb_size = [
+            Signal.like(self.exec_reqs[0].bits.uop.mem_size,
+                        name=f'exec_tlb_size{w}')
+            for w in range(self.mem_width)
+        ]
+        exec_tlb_cmd = [
+            Signal(MemoryCommand, name=f'exec_tlb_cmd{w}')
+            for w in range(self.mem_width)
+        ]
+        exec_tlb_passthru = Signal(self.mem_width)
+        for w in range(self.mem_width):
+            with m.If(will_fire_load_incoming[w] | will_fire_sta_incoming[w]
+                      | will_fire_stad_incoming[w]):
+                m.d.comb += [
+                    exec_tlb_uop[w].eq(self.exec_reqs[w].bits.uop),
+                    exec_tlb_vaddr[w].eq(self.exec_reqs[w].bits.addr),
+                    exec_tlb_size[w].eq(self.exec_reqs[w].bits.uop.mem_size),
+                    exec_tlb_cmd[w].eq(self.exec_reqs[w].bits.uop.mem_cmd),
+                ]
+            with m.Elif(will_fire_load_retry[w]):
+                m.d.comb += [
+                    exec_tlb_uop[w].eq(ldq_retry_e.uop),
+                    exec_tlb_vaddr[w].eq(ldq_retry_e.addr),
+                    exec_tlb_size[w].eq(ldq_retry_e.uop.mem_size),
+                    exec_tlb_cmd[w].eq(ldq_retry_e.uop.mem_cmd),
+                ]
+            with m.Elif(will_fire_sta_retry[w]):
+                m.d.comb += [
+                    exec_tlb_uop[w].eq(stq_retry_e.uop),
+                    exec_tlb_vaddr[w].eq(stq_retry_e.addr),
+                    exec_tlb_size[w].eq(stq_retry_e.uop.mem_size),
+                    exec_tlb_cmd[w].eq(stq_retry_e.uop.mem_cmd),
+                ]
+            with m.Elif(will_fire_core_incoming[w]):
+                m.d.comb += [
+                    exec_tlb_vaddr[w].eq(core_req.addr),
+                    exec_tlb_size[w].eq(core_req.size),
+                    exec_tlb_cmd[w].eq(core_req.cmd),
+                    exec_tlb_passthru[w].eq(core_req.phys),
+                ]
+
+        for w in range(self.mem_width):
             m.d.comb += [
-                will_fire_load_incoming[w].eq(will_fire_load_incoming_),
-                will_fire_stad_incoming[w].eq(will_fire_stad_incoming_),
-                will_fire_sta_incoming[w].eq(will_fire_sta_incoming_),
-                will_fire_std_incoming[w].eq(will_fire_std_incoming_),
-                will_fire_core_incoming[w].eq(will_fire_core_incoming_),
-                will_fire_core_retry[w].eq(will_fire_core_retry_),
-                will_fire_load_retry[w].eq(will_fire_load_retry_),
-                will_fire_store_commit[w].eq(will_fire_store_commit_),
+                tlb.req[w].valid.eq(exec_tlb_valid[w]),
+                tlb.req[w].bits.vaddr.eq(exec_tlb_vaddr[w]),
+                tlb.req[w].bits.size.eq(exec_tlb_size[w]),
+                tlb.req[w].bits.cmd.eq(exec_tlb_cmd[w]),
+                tlb.req[w].bits.passthru.eq(exec_tlb_passthru[w]),
             ]
-
-        s0_tlb_uncacheable = Signal(self.mem_width)
-        for w in range(self.mem_width):
-            for origin, size in self.io_regions.items():
-                with m.If((self.exec_reqs[w].bits.addr >= origin)
-                          & (self.exec_reqs[w].bits.addr < (origin + size))):
-                    m.d.comb += s0_tlb_uncacheable[w].eq(1)
 
         for w in range(self.mem_width):
             with m.If(will_fire_load_incoming[w]):
@@ -514,8 +633,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 m.d.sync += [
                     ldq[ldq_idx].addr.eq(self.exec_reqs[w].bits.addr),
                     ldq[ldq_idx].addr_valid.eq(1),
+                    ldq[ldq_idx].is_vaddr.eq(1),
                     ldq[ldq_idx].uop.pdst.eq(self.exec_reqs[w].bits.uop.pdst),
-                    ldq[ldq_idx].addr_uncacheable.eq(s0_tlb_uncacheable[w]),
                 ]
 
             with m.If(will_fire_sta_incoming[w] | will_fire_stad_incoming[w]):
@@ -523,6 +642,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 m.d.sync += [
                     stq[stq_idx].addr.eq(self.exec_reqs[w].bits.addr),
                     stq[stq_idx].addr_valid.eq(1),
+                    stq[stq_idx].is_vaddr.eq(1),
                     stq[stq_idx].uop.pdst.eq(self.exec_reqs[w].bits.uop.pdst),
                 ]
 
@@ -571,7 +691,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
             with m.If(will_fire_load_incoming[w]):
                 m.d.comb += [
-                    dmem_req.valid.eq(~s0_tlb_uncacheable[w]),
+                    dmem_req.valid.eq(1),
                     dmem_req.bits.uop.eq(self.exec_reqs[w].bits.uop),
                     dmem_req.bits.addr.eq(self.exec_reqs[w].bits.addr),
                     s0_executing_loads[self.exec_reqs[w].bits.uop.ldq_idx].eq(
@@ -580,9 +700,16 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             with m.Elif(will_fire_load_retry[w]):
                 m.d.comb += [
                     dmem_req.valid.eq(1),
-                    dmem_req.bits.uop.eq(ldq_retry_e.uop),
-                    dmem_req.bits.addr.eq(ldq_retry_e.addr),
+                    dmem_req.bits.uop.eq(exec_tlb_uop[w]),
+                    dmem_req.bits.addr.eq(exec_tlb_vaddr[w]),
                     s0_executing_loads[ldq_retry_idx].eq(dmem_req.fire),
+                ]
+            with m.Elif(will_fire_load_wakeup[w]):
+                m.d.comb += [
+                    dmem_req.valid.eq(1),
+                    dmem_req.bits.uop.eq(ldq_wakeup_e.uop),
+                    dmem_req.bits.addr.eq(ldq_wakeup_e.addr),
+                    s0_executing_loads[ldq_wakeup_idx].eq(dmem_req.fire),
                 ]
             with m.Elif(will_fire_store_commit[w]):
                 m.d.comb += [
@@ -626,10 +753,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         fired_load_incoming = Signal(self.mem_width)
         fired_load_retry = Signal(self.mem_width)
+        fired_load_wakeup = Signal(self.mem_width)
         fired_sta_incoming = Signal(self.mem_width)
         fired_std_incoming = Signal(self.mem_width)
         fired_stdf_incoming = Signal()
         fired_stad_incoming = Signal(self.mem_width)
+        fired_sta_retry = Signal(self.mem_width)
 
         s1_incoming_uop = [
             MicroOp(self.params, name=f's1_incoming_uop{i}')
@@ -644,9 +773,17 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             LDQEntry(self.params, name=f's1_ldq_retry_e{i}')
             for i in range(self.mem_width)
         ]
+        s1_ldq_wakeup_e = [
+            LDQEntry(self.params, name=f's1_ldq_wakeup_e{i}')
+            for i in range(self.mem_width)
+        ]
 
         s1_stq_incoming_e = [
             STQEntry(self.params, name=f's1_stq_incoming_e{i}')
+            for i in range(self.mem_width)
+        ]
+        s1_stq_retry_e = [
+            STQEntry(self.params, name=f's1_sta_retry_e{i}')
             for i in range(self.mem_width)
         ]
 
@@ -668,7 +805,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             Signal(32, name=f's1_req_addr{i}') for i in range(self.mem_width)
         ]
 
-        s1_tlb_uncacheable = Signal.like(s0_tlb_uncacheable)
+        s1_tlb_uncacheable = Signal(self.mem_width)
+        for w in range(self.mem_width):
+            for origin, size in self.io_regions.items():
+                with m.If((tlb.resp[w].bits.paddr >= origin)
+                          & (tlb.resp[w].bits.paddr < (origin + size))):
+                    m.d.comb += s1_tlb_uncacheable[w].eq(1)
 
         for w in range(self.mem_width):
             req_killed = self.br_update.uop_killed(self.exec_reqs[w].bits.uop)
@@ -677,9 +819,13 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 m.d.comb += s1_ldq_e[w].eq(s1_ldq_incoming_e[w])
             with m.Elif(fired_load_retry[w]):
                 m.d.comb += s1_ldq_e[w].eq(s1_ldq_retry_e[w])
+            with m.Elif(fired_load_wakeup[w]):
+                m.d.comb += s1_ldq_e[w].eq(s1_ldq_wakeup_e[w])
 
             with m.If(fired_sta_incoming[w] | fired_stad_incoming[w]):
                 m.d.comb += s1_stq_e[w].eq(s1_stq_incoming_e[w])
+            with m.Elif(fired_sta_retry[w]):
+                m.d.comb += s1_stq_e[w].eq(s1_stq_retry_e[w])
 
             m.d.sync += [
                 dmem_req_fired[w].eq(dcache.req[w].fire),
@@ -693,6 +839,13 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     will_fire_load_retry[w]
                     & dcache.req[w].fire
                     & ~self.br_update.uop_killed(ldq_retry_e.uop)),
+                fired_sta_retry[w].eq(
+                    will_fire_sta_retry[w]
+                    & ~self.br_update.uop_killed(stq_retry_e.uop)),
+                fired_load_wakeup[w].eq(
+                    will_fire_load_wakeup[w]
+                    & dcache.req[w].fire
+                    & ~self.br_update.uop_killed(ldq_wakeup_e.uop)),
                 fired_sta_incoming[w].eq(will_fire_sta_incoming[w]
                                          & ~req_killed),
                 fired_std_incoming[w].eq(will_fire_std_incoming[w]
@@ -707,21 +860,34 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 s1_ldq_retry_e[w].eq(ldq_retry_e),
                 s1_ldq_retry_e[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(ldq_retry_e.uop.br_mask)),
+                s1_ldq_wakeup_e[w].eq(ldq_wakeup_e),
+                s1_ldq_wakeup_e[w].uop.br_mask.eq(
+                    self.br_update.get_new_br_mask(ldq_wakeup_e.uop.br_mask)),
                 s1_stq_incoming_e[w].eq(
                     stq[self.exec_reqs[w].bits.uop.stq_idx]),
                 s1_stq_incoming_e[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(
                         stq[self.exec_reqs[w].bits.uop.stq_idx].uop.br_mask)),
+                s1_stq_retry_e[w].eq(stq_retry_e),
+                s1_stq_retry_e[w].uop.br_mask.eq(
+                    self.br_update.get_new_br_mask(stq_retry_e.uop.br_mask)),
                 s1_mem_addr[w].eq(dcache.req[w].bits.addr),
                 s1_req_addr[w].eq(self.exec_reqs[w].bits.addr),
-                s1_tlb_uncacheable[w].eq(s0_tlb_uncacheable[w]),
             ]
 
-            with m.If(will_fire_load_retry[w] & dcache.req[w].fire):
-                m.d.comb += s0_block_load_mask[ldq_retry_idx].eq(1)
+            with m.If(will_fire_load_wakeup[w] & dcache.req[w].fire):
+                m.d.comb += s0_block_load_mask[ldq_wakeup_idx].eq(1)
             with m.Elif(will_fire_load_incoming[w]):
                 m.d.comb += s0_block_load_mask[
                     self.exec_reqs[w].bits.uop.ldq_idx].eq(1)
+            with m.Elif(will_fire_load_retry[w]):
+                m.d.comb += s0_block_load_mask[ldq_retry_idx].eq(1)
+
+            with m.If(will_fire_sta_incoming[w] | will_fire_stad_incoming[w]):
+                m.d.comb += s0_block_stq_retry_mask[
+                    self.exec_reqs[w].bits.uop.stq_idx].eq(1)
+            with m.Elif(will_fire_sta_retry[w]):
+                m.d.comb += s0_block_stq_retry_mask[stq_retry_idx].eq(1)
 
         stdf_killed = self.br_update.uop_killed(self.fp_std.bits.uop)
         fired_stdf_uop = MicroOp(self.params)
@@ -732,6 +898,50 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             fired_stdf_uop.br_mask.eq(
                 self.br_update.get_new_br_mask(self.fp_std.bits.uop.br_mask)),
         ]
+
+        #
+        # TLB response
+        #
+
+        s1_tlb_paddr = [
+            Signal(self.paddr_bits, name=f's1_tlb_addr{w}')
+            for w in range(self.mem_width)
+        ]
+        s1_tlb_miss = Signal(self.mem_width)
+        for w in range(self.mem_width):
+            m.d.comb += [
+                s1_tlb_paddr[w].eq(tlb.resp[w].bits.paddr),
+                s1_tlb_miss[w].eq(tlb.resp[w].valid
+                                  & tlb.resp[w].bits.miss),
+            ]
+
+        for w in range(self.mem_width):
+            m.d.comb += dcache.s1_paddr[w].eq(s1_mem_addr[w])
+
+            with m.If(fired_load_incoming[w] | fired_load_retry[w]):
+                ldq_idx = s1_ldq_e[w].uop.ldq_idx
+                with m.If(s1_tlb_miss[w] | s1_tlb_uncacheable[w]):
+                    m.d.comb += [
+                        dcache.s1_kill[w].eq(1),
+                        s1_set_executed[ldq_idx].eq(0),
+                    ]
+                with m.If(~s1_tlb_miss[w]):
+                    m.d.comb += dcache.s1_paddr[w].eq(s1_tlb_paddr[w])
+                    m.d.sync += [
+                        ldq[ldq_idx].addr.eq(s1_tlb_paddr[w]),
+                        ldq[ldq_idx].is_vaddr.eq(0),
+                        ldq[ldq_idx].addr_uncacheable.eq(
+                            s1_tlb_uncacheable[w]),
+                    ]
+
+            with m.If(fired_sta_incoming[w] | fired_stad_incoming[w]
+                      | fired_sta_retry[w]):
+                stq_idx = s1_stq_e[w].uop.stq_idx
+                with m.If(~s1_tlb_miss[w]):
+                    m.d.sync += [
+                        stq[stq_idx].addr.eq(s1_tlb_paddr[w]),
+                        stq[stq_idx].is_vaddr.eq(0),
+                    ]
 
         #
         # Clear ROB busy
@@ -760,6 +970,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     clr_bsy_valids[w].
                     eq(s1_stq_incoming_e[w].valid
                        & ~s1_stq_incoming_e[w].uop.is_amo
+                       & ~s1_tlb_miss[w]
                        & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
                     clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
@@ -772,6 +983,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     eq(s1_stq_incoming_e[w].valid
                        & s1_stq_incoming_e[w].data_valid
                        & ~s1_stq_incoming_e[w].uop.is_amo
+                       & ~s1_tlb_miss[w]
                        & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
                     clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
@@ -783,12 +995,26 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     clr_bsy_valids[w].
                     eq(s1_stq_incoming_e[w].valid
                        & s1_stq_incoming_e[w].addr_valid
+                       & ~stq[s1_stq_incoming_e[w].uop.stq_idx].is_vaddr
                        & ~s1_stq_incoming_e[w].uop.is_amo
                        & ~self.br_update.uop_killed(s1_stq_incoming_e[w].uop)),
                     clr_bsy_rob_idx[w].eq(s1_stq_incoming_e[w].uop.rob_idx),
                     clr_bsy_br_mask[w].eq(
                         self.br_update.get_new_br_mask(
                             s1_stq_incoming_e[w].uop.br_mask)),
+                ]
+            with m.Elif(fired_sta_retry[w]):
+                m.d.sync += [
+                    clr_bsy_valids[w].eq(
+                        s1_stq_retry_e[w].valid
+                        & s1_stq_retry_e[w].data_valid
+                        & ~s1_stq_retry_e[w].uop.is_amo
+                        & ~s1_tlb_miss[w]
+                        & ~self.br_update.uop_killed(s1_stq_retry_e[w].uop)),
+                    clr_bsy_rob_idx[w].eq(s1_stq_retry_e[w].uop.rob_idx),
+                    clr_bsy_br_mask[w].eq(
+                        self.br_update.get_new_br_mask(
+                            s1_stq_retry_e[w].uop.br_mask)),
                 ]
 
             m.d.comb += [
@@ -816,6 +1042,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 stdf_clr_bsy_valid.eq(
                     stq[stq_idx].valid
                     & stq[stq_idx].addr_valid
+                    & ~stq[stq_idx].is_vaddr
                     & ~self.br_update.uop_killed(fired_stdf_uop)),
                 stdf_clr_bsy_rob_idx.eq(fired_stdf_uop.rob_idx),
                 stdf_clr_bsy_br_mask.eq(
@@ -834,9 +1061,11 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         # Memory ordering
         #
 
-        do_ld_search = Cat((fired_load_incoming[w] | fired_load_retry[w])
-                           for w in range(self.mem_width))
-        do_st_search = Cat((fired_sta_incoming[w] | fired_stad_incoming[w])
+        do_ld_search = Cat(
+            ((fired_load_incoming[w] | fired_load_retry[w]) & ~s1_tlb_miss[w])
+            | fired_load_wakeup[w] for w in range(self.mem_width))
+        do_st_search = Cat((fired_sta_incoming[w] | fired_stad_incoming[w]
+                            | fired_sta_retry[w]) & ~s1_tlb_miss[w]
                            for w in range(self.mem_width))
 
         cam_addr = [
@@ -865,21 +1094,28 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         for w in range(self.mem_width):
             m.d.comb += [
                 cam_addr[w].eq(
-                    Mux(fired_sta_incoming[w] | fired_stad_incoming[w],
-                        s1_req_addr[w], s1_mem_addr[w])),
+                    Mux(
+                        fired_load_incoming[w] | fired_load_retry[w]
+                        | fired_sta_incoming[w] | fired_stad_incoming[w]
+                        | fired_sta_retry[w], s1_tlb_paddr[w],
+                        s1_mem_addr[w])),
                 cam_uop[w].eq(
                     Mux(do_st_search[w], s1_stq_e[w].uop,
                         Mux(do_ld_search[w], s1_ldq_e[w].uop, 0))),
                 cam_mask[w].eq(gen_byte_mask(cam_addr[w],
                                              cam_uop[w].mem_size)),
                 cam_ldq_idx[w].eq(
-                    Mux(fired_load_incoming[w], s1_incoming_uop[w].ldq_idx,
-                        Mux(fired_load_retry[w], s1_ldq_retry_idx, 0))),
+                    Mux(
+                        fired_load_incoming[w], s1_incoming_uop[w].ldq_idx,
+                        Mux(fired_load_wakeup[w], s1_ldq_wakeup_idx,
+                            Mux(fired_load_retry[w], s1_ldq_retry_idx, 0)))),
                 cam_stq_idx[w].eq(
                     Mux(fired_sta_incoming[w] | fired_stad_incoming[w],
-                        s1_incoming_uop[w].stq_idx, 0)),
+                        s1_incoming_uop[w].stq_idx,
+                        Mux(fired_sta_retry[w], s1_stq_retry_idx, 0))),
                 can_forward[w].eq(
-                    Mux(fired_load_incoming[w], ~s1_tlb_uncacheable[w],
+                    Mux(fired_load_incoming[w] | fired_load_retry[w],
+                        ~s1_tlb_uncacheable[w],
                         ~ldq[cam_ldq_idx[w]].addr_uncacheable)),
             ]
 
@@ -925,6 +1161,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 with m.If(do_st_search[w] & ldq[i].valid & ldq[i].addr_valid
                           & (ldq[i].executed | ldq[i].succeeded
                              | (load_forwarders != 0))
+                          & ~ldq[i].is_vaddr
                           & ((ldq[i].st_dep_mask & (1 << cam_stq_idx[w])) != 0)
                           & addr_matches[w]
                           & ((load_mask & cam_mask[w]) != 0)):
@@ -941,9 +1178,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                         m.d.sync += ldq[i].order_fail.eq(1)
 
         for i in range(self.stq_size):
-            addr_matches = Cat(
-                (stq[i].addr_valid & (stq[i].addr[3:] == cam_addr[w][3:]))
-                for w in range(self.mem_width))
+            addr_matches = Cat((stq[i].addr_valid & ~stq[i].is_vaddr
+                                & (stq[i].addr[3:] == cam_addr[w][3:]))
+                               for w in range(self.mem_width))
 
             write_mask = gen_byte_mask(stq[i].addr, stq[i].uop.mem_size)
 

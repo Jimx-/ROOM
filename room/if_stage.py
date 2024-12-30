@@ -413,7 +413,7 @@ class IFStage(HasCoreParams, Elaboratable):
         s0_valid = Signal()
         s0_is_replay = Signal()
         s0_replay_ppc = Signal(self.paddr_bits)
-        s0_replay_resp = TLBResp(log2_int(self.fetch_bytes), self.params)
+        s0_replay_resp = TLBResp(self.params)
 
         reset = Signal(reset=1)
         reset_d1 = Signal(reset_less=True)
@@ -448,8 +448,8 @@ class IFStage(HasCoreParams, Elaboratable):
         s1_valid = Signal()
         s1_is_replay = Signal()
         s1_replay_ppc = Signal.like(s0_replay_ppc)
-        s1_replay_resp = TLBResp(log2_int(self.fetch_bytes), self.params)
-        s1_tlb_resp = TLBResp(log2_int(self.fetch_bytes), self.params)
+        s1_replay_resp = TLBResp(self.params)
+        s1_tlb_resp = TLBResp(self.params)
         f1_clear = Signal()
 
         m.d.sync += [
@@ -492,7 +492,7 @@ class IFStage(HasCoreParams, Elaboratable):
         s2_ppc = Signal.like(s1_ppc)
         s2_is_replay_reg = Signal()
         s2_is_replay = s2_is_replay_reg & s2_valid
-        s2_tlb_resp = TLBResp(log2_int(self.fetch_bytes), self.params)
+        s2_tlb_resp = TLBResp(self.params)
         s2_tlb_miss = Signal()
         s2_exception = s2_valid & (s2_tlb_resp.ae.inst
                                    | s2_tlb_resp.pf.inst) & ~s2_is_replay

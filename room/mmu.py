@@ -7,7 +7,6 @@ import riscvmodel.csrnames as csrnames
 from room.consts import *
 from room.csr import *
 from room.types import HasCoreParams
-from room.lsu import LoadStoreUnit
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
@@ -73,6 +72,35 @@ class PTE(Record):
         return self.sx() & self.u
 
 
+class CoreMemRequest(HasCoreParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('addr', self.vaddr_bits, Direction.FANOUT),
+            ('cmd', MemoryCommand, Direction.FANOUT),
+            ('size', 2, Direction.FANOUT),
+            ('signed', 1, Direction.FANOUT),
+            ('phys', 1, Direction.FANOUT),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
+class CoreMemResponse(HasCoreParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('has_data', 1, Direction.FANOUT),
+            ('data', self.xlen, Direction.FANOUT),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
 class PageTableWalker(HasCoreParams, Elaboratable, AutoCSR):
 
     class Request(HasCoreParams, Record):
@@ -114,9 +142,9 @@ class PageTableWalker(HasCoreParams, Elaboratable, AutoCSR):
 
         self.satp = CSR(csrnames.satp, xatp_layout(self.xlen))
 
-        self.mem_req = Decoupled(LoadStoreUnit.CoreRequest, params)
+        self.mem_req = Decoupled(CoreMemRequest, params)
         self.mem_nack = Signal()
-        self.mem_resp = Valid(LoadStoreUnit.CoreResponse, params)
+        self.mem_resp = Valid(CoreMemResponse, params)
 
     def elaborate(self, platform):
         m = Module()

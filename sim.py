@@ -76,6 +76,8 @@ core_params = dict(
         rpq_size=16,
         n_banks=4,
     ),
+    n_dtlb_sets=16,
+    n_dtlb_ways=4,
     use_fpu=True,
     flen=64,
     fma_latency=4,

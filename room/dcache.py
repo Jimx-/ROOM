@@ -156,7 +156,7 @@ class DCacheReq(HasCoreParams):
 
         self.uop = MicroOp(params, name=f'{name}_uop')
 
-        self.addr = Signal(self.vaddr_bits, name=f'{name}_addr')
+        self.addr = Signal(self.core_max_addr_bits, name=f'{name}_addr')
         self.data = Signal(self.xlen, name=f'{name}_data')
 
         self.from_core = Signal(name=f'{name}_from_core')
@@ -2042,6 +2042,10 @@ class DCache(HasDCacheParams, Elaboratable):
         ]
 
         self.s1_kill = Signal(self.mem_width)
+        self.s1_paddr = [
+            Signal(self.paddr_bits, name=f's1_paddr{w}')
+            for w in range(self.mem_width)
+        ]
 
         self.br_update = BranchUpdate(params)
         self.exception = Signal()
@@ -2328,7 +2332,9 @@ class DCache(HasDCacheParams, Elaboratable):
                 s1_need_resp.eq(s0_need_resp),
             ]
 
-            m.d.comb += s1_addr[w].eq(s1_req[w].addr)
+            m.d.comb += s1_addr[w].eq(
+                Mux(self.use_vm & (s1_type == DCacheReqType.LSU),
+                    self.s1_paddr[w], s1_req[w].addr))
 
         m.d.sync += s1_type.eq(s0_type)
 
@@ -2419,6 +2425,7 @@ class DCache(HasDCacheParams, Elaboratable):
         for w in range(self.mem_width):
             m.d.sync += [
                 s2_req[w].eq(s1_req[w]),
+                s2_req[w].addr.eq(s1_addr[w]),
                 s2_req[w].uop.br_mask.eq(
                     self.br_update.get_new_br_mask(s1_req[w].uop.br_mask)),
                 s2_valid[w].eq(s1_valid[w]

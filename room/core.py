@@ -328,6 +328,10 @@ class Core(HasCoreParams, Elaboratable):
                                                self.dbus_mmio,
                                                self.params,
                                                sim_debug=self.sim_debug)
+        m.d.comb += [
+            lsu.prv.eq(exc_unit.prv),
+            lsu.status.eq(exc_unit.mstatus.r),
+        ]
 
         dispatcher = m.submodules.dispatcher = Dispatcher(self.params)
 
@@ -1030,6 +1034,17 @@ class Core(HasCoreParams, Elaboratable):
         #
 
         if self.use_vm:
+            ptw_users = [(if_stage.ptw_req, if_stage.ptw_resp),
+                         (lsu.ptw_req, lsu.ptw_resp)]
+            ptw_arbiter = m.submodules.ptw_arbiter = Arbiter(
+                len(ptw_users), PageTableWalker.Request, self.params)
+            for (req, _), inp in zip(ptw_users, ptw_arbiter.inp):
+                m.d.comb += req.connect(inp)
+
+            ptw_resp_dst = Signal(range(len(ptw_users)))
+            with m.If(ptw_arbiter.out.fire):
+                m.d.sync += ptw_resp_dst.eq(ptw_arbiter.chosen)
+
             ptw = m.submodules.ptw = PageTableWalker(self.params)
             csr.add_csrs(ptw.iter_csrs())
             m.d.comb += [
@@ -1037,9 +1052,14 @@ class Core(HasCoreParams, Elaboratable):
                 ptw.mem_nack.eq(lsu.core_nack),
                 ptw.mem_resp.eq(lsu.core_resp),
                 if_stage.ptbr.eq(ptw.satp.r),
-                if_stage.ptw_req.connect(ptw.req),
-                if_stage.ptw_resp.eq(ptw.resp),
+                lsu.ptbr.eq(ptw.satp.r),
+                ptw_arbiter.out.connect(ptw.req),
             ]
+
+            with m.Switch(ptw_resp_dst):
+                for i, (_, resp) in enumerate(ptw_users):
+                    with m.Case(i):
+                        m.d.comb += resp.eq(ptw.resp)
 
         #
         # I-D bus

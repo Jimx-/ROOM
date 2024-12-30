@@ -43,6 +43,8 @@ class HasCoreParams:
             self.use_supervisor = params['use_supervisor']
 
             self.paddr_bits = params['paddr_bits']
+            self.core_max_addr_bits = max(self.vaddr_bits_extended,
+                                          self.paddr_bits)
 
             #
             # Instruction fetch
@@ -102,6 +104,13 @@ class HasCoreParams:
             self.vpn_bits = self.vaddr_bits - self.pg_offset_bits
             self.ppn_bits = self.paddr_bits - self.pg_offset_bits
 
+            #
+            # TLB
+            #
+
+            self.n_dtlb_sets = params['n_dtlb_sets']
+            self.n_dtlb_ways = params['n_dtlb_ways']
+
         #
         # GROOM
         #
@@ -114,6 +123,10 @@ class HasCoreParams:
 
             self.mem_width = self.n_threads
             self.max_br_count = 0
+
+            self.use_vm = False
+            self.paddr_bits = self.vaddr_bits
+            self.core_max_addr_bits = self.vaddr_bits
 
             #
             # Instruction fetch

@@ -34,7 +34,6 @@ class TLBReq(HasCoreParams, Record):
             ('passthru', 1, Direction.FANOUT),
             ('size', range(log_max_size + 1), Direction.FANOUT),
             ('cmd', MemoryCommand, Direction.FANOUT),
-            ('prv', PrivilegeMode, Direction.FANOUT),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
@@ -42,7 +41,7 @@ class TLBReq(HasCoreParams, Record):
 
 class TLBResp(HasCoreParams, Record):
 
-    def __init__(self, log_max_size, params, name=None, src_loc_at=0):
+    def __init__(self, params, name=None, src_loc_at=0):
         HasCoreParams.__init__(self, params)
 
         exc_layout = [
@@ -120,10 +119,10 @@ class TLB(HasCoreParams, Elaboratable):
             for w in range(req_width)
         ]
         self.resp = [
-            Valid(TLBResp, log_max_size, params, name=f'resp{w}')
-            for w in range(req_width)
+            Valid(TLBResp, params, name=f'resp{w}') for w in range(req_width)
         ]
         self.sfence = Valid(SFenceReq, params, name=f'sfence')
+        self.miss_ready = Signal()
 
         self.ptw_req = Decoupled(PageTableWalker.Request, params)
         self.ptw_resp = Valid(PageTableWalker.Response, params)
@@ -441,6 +440,8 @@ class TLB(HasCoreParams, Elaboratable):
         with m.If(~refill_valid):
             m.d.sync += refill_invalidated.eq(0)
 
+        m.d.comb += self.miss_ready.eq(~refill_valid)
+
         #
         # Response
         #
@@ -560,7 +561,7 @@ class TLB(HasCoreParams, Elaboratable):
                         (pf_inst_array[w] & s1_hits[w]).any()),
                     self.resp[w].bits.ma.ld.eq(cmd_read[w] & misaligned[w]),
                     self.resp[w].bits.ma.st.eq(cmd_write[w] & misaligned[w]),
-                    self.resp[w].bits.miss.eq(refill_done | s1_tlb_miss),
+                    self.resp[w].bits.miss.eq(refill_done | s1_tlb_miss[w]),
                     self.resp[w].bits.paddr.eq(
                         Cat(s1_req[w].vaddr[:self.pg_offset_bits], ppn[w])),
                 ]
