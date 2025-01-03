@@ -188,6 +188,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.commit = Signal()
         self.exception = Signal()
         self.cause = Signal(self.xlen)
+        self.tval = Signal(self.xlen)
         self.epc = Signal(32)
         self.prv = Signal(PrivilegeMode, reset=PrivilegeMode.M)
 
@@ -207,6 +208,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.scause = CSR(csrnames.scause, mcause_layout(self.xlen))
         self.sepc = CSR(csrnames.sepc, [('value', self.xlen, CSRAccess.RW)])
         self.stvec = CSR(csrnames.stvec, mtvec_layout(self.xlen))
+        self.stval = CSR(csrnames.stval, [('value', self.xlen, CSRAccess.RW)])
 
         self.dcsr = CSR(csrnames.dcsr, dcsr_layout)
         self.dpc = CSR(csrnames.dpc, [('value', self.xlen, CSRAccess.RW)])
@@ -302,6 +304,9 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                     self.mcause.w.ecode[:log2_int(self.xlen)]),
             ]
 
+        with m.If(self.mtval.we):
+            m.d.sync += self.mtval.r.eq(self.mtval.w)
+
         delegatable_exceptions = sum([
             1 << e for e in (
                 Cause.FETCH_MISALIGNED,
@@ -348,6 +353,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
             m.d.sync += single_stepped.eq(1)
 
         exception = insn_break | self.exception
+        tval = Mux(insn_break, self.epc, self.tval)
 
         with m.If(exception):
             with m.If(trap_to_debug):
@@ -363,6 +369,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                 m.d.sync += [
                     self.sepc.r.eq(self.epc),
                     self.scause.r.eq(self.cause),
+                    self.stval.r.eq(tval),
                     self.mstatus.r.spie.eq(self.mstatus.r.sie),
                     self.mstatus.r.spp.eq(self.prv),
                     self.mstatus.r.sie.eq(0),
@@ -371,6 +378,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                 m.d.sync += [
                     self.mepc.r.eq(self.epc),
                     self.mcause.r.eq(self.cause),
+                    self.mtval.r.eq(tval),
                     self.mstatus.r.mpie.eq(self.mstatus.r.mie),
                     self.mstatus.r.mpp.eq(self.prv),
                     self.mstatus.r.mie.eq(0),
@@ -436,5 +444,8 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                 self.scause.r.ecode.eq(
                     self.scause.w.ecode[:log2_int(self.xlen)]),
             ]
+
+        with m.If(self.stval.we):
+            m.d.sync += self.stval.r.eq(self.stval.w)
 
         return m

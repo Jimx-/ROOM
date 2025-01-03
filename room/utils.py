@@ -21,6 +21,10 @@ def wrap_decr(signal, modulo):
         return Mux(signal == 0, modulo - 1, signal - 1)
 
 
+def is_older(lhs, rhs, head):
+    return (lhs < rhs) ^ (lhs < head) ^ (rhs < head)
+
+
 def generate_imm(ip, sel):
     sign = ip[-1]
     i20_30 = Mux(sel == ImmSel.U, ip[8:19], Repl(sign, 11))

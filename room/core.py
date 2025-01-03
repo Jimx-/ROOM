@@ -16,7 +16,7 @@ from room.ex_stage import ExecUnits, ExecDebug
 from room.branch import BranchUpdate, BranchResolution
 from room.lsu import LoadStoreUnit, LSUDebug
 from room.csr import CSRFile
-from room.exc import ExceptionUnit, CoreInterrupts
+from room.exc import ExceptionUnit, CoreInterrupts, Cause
 from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
 from room.mmu import PageTableWalker
@@ -452,7 +452,7 @@ class Core(HasCoreParams, Elaboratable):
         rob = m.submodules.rob = ReorderBuffer(
             exec_units.irf_write_ports + self.mem_width + num_fp_wakeup_ports,
             self.params)
-        rob_flush_d1 = Record(rob.flush.layout)
+        rob_flush_d1 = Valid(Record, rob.flush.bits.layout)
         m.d.sync += rob_flush_d1.eq(rob.flush)
 
         for enq_uop, dis_uop in zip(rob.enq_uops, dis_uops):
@@ -511,18 +511,18 @@ class Core(HasCoreParams, Elaboratable):
             m.d.comb += [
                 if_stage.redirect_valid.eq(1),
                 if_stage.redirect_flush.eq(1),
-                if_stage.redirect_ftq_idx.eq(rob_flush_d1.ftq_idx),
+                if_stage.redirect_ftq_idx.eq(rob_flush_d1.bits.ftq_idx),
             ]
 
-            flush_pc = if_stage.get_pc[0].pc + rob_flush_d1.pc_lsb
-            with m.Switch(rob_flush_d1.flush_type):
+            flush_pc = if_stage.get_pc[0].pc + rob_flush_d1.bits.pc_lsb
+            with m.Switch(rob_flush_d1.bits.flush_type):
                 with m.Case(FlushType.EXCEPT):
                     m.d.comb += if_stage.redirect_pc.eq(exc_unit.exc_vector)
                 with m.Case(FlushType.ERET):
                     m.d.comb += if_stage.redirect_pc.eq(evec_d2)
                 with m.Case(FlushType.NEXT):
                     m.d.comb += if_stage.redirect_pc.eq(
-                        flush_pc + Mux(rob_flush_d1.is_rvc, 2, 4))
+                        flush_pc + Mux(rob_flush_d1.bits.is_rvc, 2, 4))
                 with m.Case(FlushType.REFETCH):
                     m.d.comb += if_stage.redirect_pc.eq(flush_pc)
 
@@ -551,7 +551,7 @@ class Core(HasCoreParams, Elaboratable):
                 m.d.comb += com_ftq_idx.eq(rob.commit_req.uops[w].ftq_idx)
         m.d.comb += [
             if_stage.commit.eq(
-                Mux(rob.commit_exc.valid, rob.commit_exc.ftq_idx,
+                Mux(rob.commit_exc.valid, rob.commit_exc.bits.ftq_idx,
                     com_ftq_idx)),
             if_stage.commit_valid.eq((rob.commit_req.valids != 0)
                                      | rob.commit_exc.valid),
@@ -803,7 +803,7 @@ class Core(HasCoreParams, Elaboratable):
         jmp_pc_valid = Signal()
 
         with m.If(rob.flush.valid):
-            m.d.comb += if_stage.get_pc_idx[0].eq(rob.flush.ftq_idx)
+            m.d.comb += if_stage.get_pc_idx[0].eq(rob.flush.bits.ftq_idx)
         with m.Elif(jmp_pc_valid):
             m.d.comb += if_stage.get_pc_idx[0].eq(jmp_pc_req)
 
@@ -840,6 +840,7 @@ class Core(HasCoreParams, Elaboratable):
         m.d.comb += [
             lsu.commit.eq(rob.commit_req),
             lsu.br_update.eq(br_update),
+            lsu.rob_head_idx.eq(rob.head_idx),
             lsu.exception.eq(rob_flush_d1.valid),
             rob.lsu_exc.eq(lsu.lsu_exc),
             lsu.commit_load_at_head.eq(rob.commit_load_at_head),
@@ -1013,7 +1014,19 @@ class Core(HasCoreParams, Elaboratable):
         # Exception
         #
 
-        commit_exc_pc_lsb_d1 = Signal.like(rob.commit_exc.pc_lsb)
+        tval_valid = exc_unit.exception & (
+            (exc_unit.cause == Cause.BREAKPOINT) |
+            (exc_unit.cause == Cause.LOAD_MISALIGNED) |
+            (exc_unit.cause == Cause.STORE_MISALIGNED) |
+            (exc_unit.cause == Cause.LOAD_ACCESS_FAULT) |
+            (exc_unit.cause == Cause.STORE_ACCESS_FAULT) |
+            (exc_unit.cause == Cause.FETCH_ACCESS_FAULT) |
+            (exc_unit.cause == Cause.LOAD_PAGE_FAULT) |
+            (exc_unit.cause == Cause.STORE_PAGE_FAULT) |
+            (exc_unit.cause == Cause.FETCH_PAGE_FAULT))
+
+        commit_exc_pc_lsb_d1 = Signal.like(rob.commit_exc.bits.pc_lsb)
+        commit_exc_badaddr_d1 = Signal.like(rob.commit_exc.bits.badaddr)
         m.d.comb += [
             exc_unit.epc.eq(if_stage.get_pc[0].commit_pc +
                             commit_exc_pc_lsb_d1),
@@ -1021,12 +1034,14 @@ class Core(HasCoreParams, Elaboratable):
             exc_unit.system_insn.eq(csr_port.cmd == CSRCommand.I),
             exc_unit.system_insn_imm.eq(csr_port.addr),
             exc_unit.commit.eq(rob.commit_req.valids[0]),
+            exc_unit.tval.eq(Mux(tval_valid, commit_exc_badaddr_d1, 0)),
         ]
 
         m.d.sync += [
-            commit_exc_pc_lsb_d1.eq(rob.commit_exc.pc_lsb),
+            commit_exc_pc_lsb_d1.eq(rob.commit_exc.bits.pc_lsb),
+            commit_exc_badaddr_d1.eq(rob.commit_exc.bits.badaddr),
             exc_unit.exception.eq(rob.commit_exc.valid),
-            exc_unit.cause.eq(rob.commit_exc.cause),
+            exc_unit.cause.eq(rob.commit_exc.bits.cause),
         ]
 
         #

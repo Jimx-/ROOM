@@ -8,7 +8,7 @@ from room.fu import ExecResp
 from room.branch import BranchUpdate
 from room.rob import CommitReq, Exception
 from room.exc import Cause, MStatus
-from room.utils import wrap_incr
+from room.utils import wrap_incr, is_older
 from room.dcache import LoadGen, StoreGen, DCache, SimpleDCache
 from room.mmu import PTBR, PageTableWalker, CoreMemRequest, CoreMemResponse
 from room.tlb import TLB
@@ -223,8 +223,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         self.commit_load_at_head = Signal()
 
         self.br_update = BranchUpdate(params)
+        self.rob_head_idx = Signal(range(self.core_width * self.num_rob_rows))
 
-        self.lsu_exc = Exception(params, name='lsu_exc')
+        self.lsu_exc = Valid(Exception, params, name='lsu_exc')
 
         self.prv = Signal(PrivilegeMode)
         self.status = MStatus(self.xlen)
@@ -248,6 +249,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             exception_d1.eq(self.exception),
             exception_d2.eq(exception_d1),
         ]
+        s1_exc_valid = Signal()
 
         dcache_cls = DCache if self.enable_dcache else SimpleDCache
         dcache = m.submodules.dcache = dcache_cls(self.dbus, self.dbus_mmio,
@@ -507,6 +509,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                         for i in range(self.mem_width)).any()),
                 can_fire_store_commit[w].eq(
                     stq_commit_e.valid
+                    & ~s1_exc_valid
                     & ~stq_commit_e.uop.exception
                     & ~stq_commit_e.uop.is_fence
                     & (w == 0)
@@ -620,7 +623,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         for w in range(self.mem_width):
             m.d.comb += [
-                tlb.req[w].valid.eq(exec_tlb_valid[w]),
+                tlb.req[w].valid.eq(
+                    exec_tlb_valid[w]
+                    & ~self.br_update.uop_killed(exec_tlb_uop[w])),
                 tlb.req[w].bits.vaddr.eq(exec_tlb_vaddr[w]),
                 tlb.req[w].bits.size.eq(exec_tlb_size[w]),
                 tlb.req[w].bits.cmd.eq(exec_tlb_cmd[w]),
@@ -943,6 +948,88 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                         stq[stq_idx].is_vaddr.eq(0),
                     ]
 
+        s1_exc_uops = [
+            MicroOp(self.params, name=f's1_exc_uop{w}')
+            for w in range(self.mem_width)
+        ]
+        s1_exc_vaddrs = [
+            Signal.like(exec_tlb_vaddr[0], name=f's1_exc_vaddr{w}')
+            for w in range(self.mem_width)
+        ]
+        for w in range(self.mem_width):
+            m.d.sync += [
+                s1_exc_uops[w].eq(exec_tlb_uop[w]),
+                s1_exc_uops[w].br_mask.eq(
+                    self.br_update.get_new_br_mask(exec_tlb_uop[w].br_mask)),
+                s1_exc_vaddrs[w].eq(exec_tlb_vaddr[w]),
+            ]
+
+        s1_tlb_pf_ld = Signal(self.mem_width)
+        s1_tlb_pf_st = Signal(self.mem_width)
+        s1_tlb_ae_ld = Signal(self.mem_width)
+        s1_tlb_ae_st = Signal(self.mem_width)
+        s1_exc_valids = Signal(self.mem_width)
+        s1_exc_causes = [
+            Signal(Cause, name=f's1_exc_cause{w}')
+            for w in range(self.mem_width)
+        ]
+        for w in range(self.mem_width):
+            m.d.comb += [
+                s1_tlb_pf_ld[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.pf.ld
+                                   & s1_exc_uops[w].uses_ldq),
+                s1_tlb_pf_st[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.pf.st
+                                   & s1_exc_uops[w].uses_stq),
+                s1_tlb_ae_ld[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.ae.ld
+                                   & s1_exc_uops[w].uses_ldq),
+                s1_tlb_ae_st[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.ae.st
+                                   & s1_exc_uops[w].uses_stq),
+                s1_exc_valids[w].eq((s1_tlb_pf_ld[w] | s1_tlb_pf_st[w]
+                                     | s1_tlb_ae_ld[w] | s1_tlb_ae_st[w])
+                                    & ~exception_d1),
+                s1_exc_causes[w].eq(
+                    Mux(
+                        s1_tlb_pf_ld[w], Cause.LOAD_PAGE_FAULT,
+                        Mux(
+                            s1_tlb_pf_st[w], Cause.STORE_PAGE_FAULT,
+                            Mux(s1_tlb_ae_ld[w], Cause.LOAD_ACCESS_FAULT,
+                                Cause.STORE_ACCESS_FAULT)))),
+            ]
+
+        m.d.comb += s1_exc_valid.eq(s1_exc_valids.any())
+        s1_exc_cause = Signal(Cause)
+        s1_exc_uop = MicroOp(self.params)
+        s1_exc_vaddr = Signal.like(exec_tlb_vaddr[0])
+        m.d.comb += [
+            s1_exc_cause.eq(s1_exc_causes[0]),
+            s1_exc_uop.eq(s1_exc_uops[0]),
+            s1_exc_vaddr.eq(s1_exc_vaddrs[0]),
+        ]
+
+        s1_exc_found = s1_exc_valids[0]
+        oldest_exc_rob_idx = s1_exc_uops[0].rob_idx
+        for w in range(1, self.mem_width):
+            cur_is_older = (s1_exc_valids[w] & is_older(
+                s1_exc_uops[w].rob_idx, oldest_exc_rob_idx,
+                self.rob_head_idx)) | ~s1_exc_found
+
+            with m.If(cur_is_older):
+                m.d.comb += [
+                    s1_exc_cause.eq(s1_exc_causes[w]),
+                    s1_exc_uop.eq(s1_exc_uops[w]),
+                    s1_exc_vaddr.eq(s1_exc_vaddrs[w]),
+                ]
+
+            s1_exc_found |= s1_exc_valids[w]
+            oldest_exc_rob_idx = Mux(cur_is_older, s1_exc_uops[w].rob_idx,
+                                     oldest_exc_rob_idx)
+
+        for w in range(self.mem_width):
+            with m.If(s1_exc_valids[w]):
+                with m.If(s1_exc_uops[w].uses_ldq):
+                    m.d.sync += ldq[s1_exc_uops[w].ldq_idx].uop.exception.eq(1)
+                with m.Else():
+                    m.d.sync += stq[s1_exc_uops[w].stq_idx].uop.exception.eq(1)
+
         #
         # Clear ROB busy
         #
@@ -1166,10 +1253,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                           & addr_matches[w]
                           & ((load_mask & cam_mask[w]) != 0)):
 
-                    forwarder_is_older = (
-                        load_forward_stq_idx < cam_stq_idx[w]) ^ (
-                            load_forward_stq_idx < ldq[i].next_stq_idx) ^ (
-                                cam_stq_idx[w] < ldq[i].next_stq_idx)
+                    forwarder_is_older = is_older(load_forward_stq_idx,
+                                                  cam_stq_idx[w],
+                                                  ldq[i].next_stq_idx)
 
                     with m.If(~ldq[i].forwarded
                               | ((load_forward_stq_idx != cam_stq_idx[w])
@@ -1245,18 +1331,26 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         ld_exc_valid = ~ld_fail_enc.n
         ld_exc_uop = ldq[ld_fail_enc.o].uop
 
+        use_mem_exc = (s1_exc_valid
+                       & is_older(s1_exc_uop.rob_idx, ld_exc_uop.rob_idx,
+                                  self.rob_head_idx)) | ~ld_exc_valid
+        exc_uop = MicroOp(self.params)
+        m.d.comb += exc_uop.eq(Mux(use_mem_exc, s1_exc_uop, ld_exc_uop))
+
         m.d.sync += [
-            exc_valid.eq(ld_exc_valid & ~self.exception
-                         & ~self.br_update.uop_killed(ld_exc_uop)),
-            self.lsu_exc.uop.eq(ld_exc_uop),
-            self.lsu_exc.uop.br_mask.eq(
-                self.br_update.get_new_br_mask(ld_exc_uop.br_mask)),
-            self.lsu_exc.cause.eq(Cause.MEM_ORDERING_FAULT),
+            exc_valid.eq((ld_exc_valid | s1_exc_valid) & ~self.exception
+                         & ~self.br_update.uop_killed(exc_uop)),
+            self.lsu_exc.bits.uop.eq(exc_uop),
+            self.lsu_exc.bits.uop.br_mask.eq(
+                self.br_update.get_new_br_mask(exc_uop.br_mask)),
+            self.lsu_exc.bits.cause.eq(
+                Mux(use_mem_exc, s1_exc_cause, Cause.MEM_ORDERING_FAULT)),
+            self.lsu_exc.bits.badaddr.eq(s1_exc_vaddr),
         ]
 
         m.d.comb += self.lsu_exc.valid.eq(
             exc_valid & ~self.exception
-            & ~self.br_update.uop_killed(self.lsu_exc.uop))
+            & ~self.br_update.uop_killed(self.lsu_exc.bits.uop))
 
         #
         # Writeback
@@ -1271,10 +1365,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 with m.Elif(dcache.nack[w].bits.uop.uses_ldq):
                     m.d.sync += ldq[
                         dcache.nack[w].bits.uop.ldq_idx].executed.eq(0)
-                with m.Elif((
-                        dcache.nack[w].bits.uop.stq_idx < stq_execute_head)
-                            ^ (dcache.nack[w].bits.uop.stq_idx < stq_head)
-                            ^ (stq_execute_head < stq_head)):
+                with m.Elif(
+                        is_older(dcache.nack[w].bits.uop.stq_idx,
+                                 stq_execute_head, stq_head)):
                     m.d.sync += stq_execute_head.eq(
                         dcache.nack[w].bits.uop.stq_idx)
 

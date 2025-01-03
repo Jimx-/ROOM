@@ -8,7 +8,7 @@ from room.fu import ExecResp
 from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
 from room.exc import Cause
-from room.utils import wrap_incr, wrap_decr
+from room.utils import wrap_incr, wrap_decr, is_older
 
 from roomsoc.interconnect.stream import Valid
 
@@ -55,11 +55,11 @@ class CommitExceptionReq(HasCoreParams, Record):
         HasCoreParams.__init__(self, params)
 
         Record.__init__(self, [
-            ('valid', 1),
             ('ftq_idx', range(self.ftq_size)),
             ('pc_lsb', range(self.fetch_bytes)),
             ('is_rvc', 1),
             ('cause', self.xlen),
+            ('badaddr', self.xlen),
             ('flush_type', FlushType),
         ],
                         name=name,
@@ -74,18 +74,16 @@ class Exception(HasCoreParams):
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.valid = Signal(name=f'{name}_valid')
-
         self.uop = MicroOp(params, name=f'{name}_uop')
-
         self.cause = Signal(self.xlen, name=f'{name}_cause')
+        self.badaddr = Signal(self.core_max_addr_bits, name=f'{name}_badaddr')
 
     def eq(self, rhs):
         return [
             getattr(self, name).eq(getattr(rhs, name)) for name in (
-                'valid',
                 'uop',
                 'cause',
+                'badaddr',
             )
         ]
 
@@ -116,19 +114,19 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
 
         self.commit_req = CommitReq(params, name='commit_req')
 
-        self.commit_exc = CommitExceptionReq(params)
+        self.commit_exc = Valid(CommitExceptionReq, params)
 
         self.head_idx = Signal(range(self.core_width * self.num_rob_rows))
         self.tail_idx = Signal(range(self.core_width * self.num_rob_rows))
 
         self.br_update = BranchUpdate(params)
 
-        self.lsu_exc = Exception(params, name='lsu_exc')
+        self.lsu_exc = Valid(Exception, params, name='lsu_exc')
 
         self.ready = Signal()
         self.empty = Signal()
 
-        self.flush = CommitExceptionReq(params)
+        self.flush = Valid(CommitExceptionReq, params)
 
         self.commit_load_at_head = Signal()
 
@@ -212,11 +210,13 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                     m.d.sync += rob_busy[get_row(clr.bits)].eq(0)
 
             with m.If(self.lsu_exc.valid
-                      & (get_bank(self.lsu_exc.uop.rob_idx) == w)):
+                      & (get_bank(self.lsu_exc.bits.uop.rob_idx) == w)):
                 m.d.sync += [
-                    rob_exception[get_row(self.lsu_exc.uop.rob_idx)].eq(1),
-                    rob_uop[get_row(self.lsu_exc.uop.rob_idx)].exc_cause.eq(
-                        self.lsu_exc.cause),
+                    rob_exception[get_row(
+                        self.lsu_exc.bits.uop.rob_idx)].eq(1),
+                    rob_uop[get_row(
+                        self.lsu_exc.bits.uop.rob_idx)].exc_cause.eq(
+                            self.lsu_exc.bits.cause),
                 ]
 
             m.d.comb += [
@@ -290,7 +290,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         m.d.comb += [
             self.commit_req.rollback.eq(state_is_rollback),
             self.commit_exc.valid.eq(exception_thrown & (
-                self.commit_exc.cause != Cause.MEM_ORDERING_FAULT)),
+                self.commit_exc.bits.cause != Cause.MEM_ORDERING_FAULT)),
         ]
 
         commit_exc_uop = MicroOp(self.params, name='commit_exc_uop')
@@ -298,12 +298,42 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
             with m.If(rob_head_valids[w]):
                 m.d.comb += commit_exc_uop.eq(self.commit_req.uops[w])
 
+        r_exc_valid = Signal()
+        r_exc_uop = MicroOp(self.params)
+        r_exc_badaddr = Signal(self.core_max_addr_bits)
+
         m.d.comb += [
-            self.commit_exc.ftq_idx.eq(commit_exc_uop.ftq_idx),
-            self.commit_exc.pc_lsb.eq(commit_exc_uop.pc_lsb),
-            self.commit_exc.is_rvc.eq(commit_exc_uop.is_rvc),
-            self.commit_exc.cause.eq(commit_exc_uop.exc_cause),
+            self.commit_exc.bits.ftq_idx.eq(commit_exc_uop.ftq_idx),
+            self.commit_exc.bits.pc_lsb.eq(commit_exc_uop.pc_lsb),
+            self.commit_exc.bits.is_rvc.eq(commit_exc_uop.is_rvc),
+            self.commit_exc.bits.cause.eq(commit_exc_uop.exc_cause),
+            self.commit_exc.bits.badaddr.eq(r_exc_badaddr.as_signed()),
         ]
+
+        next_exc_uop = MicroOp(self.params)
+        m.d.comb += next_exc_uop.eq(r_exc_uop)
+
+        with m.If(~(self.flush.valid | exception_thrown) & ~state_is_rollback):
+            with m.If(self.lsu_exc.valid):
+                with m.If(~r_exc_valid
+                          | is_older(self.lsu_exc.bits.uop.rob_idx,
+                                     r_exc_uop.rob_idx, rob_head_idx)):
+                    m.d.sync += [
+                        r_exc_valid.eq(1),
+                        r_exc_badaddr.eq(self.lsu_exc.bits.badaddr),
+                    ]
+                    m.d.comb += [
+                        next_exc_uop.eq(self.lsu_exc.bits.uop),
+                        next_exc_uop.exc_cause.eq(self.lsu_exc.bits.cause),
+                    ]
+
+        m.d.sync += [
+            r_exc_uop.eq(next_exc_uop),
+            r_exc_uop.br_mask.eq(
+                self.br_update.get_new_br_mask(next_exc_uop.br_mask)),
+        ]
+        with m.If(self.flush.valid | self.br_update.uop_killed(next_exc_uop)):
+            m.d.sync += r_exc_valid.eq(0)
 
         flush_commit_mask = Signal(self.core_width)
         for w in range(self.core_width):
@@ -320,22 +350,23 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         flush_commit = flush_commit_mask != 0
         m.d.comb += [
             self.flush.valid.eq(exception_thrown | flush_commit),
-            self.flush.ftq_idx.eq(flush_uop.ftq_idx),
-            self.flush.pc_lsb.eq(flush_uop.pc_lsb),
-            self.flush.is_rvc.eq(flush_uop.is_rvc),
+            self.flush.bits.ftq_idx.eq(flush_uop.ftq_idx),
+            self.flush.bits.pc_lsb.eq(flush_uop.pc_lsb),
+            self.flush.bits.is_rvc.eq(flush_uop.is_rvc),
         ]
 
         with m.If(self.flush.valid):
             with m.If(exception_thrown
-                      & (self.commit_exc.cause != Cause.MEM_ORDERING_FAULT)):
-                m.d.comb += self.flush.flush_type.eq(FlushType.EXCEPT)
+                      & (self.commit_exc.bits.cause != Cause.MEM_ORDERING_FAULT
+                         )):
+                m.d.comb += self.flush.bits.flush_type.eq(FlushType.EXCEPT)
             with m.Elif(flush_commit & (flush_uop.opcode == UOpCode.ERET)):
-                m.d.comb += self.flush.flush_type.eq(FlushType.ERET)
+                m.d.comb += self.flush.bits.flush_type.eq(FlushType.ERET)
             with m.Elif(exception_thrown):
                 # Must be a memory ordering failure, just replay the memory load
-                m.d.comb += self.flush.flush_type.eq(FlushType.REFETCH)
+                m.d.comb += self.flush.bits.flush_type.eq(FlushType.REFETCH)
             with m.Else():
-                m.d.comb += self.flush.flush_type.eq(FlushType.NEXT)
+                m.d.comb += self.flush.bits.flush_type.eq(FlushType.NEXT)
 
         do_enq = Signal()
         do_deq = Signal()
@@ -413,7 +444,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         m.d.comb += [
             self.head_idx.eq(rob_head_idx),
             self.tail_idx.eq(rob_tail_idx),
-            self.ready.eq(state_is_normal & ~full),
+            self.ready.eq(state_is_normal & ~full & ~r_exc_valid),
             self.empty.eq(empty),
         ]
 
