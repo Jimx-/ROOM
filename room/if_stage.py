@@ -13,7 +13,7 @@ from room.exc import MStatus
 from room.icache import ICache
 from room.utils import wrap_incr
 from room.mmu import PTBR, PageTableWalker
-from room.tlb import TLB, TLBResp
+from room.tlb import TLB, TLBResp, SFenceReq
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
@@ -366,6 +366,8 @@ class IFStage(HasCoreParams, Elaboratable):
         self.ptw_req = Decoupled(PageTableWalker.Request, params)
         self.ptw_resp = Valid(PageTableWalker.Response, params)
 
+        self.sfence = Valid(SFenceReq, params)
+
         if self.sim_debug:
             self.if_debug = [
                 Valid(IFDebug, name=f'if_debug{i}')
@@ -435,9 +437,10 @@ class IFStage(HasCoreParams, Elaboratable):
                 tlb.prv.eq(self.prv),
                 tlb.status.eq(self.status),
                 tlb.ptbr.eq(self.ptbr),
+                tlb.req[0].valid.eq(s0_valid),
                 tlb.req[0].bits.vaddr.eq(s0_vpc),
                 tlb.req[0].bits.size.eq(log2_int(self.fetch_bytes)),
-                tlb.req[0].valid.eq(s0_valid),
+                tlb.sfence.eq(self.sfence),
             ]
 
         #
@@ -826,7 +829,17 @@ class IFStage(HasCoreParams, Elaboratable):
         # Redirect
         #
 
-        with m.If(self.redirect_flush):
+        with m.If(self.sfence.valid):
+            m.d.comb += [
+                f1_clear.eq(1),
+                f2_clear.eq(1),
+                f3_clear.eq(1),
+                f4_clear.eq(1),
+                fb.flush.eq(1),
+                s0_valid.eq(0),
+                s0_is_replay.eq(0),
+            ]
+        with m.Elif(self.redirect_flush):
             m.d.comb += [
                 f1_clear.eq(1),
                 f2_clear.eq(1),

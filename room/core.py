@@ -584,6 +584,11 @@ class Core(HasCoreParams, Elaboratable):
                 if_stage.commit_valid.eq(1),
             ]
 
+        m.d.sync += if_stage.sfence.valid.eq(0)
+        for w in range(self.mem_width):
+            with m.If(lsu.exec_reqs[w].bits.sfence.valid):
+                m.d.sync += if_stage.sfence.eq(lsu.exec_reqs[w].bits.sfence)
+
         if self.sim_debug:
             m.d.comb += self.core_debug.flush_pipeline.eq(rob_flush_d1.valid)
 

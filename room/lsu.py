@@ -438,12 +438,18 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         can_fire_sta_incoming = Signal(self.mem_width)
         can_fire_std_incoming = Signal(self.mem_width)
         can_fire_stad_incoming = Signal(self.mem_width)
+        can_fire_sfence = Signal(self.mem_width)
         can_fire_core_incoming = Signal(self.mem_width)
         can_fire_core_retry = Signal(self.mem_width)
         can_fire_load_retry = Signal(self.mem_width)
         can_fire_load_wakeup = Signal(self.mem_width)
         can_fire_sta_retry = Signal(self.mem_width)
         can_fire_store_commit = Signal(self.mem_width)
+
+        for w in range(self.mem_width):
+            with m.If(self.exec_reqs[w].valid
+                      & self.exec_reqs[w].bits.sfence.valid):
+                m.d.comb += can_fire_sfence.eq(~0)
 
         s0_executing_loads = Array(
             Signal(name=f's0_executing{i}') for i in range(self.ldq_size))
@@ -522,6 +528,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         will_fire_sta_incoming = Signal(self.mem_width)
         will_fire_std_incoming = Signal(self.mem_width)
         will_fire_stad_incoming = Signal(self.mem_width)
+        will_fire_sfence = Signal(self.mem_width)
         will_fire_core_incoming = Signal(self.mem_width)
         will_fire_core_retry = Signal(self.mem_width)
         will_fire_load_retry = Signal(self.mem_width)
@@ -553,6 +560,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                                 avail_flags, will_fire_sta_incoming[w])
             avail_flags = sched(can_fire_std_incoming[w], Const(0b000, 3),
                                 avail_flags, will_fire_std_incoming[w])
+            avail_flags = sched(can_fire_sfence[w], Const(0b001, 3),
+                                avail_flags, will_fire_sfence[w])
             avail_flags = sched(can_fire_core_incoming[w], Const(0b011, 3),
                                 avail_flags, will_fire_core_incoming[w])
             avail_flags = sched(can_fire_core_retry[w], Const(0b011, 3),
@@ -599,6 +608,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     exec_tlb_size[w].eq(self.exec_reqs[w].bits.uop.mem_size),
                     exec_tlb_cmd[w].eq(self.exec_reqs[w].bits.uop.mem_cmd),
                 ]
+            with m.Elif(will_fire_sfence[w]):
+                m.d.comb += [
+                    exec_tlb_uop[w].eq(self.exec_reqs[w].bits.uop),
+                    exec_tlb_vaddr[w].eq(
+                        self.exec_reqs[w].bits.sfence.bits.vaddr),
+                    exec_tlb_size[w].eq(self.exec_reqs[w].bits.uop.mem_size),
+                    exec_tlb_cmd[w].eq(self.exec_reqs[w].bits.uop.mem_cmd),
+                ]
             with m.Elif(will_fire_load_retry[w]):
                 m.d.comb += [
                     exec_tlb_uop[w].eq(ldq_retry_e.uop),
@@ -631,6 +648,10 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 tlb.req[w].bits.cmd.eq(exec_tlb_cmd[w]),
                 tlb.req[w].bits.passthru.eq(exec_tlb_passthru[w]),
             ]
+
+            with m.If(will_fire_sfence[w]
+                      & self.exec_reqs[w].bits.sfence.valid):
+                m.d.comb += tlb.sfence.eq(self.exec_reqs[w].bits.sfence)
 
         for w in range(self.mem_width):
             with m.If(will_fire_load_incoming[w]):
@@ -763,6 +784,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         fired_std_incoming = Signal(self.mem_width)
         fired_stdf_incoming = Signal()
         fired_stad_incoming = Signal(self.mem_width)
+        fired_sfence = Signal(self.mem_width)
         fired_sta_retry = Signal(self.mem_width)
 
         s1_incoming_uop = [
@@ -893,6 +915,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     self.exec_reqs[w].bits.uop.stq_idx].eq(1)
             with m.Elif(will_fire_sta_retry[w]):
                 m.d.comb += s0_block_stq_retry_mask[stq_retry_idx].eq(1)
+
+        s1_sfence_valid = Signal(self.mem_width)
+        m.d.sync += fired_sfence.eq(will_fire_sfence)
+        for w in range(self.mem_width):
+            m.d.sync += s1_sfence_valid[w].eq(
+                self.exec_reqs[w].valid & self.exec_reqs[w].bits.sfence.valid)
 
         stdf_killed = self.br_update.uop_killed(self.fp_std.bits.uop)
         fired_stdf_uop = MicroOp(self.params)
@@ -1089,6 +1117,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     clr_bsy_br_mask[w].eq(
                         self.br_update.get_new_br_mask(
                             s1_stq_incoming_e[w].uop.br_mask)),
+                ]
+            with m.Elif(fired_sfence[w]):
+                m.d.sync += [
+                    clr_bsy_valids[w].eq(s1_sfence_valid[w]),
+                    clr_bsy_rob_idx[w].eq(s1_incoming_uop[w].rob_idx),
+                    clr_bsy_br_mask[w].eq(
+                        self.br_update.get_new_br_mask(
+                            s1_incoming_uop[w].br_mask)),
                 ]
             with m.Elif(fired_sta_retry[w]):
                 m.d.sync += [

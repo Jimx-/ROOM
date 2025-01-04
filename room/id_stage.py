@@ -383,37 +383,48 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                 ]
 
                 with m.If(inuop.inst[12:15] == 0):
-                    with m.If((uop.ldst == 0) & (uop.lrs1 == 0)):
-                        with m.Switch(inuop.inst[20:]):
-                            for name in ['ECALL', 'EBREAK']:
-                                with m.Case(OPIMM(name)):
+                    with m.If(uop.ldst == 0):
+                        with m.If(inuop.inst[25:] == 0x9):  # SFENCE.VMA
+                            m.d.comb += [
+                                UOPC(UOpCode.SFENCE),
+                                uop.iq_type.eq(IssueQueueType.MEM),
+                                uop.fu_type.eq(FUType.MEM),
+                                uop.lrs1_rtype.eq(RegisterType.FIX),
+                                uop.lrs2_rtype.eq(RegisterType.FIX),
+                                uop.mem_cmd.eq(MemoryCommand.SFENCE),
+                            ]
+
+                        with m.Elif(uop.lrs1 == 0):
+                            with m.Switch(inuop.inst[20:]):
+                                for name in ['ECALL', 'EBREAK']:
+                                    with m.Case(OPIMM(name)):
+                                        m.d.comb += [
+                                            UOPC(UOpCode.ERET),
+                                            uop.iq_type.eq(IssueQueueType.INT),
+                                            uop.fu_type.eq(FUType.CSR),
+                                            IMM_SEL_I,
+                                            uop.csr_cmd.eq(CSRCommand.I),
+                                            uop.is_ecall.eq(1),
+                                        ]
+
+                                for name in ['SRET', 'MRET']:
+                                    with m.Case(OPIMM(name)):
+                                        m.d.comb += [
+                                            UOPC(UOpCode.ERET),
+                                            uop.iq_type.eq(IssueQueueType.INT),
+                                            uop.fu_type.eq(FUType.CSR),
+                                            IMM_SEL_I,
+                                            uop.csr_cmd.eq(CSRCommand.I),
+                                        ]
+
+                                with m.Case(0x7b2):  # DRET
                                     m.d.comb += [
                                         UOPC(UOpCode.ERET),
                                         uop.iq_type.eq(IssueQueueType.INT),
                                         uop.fu_type.eq(FUType.CSR),
                                         IMM_SEL_I,
                                         uop.csr_cmd.eq(CSRCommand.I),
-                                        uop.is_ecall.eq(1),
                                     ]
-
-                            for name in ['SRET', 'MRET']:
-                                with m.Case(OPIMM(name)):
-                                    m.d.comb += [
-                                        UOPC(UOpCode.ERET),
-                                        uop.iq_type.eq(IssueQueueType.INT),
-                                        uop.fu_type.eq(FUType.CSR),
-                                        IMM_SEL_I,
-                                        uop.csr_cmd.eq(CSRCommand.I),
-                                    ]
-
-                            with m.Case(0x7b2):  # DRET
-                                m.d.comb += [
-                                    UOPC(UOpCode.ERET),
-                                    uop.iq_type.eq(IssueQueueType.INT),
-                                    uop.fu_type.eq(FUType.CSR),
-                                    IMM_SEL_I,
-                                    uop.csr_cmd.eq(CSRCommand.I),
-                                ]
 
                 with m.Else():
                     m.d.comb += [

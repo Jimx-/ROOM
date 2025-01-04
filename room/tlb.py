@@ -167,8 +167,10 @@ class TLB(HasCoreParams, Elaboratable):
             for i in range(self.n_superpage_entries)
         ]
         superpage_valid = Signal(self.n_superpage_entries)
-        with m.If(refill_done & ~refill_invalidated
-                  & (self.ptw_resp.bits.level < (self.pg_levels - 1))):
+        with m.If(self.sfence.valid):
+            m.d.sync += superpage_valid.eq(0)
+        with m.Elif(refill_done & ~refill_invalidated
+                    & (self.ptw_resp.bits.level < (self.pg_levels - 1))):
             with m.Switch(r_superpage_replace_way):
                 for w in range(self.n_superpage_entries):
                     with m.Case(w):

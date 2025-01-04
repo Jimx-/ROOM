@@ -262,6 +262,7 @@ class MemoryCommand(IntEnum):
     AMO_SWAP = 11
     LR = 12
     SC = 13
+    SFENCE = 14
 
     @staticmethod
     def is_read(cmd):

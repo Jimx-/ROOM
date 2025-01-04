@@ -6,9 +6,10 @@ from room.types import HasCoreParams, MicroOp
 from room.branch import BranchResolution, BranchUpdate
 from room.alu import ALU, Multiplier, IntDiv
 from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
+from room.tlb import SFenceReq
 from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe
 
-from roomsoc.interconnect.stream import Decoupled
+from roomsoc.interconnect.stream import Decoupled, Valid
 
 
 class GetPCResp(Record):
@@ -56,8 +57,10 @@ class ExecResp(HasCoreParams):
         self.data = Signal(data_width, name=f'{name}_data')
         self.addr = Signal(self.vaddr_bits + 1, name=f'{name}_addr')
 
+        self.sfence = Valid(SFenceReq, params)
+
     def eq(self, rhs):
-        attrs = ['uop', 'addr', 'data']
+        attrs = ['uop', 'addr', 'data', 'sfence']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
@@ -322,6 +325,14 @@ class AddrGenUnit(PipelinedFunctionalUnit):
         m.d.comb += [
             self.resp.bits.addr.eq(eff_addr),
             self.resp.bits.data.eq(self.req.bits.rs2_data),
+        ]
+
+        m.d.comb += [
+            self.resp.bits.sfence.valid.eq(self.req.valid & (
+                self.req.bits.uop.mem_cmd == MemoryCommand.SFENCE)),
+            self.resp.bits.sfence.bits.rs1.eq(self.req.bits.uop.mem_size[0]),
+            self.resp.bits.sfence.bits.rs2.eq(self.req.bits.uop.mem_size[1]),
+            self.resp.bits.sfence.bits.vaddr.eq(self.req.bits.rs1_data),
         ]
 
         return m
