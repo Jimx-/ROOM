@@ -1,36 +1,14 @@
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
-
-import riscvmodel.insn as insn
+import distinctipy
+import tinyrv
 import ctypes
 
+NUM_PREGS = 96
 PREG_COLORS = [
-    'rgb(0,255,0)', 'rgb(255,0,255)', 'rgb(0,127,255)', 'rgb(255,127,0)',
-    'rgb(127,191,127)', 'rgb(120,45,139)', 'rgb(48,130,3)', 'rgb(253,133,190)',
-    'rgb(236,0,30)', 'rgb(0,0,255)', 'rgb(0,255,255)', 'rgb(255,255,0)',
-    'rgb(0,255,127)', 'rgb(0,127,127)', 'rgb(139,141,248)', 'rgb(0,0,127)',
-    'rgb(131,254,21)', 'rgb(130,245,232)', 'rgb(160,71,1)', 'rgb(135,2,253)',
-    'rgb(234,222,133)', 'rgb(243,49,144)', 'rgb(152,153,28)', 'rgb(8,65,59)',
-    'rgb(42,192,193)', 'rgb(109,4,37)', 'rgb(204,74,250)', 'rgb(23,65,197)',
-    'rgb(32,193,62)', 'rgb(189,119,111)', 'rgb(95,114,97)', 'rgb(229,184,251)',
-    'rgb(91,134,179)', 'rgb(235,182,51)', 'rgb(102,82,233)', 'rgb(178,27,79)',
-    'rgb(87,253,106)', 'rgb(240,65,42)', 'rgb(183,8,163)', 'rgb(67,0,177)',
-    'rgb(69,66,2)', 'rgb(162,250,148)', 'rgb(160,192,207)', 'rgb(82,203,4)',
-    'rgb(167,100,194)', 'rgb(203,242,59)', 'rgb(101,59,70)', 'rgb(31,10,58)',
-    'rgb(80,249,178)', 'rgb(43,48,131)', 'rgb(2,187,128)', 'rgb(62,248,40)',
-    'rgb(178,205,1)', 'rgb(249,131,78)', 'rgb(100,192,241)', 'rgb(4,137,191)',
-    'rgb(200,168,155)', 'rgb(5,177,0)', 'rgb(205,236,209)', 'rgb(0,187,250)',
-    'rgb(68,27,251)', 'rgb(155,48,209)', 'rgb(12,135,63)', 'rgb(202,111,36)',
-    'rgb(170,12,6)', 'rgb(105,180,66)', 'rgb(251,2,106)', 'rgb(179,70,122)',
-    'rgb(88,2,100)', 'rgb(203,131,254)', 'rgb(181,178,90)', 'rgb(249,4,179)',
-    'rgb(5,241,195)', 'rgb(83,86,157)', 'rgb(65,210,136)', 'rgb(107,111,32)',
-    'rgb(5,56,253)', 'rgb(69,156,126)', 'rgb(252,104,247)', 'rgb(142,228,79)',
-    'rgb(72,131,245)', 'rgb(253,171,127)', 'rgb(69,251,244)',
-    'rgb(203,11,229)', 'rgb(252,48,238)', 'rgb(140,117,146)',
-    'rgb(218,100,160)', 'rgb(204,60,187)', 'rgb(253,207,197)',
-    'rgb(91,40,192)', 'rgb(10,89,8)', 'rgb(5,11,196)', 'rgb(126,2,183)',
-    'rgb(119,214,178)', 'rgb(208,157,3)', 'rgb(251,89,111)'
+    f'rgb({int(255*r)},{int(255*g)},{int(255*b)})'
+    for r, g, b in distinctipy.get_colors(NUM_PREGS)
 ]
 
 
@@ -63,225 +41,193 @@ class Instruction:
         uop_id = f'{self.uop_id:x}'
         pc = f'{self.pc:x}'
 
-        inst = f'{self.inst:032b}'
-
-        opcode = int(inst[-7:], 2)
-        funct3 = int(inst[-15:-12], 2)
-        funct7 = int(inst[-32:-25], 2)
-        funct6 = int(inst[-32:-26], 2)
-        funct5 = int(inst[-25:-20], 2)
-        funct12 = int(inst[-32:-20], 2)
-        rd = self.int_regs[int(inst[-12:-7], 2)]
-        rs1 = self.int_regs[int(inst[-20:-15], 2)]
-        rs2 = self.int_regs[int(inst[-25:-20], 2)]
-
-        shamt5 = int(inst[-25:-20], 2)
-        shamt6 = int(inst[-26:-20], 2)
-        imm_I = ctypes.c_int(int(inst[-32] * 21 + inst[-31:-20], 2)).value
-        imm_S = ctypes.c_int(
-            int(inst[-32] * 21 + inst[-31:-25] + inst[-12:-7], 2)).value
-        imm_B = ctypes.c_int(
-            int(inst[-32] * 20 + inst[-8] + inst[-31:-25] + inst[-12:-8] + '0',
-                2)).value
-        imm_U = ctypes.c_int(
-            int(inst[-32] + inst[-31:-20] + inst[-20:-12] + '0' * 12, 2)).value
-        imm_J = ctypes.c_int(
-            int(
-                inst[-32] * 12 + inst[-20:-12] + inst[-21] + inst[-31:-21] +
-                '0', 2)).value
-
         inst_text = Text()
         note_text = Text()
 
-        OPV = lambda name: getattr(insn, f'Instruction{name}'
-                                   ).field_opcode.value
-        F3 = lambda name: getattr(insn, f'Instruction{name}'
-                                  ).field_funct3.value
-        F7 = lambda name: getattr(insn, f'Instruction{name}'
-                                  ).field_funct7.value
-
-        rd_text = Text(rd, style=PREG_COLORS[self.pdst])
-        rs1_text = Text(rs1, style=PREG_COLORS[self.prs1])
-        rs2_text = Text(rs2, style=PREG_COLORS[self.prs2])
-
         illegal_insn = False
 
-        if opcode == OPV('ADDI'):
-            opstr = ''
+        op = tinyrv.decode(self.inst)
 
-            for name in [
-                    'addi', 'slti', 'sltiu', 'xori', 'ori', 'andi', 'slli',
-                    'srli'
-            ]:
-                if funct3 == F3(name.upper()):
-                    opstr = name
+        rd_text = ''
+        rs1_text = ''
+        rs2_text = ''
 
-            inst_text.append(opstr.ljust(5))
+        if (rd := op.args.get('rd')) is not None:
+            rd_text = Text(self.int_regs[rd], style=PREG_COLORS[self.pdst])
+        if (rs1 := op.args.get('rs1')) is not None:
+            rs1_text = Text(self.int_regs[rs1], style=PREG_COLORS[self.prs1])
+        if (rs2 := op.args.get('rs2')) is not None:
+            rs2_text = Text(self.int_regs[rs2], style=PREG_COLORS[self.prs2])
+
+        if op.name in {
+                'lb', 'lh', 'lw', 'ld', 'lbu', 'lhu', 'lwu', 'sb', 'sh', 'sw',
+                'sd'
+        }:
+            inst_text.append(op.name.ljust(5))
+            inst_text.append(' ')
+            if 'rd' in op.args:
+                inst_text.append(rd_text)
+                inst_text.append(f'[={self.rd_data:x}]')
+            else:
+                inst_text.append(rs2_text)
+                inst_text.append(f'[={self.data:x}]')
+            inst_text.append(f', {op.imm12}(')
+            inst_text.append(rs1_text)
+            inst_text.append(f')[={self.addr:x}]')
+
+            if op.name.startswith('l'):
+                note_text.append(f'mem[{self.addr:x}] -> {self.rd_data:x}')
+            else:
+                note_text.append(f'mem[{self.addr:x}] <- {self.rd_data:x}')
+
+        elif op.name == 'jalr':
+            if op.rs1 == 1 and op.imm12 == 0:
+                inst_text.append('ret'.ljust(5))
+                note_text.append(
+                    f'Return address {self.rs1_data + op.imm12:x}')
+            else:
+                if 'rd' in op.args and op.rd == 0:
+                    inst_text.append('jr'.ljust(5))
+                else:
+                    inst_text.append(op.name.ljust(5))
+                inst_text.append(' ')
+                if 'rd' in op.args:
+                    inst_text.append(rd_text)
+                    inst_text.append(f'[={self.rd_data:x}]')
+                else:
+                    inst_text.append(rs2_text)
+                    inst_text.append(f'[={self.data:x}]')
+                inst_text.append(', ')
+                inst_text.append(rs1_text)
+                inst_text.append(f'[={self.rs1_data + op.imm12:x}]')
+
+        elif op.name.startswith('csr'):
+            inst_text.append(op.name.ljust(5))
             inst_text.append(' ')
             inst_text.append(rd_text)
             inst_text.append(f'[={self.rd_data:x}]')
             inst_text.append(', ')
-            inst_text.append(rs1_text)
-            inst_text.append(f'[={self.rs1_data:x}]')
+            inst_text.append(tinyrv.csrs.get(op.csr, hex(op.csr)))
             inst_text.append(', ')
-            inst_text.append(str(imm_I))
+            if 'rs1' in op.args:
+                inst_text.append(rs1_text)
+                inst_text.append(f'[={self.rs1_data:x}]')
+            else:
+                inst_text.append(
+                    f'{hex(op.zimm) if abs(op.zimm) > 255 else op.zimm}')
 
-            if funct3 == F3('ADDI'):
-                if rs1 == 'zero' and rs2 == 'zero' and imm_I == 0:
-                    inst_text = 'nop'
-                elif imm_I == 0:
-                    inst_text = Text('mv    ')
+        elif 'rd' in op.args and 'rs1' in op.args:
+            if op.name == 'addi' and op.imm12 == 0:
+                if op.rd == 0 and op.rs1 == 0:
+                    inst_text.append('nop')
+                else:
+                    inst_text.append('mv'.ljust(5))
+                    inst_text.append(' ')
                     inst_text.append(rd_text)
                     inst_text.append(f'[={self.rd_data:x}]')
                     inst_text.append(', ')
                     inst_text.append(rs1_text)
                     inst_text.append(f'[={self.rs1_data:x}]')
 
-        elif opcode == OPV('ADD'):
-            opstr = ''
-
-            for name in [
-                    'add', 'slt', 'sltu', 'xor', 'or', 'and', 'sll', 'srl',
-                    'sra'
-            ]:
-                if funct3 == F3(name.upper()):
-                    opstr = name
-
-            inst_text.append(opstr.ljust(5))
-            inst_text.append(' ')
-            inst_text.append(rd_text)
-            inst_text.append(f'[={self.rd_data:x}]')
-            inst_text.append(', ')
-            inst_text.append(rs1_text)
-            inst_text.append(f'[={self.rs1_data:x}]')
-            inst_text.append(', ')
-            inst_text.append(rs2_text)
-            inst_text.append(f'[={self.rs2_data:x}]')
-
-        elif opcode == OPV('LD'):
-            opstr = ''
-
-            size = {0: 'b', 1: 'h', 2: 'w', 3: 'd'}[funct3 & 3]
-            unsigned = {0: '', 1: 'u'}[(funct3 >> 2) & 1]
-
-            opstr = 'l' + size + unsigned
-
-            inst_text.append(opstr.ljust(5))
-            inst_text.append(' ')
-            inst_text.append(rd_text)
-            inst_text.append(f'[={self.rd_data:x}]')
-            inst_text.append(f', {imm_I}(')
-            inst_text.append(rs1_text)
-            inst_text.append(f')[={self.addr:x}]')
-
-            note_text.append(f'MEM[{self.addr:x}] -> {self.rd_data:x}')
-
-        elif opcode == OPV('SD'):
-            opstr = ''
-
-            size = {0: 'b', 1: 'h', 2: 'w', 3: 'd'}[funct3 & 3]
-
-            opstr = 's' + size
-
-            inst_text.append(opstr.ljust(5))
-            inst_text.append(' ')
-            inst_text.append(rs2_text)
-            inst_text.append(f'[={self.data:x}]')
-            inst_text.append(f', {imm_S}(')
-            inst_text.append(rs1_text)
-            inst_text.append(f')[={self.addr:x}]')
-
-            note_text.append(f'MEM[{self.addr:x}] <- {self.data:x}')
-
-        elif opcode == OPV('BEQ'):
-            opstr = ''
-
-            if funct3 == F3('BEQ'):
-                opstr = 'beq'
-                taken = self.rs1_data == self.rs2_data
-            elif funct3 == F3('BNE'):
-                opstr = 'bne'
-                taken = self.rs1_data != self.rs2_data
-            elif funct3 == F3('BLT'):
-                opstr = 'blt'
-                taken = ctypes.c_long(self.rs1_data).value < ctypes.c_long(
-                    self.rs2_data).value
-            elif funct3 == F3('BLTU'):
-                opstr = 'bltu'
-                taken = self.rs1_data < self.rs2_data
-            elif funct3 == F3('BGE'):
-                opstr = 'bge'
-                taken = ctypes.c_long(self.rs1_data).value >= ctypes.c_long(
-                    self.rs2_data).value
-            elif funct3 == F3('BGEU'):
-                opstr = 'bgeu'
-                taken = self.rs1_data >= self.rs2_data
             else:
-                illegal_insn = True
+                inst_text.append(op.name.ljust(5))
+                inst_text.append(' ')
+                inst_text.append(rd_text)
+                inst_text.append(f'[={self.rd_data:x}]')
+                inst_text.append(', ')
+                inst_text.append(rs1_text)
+                inst_text.append(f'[={self.rs1_data:x}]')
+                if 'rs2' in op.args:
+                    inst_text.append(', ')
+                    inst_text.append(rs2_text)
+                    inst_text.append(f'[={self.rs2_data:x}]')
 
-            inst_text.append(opstr.ljust(5))
-            inst_text.append(' ')
-            inst_text.append(rs1_text)
-            inst_text.append(f'[={self.rs1_data:x}]')
-            inst_text.append(', ')
-            inst_text.append(rs2_text)
-            inst_text.append(f'[={self.rs2_data:x}]')
-            inst_text.append(f', {imm_B}[={self.pc + imm_B:x}]')
+                for name in ('imm12', 'shamtw', 'shamtd'):
+                    if name in op.args:
+                        inst_text.append(', ')
+                        inst_text.append(
+                            hex(op.args[name]) if abs(op.args[name]) >
+                            255 else str(op.args[name]))
 
-            note_text.append('Taken' if taken else 'Not taken')
+        elif op.name == 'jal' or ('bimm12' in op.args):
+            target = hex(self.pc +
+                         (op.jimm20 if 'jimm20' in op.args else op.bimm12))
 
-        elif opcode == OPV('JAL'):
-            if rd == 'zero':
-                inst_text.append(f'j     {imm_J}[={self.pc + imm_J:x}]')
-            elif rd == 'ra':
-                inst_text.append(f'call  {imm_J}[={self.pc + imm_J:x}]')
+            if 'rd' in op.args and op.rd == 0:
+                inst_text.append('j'.ljust(5))
+                inst_text.append(' ')
+                inst_text.append(target)
+            elif 'rd' in op.args and op.rd == 1:
+                inst_text.append('call'.ljust(5))
+                inst_text.append(' ')
+                inst_text.append(target)
                 note_text.append(f'Return address {self.rd_data:x}')
             else:
-                inst_text.append('jal'.ljust(5))
+                sep = ''
+                inst_text.append(op.name.ljust(5))
                 inst_text.append(' ')
-                inst_text.append(rd_text)
-                inst_text.append(f'[={self.rd_data:x}]')
-                inst_text.append(f', {imm_J}[={self.pc + imm_J:x}]')
+                if 'rd' in op.args:
+                    inst_text.append(rd_text)
+                    inst_text.append(f'[={self.rd_data:x}]')
+                    sep = ', '
 
-        elif opcode == OPV('JALR'):
-            if rs1 == 'ra':
-                inst_text.append('ret')
-                note_text.append(f'Return address {self.rs1_data + imm_I:x}')
-            elif rd == 'zero':
-                inst_text.append('jr'.ljust(5))
-                inst_text.append(' ')
-                inst_text.append(f'{imm_I}(')
-                inst_text.append(rs1_text)
-                inst_text.append(f')[={self.rs1_data + imm_I:x}]')
-            else:
-                inst_text.append('jalr'.ljust(5))
-                inst_text.append(' ')
-                inst_text.append(rd_text)
-                inst_text.append(f'[={self.rd_data:x}]')
-                inst_text.append(f', {imm_I}(')
-                inst_text.append(rs1_text)
-                inst_text.append(f')[={self.rs1_data + imm_I:x}]')
+                if 'rs1' in op.args:
+                    inst_text.append(sep)
+                    inst_text.append(rs1_text)
+                    inst_text.append(f'[={self.rs1_data:x}]')
+                    sep = ', '
 
-        elif opcode == OPV('AUIPC'):
-            inst_text.append('auipc'.ljust(5))
+                if 'rs2' in op.args:
+                    inst_text.append(sep)
+                    inst_text.append(rs2_text)
+                    inst_text.append(f'[={self.rs2_data:x}]')
+                    sep = ', '
+
+                inst_text.append(sep)
+                inst_text.append(target)
+
+        elif 'rd' in op.args and 'imm20' in op.args:
+            inst_text.append(op.name.ljust(5))
             inst_text.append(' ')
             inst_text.append(rd_text)
             inst_text.append(f'[={self.rd_data:x}]')
-            inst_text.append(f', {imm_U:x}')
-            inst_text.append(f'[={self.pc + imm_U:x}]')
+            inst_text.append(', ')
+            inst_text.append(
+                hex(op.imm20) if abs(op.imm20) > 255 else str(op.imm20))
 
-        elif opcode == OPV('LUI'):
-            inst_text.append('lui'.ljust(5))
+        elif op.valid():
+            inst_text.append(op.name.ljust(5))
             inst_text.append(' ')
-            inst_text.append(rd_text)
-            inst_text.append(f'[={self.rd_data:x}]')
-            inst_text.append(f', {imm_U:x}')
+            inst_text.append(op.arg_str())
 
         else:
             illegal_insn = True
 
+        if op.name in {'beq', 'bne', 'blt', 'bltu', 'bge', 'bgeu'}:
+            taken = False
+
+            match op.name:
+                case 'beq':
+                    taken = self.rs1_data == self.rs2_data
+                case 'bne':
+                    taken = self.rs1_data != self.rs2_data
+                case 'blt':
+                    taken = ctypes.c_long(self.rs1_data).value < ctypes.c_long(
+                        self.rs2_data).value
+                case 'bltu':
+                    taken = self.rs1_data < self.rs2_data
+                case 'bge':
+                    taken = ctypes.c_long(
+                        self.rs1_data).value >= ctypes.c_long(
+                            self.rs2_data).value
+                case 'bgeu':
+                    taken = self.rs1_data >= self.rs2_data
+
+            note_text.append('Taken' if taken else 'Not taken')
+
         if illegal_insn:
             inst_text = Text(hex(self.inst), style='red')
+            note_text = Text('Illegal instruction', style='red')
 
         table.add_row(uop_id, pc, inst_text, note_text)
         return (uop_id, pc, inst_text, note_text)

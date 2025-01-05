@@ -2,10 +2,13 @@
 # It is not intended for manual editing.
 
 [metadata]
-groups = ["default", "dev"]
+groups = ["default", "dev", "distinctpy", "tinyrv"]
 strategy = ["cross_platform"]
-lock_version = "4.4.1"
-content_hash = "sha256:cf59060f0753d7e34361dd7ea00f7248cd88c662add2e77986909300278ce6ab"
+lock_version = "4.5.0"
+content_hash = "sha256:a4b5856b27760e0855cd96320359d90277c78fa039bc560c0fc35dc709ae3058"
+
+[[metadata.targets]]
+requires_python = ">=3.11"
 
 [[package]]
 name = "amaranth"
@@ -14,6 +17,7 @@ requires_python = "~=3.8"
 summary = "Amaranth hardware definition language"
 dependencies = [
     "Jinja2~=3.0",
+    "importlib-resources; python_version < \"3.9\"",
     "pyvcd<0.5,>=0.2.2",
 ]
 files = [
@@ -22,7 +26,7 @@ files = [
 
 [[package]]
 name = "amaranth-soc"
-version = "0.1.dev62+g59223a8"
+version = "0.1.dev62"
 requires_python = "~=3.8"
 git = "https://github.com/amaranth-lang/amaranth-soc"
 ref = "59223a8"
@@ -34,12 +38,13 @@ dependencies = [
 
 [[package]]
 name = "amaranth-stdio"
-version = "0.1.dev17+gd33387c"
+version = "0.1.dev17"
 git = "https://github.com/amaranth-lang/amaranth-stdio"
 revision = "d33387c8598df1cfc21e939d919819983b893edd"
 summary = "Industry standard I/O for Amaranth HDL"
 dependencies = [
     "amaranth<0.5,>=0.3",
+    "importlib-metadata; python_version < \"3.8\"",
 ]
 
 [[package]]
@@ -50,6 +55,32 @@ summary = "Cross-platform colored terminal text."
 files = [
     {file = "colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6"},
     {file = "colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44"},
+]
+
+[[package]]
+name = "dataclasses-struct"
+version = "0.8.3"
+requires_python = "<4.0.0,>=3.8.1"
+summary = "Converting dataclasses to and from fixed-length binary data using struct"
+dependencies = [
+    "typing-extensions<5.0.0,>=4.5.0",
+]
+files = [
+    {file = "dataclasses_struct-0.8.3-py3-none-any.whl", hash = "sha256:ab0ae3fd93a98b446893182522bfddf3040913dffbe5a83ab4c08f312ceb0592"},
+    {file = "dataclasses_struct-0.8.3.tar.gz", hash = "sha256:c125f3687940afcd2e3bbf2fd73ef31fa425265be65557e360527a4c1ccd038e"},
+]
+
+[[package]]
+name = "distinctipy"
+version = "1.3.4"
+requires_python = ">=3.8"
+summary = "A lightweight package for generating visually distinct colours."
+dependencies = [
+    "numpy>=1.16.3",
+]
+files = [
+    {file = "distinctipy-1.3.4-py3-none-any.whl", hash = "sha256:2bf57d9d20dbc5c2fd462298573cc963c037f493d04ec61e94cb8d0bf5023c74"},
+    {file = "distinctipy-1.3.4.tar.gz", hash = "sha256:fed97afff1afb73ecaa87c85461021f0ba89fae63067c0125b9673526510aac4"},
 ]
 
 [[package]]
@@ -73,6 +104,35 @@ dependencies = [
 files = [
     {file = "Jinja2-3.1.2-py3-none-any.whl", hash = "sha256:6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61"},
     {file = "Jinja2-3.1.2.tar.gz", hash = "sha256:31351a702a408a9e7595a8fc6150fc3f43bb6bf7e319770cbc0db9df9437e852"},
+]
+
+[[package]]
+name = "lief"
+version = "0.16.2"
+requires_python = ">=3.8"
+summary = "Library to instrument executable formats"
+files = [
+    {file = "lief-0.16.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:41b8c2f64d74ee85ca96af67347cbdd92c5562b5500b9be9882988f0c4134335"},
+    {file = "lief-0.16.2-cp311-cp311-macosx_11_0_x86_64.whl", hash = "sha256:f2284379d84d414150c7e935e70ef06d72298a28f9fda025daaf0698fcea4dcd"},
+    {file = "lief-0.16.2-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:ed3e8122c6d3f845ba4f8a3135dc53fd796156de14d8dbdc3ba310ebbeae6b69"},
+    {file = "lief-0.16.2-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:3b11d0f59bbea089872a433993e8b4078d8138939e9bd1f294ca0238b1d3fb47"},
+    {file = "lief-0.16.2-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:0c2d766481bd0dbdaa6c4c0a20e5da8d44ad163b5120c9db91ecea92661fda01"},
+    {file = "lief-0.16.2-cp311-cp311-win32.whl", hash = "sha256:9b977e0709beb658898025b6a21dc5f59ce484340473fa0b69ce9659400d3ac3"},
+    {file = "lief-0.16.2-cp311-cp311-win_amd64.whl", hash = "sha256:ea1ebaa74bc021f7881aa8e67875e3736526f039c7811f92aa1fe8a4520224d8"},
+    {file = "lief-0.16.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:8e9499516d469ef5a62afeb0ab404ba7c30c05ec197a1775ddb9cdcbbfddd2e6"},
+    {file = "lief-0.16.2-cp312-cp312-macosx_11_0_x86_64.whl", hash = "sha256:b96a5e4656ca2f929b4d7aa631661de47de683eb2c623d039105b5727811fdff"},
+    {file = "lief-0.16.2-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:220ff69e5c0bae8bc114120c7a49485962c58e932a26bb0e9746a17ebfda552d"},
+    {file = "lief-0.16.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:0b7e4e55ded9897867930a15a553dd29e633b4fbf4b5db15ee1a4e0b8b35f469"},
+    {file = "lief-0.16.2-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:4dbc93b5781c9265f682345c07fa817e46a3d89893a597e4b10c4411a8d3f5a5"},
+    {file = "lief-0.16.2-cp312-cp312-win32.whl", hash = "sha256:2d0352eb57cf9876e37ff84e805cf015455bcae5d4da3c1ba310970a6929ecd6"},
+    {file = "lief-0.16.2-cp312-cp312-win_amd64.whl", hash = "sha256:5d57f763429f6c2ce1a8e6928035809b7ffc29d794928d22f41a157a78a51c72"},
+    {file = "lief-0.16.2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:5a32212a9ff4e20a1dcd091ca136e871cccd8a37932df2415e9d3c9debe9908a"},
+    {file = "lief-0.16.2-cp313-cp313-macosx_11_0_x86_64.whl", hash = "sha256:bb6bb1284b27e0f013b5cad1163ea87433b338ea3ecec37f7981dc756d77f703"},
+    {file = "lief-0.16.2-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:6f41849881fff72fa26f360353d052cd8d1787b6b05e39f35f78d43520b51435"},
+    {file = "lief-0.16.2-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:df6c91a1a9d7f3ae53a075ad0165bdefe30d041114cb26baca287e663d76b32a"},
+    {file = "lief-0.16.2-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:2b16db951aeff911d092655ad741d3d4fefca387f3c5ee903255663e15a695ad"},
+    {file = "lief-0.16.2-cp313-cp313-win32.whl", hash = "sha256:d9daf7742cc95f6e22d06c140014bee46b942ee4e7cb3c8ecff95d736233073c"},
+    {file = "lief-0.16.2-cp313-cp313-win_amd64.whl", hash = "sha256:f040368d927ca494309de8742b0b7d1d80e234989f36cffc4587530a073a543e"},
 ]
 
 [[package]]
@@ -128,6 +188,55 @@ files = [
 ]
 
 [[package]]
+name = "numpy"
+version = "2.2.1"
+requires_python = ">=3.10"
+summary = "Fundamental package for array computing in Python"
+files = [
+    {file = "numpy-2.2.1-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:40f9e544c1c56ba8f1cf7686a8c9b5bb249e665d40d626a23899ba6d5d9e1484"},
+    {file = "numpy-2.2.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:f9b57eaa3b0cd8db52049ed0330747b0364e899e8a606a624813452b8203d5f7"},
+    {file = "numpy-2.2.1-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:bc8a37ad5b22c08e2dbd27df2b3ef7e5c0864235805b1e718a235bcb200cf1cb"},
+    {file = "numpy-2.2.1-cp311-cp311-macosx_14_0_x86_64.whl", hash = "sha256:9036d6365d13b6cbe8f27a0eaf73ddcc070cae584e5ff94bb45e3e9d729feab5"},
+    {file = "numpy-2.2.1-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:51faf345324db860b515d3f364eaa93d0e0551a88d6218a7d61286554d190d73"},
+    {file = "numpy-2.2.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:38efc1e56b73cc9b182fe55e56e63b044dd26a72128fd2fbd502f75555d92591"},
+    {file = "numpy-2.2.1-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:31b89fa67a8042e96715c68e071a1200c4e172f93b0fbe01a14c0ff3ff820fc8"},
+    {file = "numpy-2.2.1-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:4c86e2a209199ead7ee0af65e1d9992d1dce7e1f63c4b9a616500f93820658d0"},
+    {file = "numpy-2.2.1-cp311-cp311-win32.whl", hash = "sha256:b34d87e8a3090ea626003f87f9392b3929a7bbf4104a05b6667348b6bd4bf1cd"},
+    {file = "numpy-2.2.1-cp311-cp311-win_amd64.whl", hash = "sha256:360137f8fb1b753c5cde3ac388597ad680eccbbbb3865ab65efea062c4a1fd16"},
+    {file = "numpy-2.2.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:694f9e921a0c8f252980e85bce61ebbd07ed2b7d4fa72d0e4246f2f8aa6642ab"},
+    {file = "numpy-2.2.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:3683a8d166f2692664262fd4900f207791d005fb088d7fdb973cc8d663626faa"},
+    {file = "numpy-2.2.1-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:780077d95eafc2ccc3ced969db22377b3864e5b9a0ea5eb347cc93b3ea900315"},
+    {file = "numpy-2.2.1-cp312-cp312-macosx_14_0_x86_64.whl", hash = "sha256:55ba24ebe208344aa7a00e4482f65742969a039c2acfcb910bc6fcd776eb4355"},
+    {file = "numpy-2.2.1-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:9b1d07b53b78bf84a96898c1bc139ad7f10fda7423f5fd158fd0f47ec5e01ac7"},
+    {file = "numpy-2.2.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5062dc1a4e32a10dc2b8b13cedd58988261416e811c1dc4dbdea4f57eea61b0d"},
+    {file = "numpy-2.2.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:fce4f615f8ca31b2e61aa0eb5865a21e14f5629515c9151850aa936c02a1ee51"},
+    {file = "numpy-2.2.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:67d4cda6fa6ffa073b08c8372aa5fa767ceb10c9a0587c707505a6d426f4e046"},
+    {file = "numpy-2.2.1-cp312-cp312-win32.whl", hash = "sha256:32cb94448be47c500d2c7a95f93e2f21a01f1fd05dd2beea1ccd049bb6001cd2"},
+    {file = "numpy-2.2.1-cp312-cp312-win_amd64.whl", hash = "sha256:ba5511d8f31c033a5fcbda22dd5c813630af98c70b2661f2d2c654ae3cdfcfc8"},
+    {file = "numpy-2.2.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:f1d09e520217618e76396377c81fba6f290d5f926f50c35f3a5f72b01a0da780"},
+    {file = "numpy-2.2.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:3ecc47cd7f6ea0336042be87d9e7da378e5c7e9b3c8ad0f7c966f714fc10d821"},
+    {file = "numpy-2.2.1-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:f419290bc8968a46c4933158c91a0012b7a99bb2e465d5ef5293879742f8797e"},
+    {file = "numpy-2.2.1-cp313-cp313-macosx_14_0_x86_64.whl", hash = "sha256:5b6c390bfaef8c45a260554888966618328d30e72173697e5cabe6b285fb2348"},
+    {file = "numpy-2.2.1-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:526fc406ab991a340744aad7e25251dd47a6720a685fa3331e5c59fef5282a59"},
+    {file = "numpy-2.2.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f74e6fdeb9a265624ec3a3918430205dff1df7e95a230779746a6af78bc615af"},
+    {file = "numpy-2.2.1-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:53c09385ff0b72ba79d8715683c1168c12e0b6e84fb0372e97553d1ea91efe51"},
+    {file = "numpy-2.2.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:f3eac17d9ec51be534685ba877b6ab5edc3ab7ec95c8f163e5d7b39859524716"},
+    {file = "numpy-2.2.1-cp313-cp313-win32.whl", hash = "sha256:9ad014faa93dbb52c80d8f4d3dcf855865c876c9660cb9bd7553843dd03a4b1e"},
+    {file = "numpy-2.2.1-cp313-cp313-win_amd64.whl", hash = "sha256:164a829b6aacf79ca47ba4814b130c4020b202522a93d7bff2202bfb33b61c60"},
+    {file = "numpy-2.2.1-cp313-cp313t-macosx_10_13_x86_64.whl", hash = "sha256:4dfda918a13cc4f81e9118dea249e192ab167a0bb1966272d5503e39234d694e"},
+    {file = "numpy-2.2.1-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:733585f9f4b62e9b3528dd1070ec4f52b8acf64215b60a845fa13ebd73cd0712"},
+    {file = "numpy-2.2.1-cp313-cp313t-macosx_14_0_arm64.whl", hash = "sha256:89b16a18e7bba224ce5114db863e7029803c179979e1af6ad6a6b11f70545008"},
+    {file = "numpy-2.2.1-cp313-cp313t-macosx_14_0_x86_64.whl", hash = "sha256:676f4eebf6b2d430300f1f4f4c2461685f8269f94c89698d832cdf9277f30b84"},
+    {file = "numpy-2.2.1-cp313-cp313t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:27f5cdf9f493b35f7e41e8368e7d7b4bbafaf9660cba53fb21d2cd174ec09631"},
+    {file = "numpy-2.2.1-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c1ad395cf254c4fbb5b2132fee391f361a6e8c1adbd28f2cd8e79308a615fe9d"},
+    {file = "numpy-2.2.1-cp313-cp313t-musllinux_1_2_aarch64.whl", hash = "sha256:08ef779aed40dbc52729d6ffe7dd51df85796a702afbf68a4f4e41fafdc8bda5"},
+    {file = "numpy-2.2.1-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:26c9c4382b19fcfbbed3238a14abf7ff223890ea1936b8890f058e7ba35e8d71"},
+    {file = "numpy-2.2.1-cp313-cp313t-win32.whl", hash = "sha256:93cf4e045bae74c90ca833cba583c14b62cb4ba2cba0abd2b141ab52548247e2"},
+    {file = "numpy-2.2.1-cp313-cp313t-win_amd64.whl", hash = "sha256:bff7d8ec20f5f42607599f9994770fa65d76edca264a87b5e4ea5629bce12268"},
+    {file = "numpy-2.2.1.tar.gz", hash = "sha256:45681fd7128c8ad1c379f0ca0776a8b0c6583d2f69889ddac01559dfe4390918"},
+]
+
+[[package]]
 name = "packaging"
 version = "23.2"
 requires_python = ">=3.7"
@@ -164,9 +273,12 @@ requires_python = ">=3.7"
 summary = "pytest: simple powerful testing with Python"
 dependencies = [
     "colorama; sys_platform == \"win32\"",
+    "exceptiongroup>=1.0.0rc8; python_version < \"3.11\"",
+    "importlib-metadata>=0.12; python_version < \"3.8\"",
     "iniconfig",
     "packaging",
     "pluggy<2.0,>=0.12",
+    "tomli>=1.0.0; python_version < \"3.11\"",
 ]
 files = [
     {file = "pytest-7.4.3-py3-none-any.whl", hash = "sha256:0d009c083ea859a71b76adf7c1d502e4bc170b80a8ef002da5806527b9591fac"},
@@ -184,6 +296,16 @@ files = [
 ]
 
 [[package]]
+name = "readchar"
+version = "4.2.1"
+requires_python = ">=3.8"
+summary = "Library to easily read single chars and key strokes"
+files = [
+    {file = "readchar-4.2.1-py3-none-any.whl", hash = "sha256:a769305cd3994bb5fa2764aa4073452dc105a4ec39068ffe6efd3c20c60acc77"},
+    {file = "readchar-4.2.1.tar.gz", hash = "sha256:91ce3faf07688de14d800592951e5575e9c7a3213738ed01d394dcc949b79adb"},
+]
+
+[[package]]
 name = "rich"
 version = "13.6.0"
 requires_python = ">=3.7.0"
@@ -191,6 +313,7 @@ summary = "Render rich text, tables, progress bars, syntax highlighting, markdow
 dependencies = [
     "markdown-it-py>=2.2.0",
     "pygments<3.0.0,>=2.13.0",
+    "typing-extensions<5.0,>=4.0.0; python_version < \"3.9\"",
 ]
 files = [
     {file = "rich-13.6.0-py3-none-any.whl", hash = "sha256:2b38e2fe9ca72c9a00170a1a2d20c63c790d0e10ef1fe35eba76e1e7b1d7d245"},
@@ -204,4 +327,29 @@ summary = "RISC-V Model"
 files = [
     {file = "riscv-model-0.6.6.tar.gz", hash = "sha256:dfff035b75ed36de33a99f95f1098697be308d4c7161a99407b82df22fd54d69"},
     {file = "riscv_model-0.6.6-py3-none-any.whl", hash = "sha256:94fb3c93ac74fd3fa8c82a600a4c0030fdef020a8c81423aa40e4666687349b6"},
+]
+
+[[package]]
+name = "tinyrv"
+version = "0.0.9"
+requires_python = ">=3.8"
+summary = "A tiny RISC-V instruction set simulator"
+dependencies = [
+    "dataclasses-struct",
+    "lief",
+    "readchar",
+]
+files = [
+    {file = "tinyrv-0.0.9-py3-none-any.whl", hash = "sha256:b4c19d628cb8852a201113805bacefe6a169c7407d8bc1f11e95b312d5821e5a"},
+    {file = "tinyrv-0.0.9.tar.gz", hash = "sha256:f751c7f123058a0454f16e15589148d5c789b23c8c000be12cf928eab1665a74"},
+]
+
+[[package]]
+name = "typing-extensions"
+version = "4.12.2"
+requires_python = ">=3.8"
+summary = "Backported and Experimental Type Hints for Python 3.8+"
+files = [
+    {file = "typing_extensions-4.12.2-py3-none-any.whl", hash = "sha256:04e5ca0351e0f3f85c6853954072df659d0d13fac324d0072316b67d7794700d"},
+    {file = "typing_extensions-4.12.2.tar.gz", hash = "sha256:1a7ead55c7e559dd4dee8856e3a88b41225abfe1ce8df57b7c13915fe121ffb8"},
 ]
