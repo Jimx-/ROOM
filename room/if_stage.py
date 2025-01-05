@@ -647,8 +647,8 @@ class IFStage(HasCoreParams, Elaboratable):
             if w == 0:
                 inst0 = Cat(f3_prev_half, s3_data[0:16])
                 inst1 = s3_data[0:32]
-                dec0 = RVCDecoder()
-                dec1 = RVCDecoder()
+                dec0 = RVCDecoder(self.xlen)
+                dec1 = RVCDecoder(self.xlen)
                 br_dec0 = BranchDecoder(self.vaddr_bits_extended)
                 br_dec1 = BranchDecoder(self.vaddr_bits_extended)
                 m.submodules += [dec0, dec1, br_dec0, br_dec1]
@@ -680,7 +680,7 @@ class IFStage(HasCoreParams, Elaboratable):
             else:
                 inst = Signal(32)
                 pc = f3_aligned_pc + (w * 2)
-                dec = RVCDecoder()
+                dec = RVCDecoder(self.xlen)
                 br_dec = BranchDecoder(self.vaddr_bits_extended)
                 m.submodules += [dec, br_dec]
 
