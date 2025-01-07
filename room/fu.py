@@ -179,7 +179,7 @@ class ALUUnit(PipelinedFunctionalUnit):
         opb_data = Signal(self.xlen)
 
         if self.is_jmp:
-            uop_pc = self.get_pc.pc | uop.pc_lsb
+            uop_pc = (self.get_pc.pc | uop.pc_lsb) - Mux(uop.edge_inst, 2, 0)
 
             m.d.comb += opa_data.eq(
                 Mux(uop.opa_sel == OpA.RS1, self.req.bits.rs1_data,

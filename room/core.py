@@ -514,7 +514,8 @@ class Core(HasCoreParams, Elaboratable):
                 if_stage.redirect_ftq_idx.eq(rob_flush_d1.bits.ftq_idx),
             ]
 
-            flush_pc = if_stage.get_pc[0].pc + rob_flush_d1.bits.pc_lsb
+            flush_pc = if_stage.get_pc[0].pc + rob_flush_d1.bits.pc_lsb - Mux(
+                rob_flush_d1.bits.edge_inst, 2, 0)
             with m.Switch(rob_flush_d1.bits.flush_type):
                 with m.Case(FlushType.EXCEPT):
                     m.d.comb += if_stage.redirect_pc.eq(exc_unit.exc_vector)
@@ -529,8 +530,9 @@ class Core(HasCoreParams, Elaboratable):
         with m.Elif(br_update.br_res.mispredict & ~rob_flush_d1.valid):
             uop = br_update.br_res.uop
             uop_pc = if_stage.get_pc[1].pc | uop.pc_lsb
-            npc = uop_pc + Mux(uop.is_rvc, 2, 4)
-            br_target = uop_pc + br_update.br_res.target_offset
+            npc = uop_pc + Mux(uop.is_rvc | uop.edge_inst, 2, 4)
+            br_target = uop_pc + br_update.br_res.target_offset - Mux(
+                uop.edge_inst, 2, 0)
             bj_addr = Mux(br_update.br_res.cfi_type == CFIType.JALR,
                           br_update.br_res.jalr_target, br_target)
             redirect_target = Mux(br_update.br_res.pc_sel == PCSel.PC_PLUS_4,

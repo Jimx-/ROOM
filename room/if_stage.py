@@ -5,7 +5,7 @@ from amaranth.utils import log2_int
 
 from room.consts import *
 from room.rvc import RVCDecoder
-from room.id_stage import BranchDecoder
+from room.id_stage import BranchDecoder, BranchSignals
 from room.types import HasCoreParams, MicroOp
 from room.fu import GetPCResp
 from room.breakpoint import Breakpoint, BreakpointMatcher
@@ -40,6 +40,7 @@ class FetchBundle(HasCoreParams):
 
         self.pc = Signal(32, name=f'{name}_pc')
         self.next_pc = Signal(32, name=f'{name}_next_pc')
+        self.edge_inst = Signal(name=f'{name}_edge_inst')
         self.insts = [
             Signal(32, name=f'{name}_inst{i}') for i in range(self.fetch_width)
         ]
@@ -65,6 +66,7 @@ class FetchBundle(HasCoreParams):
         ret = [
             self.pc.eq(rhs.pc),
             self.next_pc.eq(rhs.next_pc),
+            self.edge_inst.eq(rhs.edge_inst),
             self.mask.eq(rhs.mask),
             self.cfi_valid.eq(rhs.cfi_valid),
             self.cfi_idx.eq(rhs.cfi_idx),
@@ -136,7 +138,7 @@ class FetchBuffer(HasCoreParams, Elaboratable):
                 in_uops[w].ftq_idx.eq(self.w_data.ftq_idx),
                 in_uops[w].pc_lsb.eq(pc),
                 in_uops[w].inst.eq(self.w_data.exp_insts[w]),
-                in_uops[w].is_rvc.eq(in_uops[w].inst[0:2] != 3),
+                in_uops[w].is_rvc.eq(self.w_data.insts[w][0:2] != 3),
                 in_uops[w].taken.eq((self.w_data.cfi_idx == w)
                                     & self.w_data.cfi_valid),
                 in_uops[w].exc_ae_if.eq(self.w_data.exc_ae_if),
@@ -144,6 +146,10 @@ class FetchBuffer(HasCoreParams, Elaboratable):
                 in_uops[w].bp_exc_if.eq(self.w_data.bp_exc_if[w]),
                 in_uops[w].bp_debug_if.eq(self.w_data.bp_debug_if[w]),
             ]
+
+            if w == 0:
+                with m.If(self.w_data.edge_inst):
+                    m.d.comb += in_uops[w].edge_inst.eq(1)
 
         if self.sim_debug:
             id_counter = Signal(MicroOp.ID_WIDTH)
@@ -155,8 +161,11 @@ class FetchBuffer(HasCoreParams, Elaboratable):
                     in_uops[w].uop_id.eq(next_id),
                     self.if_debug[w].valid.eq(in_mask[w]),
                     self.if_debug[w].bits.uop_id.eq(in_uops[w].uop_id),
-                    self.if_debug[w].bits.inst.eq(in_uops[w].inst),
-                    self.if_debug[w].bits.pc.eq(pc),
+                    self.if_debug[w].bits.inst.eq(
+                        Mux(in_uops[w].is_rvc, self.w_data.insts[w][:16],
+                            self.w_data.insts[w])),
+                    self.if_debug[w].bits.pc.eq(
+                        Mux(in_uops[w].edge_inst, pc - 2, pc)),
                 ]
 
                 next_id = Mux(in_mask[w], next_id + 1, next_id)
@@ -644,6 +653,9 @@ class IFStage(HasCoreParams, Elaboratable):
             for m_bp, bp in zip(bp_matcher.bp, self.bp):
                 m.d.comb += m_bp.eq(bp)
 
+            br_sigs = BranchSignals(vaddr_bits=self.vaddr_bits,
+                                    name=f'br_sigs{w}')
+
             if w == 0:
                 inst0 = Cat(f3_prev_half, s3_data[0:16])
                 inst1 = s3_data[0:32]
@@ -666,14 +678,20 @@ class IFStage(HasCoreParams, Elaboratable):
                 ]
 
                 with m.If(f3_prev_half_valid):
-                    pass
+                    m.d.comb += [
+                        f3_insts[w].eq(inst0),
+                        f3_exp_insts[w].eq(dec0.instr_o),
+                        bp_matcher.pc.eq(pc0),
+                        f3_fetch_bundle.edge_inst.eq(1),
+                        br_sigs.eq(br_dec0.out),
+                    ]
                 with m.Else():
                     m.d.comb += [
                         f3_insts[w].eq(inst1),
                         f3_exp_insts[w].eq(dec1.instr_o),
                         bp_matcher.pc.eq(pc1),
+                        br_sigs.eq(br_dec1.out),
                     ]
-                    br_sigs = br_dec1.out
 
                 m.d.comb += [valid.eq(1)]
 
@@ -691,9 +709,8 @@ class IFStage(HasCoreParams, Elaboratable):
                     br_dec.pc.eq(pc),
                     f3_exp_insts[w].eq(dec.instr_o),
                     bp_matcher.pc.eq(pc),
+                    br_sigs.eq(br_dec.out),
                 ]
-
-                br_sigs = br_dec.out
 
                 if w == 1:
                     m.d.comb += [
@@ -751,7 +768,7 @@ class IFStage(HasCoreParams, Elaboratable):
                 f3_prev_half.eq(last_inst),
                 f3_prev_half_valid.eq(~(f3_mask[self.fetch_width - 2]
                                         & ~f3_is_rvc[self.fetch_width - 2])
-                                      & (last_inst[0:2] != 3)),
+                                      & (last_inst[0:2] == 3)),
             ]
         with m.Elif(f3_clear):
             m.d.sync += f3_prev_half_valid.eq(0)

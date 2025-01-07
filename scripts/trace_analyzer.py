@@ -59,6 +59,38 @@ class Instruction:
         if (rs2 := op.args.get('rs2')) is not None:
             rs2_text = Text(self.int_regs[rs2], style=PREG_COLORS[self.prs2])
 
+        if (rd_p := op.args.get('rd_p')) is not None:
+            rd_text = Text(self.int_regs[rd_p + 8],
+                           style=PREG_COLORS[self.pdst])
+        if (rd_n0 := op.args.get('rd_n0')) is not None:
+            rd_text = Text(self.int_regs[rd_n0], style=PREG_COLORS[self.pdst])
+        if (rd_n2 := op.args.get('rd_n2')) is not None:
+            rd_text = Text(self.int_regs[rd_n2], style=PREG_COLORS[self.pdst])
+        if (rd_rs1_p := op.args.get('rd_rs1_p')) is not None:
+            rd_text = Text(self.int_regs[rd_rs1_p + 8],
+                           style=PREG_COLORS[self.pdst])
+            rs1_text = Text(self.int_regs[rd_rs1_p + 8],
+                            style=PREG_COLORS[self.prs1])
+        if (rd_rs1_n0 := op.args.get('rd_rs1_n0')) is not None:
+            rd_text = Text(self.int_regs[rd_rs1_n0],
+                           style=PREG_COLORS[self.pdst])
+            rs1_text = Text(self.int_regs[rd_rs1_n0],
+                            style=PREG_COLORS[self.prs1])
+        if (rs1_p := op.args.get('rs1_p')) is not None:
+            rs1_text = Text(self.int_regs[rs1_p + 8],
+                            style=PREG_COLORS[self.prs1])
+        if (rs1_n0 := op.args.get('rs1_n0')) is not None:
+            rs1_text = Text(self.int_regs[rs1_n0],
+                            style=PREG_COLORS[self.prs1])
+        if (rs2_p := op.args.get('rs2_p')) is not None:
+            rs2_text = Text(self.int_regs[rs2_p + 8],
+                            style=PREG_COLORS[self.prs2])
+        if (rs2_n0 := op.args.get('rs2_n0')) is not None:
+            rs2_text = Text(self.int_regs[rs2_n0],
+                            style=PREG_COLORS[self.prs2])
+
+        op_name = op.name.replace('_', '.')
+
         if op.name in {
                 'lb', 'lh', 'lw', 'ld', 'lbu', 'lhu', 'lwu', 'sb', 'sh', 'sw',
                 'sd'
@@ -78,7 +110,7 @@ class Instruction:
             if op.name.startswith('l'):
                 note_text.append(f'mem[{self.addr:x}] -> {self.rd_data:x}')
             else:
-                note_text.append(f'mem[{self.addr:x}] <- {self.rd_data:x}')
+                note_text.append(f'mem[{self.addr:x}] <- {self.data:x}')
 
         elif op.name == 'jalr':
             if op.rs1 == 1 and op.imm12 == 0:
@@ -115,6 +147,149 @@ class Instruction:
             else:
                 inst_text.append(
                     f'{hex(op.zimm) if abs(op.zimm) > 255 else op.zimm}')
+
+        elif 'rd_rs1_p' in op.args:
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rd_text)
+            inst_text.append(f'[={self.rd_data:x}]')
+            inst_text.append(', ')
+            inst_text.append(rs1_text)
+            inst_text.append(f'[={self.rs1_data:x}]')
+            inst_text.append(', ')
+
+            if 'rs2_p' in op.args:
+                inst_text.append(rs2_text)
+                inst_text.append(f'[={self.rs2_data:x}]')
+            elif 'nzuimm6' in op.args:
+                inst_text.append(str(op.nzuimm6))
+            elif 'imm6' in op.args:
+                inst_text.append(str(op.imm6))
+
+        elif 'rd_rs1_n0' in op.args:
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rd_text)
+            inst_text.append(f'[={self.rd_data:x}]')
+            inst_text.append(', ')
+            inst_text.append(rs1_text)
+            inst_text.append(f'[={self.rs1_data:x}]')
+            inst_text.append(', ')
+
+            if 'rs2_n0' in op.args:
+                inst_text.append(rs2_text)
+                inst_text.append(f'[={self.rs2_data:x}]')
+            elif 'nzuimm6' in op.args:
+                inst_text.append(str(op.nzuimm6))
+            elif 'nzimm6' in op.args:
+                inst_text.append(str(op.nzimm6))
+            elif 'imm6' in op.args:
+                inst_text.append(str(op.imm6))
+
+        elif 'rd_n0' in op.args:
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rd_text)
+            inst_text.append(f'[={self.rd_data:x}]')
+            inst_text.append(', ')
+
+            if 'imm6' in op.args:
+                inst_text.append(str(op.imm6))
+            elif 'uimm8sp' in op.args:
+                inst_text.append(f'{hex(op.uimm8sp)}(sp)')
+                inst_text.append(f'[={self.rs1_data:x}]')
+            elif 'uimm9sp' in op.args:
+                inst_text.append(f'{hex(op.uimm9sp)}(sp)')
+                inst_text.append(f'[={self.rs1_data:x}]')
+            else:
+                inst_text.append(rs2_text)
+                inst_text.append(f'[={self.rs2_data:x}]')
+
+        elif op.name in {'c_sw', 'c_sd', 'c_lw', 'c_ld'}:
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            if 'rs2_p' in op.args:
+                inst_text.append(rs2_text)
+                inst_text.append(f'[={self.data:x}]')
+            else:
+                inst_text.append(rd_text)
+                inst_text.append(f'[={self.rd_data:x}]')
+            inst_text.append(', ')
+
+            if 'uimm7' in op.args:
+                inst_text.append(str(op.uimm7))
+            else:
+                inst_text.append(str(op.uimm8))
+            inst_text.append('(')
+            inst_text.append(rs1_text)
+            inst_text.append(')')
+            inst_text.append(f'[={self.addr:x}]')
+
+            if op.name.startswith('c_l'):
+                note_text.append(f'mem[{self.addr:x}] -> {self.rd_data:x}')
+            else:
+                note_text.append(f'mem[{self.addr:x}] <- {self.data:x}')
+
+        elif op.name == 'c_lui':
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rd_text)
+            inst_text.append(f'[={self.rd_data:x}]')
+            inst_text.append(', ')
+            inst_text.append(hex(op.nzimm18))
+
+        elif op.name == 'c_swsp':
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rs2_text)
+            inst_text.append(f'[={self.data:x}]')
+            inst_text.append(f', ')
+            inst_text.append(f'{hex(op.uimm8sp_s)}(sp)')
+            inst_text.append(f'[={self.rs1_data:x}]')
+
+        elif op.name == 'c_sdsp':
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rs2_text)
+            inst_text.append(f'[={self.data:x}]')
+            inst_text.append(f', ')
+            inst_text.append(f'{hex(op.uimm9sp_s)}(sp)')
+            inst_text.append(f'[={self.rs1_data:x}]')
+
+        elif op.name == 'c_addi4spn':
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rd_text)
+            inst_text.append(f'[={self.rd_data:x}]')
+            inst_text.append(', ')
+            inst_text.append(hex(op.nzuimm10))
+
+        elif op.name == 'c_addi16sp':
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(hex(self.nzimm10))
+
+        elif op.name == 'c_jalr':
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append('ra')
+            inst_text.append(f'[={self.rd_data:x}]')
+            inst_text.append(', ')
+            inst_text.append(rs1_text)
+            inst_text.append(f'[={self.rs1_data:x}]')
+
+        elif op.name == 'c_jr':
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rs1_text)
+            inst_text.append(f'[={self.rs1_data:x}]')
+
+        elif op.name == 'c_j':
+            target = hex(self.pc + op.imm12)
+
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(target)
 
         elif 'rd' in op.args and 'rs1' in op.args:
             if op.name == 'addi' and op.imm12 == 0:

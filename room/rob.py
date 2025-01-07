@@ -56,6 +56,7 @@ class CommitExceptionReq(HasCoreParams, Record):
 
         Record.__init__(self, [
             ('ftq_idx', range(self.ftq_size)),
+            ('edge_inst', 1),
             ('pc_lsb', range(self.fetch_bytes)),
             ('is_rvc', 1),
             ('cause', self.xlen),
@@ -304,6 +305,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
 
         m.d.comb += [
             self.commit_exc.bits.ftq_idx.eq(commit_exc_uop.ftq_idx),
+            self.commit_exc.bits.edge_inst.eq(commit_exc_uop.edge_inst),
             self.commit_exc.bits.pc_lsb.eq(commit_exc_uop.pc_lsb),
             self.commit_exc.bits.is_rvc.eq(commit_exc_uop.is_rvc),
             self.commit_exc.bits.cause.eq(commit_exc_uop.exc_cause),
@@ -351,6 +353,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         m.d.comb += [
             self.flush.valid.eq(exception_thrown | flush_commit),
             self.flush.bits.ftq_idx.eq(flush_uop.ftq_idx),
+            self.flush.bits.edge_inst.eq(flush_uop.edge_inst),
             self.flush.bits.pc_lsb.eq(flush_uop.pc_lsb),
             self.flush.bits.is_rvc.eq(flush_uop.is_rvc),
         ]

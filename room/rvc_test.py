@@ -421,7 +421,7 @@ def test_c1_lui(xlen):
         op = tinyrv.decode(exp_inst, xlen=xlen)
         assert op.name == 'lui'
         assert op.rd == rd
-        assert op.imm20 == imm << 12
+        assert op.imm20 == imm
 
     run_test(dut, rvc_unittest(dut, c_inst, check), sync=False)
 

@@ -81,14 +81,14 @@ class RVCDecoder(Elaboratable):
 
                     with m.Case(0b110):  # c.sw
                         m.d.comb += instr_o.eq(
-                            Cat(OPV7('SW'), ld_imm[:5], Const(2, 3), rs1p,
-                                rs2p, ld_imm >> 5))
+                            Cat(OPV7('SW'), lw_imm[:5], Const(2, 3), rs1p,
+                                rs2p, lw_imm >> 5))
 
                     with m.Case(0b111):
                         if self.xlen == 32:  # c.fsw
                             m.d.comb += instr_o.eq(
-                                Cat(Const(0x27, 7), ld_imm[:5], Const(2, 3),
-                                    rs1p, rs2p, ld_imm >> 5))
+                                Cat(Const(0x27, 7), lw_imm[:5], Const(2, 3),
+                                    rs1p, rs2p, lw_imm >> 5))
 
                         else:  # c.sd
                             m.d.comb += instr_o.eq(
@@ -116,11 +116,12 @@ class RVCDecoder(Elaboratable):
                         m.d.comb += instr_o.eq(
                             Cat(OPV7('ADDI'), rd, Const(0, 3), x0, addi_imm))
 
-                    with m.Case(0b011):
+                    with m.Case(0b011
+                                ):  # c.addi16sp (rd = 2), c.lui (rd != {0, 2})
                         addi16sp = Cat(Mux(addi_imm.any(), OPV7('ADDI'), 0),
                                        rd, Const(0, 3), rd, addi16sp_imm)
                         lui = Cat(Mux(addi_imm.any(), OPV7('LUI'), 0), rd,
-                                  lui_imm)
+                                  lui_imm[12:32])
                         m.d.comb += instr_o.eq(
                             Mux((rd == x0) | (rd == sp), addi16sp, lui))
 
