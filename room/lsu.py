@@ -948,12 +948,18 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                                   & tlb.resp[w].bits.miss),
             ]
 
+        s1_tlb_pf_ld = Signal(self.mem_width)
+        s1_tlb_pf_st = Signal(self.mem_width)
+        s1_tlb_ae_ld = Signal(self.mem_width)
+        s1_tlb_ae_st = Signal(self.mem_width)
+
         for w in range(self.mem_width):
             m.d.comb += dcache.s1_paddr[w].eq(s1_mem_addr[w])
 
             with m.If(fired_load_incoming[w] | fired_load_retry[w]):
                 ldq_idx = s1_ldq_e[w].uop.ldq_idx
-                with m.If(s1_tlb_miss[w] | s1_tlb_uncacheable[w]):
+                with m.If(s1_tlb_miss[w] | s1_tlb_uncacheable[w]
+                          | s1_tlb_pf_ld[w] | s1_tlb_ae_ld[w]):
                     m.d.comb += [
                         dcache.s1_kill[w].eq(1),
                         s1_set_executed[ldq_idx].eq(0),
@@ -992,10 +998,6 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 s1_exc_vaddrs[w].eq(exec_tlb_vaddr[w]),
             ]
 
-        s1_tlb_pf_ld = Signal(self.mem_width)
-        s1_tlb_pf_st = Signal(self.mem_width)
-        s1_tlb_ae_ld = Signal(self.mem_width)
-        s1_tlb_ae_st = Signal(self.mem_width)
         s1_exc_valids = Signal(self.mem_width)
         s1_exc_causes = [
             Signal(Cause, name=f's1_exc_cause{w}')
@@ -1298,6 +1300,18 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                                  & forwarder_is_older)):
                         m.d.comb += failed_loads[i].eq(1)
                         m.d.sync += ldq[i].order_fail.eq(1)
+
+                with m.If(do_ld_search[w] & ldq[i].valid & ldq[i].addr_valid
+                          & ~ldq[i].is_vaddr & addr_matches[w]
+                          & ((load_mask & cam_mask[w]) != 0)):
+                    searcher_is_older = is_older(cam_ldq_idx[w], i, ldq_head)
+                    with m.If(~searcher_is_older & (cam_ldq_idx[w] != i)):
+                        with m.If(~(ldq[i].executed & ldq[i].succeeded)):
+                            m.d.comb += [
+                                can_forward[w].eq(0),
+                                dcache.s1_kill[w].eq(dmem_req_fired[w]),
+                                s1_set_executed[cam_ldq_idx[w]].eq(0),
+                            ]
 
         for i in range(self.stq_size):
             addr_matches = Cat((stq[i].addr_valid & ~stq[i].is_vaddr
