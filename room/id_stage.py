@@ -5,6 +5,7 @@ from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.branch import BranchMaskAllocator, BranchUpdate
 from room.exc import Cause
+from room.csr import CSRDecode
 from room.fpu import FPFormat
 
 from roomsoc.interconnect.stream import Valid
@@ -80,6 +81,8 @@ class DecodeUnit(HasCoreParams, Elaboratable):
 
         self.interrupt = Signal()
         self.interrupt_cause = Signal(self.xlen)
+
+        self.csr_decode = CSRDecode()
 
     def elaborate(self, platform):
         m = Module()
@@ -769,6 +772,16 @@ class DecodeUnit(HasCoreParams, Elaboratable):
         m.d.comb += uop.imm_packed.eq(
             Cat(inuop.inst[12:20], di20_25, inuop.inst[25:32]))
 
+        csr_en = (uop.csr_cmd == CSRCommand.C) | (
+            uop.csr_cmd == CSRCommand.S) | (uop.csr_cmd == CSRCommand.W)
+        csr_ren = ((uop.csr_cmd == CSRCommand.C) |
+                   (uop.csr_cmd == CSRCommand.S)) & (uop.lrs1 == 0)
+        m.d.comb += self.csr_decode.inst.eq(uop.inst)
+
+        id_insn_illegal = insn_illegal | (
+            csr_en & (self.csr_decode.read_illegal
+                      | ~csr_ren & self.csr_decode.write_illegal))
+
         with m.If(self.interrupt):
             m.d.comb += [
                 uop.exception.eq(1),
@@ -794,7 +807,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                 uop.exception.eq(1),
                 uop.exc_cause.eq(Cause.FETCH_ACCESS_FAULT),
             ]
-        with m.Elif(insn_illegal):
+        with m.Elif(id_insn_illegal):
             m.d.comb += [
                 uop.exception.eq(1),
                 uop.exc_cause.eq(Cause.ILLEGAL_INSTRUCTION),
@@ -832,6 +845,10 @@ class DecodeStage(HasCoreParams, Elaboratable):
         self.interrupt_cause = Signal(self.xlen)
         self.single_step = Signal()
 
+        self.csr_decode = [
+            CSRDecode(name=f'csr_decode{w}') for w in range(self.core_width)
+        ]
+
         if sim_debug:
             self.id_debug = [
                 Valid(IDDebug, params, name=f'id_debug{i}')
@@ -862,6 +879,7 @@ class DecodeStage(HasCoreParams, Elaboratable):
                 self.uops[i].eq(dec.out_uop),
                 dec.interrupt.eq(self.interrupt),
                 dec.interrupt_cause.eq(self.interrupt_cause),
+                dec.csr_decode.connect(self.csr_decode[i]),
             ]
 
             with m.If(self.single_step & (single_stepped if (i == 0) else 1)):

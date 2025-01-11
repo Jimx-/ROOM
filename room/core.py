@@ -203,7 +203,10 @@ class Core(HasCoreParams, Elaboratable):
         exc_unit = m.submodules.exc_unit = ExceptionUnit(self.params)
         csr.add_csrs(exc_unit.iter_csrs())
 
-        m.d.comb += exc_unit.interrupts.eq(self.interrupts)
+        m.d.comb += [
+            exc_unit.interrupts.eq(self.interrupts),
+            csr.prv.eq(exc_unit.prv),
+        ]
 
         #
         # Breakpoint unit
@@ -258,6 +261,8 @@ class Core(HasCoreParams, Elaboratable):
             self.params, sim_debug=self.sim_debug)
         for a, b in zip(dec_stage.fetch_packet, if_stage.fetch_packet):
             m.d.comb += a.eq(b)
+        for a, b in zip(dec_stage.csr_decode, csr.decode):
+            m.d.comb += a.connect(b)
         m.d.comb += [
             dec_stage.fetch_packet_valid.eq(if_stage.fetch_packet_valid),
             dec_stage.dis_ready.eq(dis_ready),

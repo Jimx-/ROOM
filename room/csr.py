@@ -4,6 +4,7 @@ import riscvmodel.csrnames as csrnames
 
 from amaranth import *
 from amaranth.utils import bits_for, log2_int
+from amaranth.hdl.rec import Direction
 
 from room.consts import *
 from room.types import HasCoreParams
@@ -66,6 +67,18 @@ class CSRRecord(Record):
         super().__init__(fields, name=name, src_loc_at=1 + src_loc_at)
 
 
+class CSRDecode(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('inst', 32, Direction.FANOUT),
+            ('read_illegal', 1, Direction.FANIN),
+            ('write_illegal', 1, Direction.FANIN),
+        ],
+                         name=name,
+                         src_loc_at=src_loc_at + 1)
+
+
 def misa_layout(xlen):
     return [
         ("extensions", 26, CSRAccess.RW),
@@ -83,6 +96,11 @@ class CSRFile(HasCoreParams, Elaboratable):
         self.depth = depth
         self._csr_map = OrderedDict()
         self._ports = []
+
+        self.prv = Signal(PrivilegeMode)
+        self.decode = [
+            CSRDecode(name=f'decode{w}') for w in range(self.core_width)
+        ]
 
         self.mhartid = CSR(csrnames.mhartid,
                            [('value', self.width, CSRAccess.RO)])
@@ -164,5 +182,15 @@ class CSRFile(HasCoreParams, Elaboratable):
                             rw = (1 << i) & csr.mask
                             m.d.comb += csr.w[i].eq(
                                 w_data[i] if rw else csr.r[i])
+
+        for dec in self.decode:
+            csr_addr = dec.inst[20:]
+            csr_mode = csr_addr[8:10]
+            csr_prv_ok = self.prv >= csr_mode
+
+            m.d.comb += [
+                dec.read_illegal.eq(~csr_prv_ok),
+                dec.write_illegal.eq(csr_addr[10:12].all()),
+            ]
 
         return m
