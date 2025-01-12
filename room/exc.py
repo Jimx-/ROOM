@@ -57,12 +57,12 @@ def mstatus_layout(xlen):
         ("mie", 1, CSRAccess.RW),  # Machine Interrupt Enable
         ("upie", 1, CSRAccess.RO),  # User Previous Interrupt Enable
         ("spie", 1, CSRAccess.RO),  # Supervisor Previous Interrupt Enable
-        ("zero1", 1, CSRAccess.RO),
+        ("ube", 1, CSRAccess.RO),
         ("mpie", 1, CSRAccess.RW),  # Machine Previous Interrupt Enable
         ("spp", 1, CSRAccess.RO),  # Supervisor Previous Privilege
-        ("zero2", 2, CSRAccess.RO),
+        ("vs", 2, CSRAccess.RO),
         ("mpp", 2, CSRAccess.RW),  # Machine Previous Privilege
-        ("fs", 2, CSRAccess.RO),  # FPU Status
+        ("fs", 2, CSRAccess.RW),  # FPU Status
         ("xs", 2, CSRAccess.RO),  # user-mode eXtensions Status
         ("mprv", 1, CSRAccess.RO),  # Modify PRiVilege
         ("sum", 1, CSRAccess.RO),  # Supervisor User Memory access
@@ -426,8 +426,16 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                         self.mstatus.r.tvm.eq(self.mstatus.w.tvm),
                     ]
 
-                if self.use_supervisor and self.use_fpu:
-                    m.d.sync += self.mstatus.r.fs.eq(self.mstatus.w.fs)
+            if self.use_supervisor and self.use_fpu:
+                m.d.sync += self.mstatus.r.fs.eq(self.mstatus.w.fs)
+
+        m.d.comb += self.mstatus.r.sd.eq(self.mstatus.r.fs.all()
+                                         | self.mstatus.r.vs.all()
+                                         | self.mstatus.r.xs.all())
+        if self.use_supervisor:
+            m.d.comb += self.mstatus.r.sxl.eq(log2_int(self.xlen) - 4)
+        if self.use_user:
+            m.d.comb += self.mstatus.r.uxl.eq(log2_int(self.xlen) - 4)
 
         with m.If(self.stvec.we):
             m.d.sync += [
