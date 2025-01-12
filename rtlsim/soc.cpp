@@ -57,7 +57,7 @@ void sim_trace_enable(bool enable) { trace_enabled = enable; }
 class SoC::Impl {
 public:
     Impl(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
-         std::string_view bootrom)
+         std::string_view bootrom, std::string_view dtb)
         : ram_addr_(memory_addr)
     {
         Verilated::randReset(VERILATOR_RESET_VALUE);
@@ -75,7 +75,7 @@ public:
         if (!sd_image.empty()) sdcard_.reset(new SDCard(sd_image));
 
 #ifdef ITRACE
-        (void)new Tracer(memory_addr, memory_size, bootrom);
+        (void)new Tracer(memory_addr, memory_size, bootrom, dtb);
 #endif
 
 #ifdef VCD_OUTPUT
@@ -311,8 +311,8 @@ private:
 template <> SoC* Singleton<SoC>::m_singleton = nullptr;
 
 SoC::SoC(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
-         std::string_view bootrom)
-    : impl_(new Impl(sd_image, memory_addr, memory_size, bootrom))
+         std::string_view bootrom, std::string_view dtb)
+    : impl_(new Impl(sd_image, memory_addr, memory_size, bootrom, dtb))
 {}
 
 SoC::~SoC() { delete impl_; }

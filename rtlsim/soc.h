@@ -11,7 +11,7 @@ namespace room {
 class SoC : public Singleton<SoC> {
 public:
     SoC(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
-        std::string_view bootrom);
+        std::string_view bootrom, std::string_view dtb);
     ~SoC();
 
     int run();

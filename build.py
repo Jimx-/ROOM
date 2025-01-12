@@ -406,6 +406,10 @@ if __name__ == "__main__":
                         type=int,
                         help='SoC clock frequency',
                         default=50e6)
+    parser.add_argument('--dtb',
+                        type=str,
+                        help='Path to device tree blob',
+                        default=None)
     parser.add_argument('--sim', action='store_true')
     args = parser.parse_args()
 
@@ -416,6 +420,11 @@ if __name__ == "__main__":
         ram = read_mem_image(args.ram, word_len=64)
     else:
         ram = [0x6f]
+
+    if args.dtb is not None:
+        dtb = read_mem_image(args.dtb, word_len=64)
+        rom += [0] * (32 - len(rom))
+        rom += dtb
 
     top = Top(args.freq,
               rom_image=rom,

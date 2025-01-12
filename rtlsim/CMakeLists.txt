@@ -49,6 +49,7 @@ endif()
 if (USE_DROMAJO)
    add_definitions(-DDROMAJO)
    add_subdirectory(dromajo)
+   target_compile_definitions(dromajo_cosim PRIVATE VLEN=0 ELEN=0)
 
    include_directories(dromajo/include)
 

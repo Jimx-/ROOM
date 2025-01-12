@@ -143,8 +143,9 @@ class CSRFile(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        isa_string = 'IMC' + ('F' if self.use_fpu and self.flen >= 32 else ''
-                              ) + ('D' if self.use_fpu and self.flen >= 64 else
+        isa_string = 'IMAC' + ('F'
+                               if self.use_fpu and self.flen >= 32 else '') + (
+                                   'D' if self.use_fpu and self.flen >= 64 else
                                    '') + ('S' if self.use_supervisor else
                                           '') + ('U' if self.use_user else '')
 

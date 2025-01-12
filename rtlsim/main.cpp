@@ -17,6 +17,7 @@ cxxopts::ParseResult parse_arguments(int argc, char* argv[])
             ("M,memory-size", "Memory size (MB)", cxxopts::value<unsigned int>()->default_value("256"))
             ("A,memory-addr", "Memory base address", cxxopts::value<uint64_t>()->default_value("0x80000000"))
             ("b,bootrom", "Path to boot ROM", cxxopts::value<std::string>()->default_value(""))
+            ("d,dtb", "Path to device tree blob", cxxopts::value<std::string>()->default_value(""))
             ("h,help", "Print help");
         // clang-format on
 
@@ -46,19 +47,21 @@ int main(int argc, char* argv[])
     uint64_t memory_addr;
     unsigned int memory_size_mb;
     std::string bootrom;
+    std::string dtb;
 
     try {
         sd_image = options["sd-image"].as<std::string>();
         memory_addr = options["memory-addr"].as<uint64_t>();
         memory_size_mb = options["memory-size"].as<unsigned int>();
         bootrom = options["bootrom"].as<std::string>();
+        dtb = options["dtb"].as<std::string>();
     } catch (const cxxopts::exceptions::exception& e) {
         spdlog::error("Failed to parse options: {}", e.what());
         exit(EXIT_FAILURE);
     }
 
     room::SoC soc(sd_image, memory_addr, (size_t)memory_size_mb << 20UL,
-                  bootrom);
+                  bootrom, dtb);
 
     try {
         soc.run();

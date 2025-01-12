@@ -57,7 +57,7 @@ static void dromajo_error_log(int hartid, const char* fmt, ...)
 #endif
 
 Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
-               std::string_view bootrom)
+               std::string_view bootrom, std::string_view dtb)
     : should_stop_(false), cycle_(0), last_commit_cycle_(0)
 {
 #ifdef DROMAJO
@@ -82,9 +82,17 @@ Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
 
     fclose(cfg_file);
 
-    char* argv[] = {(char*)"rtlsim", tempname};
+    std::vector<char*> argv{(char*)"rtlsim"};
+    std::string dtb_str(dtb);
 
-    dromajo_state_ = dromajo_cosim_init(2, argv);
+    if (!dtb.empty()) {
+        argv.push_back((char*)"--dtb");
+        argv.push_back(dtb_str.data());
+    }
+
+    argv.push_back(tempname);
+
+    dromajo_state_ = dromajo_cosim_init(argv.size(), &argv[0]);
 
     ::unlink(tempname);
 
