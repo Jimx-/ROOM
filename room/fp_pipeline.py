@@ -3,7 +3,7 @@ from amaranth import *
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.fu import ExecResp
-from room.regfile import RegisterFile, RegisterRead
+from room.regfile import RegisterFile, RegisterRead, WritebackDebug
 from room.branch import BranchUpdate
 from room.issue import IssueUnit
 from room.ex_stage import ExecUnits
@@ -47,6 +47,12 @@ class FPPipeline(HasCoreParams, Elaboratable):
         self.br_update = BranchUpdate(params)
 
         self.flush_pipeline = Signal()
+
+        if self.sim_debug:
+            self.wb_debug = [
+                Valid(WritebackDebug, params, name=f'wb_debug{i}')
+                for i in range(self.num_wakeup_ports)
+            ]
 
     def elaborate(self, platform):
         m = Module()
@@ -163,8 +169,22 @@ class FPPipeline(HasCoreParams, Elaboratable):
             fregfile.write_ports[0].bits.data.eq(mem_wbarb.out.bits.data),
         ]
 
-        for wp, fresp in zip(fregfile.write_ports[1:self.mem_width],
-                             self.mem_wb_ports[1:]):
+        if self.sim_debug:
+            wb_debug = self.wb_debug[0]
+
+            m.d.comb += [
+                wb_debug.valid.eq(fregfile.write_ports[0].valid),
+                wb_debug.bits.data.eq(fregfile.write_ports[0].bits.data),
+            ]
+
+            m.d.sync += [
+                wb_debug.bits.uop_id.eq(mem_wbarb.out.bits.uop.uop_id),
+                wb_debug.bits.pdst.eq(mem_wbarb.out.bits.uop.pdst),
+            ]
+
+        for i, (wp, fresp) in enumerate(
+                zip(fregfile.write_ports[1:self.mem_width],
+                    self.mem_wb_ports[1:]), 1):
             m.d.sync += [
                 wp.valid.eq(fresp.valid & fresp.bits.uop.rf_wen()
                             & (fresp.bits.uop.dst_rtype == RegisterType.FLT)),
@@ -172,13 +192,37 @@ class FPPipeline(HasCoreParams, Elaboratable):
                 wp.bits.data.eq(fresp.bits.data),
             ]
 
-        for eu, wp in zip([eu for eu in exec_units if eu.frf_write],
-                          fregfile.write_ports[self.mem_width:]):
+            if self.sim_debug:
+                wb_debug = self.wb_debug[i]
+
+                m.d.comb += [
+                    wb_debug.valid.eq(wp.valid),
+                    wb_debug.bits.data.eq(wp.bits.data),
+                ]
+
+                m.d.sync += [
+                    wb_debug.bits.uop_id.eq(fresp.bits.uop.uop_id),
+                    wb_debug.bits.pdst.eq(fresp.bits.uop.pdst),
+                ]
+
+        for i, (eu, wp) in enumerate(
+                zip([eu for eu in exec_units if eu.frf_write],
+                    fregfile.write_ports[self.mem_width:]), self.mem_width):
             m.d.comb += [
                 wp.valid.eq(eu.fresp.valid & eu.fresp.bits.uop.rf_wen()),
                 wp.bits.addr.eq(eu.fresp.bits.uop.pdst),
                 wp.bits.data.eq(eu.fresp.bits.data),
             ]
+
+            if self.sim_debug:
+                wb_debug = self.wb_debug[i]
+
+                m.d.comb += [
+                    wb_debug.valid.eq(wp.valid),
+                    wb_debug.bits.uop_id.eq(eu.fresp.bits.uop.uop_id),
+                    wb_debug.bits.pdst.eq(eu.fresp.bits.uop.pdst),
+                    wb_debug.bits.data.eq(wp.bits.data),
+                ]
 
         fpiu_unit = [eu for eu in exec_units if eu.has_fpiu][0]
         fpiu_is_stq = fpiu_unit.mem_iresp.bits.uop.opcode == UOpCode.STA

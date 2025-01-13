@@ -153,6 +153,13 @@ def generate_trace_if(m, core, output_dir):
         signals[f'i_wb_debug{i}_pdst'] = wb_debug.bits.pdst
         signals[f'i_wb_debug{i}_data'] = wb_debug.bits.data
 
+    if hasattr(core.core_debug, 'fp_wb_debug'):
+        for i, wb_debug in enumerate(core.core_debug.fp_wb_debug):
+            signals[f'i_fp_wb_debug{i}_valid'] = wb_debug.valid
+            signals[f'i_fp_wb_debug{i}_uop_id'] = wb_debug.bits.uop_id
+            signals[f'i_fp_wb_debug{i}_pdst'] = wb_debug.bits.pdst
+            signals[f'i_fp_wb_debug{i}_data'] = wb_debug.bits.data
+
     for i, com_debug in enumerate(core.core_debug.commit_debug):
         signals[f'i_commit_debug{i}_valid'] = com_debug.valid
         signals[f'i_commit_debug{i}_uop_id'] = com_debug.bits.uop_id

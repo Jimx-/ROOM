@@ -465,8 +465,17 @@ class IntToFPUnit(PipelinedFunctionalUnit):
             ifpu.inp.bits.int_fmt.eq(Cat(typ[1], 1)),
         ]
 
+        out_single_pipe = m.submodules.out_single_pipe = Pipe(
+            width=1, depth=self.latency)
+        m.d.comb += [
+            out_single_pipe.in_valid.eq(self.req.valid),
+            out_single_pipe.in_data.eq(self.req.bits.uop.fp_single),
+        ]
+
+        box = Cat(Const(0, 32), out_single_pipe.out.bits.replicate(32))
+
         m.d.comb += self.resp.bits.data.eq(
-            Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits))
+            Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits) | box)
 
         return m
 

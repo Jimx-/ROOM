@@ -11,7 +11,7 @@ from room.rename import RenameStage
 from room.dispatch import Dispatcher
 from room.issue import IssueUnit
 from room.rob import ReorderBuffer, FlushType
-from room.regfile import RegisterFile, RegisterRead
+from room.regfile import RegisterFile, RegisterRead, WritebackDebug
 from room.ex_stage import ExecUnits, ExecDebug
 from room.branch import BranchUpdate, BranchResolution
 from room.lsu import LoadStoreUnit, LSUDebug
@@ -24,20 +24,6 @@ from room.utils import Arbiter
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 from roomsoc.interconnect import wishbone, tilelink as tl
-
-
-class WritebackDebug(HasCoreParams, Record):
-
-    def __init__(self, params, name=None, src_loc_at=0):
-        HasCoreParams.__init__(self, params)
-
-        Record.__init__(self, [
-            ('uop_id', MicroOp.ID_WIDTH),
-            ('pdst', range(self.num_pregs)),
-            ('data', self.xlen),
-        ],
-                        name=name,
-                        src_loc_at=1 + src_loc_at)
 
 
 class CommitDebug(Record):
@@ -82,6 +68,14 @@ class CoreDebug(HasCoreParams):
             for i in range(self.mem_width + int_width)
         ]
 
+        if self.use_fpu:
+            fp_width = self.issue_params[IssueQueueType.FP]['issue_width']
+
+            self.fp_wb_debug = [
+                Valid(WritebackDebug, params, name=f'fp_wb_debug{i}')
+                for i in range(self.mem_width + fp_width)
+            ]
+
         self.commit_debug = [
             Valid(CommitDebug, name=f'commit_debug{i}')
             for i in range(self.core_width)
@@ -108,6 +102,10 @@ class CoreDebug(HasCoreParams):
 
         for l, r in zip(self.wb_debug, rhs.wb_debug):
             ret.append(l.eq(r))
+
+        if self.use_fpu:
+            for l, r in zip(self.fp_wb_debug, rhs.fp_wb_debug):
+                ret.append(l.eq(r))
 
         for l, r in zip(self.commit_debug, rhs.commit_debug):
             ret.append(l.eq(r))
@@ -224,6 +222,11 @@ class Core(HasCoreParams, Elaboratable):
         if self.use_fpu:
             fp_pipeline = m.submodules.fp_pipeline = FPPipeline(
                 self.params, sim_debug=self.sim_debug)
+
+            if self.sim_debug:
+                for a, b in zip(self.core_debug.fp_wb_debug,
+                                fp_pipeline.wb_debug):
+                    m.d.comb += a.eq(b)
 
         #
         # Instruction fetch

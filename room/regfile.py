@@ -9,6 +9,20 @@ from room.branch import BranchUpdate
 from roomsoc.interconnect.stream import Decoupled
 
 
+class WritebackDebug(HasCoreParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('uop_id', MicroOp.ID_WIDTH),
+            ('pdst', range(self.num_pregs)),
+            ('data', self.xlen),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
 class RFReadPort(Record):
 
     def __init__(self, addr_width, data_width, name=None, src_loc_at=0):

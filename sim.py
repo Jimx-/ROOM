@@ -346,6 +346,16 @@ if __name__ == "__main__":
                         data = yield wb_debug.bits.data
                         print(f'WB {id} {pdst} {data:x}', file=log_file)
 
+                if hasattr(dut.core_debug, 'fp_wb_debug'):
+                    for wb_debug in dut.core_debug.fp_wb_debug:
+                        valid = yield wb_debug.valid
+
+                        if valid:
+                            id = yield wb_debug.bits.uop_id
+                            pdst = yield wb_debug.bits.pdst
+                            data = yield wb_debug.bits.data
+                            print(f'WB {id} {pdst} {data:x}', file=log_file)
+
                 for com_debug in dut.core_debug.commit_debug:
                     valid = yield com_debug.valid
 
