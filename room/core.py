@@ -469,6 +469,7 @@ class Core(HasCoreParams, Elaboratable):
             rob.enq_valids.eq(dis_fire),
             rob.enq_partial_stalls.eq(dis_stalls[-1]),
             rob.br_update.eq(br_update),
+            rob.csr_stall.eq(exc_unit.csr_stall),
             rob_ready.eq(rob.ready),
             rob_empty.eq(rob.empty),
         ]

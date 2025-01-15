@@ -159,7 +159,7 @@ class FetchBuffer(HasCoreParams, Elaboratable):
                 pc = self.w_data.pc + (w << 1)
                 m.d.comb += [
                     in_uops[w].uop_id.eq(next_id),
-                    self.if_debug[w].valid.eq(in_mask[w]),
+                    self.if_debug[w].valid.eq(do_enq & in_mask[w]),
                     self.if_debug[w].bits.uop_id.eq(in_uops[w].uop_id),
                     self.if_debug[w].bits.inst.eq(
                         Mux(in_uops[w].is_rvc, self.w_data.insts[w][:16],
@@ -168,7 +168,7 @@ class FetchBuffer(HasCoreParams, Elaboratable):
                         Mux(in_uops[w].edge_inst, pc - 2, pc)),
                 ]
 
-                next_id = Mux(in_mask[w], next_id + 1, next_id)
+                next_id = Mux(do_enq & in_mask[w], next_id + 1, next_id)
 
             m.d.sync += id_counter.eq(next_id)
 

@@ -345,7 +345,7 @@ class RegReadDecoder(Elaboratable):
                     IMM_I,
                 ]
 
-            with m.Case(UOpCode.ERET):
+            with m.Case(UOpCode.ERET, UOpCode.WFI):
                 m.d.comb += [
                     F(ALUOperator.ADD),
                     OPA_ZERO,

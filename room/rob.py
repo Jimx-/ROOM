@@ -127,6 +127,8 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         self.ready = Signal()
         self.empty = Signal()
 
+        self.csr_stall = Signal()
+
         self.flush = Valid(CommitExceptionReq, params)
 
         self.commit_load_at_head = Signal()
@@ -224,7 +226,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 can_throw_exception[w].eq(rob_valid[rob_head]
                                           & rob_exception[rob_head]),
                 can_commit[w].eq(rob_valid[rob_head]
-                                 & ~rob_busy[rob_head]),
+                                 & ~rob_busy[rob_head] & ~self.csr_stall),
                 self.commit_req.valids[w].eq(will_commit[w]),
                 self.commit_req.uops[w].eq(rob_uop[commit_idx]),
             ]

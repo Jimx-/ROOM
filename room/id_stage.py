@@ -429,6 +429,14 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                         uop.csr_cmd.eq(CSRCommand.I),
                                     ]
 
+                                with m.Case(OPIMM('WFI')):
+                                    m.d.comb += [
+                                        UOPC(UOpCode.WFI),
+                                        uop.iq_type.eq(IssueQueueType.INT),
+                                        uop.fu_type.eq(FUType.CSR),
+                                        uop.csr_cmd.eq(CSRCommand.I),
+                                    ]
+
                 with m.Else():
                     m.d.comb += [
                         uop.iq_type.eq(IssueQueueType.INT),

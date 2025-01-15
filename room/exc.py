@@ -201,6 +201,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.prv = Signal(PrivilegeMode, reset=PrivilegeMode.M)
 
         self.single_step = Signal()
+        self.csr_stall = Signal()
 
         self.mstatus = CSR(csrnames.mstatus, mstatus_layout(self.xlen))
         self.mip = CSR(csrnames.mip, mip_layout(self.xlen))
@@ -274,6 +275,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         insn_sret = Signal()
         insn_dret = Signal()
         insn_ret = insn_mret | insn_sret | insn_dret
+        insn_wfi = Signal()
         with m.If(self.system_insn):
             with m.Switch(self.system_insn_imm):
                 with m.Case(insn.InstructionEBREAK.field_imm.value):
@@ -284,6 +286,8 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                     m.d.comb += insn_sret.eq(1)
                 with m.Case(0x7b2):  # DRET
                     m.d.comb += insn_dret.eq(1)
+                with m.Case(insn.InstructionWFI.field_imm.value):
+                    m.d.comb += insn_wfi.eq(1)
 
         cause = MCause(self.xlen)
         m.d.comb += cause.eq(self.cause)
@@ -373,6 +377,12 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
         exception = insn_break | self.exception
         tval = Mux(insn_break, self.epc, self.tval)
+
+        wfi_active = Signal()
+        with m.If(insn_wfi & ~self.single_step & ~self.debug_mode):
+            m.d.sync += wfi_active.eq(1)
+        with m.If(self.interrupts.debug | exception):
+            m.d.sync += wfi_active.eq(0)
 
         with m.If(exception):
             with m.If(trap_to_debug):
@@ -474,5 +484,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
         with m.If(self.stval.we):
             m.d.sync += self.stval.r.eq(self.stval.w)
+
+        m.d.comb += self.csr_stall.eq(wfi_active)
 
         return m
