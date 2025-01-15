@@ -278,6 +278,28 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             STQEntry(self.params, name=f'stq{i}')
             for i in range(self.stq_size))
 
+        ldq_addr = Array(
+            Signal.like(ldq[i].addr, name=f'ldq_addr{i}')
+            for i in range(self.ldq_size))
+        ldq_is_vaddr = Array(
+            Signal(name=f'ldq_is_vaddr{i}') for i in range(self.ldq_size))
+        for i in range(self.ldq_size):
+            m.d.comb += [
+                ldq_addr[i].eq(ldq[i].addr),
+                ldq_is_vaddr[i].eq(ldq[i].is_vaddr),
+            ]
+
+        stq_addr = Array(
+            Signal.like(stq[i].addr, name=f'stq_addr{i}')
+            for i in range(self.stq_size))
+        stq_is_vaddr = Array(
+            Signal(name=f'stq_is_vaddr{i}') for i in range(self.stq_size))
+        for i in range(self.stq_size):
+            m.d.comb += [
+                stq_addr[i].eq(stq[i].addr),
+                stq_is_vaddr[i].eq(stq[i].is_vaddr),
+            ]
+
         ldq_head = Signal(range(self.ldq_size))
         ldq_tail = Signal.like(ldq_head)
         stq_head = Signal(range(self.stq_size))
@@ -380,15 +402,6 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             Cat(*s2_block_load_mask).eq(Cat(*s1_block_load_mask)),
         ]
 
-        s0_block_stq_retry_mask = Array(
-            Signal(name=f's0_block_stq_retry_mask{i}')
-            for i in range(self.stq_size))
-        s1_block_stq_retry_mask = Array(
-            Signal(name=f's1_block_stq_retry_mask{i}')
-            for i in range(self.stq_size))
-        m.d.sync += Cat(*s1_block_stq_retry_mask).eq(
-            Cat(*s0_block_stq_retry_mask))
-
         ldq_retry_enc = RRPriorityEncoder(self.ldq_size)
         m.submodules += ldq_retry_enc
         for i in range(self.ldq_size):
@@ -423,8 +436,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         m.submodules += stq_retry_enc
         for i in range(self.stq_size):
             m.d.comb += stq_retry_enc.i[i].eq(stq[i].addr_valid
-                                              & stq[i].is_vaddr
-                                              & ~s0_block_stq_retry_mask[i])
+                                              & stq_is_vaddr[i])
         m.d.comb += stq_retry_enc.head_or_tail.eq(stq_commit_head)
         stq_retry_idx = Signal(range(self.stq_size))
         m.d.sync += stq_retry_idx.eq(stq_retry_enc.o)
@@ -505,8 +517,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 can_fire_sta_retry[w].eq(
                     stq_retry_e.valid
                     & stq_retry_e.addr_valid
-                    & stq_retry_e.is_vaddr
-                    & ~s1_block_stq_retry_mask[stq_retry_idx]
+                    & stq_is_vaddr[stq_retry_idx]
                     & (w == self.mem_width - 1)
                     & tlb_miss_ready
                     & ~Cat(
@@ -910,12 +921,6 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             with m.Elif(will_fire_load_retry[w]):
                 m.d.comb += s0_block_load_mask[ldq_retry_idx].eq(1)
 
-            with m.If(will_fire_sta_incoming[w] | will_fire_stad_incoming[w]):
-                m.d.comb += s0_block_stq_retry_mask[
-                    self.exec_reqs[w].bits.uop.stq_idx].eq(1)
-            with m.Elif(will_fire_sta_retry[w]):
-                m.d.comb += s0_block_stq_retry_mask[stq_retry_idx].eq(1)
-
         s1_sfence_valid = Signal(self.mem_width)
         m.d.sync += fired_sfence.eq(will_fire_sfence)
         for w in range(self.mem_width):
@@ -965,9 +970,13 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                         s1_set_executed[ldq_idx].eq(0),
                     ]
                 with m.If(~s1_tlb_miss[w]):
-                    m.d.comb += dcache.s1_paddr[w].eq(s1_tlb_paddr[w])
+                    m.d.comb += [
+                        dcache.s1_paddr[w].eq(s1_tlb_paddr[w]),
+                        ldq_addr[ldq_idx].eq(s1_tlb_paddr[w]),
+                        ldq_is_vaddr[ldq_idx].eq(0),
+                    ]
                     m.d.sync += [
-                        ldq[ldq_idx].addr.eq(s1_tlb_paddr[w]),
+                        ldq[ldq_idx].addr.eq(ldq_addr[ldq_idx]),
                         ldq[ldq_idx].is_vaddr.eq(0),
                         ldq[ldq_idx].addr_uncacheable.eq(
                             s1_tlb_uncacheable[w]),
@@ -977,8 +986,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                       | fired_sta_retry[w]):
                 stq_idx = s1_stq_e[w].uop.stq_idx
                 with m.If(~s1_tlb_miss[w]):
+                    m.d.comb += [
+                        stq_addr[stq_idx].eq(s1_tlb_paddr[w]),
+                        stq_is_vaddr[stq_idx].eq(0),
+                    ]
                     m.d.sync += [
-                        stq[stq_idx].addr.eq(s1_tlb_paddr[w]),
+                        stq[stq_idx].addr.eq(stq_addr[stq_idx]),
                         stq[stq_idx].is_vaddr.eq(0),
                     ]
 
@@ -1272,10 +1285,10 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         ]
 
         for i in range(self.ldq_size):
-            addr_matches = Cat(ldq[i].addr[3:] == cam_addr[w][3:]
+            addr_matches = Cat(ldq_addr[i][3:] == cam_addr[w][3:]
                                for w in range(self.mem_width))
 
-            load_mask = gen_byte_mask(ldq[i].addr, ldq[i].uop.mem_size)
+            load_mask = gen_byte_mask(ldq_addr[i], ldq[i].uop.mem_size)
 
             load_forwarders = Cat(s2_forward_valid[w]
                                   & (s2_forward_ldq_idx[w] == i)
@@ -1286,7 +1299,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 with m.If(do_st_search[w] & ldq[i].valid & ldq[i].addr_valid
                           & (ldq[i].executed | ldq[i].succeeded
                              | (load_forwarders != 0))
-                          & ~ldq[i].is_vaddr
+                          & ~ldq_is_vaddr[i]
                           & ((ldq[i].st_dep_mask & (1 << cam_stq_idx[w])) != 0)
                           & addr_matches[w]
                           & ((load_mask & cam_mask[w]) != 0)):
@@ -1302,7 +1315,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                         m.d.sync += ldq[i].order_fail.eq(1)
 
                 with m.If(do_ld_search[w] & ldq[i].valid & ldq[i].addr_valid
-                          & ~ldq[i].is_vaddr & addr_matches[w]
+                          & ~ldq_is_vaddr[i] & addr_matches[w]
                           & ((load_mask & cam_mask[w]) != 0)):
                     searcher_is_older = is_older(cam_ldq_idx[w], i, ldq_head)
                     with m.If(~searcher_is_older & (cam_ldq_idx[w] != i)):
@@ -1314,11 +1327,11 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                             ]
 
         for i in range(self.stq_size):
-            addr_matches = Cat((stq[i].addr_valid & ~stq[i].is_vaddr
-                                & (stq[i].addr[3:] == cam_addr[w][3:]))
+            addr_matches = Cat((stq[i].addr_valid & ~stq_is_vaddr[i]
+                                & (stq_addr[i][3:] == cam_addr[w][3:]))
                                for w in range(self.mem_width))
 
-            write_mask = gen_byte_mask(stq[i].addr, stq[i].uop.mem_size)
+            write_mask = gen_byte_mask(stq_addr[i], stq[i].uop.mem_size)
 
             for w in range(self.mem_width):
                 with m.If(do_ld_search[w] & stq[i].valid

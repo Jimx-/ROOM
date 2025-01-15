@@ -152,6 +152,14 @@ class MStatus(CSRRecord):
                          src_loc_at=1 + src_loc_at)
 
 
+class MIP(CSRRecord):
+
+    def __init__(self, xlen, name=None, src_loc_at=0):
+        super().__init__(mip_layout(xlen),
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class MCause(CSRRecord):
 
     def __init__(self, xlen, name=None, src_loc_at=0):
@@ -306,6 +314,17 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
         with m.If(self.mtval.we):
             m.d.sync += self.mtval.r.eq(self.mtval.w)
+
+        delegatable_interrupts = MIP(self.xlen)
+        m.d.comb += [
+            delegatable_interrupts.ssip.eq(self.use_supervisor),
+            delegatable_interrupts.stip.eq(self.use_supervisor),
+            delegatable_interrupts.seip.eq(self.use_supervisor),
+        ]
+
+        with m.If(self.mideleg.we):
+            m.d.sync += self.mideleg.r.eq(self.mideleg.w
+                                          & delegatable_interrupts)
 
         delegatable_exceptions = sum([
             1 << e for e in (
