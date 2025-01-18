@@ -9,6 +9,7 @@ from roomsoc.interconnect import axi, tilelink as tl
 from roomsoc.peripheral.l2cache import L2Cache
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.sdc import MockSDController
+from roomsoc.peripheral.clint import CLINT
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 
 import argparse
@@ -151,6 +152,12 @@ class Top(Elaboratable):
         soc.add_cpu(core)
         m.d.comb += core.reset_vector.eq(0x10000)
 
+        clint = CLINT(n_harts=1)
+        m.d.comb += [
+            core.interrupts.msip.eq(clint.msip[0]),
+            core.interrupts.mtip.eq(clint.mtip[0]),
+        ]
+
         if self.sim_debug:
             m.d.comb += self.core_debug.eq(core.core_debug)
 
@@ -235,6 +242,8 @@ class Top(Elaboratable):
 
         sdc = MockSDController()
         soc.add_peripheral('sdc', sdc)
+
+        soc.add_peripheral('clint', clint)
 
         dm_base = 0
 

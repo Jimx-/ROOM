@@ -13,6 +13,7 @@ from roomsoc.peripheral.l2cache import L2Cache
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 from roomsoc.peripheral.sdc import SDController
+from roomsoc.peripheral.clint import CLINT
 from roomsoc.platform.kc705 import KC705Platform
 
 import argparse
@@ -291,6 +292,12 @@ class Top(Elaboratable):
         soc.add_cpu(core)
         m.d.comb += core.reset_vector.eq(0x10000)
 
+        clint = CLINT(n_harts=1)
+        m.d.comb += [
+            core.interrupts.msip.eq(clint.msip[0]),
+            core.interrupts.mtip.eq(clint.mtip[0]),
+        ]
+
         if self.sim:
             generate_trace_if(m, core, '/tmp')
 
@@ -385,6 +392,8 @@ class Top(Elaboratable):
 
         soc.add_peripheral('uart', self.uart)
         soc.add_peripheral('sdc', self.sdc)
+
+        soc.add_peripheral('clint', clint)
 
         dm_base = 0
 
