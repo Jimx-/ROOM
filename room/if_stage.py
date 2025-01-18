@@ -865,9 +865,11 @@ class IFStage(HasCoreParams, Elaboratable):
                 fb.flush.eq(1),
                 s0_valid.eq(self.redirect_valid),
                 s0_vpc.eq(self.redirect_pc),
+                s0_is_replay.eq(0),
                 ftq.redirect_valid.eq(self.redirect_valid),
                 ftq.redirect_idx.eq(self.redirect_ftq_idx),
             ]
+            m.d.sync += f3_prev_half_valid.eq(0)
 
         #
         # Debug signals

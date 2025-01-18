@@ -270,6 +270,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         with m.If(self.dscratch1.we):
             m.d.sync += self.dscratch1.r.eq(self.dscratch1.w)
 
+        insn_call = Signal()
         insn_break = Signal()
         insn_mret = Signal()
         insn_sret = Signal()
@@ -278,6 +279,8 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         insn_wfi = Signal()
         with m.If(self.system_insn):
             with m.Switch(self.system_insn_imm):
+                with m.Case(insn.InstructionECALL.field_imm.value):
+                    m.d.comb += insn_call.eq(1)
                 with m.Case(insn.InstructionEBREAK.field_imm.value):
                     m.d.comb += insn_break.eq(1)
                 with m.Case(insn.InstructionMRET.field_imm.value):
@@ -290,7 +293,9 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                     m.d.comb += insn_wfi.eq(1)
 
         cause = MCause(self.xlen)
-        m.d.comb += cause.eq(self.cause)
+        m.d.comb += cause.eq(
+            Mux(insn_call, Cause.ECALL_FROM_U + self.prv,
+                Mux(insn_break, Cause.BREAKPOINT, self.cause)))
 
         single_stepped = Signal()
 
@@ -375,7 +380,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         with m.Elif(self.commit | self.exception):
             m.d.sync += single_stepped.eq(1)
 
-        exception = insn_break | self.exception
+        exception = insn_call | insn_break | self.exception
         tval = Mux(insn_break, self.epc, self.tval)
 
         wfi_active = Signal()
@@ -392,25 +397,28 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                         self.dcsr.r.cause.eq(
                             Mux(single_stepped, 4, Mux(is_debug_int, 3, 1))),
                         self.dpc.r.eq(self.epc),
+                        self.prv.eq(PrivilegeMode.M),
                     ]
 
             with m.Elif(delegate):
                 m.d.sync += [
                     self.sepc.r.eq(self.epc),
-                    self.scause.r.eq(self.cause),
+                    self.scause.r.eq(cause),
                     self.stval.r.eq(tval),
                     self.mstatus.r.spie.eq(self.mstatus.r.sie),
                     self.mstatus.r.spp.eq(self.prv),
                     self.mstatus.r.sie.eq(0),
+                    self.prv.eq(PrivilegeMode.S),
                 ]
             with m.Else():
                 m.d.sync += [
                     self.mepc.r.eq(self.epc),
-                    self.mcause.r.eq(self.cause),
+                    self.mcause.r.eq(cause),
                     self.mtval.r.eq(tval),
                     self.mstatus.r.mpie.eq(self.mstatus.r.mie),
                     self.mstatus.r.mpp.eq(self.prv),
                     self.mstatus.r.mie.eq(0),
+                    self.prv.eq(PrivilegeMode.M),
                 ]
 
         with m.If(insn_ret):
