@@ -26,6 +26,7 @@ class Instruction:
         self.inst = inst
 
         self.br_mask = -1
+        self.decoded = False
 
         self.pdst = 0
         self.rd_data = 0
@@ -267,7 +268,7 @@ class Instruction:
         elif op.name == 'c_addi16sp':
             inst_text.append(op_name.ljust(5))
             inst_text.append(' ')
-            inst_text.append(hex(self.nzimm10))
+            inst_text.append(hex(op.nzimm10))
 
         elif op.name == 'c_jalr':
             inst_text.append(op_name.ljust(5))
@@ -452,6 +453,7 @@ class TraceParser:
                     raise ValueError(f'Micro-op {id} not found')
 
                 inst.br_mask = br_mask
+                inst.decoded = True
 
             elif cmd == 'EX':
                 id = int(args[0])
@@ -509,7 +511,7 @@ class TraceParser:
 
                 killed = []
                 for k, v in self.insts.items():
-                    if v.br_mask & br_mask != 0:
+                    if (v.br_mask & br_mask) != 0 or not v.decoded:
                         killed.append(k)
 
                 for k in killed:

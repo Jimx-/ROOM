@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <unordered_map>
 #include <string>
+#include <memory>
+#include <fstream>
 
 #include "singleton.h"
 
@@ -15,7 +17,8 @@ namespace room {
 
 class Tracer : public Singleton<Tracer> {
 public:
-    Tracer(uint64_t memory_addr, size_t memory_size, std::string_view bootrom, std::string_view dtb);
+    Tracer(uint64_t memory_addr, size_t memory_size, std::string_view bootrom,
+           std::string_view dtb, std::string_view trace_log_path);
     ~Tracer();
 
     void trace_if(int uop_id, uint64_t pc, uint32_t insn);
@@ -61,6 +64,8 @@ private:
     bool should_stop_;
 
     uint64_t cycle_, last_commit_cycle_;
+
+    std::unique_ptr<std::ofstream> trace_log_;
 
 #ifdef DROMAJO
     dromajo_cosim_state_t* dromajo_state_;

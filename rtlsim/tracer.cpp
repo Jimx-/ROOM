@@ -57,9 +57,15 @@ static void dromajo_error_log(int hartid, const char* fmt, ...)
 #endif
 
 Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
-               std::string_view bootrom, std::string_view dtb)
+               std::string_view bootrom, std::string_view dtb,
+               std::string_view trace_log_path)
     : should_stop_(false), cycle_(0), last_commit_cycle_(0)
 {
+    if (!trace_log_path.empty()) {
+        trace_log_ =
+            std::make_unique<std::ofstream>(std::string(trace_log_path));
+    }
+
 #ifdef DROMAJO
     char tempname[] = "/tmp/rtlsim-XXXXXX";
 
@@ -121,6 +127,11 @@ void Tracer::trace_if(int uop_id, uint64_t pc, uint32_t insn)
     inst.inst = insn;
 
     insts_.emplace(uop_id, inst);
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("I {} {:x} {:x}", uop_id, pc, insn)
+                      << std::endl;
+    }
 }
 
 void Tracer::trace_id(int uop_id, int br_mask)
@@ -133,6 +144,11 @@ void Tracer::trace_id(int uop_id, int br_mask)
 
     it->second.br_mask = br_mask;
     it->second.decoded = true;
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("ID {} {:x}", uop_id, br_mask)
+                      << std::endl;
+    }
 }
 
 void Tracer::trace_ex(int uop_id, int opcode, int prs1, uint64_t rs1_data,
@@ -148,6 +164,12 @@ void Tracer::trace_ex(int uop_id, int opcode, int prs1, uint64_t rs1_data,
     it->second.prs2 = prs2;
     it->second.rs1_data = rs1_data;
     it->second.rs2_data = rs2_data;
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("EX {} {} {} {:x} {} {:x}", uop_id, opcode,
+                                     prs1, rs1_data, prs2, rs2_data)
+                      << std::endl;
+    }
 }
 
 void Tracer::trace_mem(int uop_id, int opcode, uint64_t addr, uint64_t data,
@@ -170,6 +192,12 @@ void Tracer::trace_mem(int uop_id, int opcode, uint64_t addr, uint64_t data,
         it->second.addr = addr;
         it->second.data = data;
     }
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("MEM {} {} {} {} {:x} {:x}", uop_id,
+                                     opcode, prs1, prs2, addr, data)
+                      << std::endl;
+    }
 }
 
 void Tracer::trace_wb(int uop_id, int pdst, uint64_t data)
@@ -182,6 +210,11 @@ void Tracer::trace_wb(int uop_id, int pdst, uint64_t data)
 
     it->second.pdst = pdst;
     it->second.rd_data = data;
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("WB {} {} {:x}", uop_id, pdst, data)
+                      << std::endl;
+    }
 }
 
 void Tracer::trace_commit(int uop_id)
@@ -195,6 +228,10 @@ void Tracer::trace_commit(int uop_id)
     commit(it->second);
 
     insts_.erase(it);
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("C {}", uop_id) << std::endl;
+    }
 }
 
 void Tracer::trace_branch_mispredict(int mispredict_mask)
@@ -207,17 +244,31 @@ void Tracer::trace_branch_mispredict(int mispredict_mask)
         else
             it++;
     }
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("BRK {:x}", mispredict_mask) << std::endl;
+    }
 }
 
 void Tracer::trace_branch_resolve(int resolve_mask)
 {
-
     for (auto& [uop_id, inst] : insts_) {
         inst.br_mask &= ~resolve_mask;
     }
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("BRR {:x}", resolve_mask) << std::endl;
+    }
 }
 
-void Tracer::trace_flush() { insts_.clear(); }
+void Tracer::trace_flush()
+{
+    insts_.clear();
+
+    if (trace_log_) {
+        (*trace_log_) << "X" << std::endl;
+    }
+}
 
 void Tracer::tick()
 {
@@ -228,6 +279,10 @@ void Tracer::tick()
                       "cycle = {}",
                       last_commit_cycle_);
         should_stop_ = true;
+    }
+
+    if (trace_log_) {
+        (*trace_log_) << "+" << std::endl;
     }
 }
 
