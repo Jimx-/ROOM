@@ -185,10 +185,10 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
         self.interrupt = Signal()
         self.interrupt_cause = Signal(self.xlen)
-        self.exc_vector = Signal(32)
+        self.exc_vector = Signal(self.vaddr_bits_extended)
 
         self.debug_mode = Signal()
-        self.debug_entry = Signal(32)
+        self.debug_entry = Signal(self.paddr_bits)
 
         self.system_insn = Signal()
         self.system_insn_imm = Signal(12)
@@ -197,7 +197,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.exception = Signal()
         self.cause = Signal(self.xlen)
         self.tval = Signal(self.xlen)
-        self.epc = Signal(32)
+        self.epc = Signal(self.vaddr_bits_extended)
         self.prv = Signal(PrivilegeMode, reset=PrivilegeMode.M)
 
         self.single_step = Signal()

@@ -43,7 +43,7 @@ def read_mem_image(filename, word_len=32):
 
 core_params = dict(
     xlen=64,
-    vaddr_bits=32,
+    vaddr_bits=39,
     paddr_bits=36,
     fetch_width=4,
     fetch_buffer_size=16,

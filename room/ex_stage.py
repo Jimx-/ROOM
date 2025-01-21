@@ -93,7 +93,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
 
         self.get_pc = None
         if has_jmp_unit:
-            self.get_pc = GetPCResp(name='get_pc')
+            self.get_pc = GetPCResp(params, name='get_pc')
 
         self.lsu_req = None
         if has_mem:

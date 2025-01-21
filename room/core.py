@@ -907,7 +907,7 @@ class Core(HasCoreParams, Elaboratable):
             oldest_res = next_res
 
         jmp_unit = [eu for eu in exec_units if eu.has_jmp_unit][0]
-        jalr_target_d1 = Signal(32)
+        jalr_target_d1 = Signal(self.vaddr_bits_extended)
         m.d.sync += [
             br_update.br_res.eq(oldest_res),
             br_update.br_res.mispredict.eq(mispredict_val),

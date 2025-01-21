@@ -50,7 +50,7 @@ class ICache(HasICacheParams, Elaboratable):
         self.ibus = ibus
 
         self.req = Decoupled(ICacheReq, params)
-        self.s1_paddr = Signal(32)
+        self.s1_paddr = Signal(self.paddr_bits)
         self.s1_kill = Signal()
         self.s2_kill = Signal()
 
@@ -64,7 +64,7 @@ class ICache(HasICacheParams, Elaboratable):
         block_off_bits = log2_int(self.block_bytes)
         index_bits = log2_int(self.n_sets)
         untag_bits = block_off_bits + index_bits
-        tag_bits = 32 - untag_bits
+        tag_bits = self.paddr_bits - untag_bits
 
         word_bits = self.fetch_bytes * 8
 

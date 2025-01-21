@@ -7,22 +7,24 @@ from room.branch import BranchResolution, BranchUpdate
 from room.alu import ALU, Multiplier, IntDiv
 from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
 from room.tlb import SFenceReq
-from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe
+from room.utils import sign_extend, generate_imm, generate_imm_type, generate_imm_rm, Pipe
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
 
-class GetPCResp(Record):
+class GetPCResp(HasCoreParams, Record):
 
-    def __init__(self, name=None, src_loc_at=0):
-        super().__init__([
-            ('pc', 32),
-            ('commit_pc', 32),
-            ('next_pc', 32),
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('pc', self.vaddr_bits_extended),
+            ('commit_pc', self.vaddr_bits_extended),
+            ('next_pc', self.vaddr_bits_extended),
             ('next_valid', 1),
         ],
-                         name=name,
-                         src_loc_at=src_loc_at + 1)
+                        name=name,
+                        src_loc_at=src_loc_at + 1)
 
 
 class ExecReq:
@@ -80,7 +82,7 @@ class FunctionalUnit(HasCoreParams, Elaboratable):
                                        name='br_res') if is_alu else None
         self.get_pc = None
         if is_jmp:
-            self.get_pc = GetPCResp(name='get_pc')
+            self.get_pc = GetPCResp(params, name='get_pc')
 
 
 class PipelinedFunctionalUnit(FunctionalUnit):
@@ -180,10 +182,12 @@ class ALUUnit(PipelinedFunctionalUnit):
 
         if self.is_jmp:
             uop_pc = (self.get_pc.pc | uop.pc_lsb) - Mux(uop.edge_inst, 2, 0)
+            uop_pc_sext = sign_extend(uop_pc[:self.vaddr_bits_extended],
+                                      self.xlen)
 
             m.d.comb += opa_data.eq(
                 Mux(uop.opa_sel == OpA.RS1, self.req.bits.rs1_data,
-                    Mux(uop.opa_sel == OpA.PC, uop_pc, 0)))
+                    Mux(uop.opa_sel == OpA.PC, uop_pc_sext, 0)))
         else:
             m.d.comb += opa_data.eq(
                 Mux(uop.opa_sel == OpA.RS1, self.req.bits.rs1_data, 0))

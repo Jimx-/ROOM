@@ -25,6 +25,13 @@ def is_older(lhs, rhs, head):
     return (lhs < rhs) ^ (lhs < head) ^ (rhs < head)
 
 
+def sign_extend(x, length):
+    if len(x) == length:
+        return x
+
+    return Cat(x, x[-1].replicate(length - len(x)))
+
+
 def generate_imm(ip, sel):
     sign = ip[-1]
     i20_30 = Mux(sel == ImmSel.U, ip[8:19], Repl(sign, 11))

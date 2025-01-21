@@ -11,7 +11,7 @@ from room.fu import GetPCResp
 from room.breakpoint import Breakpoint, BreakpointMatcher
 from room.exc import MStatus
 from room.icache import ICache
-from room.utils import wrap_incr
+from room.utils import wrap_incr, sign_extend
 from room.mmu import PTBR, PageTableWalker
 from room.tlb import TLB, TLBResp, SFenceReq
 
@@ -23,7 +23,7 @@ class IFDebug(Record):
     def __init__(self, name=None, src_loc_at=0):
         super().__init__([
             ('uop_id', MicroOp.ID_WIDTH),
-            ('pc', 32),
+            ('pc', 64),
             ('inst', 32),
         ],
                          name=name,
@@ -38,8 +38,8 @@ class FetchBundle(HasCoreParams):
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
-        self.pc = Signal(32, name=f'{name}_pc')
-        self.next_pc = Signal(32, name=f'{name}_next_pc')
+        self.pc = Signal(self.vaddr_bits_extended, name=f'{name}_pc')
+        self.next_pc = Signal(self.vaddr_bits_extended, name=f'{name}_next_pc')
         self.edge_inst = Signal(name=f'{name}_edge_inst')
         self.insts = [
             Signal(32, name=f'{name}_inst{i}') for i in range(self.fetch_width)
@@ -156,7 +156,8 @@ class FetchBuffer(HasCoreParams, Elaboratable):
             next_id = id_counter
 
             for w in range(self.fetch_width):
-                pc = self.w_data.pc + (w << 1)
+                pc = self.w_data.pc + (w << 1) - Mux(in_uops[w].edge_inst, 2,
+                                                     0)
                 m.d.comb += [
                     in_uops[w].uop_id.eq(next_id),
                     self.if_debug[w].valid.eq(do_enq & in_mask[w]),
@@ -165,7 +166,7 @@ class FetchBuffer(HasCoreParams, Elaboratable):
                         Mux(in_uops[w].is_rvc, self.w_data.insts[w][:16],
                             self.w_data.insts[w])),
                     self.if_debug[w].bits.pc.eq(
-                        Mux(in_uops[w].edge_inst, pc - 2, pc)),
+                        sign_extend(pc[:self.vaddr_bits_extended], self.xlen)),
                 ]
 
                 next_id = Mux(do_enq & in_mask[w], next_id + 1, next_id)
@@ -277,7 +278,7 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
             Signal(range(self.ftq_size), name=f'get_pc_idx{i}')
             for i in range(2)
         ]
-        self.get_pc = [GetPCResp(name=f'get_pc{i}') for i in range(2)]
+        self.get_pc = [GetPCResp(params, name=f'get_pc{i}') for i in range(2)]
 
     def elaborate(self, platform):
         m = Module()
@@ -291,7 +292,8 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
                 == deq_ptr) | (wrap_incr(w_ptr, self.ftq_size) == deq_ptr)
 
         pcs = Array(
-            Signal(32 - pc_lsb_w, name=f'pc{i}') for i in range(self.ftq_size))
+            Signal(self.vaddr_bits_extended - pc_lsb_w, name=f'pc{i}')
+            for i in range(self.ftq_size))
 
         with m.If(self.w_en & self.w_rdy):
             m.d.sync += [
@@ -330,7 +332,7 @@ class IFStage(HasCoreParams, Elaboratable):
     def __init__(self, ibus, params, sim_debug=False):
         super().__init__(params)
 
-        self.reset_vector = Signal(32)
+        self.reset_vector = Signal(self.vaddr_bits_extended)
 
         self.ibus = ibus
         self.enable_icache = params.get('icache_params') is not None
@@ -354,10 +356,10 @@ class IFStage(HasCoreParams, Elaboratable):
         self.get_pc_idx = [
             Signal(self.ftq_size, name=f'get_pc_idx{i}') for i in range(2)
         ]
-        self.get_pc = [GetPCResp(name=f'get_pc{i}') for i in range(2)]
+        self.get_pc = [GetPCResp(params, name=f'get_pc{i}') for i in range(2)]
 
         self.redirect_valid = Signal()
-        self.redirect_pc = Signal(32)
+        self.redirect_pc = Signal(self.vaddr_bits_extended)
         self.redirect_flush = Signal()
         self.redirect_ftq_idx = Signal(range(self.ftq_size))
 
@@ -420,7 +422,7 @@ class IFStage(HasCoreParams, Elaboratable):
         # F0 - Next PC select
         #
 
-        s0_vpc = Signal(32)
+        s0_vpc = Signal(self.vaddr_bits_extended)
         s0_valid = Signal()
         s0_is_replay = Signal()
         s0_replay_ppc = Signal(self.paddr_bits)
@@ -486,7 +488,7 @@ class IFStage(HasCoreParams, Elaboratable):
                 icache.s1_kill.eq(tlb.resp[0].bits.miss | f1_clear),
             ]
 
-            f1_predicted_target = Signal(32)
+            f1_predicted_target = Signal(self.vaddr_bits_extended)
             m.d.comb += f1_predicted_target.eq(next_fetch(s1_vpc))
 
             with m.If(s1_valid & ~s1_tlb_miss):
@@ -522,7 +524,7 @@ class IFStage(HasCoreParams, Elaboratable):
                 s2_tlb_miss.eq(s1_tlb_miss),
             ]
 
-            f2_predicted_target = Signal(32)
+            f2_predicted_target = Signal(self.vaddr_bits_extended)
             m.d.comb += f2_predicted_target.eq(next_fetch(s2_vpc))
 
             with m.If((s2_valid & ~icache.resp.valid)
@@ -604,7 +606,7 @@ class IFStage(HasCoreParams, Elaboratable):
             m.d.sync += f3_empty.eq(1)
 
         s3_valid = Signal()
-        s3_pc = Signal(32)
+        s3_pc = Signal.like(s2_vpc)
         s3_data = Signal(self.fetch_bytes * 8)
         s3_exc_ae = Signal()
         s3_exc_pf = Signal()
@@ -624,7 +626,8 @@ class IFStage(HasCoreParams, Elaboratable):
         f3_is_rvc = Signal(self.fetch_width)
         f3_redirects = Signal(self.fetch_width)
         f3_targets = Array(
-            Signal(32, name=f'f3_target{i}') for i in range(self.fetch_width))
+            Signal(self.vaddr_bits_extended, name=f'f3_target{i}')
+            for i in range(self.fetch_width))
         f3_plus4_mask = Signal(self.fetch_width)
         f3_cfi_types = Array(
             Signal(CFIType, name=f'f3_cfi_type{i}')
@@ -653,7 +656,7 @@ class IFStage(HasCoreParams, Elaboratable):
             for m_bp, bp in zip(bp_matcher.bp, self.bp):
                 m.d.comb += m_bp.eq(bp)
 
-            br_sigs = BranchSignals(vaddr_bits=self.vaddr_bits,
+            br_sigs = BranchSignals(vaddr_bits=self.vaddr_bits_extended,
                                     name=f'br_sigs{w}')
 
             if w == 0:
@@ -782,7 +785,7 @@ class IFStage(HasCoreParams, Elaboratable):
             f3_fetch_bundle.cfi_idx.eq(f3_prio_enc.o),
         ]
 
-        f3_predicted_target = Signal(32)
+        f3_predicted_target = Signal(self.vaddr_bits_extended)
         m.d.comb += [
             f3_predicted_target.eq(
                 Mux(
