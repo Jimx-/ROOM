@@ -1043,9 +1043,11 @@ class Core(HasCoreParams, Elaboratable):
 
         commit_exc_pc_lsb_d1 = Signal.like(rob.commit_exc.bits.pc_lsb)
         commit_exc_badaddr_d1 = Signal.like(rob.commit_exc.bits.badaddr)
+        commit_exc_edge_inst_d1 = Signal()
         m.d.comb += [
             exc_unit.epc.eq(if_stage.get_pc[0].commit_pc +
-                            commit_exc_pc_lsb_d1),
+                            commit_exc_pc_lsb_d1 -
+                            Mux(commit_exc_edge_inst_d1, 2, 0)),
             exc_unit.debug_entry.eq(self.debug_entry),
             exc_unit.system_insn.eq(csr_port.cmd == CSRCommand.I),
             exc_unit.system_insn_imm.eq(csr_port.addr),
@@ -1056,6 +1058,7 @@ class Core(HasCoreParams, Elaboratable):
         m.d.sync += [
             commit_exc_pc_lsb_d1.eq(rob.commit_exc.bits.pc_lsb),
             commit_exc_badaddr_d1.eq(rob.commit_exc.bits.badaddr),
+            commit_exc_edge_inst_d1.eq(rob.commit_exc.bits.edge_inst),
             exc_unit.exception.eq(rob.commit_exc.valid),
             exc_unit.cause.eq(rob.commit_exc.bits.cause),
         ]

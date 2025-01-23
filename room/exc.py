@@ -8,6 +8,7 @@ from enum import IntEnum
 from room.consts import PrivilegeMode
 from room.csr import *
 from room.types import HasCoreParams
+from room.utils import sign_extend
 
 
 class CoreInterrupts(Record):
@@ -380,8 +381,9 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         with m.Elif(self.commit | self.exception):
             m.d.sync += single_stepped.eq(1)
 
+        epc_sext = sign_extend(self.epc, self.xlen)
         exception = insn_call | insn_break | self.exception
-        tval = Mux(insn_break, self.epc, self.tval)
+        tval = Mux(insn_break, epc_sext, self.tval)
 
         wfi_active = Signal()
         with m.If(insn_wfi & ~self.single_step & ~self.debug_mode):
@@ -396,13 +398,13 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                         self.debug_mode.eq(1),
                         self.dcsr.r.cause.eq(
                             Mux(single_stepped, 4, Mux(is_debug_int, 3, 1))),
-                        self.dpc.r.eq(self.epc),
+                        self.dpc.r.eq(epc_sext),
                         self.prv.eq(PrivilegeMode.M),
                     ]
 
             with m.Elif(delegate):
                 m.d.sync += [
-                    self.sepc.r.eq(self.epc),
+                    self.sepc.r.eq(epc_sext),
                     self.scause.r.eq(cause),
                     self.stval.r.eq(tval),
                     self.mstatus.r.spie.eq(self.mstatus.r.sie),
@@ -412,7 +414,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                 ]
             with m.Else():
                 m.d.sync += [
-                    self.mepc.r.eq(self.epc),
+                    self.mepc.r.eq(epc_sext),
                     self.mcause.r.eq(cause),
                     self.mtval.r.eq(tval),
                     self.mstatus.r.mpie.eq(self.mstatus.r.mie),
