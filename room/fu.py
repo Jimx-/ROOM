@@ -3,28 +3,13 @@ from amaranth import tracer
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
-from room.branch import BranchResolution, BranchUpdate
+from room.branch import GetPCResp, BranchResolution, BranchUpdate
 from room.alu import ALU, Multiplier, IntDiv
 from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
 from room.tlb import SFenceReq
 from room.utils import sign_extend, generate_imm, generate_imm_type, generate_imm_rm, Pipe
 
 from roomsoc.interconnect.stream import Decoupled, Valid
-
-
-class GetPCResp(HasCoreParams, Record):
-
-    def __init__(self, params, name=None, src_loc_at=0):
-        HasCoreParams.__init__(self, params)
-
-        Record.__init__(self, [
-            ('pc', self.vaddr_bits_extended),
-            ('commit_pc', self.vaddr_bits_extended),
-            ('next_pc', self.vaddr_bits_extended),
-            ('next_valid', 1),
-        ],
-                        name=name,
-                        src_loc_at=src_loc_at + 1)
 
 
 class ExecReq:

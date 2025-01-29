@@ -94,6 +94,21 @@ core_params = dict(
     use_user=True,
     use_supervisor=True,
     pg_levels=3,
+    use_bpd=True,
+    ghist_length=64,
+    bpd_meta_length=120,
+    n_ras_entries=16,
+    tage_params=dict(
+        table_params=[
+            (128, 2, 7),
+            (128, 4, 7),
+            (256, 8, 8),
+            (256, 16, 8),
+            (128, 32, 9),
+            (128, 64, 9),
+        ],
+        u_bit_period=2048,
+    ),
 )
 
 l2cache_params = dict(

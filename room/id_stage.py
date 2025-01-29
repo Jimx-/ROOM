@@ -46,6 +46,11 @@ class BranchDecoder(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        def compute_br_target(pc, inst):
+            b_imm32 = Cat(Const(0, 1), inst[8:12], inst[25:31], inst[7],
+                          inst[31].replicate(20)).as_signed()
+            return ((pc.as_signed() + b_imm32) & -2)[:len(pc)].as_unsigned()
+
         def compute_jal_target(pc, inst):
             j_imm32 = Cat(Const(0, 1), inst[21:25], inst[25:31], inst[20],
                           inst[12:20], Repl(inst[31], 12)).as_signed()
@@ -65,7 +70,8 @@ class BranchDecoder(Elaboratable):
                 m.d.comb += self.out.cfi_type.eq(CFIType.BR)
 
         m.d.comb += self.out.target.eq(
-            Mux(self.out.cfi_type == CFIType.BR, 0,
+            Mux(self.out.cfi_type == CFIType.BR,
+                compute_br_target(self.pc, self.inst),
                 compute_jal_target(self.pc, self.inst)))
 
         return m

@@ -13,7 +13,7 @@ from room.issue import IssueUnit
 from room.rob import ReorderBuffer, FlushType
 from room.regfile import RegisterFile, RegisterRead, WritebackDebug
 from room.ex_stage import ExecUnits, ExecDebug
-from room.branch import BranchUpdate, BranchResolution
+from room.branch import GlobalHistory, BranchUpdate, BranchResolution
 from room.lsu import LoadStoreUnit, LSUDebug
 from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts, Cause
@@ -521,6 +521,7 @@ class Core(HasCoreParams, Elaboratable):
                 if_stage.redirect_valid.eq(1),
                 if_stage.redirect_flush.eq(1),
                 if_stage.redirect_ftq_idx.eq(rob_flush_d1.bits.ftq_idx),
+                if_stage.redirect_ghist.br_not_taken.eq(1),
             ]
 
             flush_pc = if_stage.get_pc[0].pc + rob_flush_d1.bits.pc_lsb - Mux(
@@ -547,11 +548,34 @@ class Core(HasCoreParams, Elaboratable):
             redirect_target = Mux(br_update.br_res.pc_sel == PCSel.PC_PLUS_4,
                                   npc, bj_addr)
 
+            use_same_ghist = (br_update.br_res.cfi_type
+                              == CFIType.BR) & ~br_update.br_res.taken & (
+                                  npc[log2_int(self.fetch_bytes):]
+                                  == uop_pc[log2_int(self.fetch_bytes):])
+
+            next_ghist = GlobalHistory(self.params)
+            cfi_idx = uop.pc_lsb[1:]
+            if_stage.get_pc[1].ghist.update(
+                m,
+                branches=if_stage.get_pc[1].entry.br_mask,
+                cfi_taken=br_update.br_res.taken,
+                cfi_is_br=(br_update.br_res.cfi_type == CFIType.BR),
+                cfi_idx=cfi_idx,
+                cfi_valid=1,
+                cfi_is_call=if_stage.get_pc[1].entry.cfi_is_call &
+                (if_stage.get_pc[1].entry.cfi_idx == cfi_idx),
+                cfi_is_ret=if_stage.get_pc[1].entry.cfi_is_ret &
+                (if_stage.get_pc[1].entry.cfi_idx == cfi_idx),
+                new_ghist=next_ghist)
+
             m.d.comb += [
                 if_stage.redirect_valid.eq(1),
                 if_stage.redirect_pc.eq(redirect_target),
                 if_stage.redirect_flush.eq(1),
                 if_stage.redirect_ftq_idx.eq(uop.ftq_idx),
+                if_stage.redirect_ghist.eq(
+                    Mux(use_same_ghist, if_stage.get_pc[1].ghist, next_ghist)),
+                if_stage.redirect_ghist.br_not_taken.eq(use_same_ghist),
             ]
         with m.Elif(br_update.mispredict_mask != 0):
             m.d.comb += if_stage.redirect_flush.eq(1)
@@ -566,6 +590,7 @@ class Core(HasCoreParams, Elaboratable):
                     com_ftq_idx)),
             if_stage.commit_valid.eq((rob.commit_req.valids != 0)
                                      | rob.commit_exc.valid),
+            if_stage.br_update.eq(br_update),
         ]
 
         if self.use_fpu:

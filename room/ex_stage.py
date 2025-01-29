@@ -2,10 +2,9 @@ from amaranth import *
 
 from room.consts import *
 from room.fu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit
-from room.if_stage import GetPCResp
-from room.branch import BranchResolution, BranchUpdate
+from room.branch import GetPCResp, BranchResolution, BranchUpdate, BranchKillableFIFO
 from room.types import HasCoreParams, MicroOp
-from room.utils import BranchKillableFIFO, Arbiter, generate_imm
+from room.utils import Arbiter, generate_imm
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 

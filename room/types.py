@@ -56,6 +56,14 @@ class HasCoreParams:
             self.max_br_count = params['max_br_count']
 
             #
+            # Branch prediction
+            #
+            self.use_bpd = params['use_bpd']
+            self.ghist_length = params.get('ghist_length', 64)
+            self.bpd_meta_length = params['bpd_meta_length']
+            self.n_ras_entries = params['n_ras_entries']
+
+            #
             # Physical register file
             #
 

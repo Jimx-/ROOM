@@ -1,11 +1,12 @@
 from amaranth import *
 from amaranth import tracer
+from amaranth.hdl.ast import ValueCastable
 from amaranth.lib.fifo import AsyncFIFO
 
 import math
 
 
-class Valid:
+class Valid(ValueCastable):
 
     def __init__(self, cls, *args, name=None, src_loc_at=0, **kwargs):
         if name is None:
@@ -17,6 +18,16 @@ class Valid:
     @property
     def fire(self):
         return self.valid
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.valid, Value.cast(self.bits))
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
 
     def eq(self, rhs):
         return [
@@ -114,10 +125,12 @@ class Queue(Elaboratable):
                  cls,
                  *args,
                  flow=True,
+                 pipe=False,
                  has_flush=False,
                  **kwargs):
         self.depth = depth
         self.flow = flow
+        self.pipe = pipe
         self.has_flush = has_flush
 
         self.enq = Decoupled(cls, *args, **kwargs)
@@ -192,6 +205,10 @@ class Queue(Elaboratable):
                 ]
                 with m.If(self.deq.ready):
                     m.d.comb += do_enq.eq(0)
+
+        if self.pipe:
+            with m.If(self.deq.ready):
+                m.d.comb += self.enq.ready.eq(1)
 
         ptr_diff = (enq_ptr - deq_ptr)[:len(enq_ptr)]
 

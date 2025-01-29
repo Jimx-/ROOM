@@ -7,15 +7,16 @@ from room.consts import *
 from room.rvc import RVCDecoder
 from room.id_stage import BranchDecoder, BranchSignals
 from room.types import HasCoreParams, MicroOp
-from room.fu import GetPCResp
 from room.breakpoint import Breakpoint, BreakpointMatcher
 from room.exc import MStatus
 from room.icache import ICache
 from room.utils import wrap_incr, sign_extend
 from room.mmu import PTBR, PageTableWalker
 from room.tlb import TLB, TLBResp, SFenceReq
+from room.branch import GlobalHistory, FTQEntry, GetPCResp, BranchUpdate
+from room.bpd import BranchPredictor, BranchPredictionUpdate, BranchPredictions
 
-from roomsoc.interconnect.stream import Decoupled, Valid
+from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
 
 class IFDebug(Record):
@@ -53,6 +54,11 @@ class FetchBundle(HasCoreParams):
         self.cfi_valid = Signal(name=f'{name}_cfi_valid')
         self.cfi_idx = Signal(range(self.fetch_width), name=f'{name}_cfi_idx')
         self.cfi_type = Signal(CFIType, name=f'{name}_cfi_type')
+        self.cfi_npc_plus4 = Signal(name=f'{name}__cfi_npc_plus4')
+        self.cfi_is_call = Signal(name=f'{name}__cfi_is_call')
+        self.cfi_is_ret = Signal(name=f'{name}__cfi_is_ret')
+
+        self.br_mask = Signal(self.fetch_width, name=f'{name}__br_mask')
 
         self.ftq_idx = Signal(range(self.ftq_size), name=f'{name}_ftq_size')
 
@@ -62,20 +68,29 @@ class FetchBundle(HasCoreParams):
         self.bp_exc_if = Signal(self.fetch_width, name=f'{name}_bp_exc_if')
         self.bp_debug_if = Signal(self.fetch_width, name=f'{name}_bp_debug_if')
 
+        self.ghist = GlobalHistory(params)
+        self.bpd_meta = Signal(self.bpd_meta_length, name=f'{name}__bpd_meta')
+
     def eq(self, rhs):
         ret = [
             self.pc.eq(rhs.pc),
             self.next_pc.eq(rhs.next_pc),
             self.edge_inst.eq(rhs.edge_inst),
             self.mask.eq(rhs.mask),
+            self.br_mask.eq(rhs.br_mask),
             self.cfi_valid.eq(rhs.cfi_valid),
             self.cfi_idx.eq(rhs.cfi_idx),
             self.cfi_type.eq(rhs.cfi_type),
+            self.cfi_npc_plus4.eq(rhs.cfi_npc_plus4),
+            self.cfi_is_call.eq(rhs.cfi_is_call),
+            self.cfi_is_ret.eq(rhs.cfi_is_ret),
             self.ftq_idx.eq(rhs.ftq_idx),
             self.exc_pf_if.eq(rhs.exc_pf_if),
             self.exc_ae_if.eq(rhs.exc_ae_if),
             self.bp_exc_if.eq(rhs.bp_exc_if),
             self.bp_debug_if.eq(rhs.bp_debug_if),
+            self.ghist.eq(rhs.ghist),
+            self.bpd_meta.eq(rhs.bpd_meta),
         ]
         for inst, rinst in zip(self.insts, rhs.insts):
             ret.append(inst.eq(rinst))
@@ -268,17 +283,19 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
         self.w_en = Signal()
         self.w_rdy = Signal()
 
-        self.deq_idx = Signal(range(self.ftq_size))
-        self.deq_valid = Signal()
+        self.deq_idx = Valid(Signal, range(self.ftq_size))
 
-        self.redirect_idx = Signal(range(self.ftq_size))
-        self.redirect_valid = Signal()
+        self.redirect_idx = Valid(Signal, range(self.ftq_size))
 
         self.get_pc_idx = [
             Signal(range(self.ftq_size), name=f'get_pc_idx{i}')
             for i in range(2)
         ]
         self.get_pc = [GetPCResp(params, name=f'get_pc{i}') for i in range(2)]
+
+        self.br_update = BranchUpdate(params)
+
+        self.bpd_update = Valid(BranchPredictionUpdate, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -287,41 +304,271 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
 
         w_ptr = Signal(range(self.ftq_size), reset=1)
         deq_ptr = Signal(range(self.ftq_size))
+        bpd_ptr = Signal(range(self.ftq_size))
 
         full = (wrap_incr(wrap_incr(w_ptr, self.ftq_size), self.ftq_size)
-                == deq_ptr) | (wrap_incr(w_ptr, self.ftq_size) == deq_ptr)
+                == bpd_ptr) | (wrap_incr(w_ptr, self.ftq_size) == bpd_ptr)
 
         pcs = Array(
             Signal(self.vaddr_bits_extended - pc_lsb_w, name=f'pc{i}')
             for i in range(self.ftq_size))
+        meta = Memory(width=self.bpd_meta_length, depth=self.ftq_size)
+        mem = Array(
+            FTQEntry(self.params, name=f'entry{i}')
+            for i in range(self.ftq_size))
+        ghist = [
+            Memory(width=len(self.w_data.ghist), depth=self.ftq_size)
+            for _ in range(2)
+        ]
+
+        prev_entry = FTQEntry(self.params)
+        prev_ghist = GlobalHistory(self.params)
 
         with m.If(self.w_en & self.w_rdy):
+            new_entry = FTQEntry(self.params)
+            m.d.comb += [
+                new_entry.cfi_valid.eq(self.w_data.cfi_valid),
+                new_entry.cfi_idx.eq(self.w_data.cfi_idx),
+                new_entry.cfi_taken.eq(self.w_data.cfi_valid),
+                new_entry.cfi_type.eq(self.w_data.cfi_type),
+                new_entry.cfi_npc_plus4.eq(self.w_data.cfi_npc_plus4),
+                new_entry.br_mask.eq(self.w_data.br_mask),
+            ]
+
+            new_ghist = GlobalHistory(self.params)
+            with m.If(self.w_data.ghist.br_not_taken):
+                m.d.comb += new_ghist.eq(self.w_data.ghist)
+            with m.Else():
+                prev_ghist.update(m,
+                                  branches=prev_entry.br_mask,
+                                  cfi_taken=prev_entry.cfi_taken,
+                                  cfi_is_br=(prev_entry.br_mask &
+                                             (1 << prev_entry.cfi_idx)).any(),
+                                  cfi_idx=prev_entry.cfi_idx,
+                                  cfi_valid=prev_entry.cfi_valid,
+                                  cfi_is_call=prev_entry.cfi_is_call,
+                                  cfi_is_ret=prev_entry.cfi_is_ret,
+                                  new_ghist=new_ghist)
+
             m.d.sync += [
                 pcs[w_ptr].eq(self.w_data.pc >> pc_lsb_w),
+                mem[w_ptr].eq(new_entry),
                 w_ptr.eq(wrap_incr(w_ptr, self.ftq_size)),
+            ]
+
+            meta_wport = m.submodules.meta_wport = meta.write_port()
+            m.d.comb += [
+                meta_wport.addr.eq(w_ptr),
+                meta_wport.data.eq(self.w_data.bpd_meta),
+                meta_wport.en.eq(1),
+            ]
+
+            for i, ghist_mem in enumerate(ghist):
+                ghist_wport = ghist_mem.write_port()
+                setattr(m.submodules, f'ghist_wport{i}', ghist_wport)
+                m.d.comb += [
+                    ghist_wport.addr.eq(w_ptr),
+                    ghist_wport.data.eq(new_ghist),
+                    ghist_wport.en.eq(1),
+                ]
+
+            m.d.sync += [
+                prev_entry.eq(new_entry),
+                prev_ghist.eq(new_ghist),
             ]
 
         m.d.comb += self.w_idx.eq(w_ptr)
 
-        with m.If(self.deq_valid):
-            m.d.sync += deq_ptr.eq(self.deq_idx)
+        with m.If(self.deq_idx.valid):
+            m.d.sync += deq_ptr.eq(self.deq_idx.bits)
 
-        m.d.comb += self.w_rdy.eq(~full)
+        redirect_valid_d1 = Signal()
+        redirect_idx_d1 = Signal.like(self.redirect_idx.bits)
+        m.d.sync += [
+            redirect_valid_d1.eq(self.redirect_idx.valid),
+            redirect_idx_d1.eq(self.redirect_idx.bits),
+        ]
 
-        with m.If(self.redirect_valid):
-            m.d.sync += w_ptr.eq(wrap_incr(self.redirect_idx, self.ftq_size))
+        bpd_update_mispredict = Signal()
+        bpd_update_mispredict_d1 = Signal()
+        bpd_update_repair = Signal()
+        bpd_update_repair_d1 = Signal()
+        bpd_repair_idx = Signal(range(self.ftq_size))
+        bpd_end_idx = Signal(range(self.ftq_size))
+        bpd_repair_pc = Signal.like(pcs[0])
+        m.d.sync += [
+            bpd_update_mispredict_d1.eq(bpd_update_mispredict),
+            bpd_update_repair_d1.eq(bpd_update_repair),
+        ]
 
-        for get_pc_idx, get_pc in zip(self.get_pc_idx, self.get_pc):
+        bpd_idx = Signal(range(self.ftq_size))
+        bpd_entry = FTQEntry(self.params)
+        bpd_pc = Signal.like(pcs[0])
+        m.d.comb += bpd_idx.eq(
+            Mux(
+                self.redirect_idx.valid, self.redirect_idx.bits,
+                Mux(bpd_update_mispredict | bpd_update_repair, bpd_repair_idx,
+                    bpd_ptr)))
+        m.d.sync += [
+            bpd_entry.eq(mem[bpd_idx]),
+            bpd_pc.eq(pcs[bpd_idx]),
+        ]
+
+        meta_rport = m.submodules.meta_rport = meta.read_port(
+            transparent=False)
+        bpd_meta = Signal(self.bpd_meta_length)
+        m.d.comb += [
+            meta_rport.addr.eq(bpd_idx),
+            bpd_meta.eq(meta_rport.data),
+        ]
+
+        ghist_rport0 = m.submodules.ghist_rport0 = ghist[0].read_port(
+            transparent=False)
+        bpd_ghist = GlobalHistory(self.params)
+        m.d.comb += [
+            ghist_rport0.addr.eq(bpd_idx),
+            bpd_ghist.eq(ghist_rport0.data),
+        ]
+
+        br_res_mispredict_d1 = Signal()
+        br_res_ftq_idx_d1 = Signal.like(self.br_update.br_res.uop.ftq_idx)
+        w_ptr_d1 = Signal.like(w_ptr)
+        m.d.sync += [
+            br_res_mispredict_d1.eq(self.br_update.br_res.mispredict),
+            br_res_ftq_idx_d1.eq(self.br_update.br_res.uop.ftq_idx),
+            w_ptr_d1.eq(w_ptr),
+        ]
+
+        with m.If(self.redirect_idx.valid):
+            m.d.sync += [
+                bpd_update_mispredict.eq(0),
+                bpd_update_repair.eq(0),
+            ]
+        with m.Elif(br_res_mispredict_d1):
+            m.d.sync += [
+                bpd_update_mispredict.eq(1),
+                bpd_repair_idx.eq(br_res_ftq_idx_d1),
+                bpd_end_idx.eq(w_ptr_d1),
+            ]
+        with m.Elif(bpd_update_mispredict):
+            m.d.sync += [
+                bpd_update_mispredict.eq(0),
+                bpd_update_repair.eq(1),
+                bpd_repair_idx.eq(wrap_incr(bpd_repair_idx, self.ftq_size))
+            ]
+        with m.Elif(bpd_update_repair & bpd_update_mispredict_d1):
+            m.d.sync += [
+                bpd_repair_pc.eq(bpd_pc),
+                bpd_repair_idx.eq(wrap_incr(bpd_repair_idx, self.ftq_size))
+            ]
+        with m.Elif(bpd_update_repair):
+            m.d.sync += bpd_repair_idx.eq(
+                wrap_incr(bpd_repair_idx, self.ftq_size))
+            with m.If((wrap_incr(bpd_repair_idx, self.ftq_size) == bpd_end_idx)
+                      | (bpd_pc == bpd_repair_pc)):
+                m.d.sync += bpd_update_repair.eq(0)
+
+        do_commit_update = Signal()
+        m.d.comb += do_commit_update.eq(
+            ~bpd_update_mispredict
+            & ~bpd_update_repair
+            & (bpd_ptr != deq_ptr)
+            & (wrap_incr(bpd_ptr, self.ftq_size) != w_ptr)
+            & ~self.br_update.br_res.mispredict
+            & ~self.redirect_idx.valid & ~redirect_valid_d1)
+
+        with m.If(do_commit_update):
+            m.d.sync += bpd_ptr.eq(wrap_incr(bpd_ptr, self.ftq_size))
+
+        first_empty = Signal(reset=1)
+        do_bpd_update = Signal()
+        m.d.sync += do_bpd_update.eq(do_commit_update | bpd_update_mispredict
+                                     | bpd_update_repair)
+
+        with m.If(do_bpd_update):
+            cfi_mask = Signal(self.fetch_width)
+            with m.Switch(bpd_entry.cfi_idx):
+                for w in range(self.fetch_width):
+                    with m.Case(w):
+                        m.d.comb += [
+                            cfi_mask.eq((1 << (w + 1)) - 1),
+                            self.bpd_update.bits.cfi_is_br.eq(
+                                bpd_entry.br_mask[w]),
+                        ]
+
+            m.d.comb += [
+                self.bpd_update.valid.eq(
+                    ~first_empty
+                    & (bpd_entry.cfi_valid | bpd_entry.br_mask.any())
+                    & ~(bpd_update_repair_d1 & (bpd_pc == bpd_repair_pc))),
+                self.bpd_update.bits.is_mispredict_update.eq(
+                    bpd_update_mispredict_d1),
+                self.bpd_update.bits.is_repair_update.eq(bpd_update_repair_d1),
+                self.bpd_update.bits.pc.eq(bpd_pc << pc_lsb_w),
+                self.bpd_update.bits.br_mask.eq(
+                    Mux(bpd_entry.cfi_valid, cfi_mask & bpd_entry.br_mask,
+                        bpd_entry.br_mask)),
+                self.bpd_update.bits.cfi_idx.valid.eq(bpd_entry.cfi_valid),
+                self.bpd_update.bits.cfi_idx.bits.eq(bpd_entry.cfi_idx),
+                self.bpd_update.bits.cfi_mispredicted.eq(
+                    bpd_entry.cfi_mispredicted),
+                self.bpd_update.bits.cfi_taken.eq(bpd_entry.cfi_taken),
+                self.bpd_update.bits.cfi_is_jal.eq(
+                    (bpd_entry.cfi_type == CFIType.JAL)
+                    | (bpd_entry.cfi_type == CFIType.JALR)),
+                self.bpd_update.bits.ghist.eq(bpd_ghist.history),
+                self.bpd_update.bits.meta.eq(bpd_meta),
+            ]
+
+            m.d.sync += first_empty.eq(0)
+
+        m.d.comb += self.w_rdy.eq(~full | do_commit_update)
+
+        redirect_new_entry = FTQEntry(self.params)
+        m.d.sync += redirect_new_entry.eq(mem[self.redirect_idx.bits])
+
+        with m.If(self.redirect_idx.valid):
+            m.d.sync += w_ptr.eq(
+                wrap_incr(self.redirect_idx.bits, self.ftq_size))
+
+            with m.If(self.br_update.br_res.mispredict):
+                m.d.sync += [
+                    redirect_new_entry.cfi_valid.eq(1),
+                    redirect_new_entry.cfi_idx.eq(
+                        self.br_update.br_res.uop.pc_lsb >> 1),
+                    redirect_new_entry.cfi_mispredicted.eq(1),
+                    redirect_new_entry.cfi_taken.eq(
+                        self.br_update.br_res.taken),
+                ]
+
+        with m.Elif(redirect_valid_d1):
+            m.d.sync += [
+                prev_entry.eq(redirect_new_entry),
+                prev_ghist.eq(bpd_ghist),
+                mem[redirect_idx_d1].eq(redirect_new_entry),
+            ]
+
+        ghist_rport1 = m.submodules.ghist_rport1 = ghist[1].read_port(
+            transparent=False)
+
+        for i, (get_pc_idx,
+                get_pc) in enumerate(zip(self.get_pc_idx, self.get_pc)):
             next_idx = wrap_incr(get_pc_idx, self.ftq_size)
             next_is_w = (next_idx == w_ptr) & self.w_en & self.w_rdy
 
+            if i == 1:
+                m.d.comb += [
+                    ghist_rport1.addr.eq(get_pc_idx),
+                    get_pc.ghist.eq(ghist_rport1.data),
+                ]
+
             m.d.sync += [
                 get_pc.pc.eq(pcs[get_pc_idx] << pc_lsb_w),
-                get_pc.commit_pc.eq(pcs[Mux(self.deq_valid, self.deq_idx,
-                                            deq_ptr)] << pc_lsb_w),
+                get_pc.commit_pc.eq(pcs[Mux(self.deq_idx.valid, self.deq_idx.
+                                            bits, deq_ptr)] << pc_lsb_w),
                 get_pc.next_valid.eq((next_idx != w_ptr) | next_is_w),
-                get_pc.next_pc.eq(Mux(next_is_w, self.w_data.pc,
-                                      pcs[next_idx])),
+                get_pc.next_pc.eq(
+                    Mux(next_is_w, self.w_data.pc, pcs[next_idx] << pc_lsb_w)),
             ]
 
         return m
@@ -358,10 +605,13 @@ class IFStage(HasCoreParams, Elaboratable):
         ]
         self.get_pc = [GetPCResp(params, name=f'get_pc{i}') for i in range(2)]
 
+        self.br_update = BranchUpdate(params)
+
         self.redirect_valid = Signal()
         self.redirect_pc = Signal(self.vaddr_bits_extended)
         self.redirect_flush = Signal()
         self.redirect_ftq_idx = Signal(range(self.ftq_size))
+        self.redirect_ghist = GlobalHistory(self.params)
 
         self.flush_icache = Signal()
 
@@ -418,12 +668,15 @@ class IFStage(HasCoreParams, Elaboratable):
                 tlb.ptw_resp.eq(self.ptw_resp),
             ]
 
+        bpd = m.submodules.bpd = BranchPredictor(self.params)
+
         #
         # F0 - Next PC select
         #
 
         s0_vpc = Signal(self.vaddr_bits_extended)
         s0_valid = Signal()
+        s0_ghist = GlobalHistory(self.params)
         s0_is_replay = Signal()
         s0_replay_ppc = Signal(self.paddr_bits)
         s0_replay_resp = TLBResp(self.params)
@@ -454,12 +707,19 @@ class IFStage(HasCoreParams, Elaboratable):
                 tlb.sfence.eq(self.sfence),
             ]
 
+        m.d.comb += [
+            bpd.f0_req.valid.eq(s0_valid),
+            bpd.f0_req.bits.pc.eq(s0_vpc),
+            bpd.f0_req.bits.ghist.eq(s0_ghist),
+        ]
+
         #
         # F1 - ICache Access
         #
 
         s1_vpc = Signal.like(s0_vpc)
         s1_valid = Signal()
+        s1_ghist = GlobalHistory(self.params)
         s1_is_replay = Signal()
         s1_replay_ppc = Signal.like(s0_replay_ppc)
         s1_replay_resp = TLBResp(self.params)
@@ -469,6 +729,7 @@ class IFStage(HasCoreParams, Elaboratable):
         m.d.sync += [
             s1_vpc.eq(s0_vpc),
             s1_valid.eq(s0_valid),
+            s1_ghist.eq(s0_ghist),
             s1_is_replay.eq(s0_is_replay),
             s1_replay_ppc.eq(s0_replay_ppc),
             s1_replay_resp.eq(s0_replay_resp),
@@ -495,6 +756,7 @@ class IFStage(HasCoreParams, Elaboratable):
                 m.d.comb += [
                     s0_valid.eq(~(s1_tlb_resp.ae.inst | s1_tlb_resp.pf.inst)),
                     s0_vpc.eq(f1_predicted_target),
+                    s0_ghist.eq(s1_ghist),
                 ]
 
         #
@@ -504,6 +766,7 @@ class IFStage(HasCoreParams, Elaboratable):
         s2_vpc = Signal.like(s1_vpc)
         s2_valid = Signal()
         s2_ppc = Signal.like(s1_ppc)
+        s2_ghist = GlobalHistory(self.params)
         s2_is_replay_reg = Signal()
         s2_is_replay = s2_is_replay_reg & s2_valid
         s2_tlb_resp = TLBResp(self.params)
@@ -519,6 +782,7 @@ class IFStage(HasCoreParams, Elaboratable):
                 s2_vpc.eq(s1_vpc),
                 s2_valid.eq(s1_valid & ~f1_clear),
                 s2_ppc.eq(s1_ppc),
+                s2_ghist.eq(s1_ghist),
                 s2_is_replay_reg.eq(s1_is_replay),
                 s2_tlb_resp.eq(s1_tlb_resp),
                 s2_tlb_miss.eq(s1_tlb_miss),
@@ -533,6 +797,7 @@ class IFStage(HasCoreParams, Elaboratable):
                     s0_valid.eq(~(s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst)
                                 | s2_is_replay | s2_tlb_miss),
                     s0_vpc.eq(s2_vpc),
+                    s0_ghist.eq(s2_ghist),
                     s0_is_replay.eq(s2_valid & icache.resp.valid),
                     f1_clear.eq(1),
                 ]
@@ -546,6 +811,7 @@ class IFStage(HasCoreParams, Elaboratable):
                             (s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst)
                             & ~s2_is_replay)),
                         s0_vpc.eq(f2_predicted_target),
+                        s0_ghist.eq(s2_ghist),
                     ]
 
             m.d.comb += [
@@ -576,7 +842,8 @@ class IFStage(HasCoreParams, Elaboratable):
 
         f3_clear = Signal()
 
-        f3_pipe_reg = Signal(self.fetch_bytes * 8 + 2 + len(s2_vpc))
+        f3_pipe_reg = Signal(self.fetch_bytes * 8 + 2 + len(s2_vpc) +
+                             len(s2_ghist))
         f3_empty = Signal(reset=1)
 
         f4_ready = Signal()
@@ -585,10 +852,11 @@ class IFStage(HasCoreParams, Elaboratable):
             f3_w_en = s2_valid & ~f2_clear & (icache.resp.valid | (
                 (s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst) & ~s2_tlb_miss))
             f3_w_data = Cat(icache.resp.bits.data, s2_tlb_resp.ae.inst,
-                            s2_tlb_resp.pf.inst, s2_vpc)
+                            s2_tlb_resp.pf.inst, s2_vpc, s2_ghist)
         else:
             f3_w_en = s2_valid & ~f2_clear & self.ibus.ack
-            f3_w_data = Cat(self.ibus.dat_r, Const(0, 2), s2_vpc)
+            f3_w_data = Cat(self.ibus.dat_r, Const(0, 2), s2_vpc,
+                            Const(0, len(s2_ghist)))
 
         m.d.comb += f3_ready.eq(f3_empty)
 
@@ -605,14 +873,34 @@ class IFStage(HasCoreParams, Elaboratable):
         with m.If(f3_clear):
             m.d.sync += f3_empty.eq(1)
 
+        f3_was_ready = Signal()
+        m.d.sync += f3_was_ready.eq(f3_ready)
+
+        f3_bpd_resp = m.submodules.f3_bpd_resp = Queue(1,
+                                                       BranchPredictions,
+                                                       self.params,
+                                                       flow=True,
+                                                       pipe=True,
+                                                       has_flush=True)
+        m.d.comb += [
+            f3_bpd_resp.enq.valid.eq(~f3_empty & f3_was_ready),
+            f3_bpd_resp.enq.bits.eq(bpd.f3_resp),
+            f3_bpd_resp.deq.ready.eq(f4_ready),
+            f3_bpd_resp.flush.eq(f3_clear),
+        ]
+
         s3_valid = Signal()
         s3_pc = Signal.like(s2_vpc)
         s3_data = Signal(self.fetch_bytes * 8)
         s3_exc_ae = Signal()
         s3_exc_pf = Signal()
+        s3_ghist = GlobalHistory(self.params)
+        assert len(Cat(s3_data, s3_exc_ae, s3_exc_pf, s3_pc,
+                       s3_ghist)) == len(f3_pipe_reg)
         m.d.comb += [
             s3_valid.eq(~f3_empty),
-            Cat(s3_data, s3_exc_ae, s3_exc_pf, s3_pc).eq(f3_pipe_reg),
+            Cat(s3_data, s3_exc_ae, s3_exc_pf, s3_pc,
+                s3_ghist).eq(f3_pipe_reg),
         ]
 
         f3_prev_half = Signal(16)
@@ -623,6 +911,7 @@ class IFStage(HasCoreParams, Elaboratable):
         f3_insts = [Signal(32) for _ in range(self.fetch_width)]
         f3_exp_insts = [Signal(32) for _ in range(self.fetch_width)]
         f3_mask = Signal(self.fetch_width)
+        f3_br_mask = Signal(self.fetch_width)
         f3_is_rvc = Signal(self.fetch_width)
         f3_redirects = Signal(self.fetch_width)
         f3_targets = Array(
@@ -642,6 +931,7 @@ class IFStage(HasCoreParams, Elaboratable):
             m.d.comb += binst.eq(inst)
         m.d.comb += [
             f3_fetch_bundle.mask.eq(f3_mask),
+            f3_fetch_bundle.br_mask.eq(f3_br_mask),
             f3_fetch_bundle.pc.eq(f3_aligned_pc),
             f3_fetch_bundle.exc_ae_if.eq(s3_exc_ae),
             f3_fetch_bundle.exc_pf_if.eq(s3_exc_pf),
@@ -747,16 +1037,22 @@ class IFStage(HasCoreParams, Elaboratable):
             ]
 
             if w == 0:
-                f3_plus4_mask[w].eq(
+                m.d.comb += f3_plus4_mask[w].eq(
                     ((f3_insts[w][0:2] == 3) & ~f3_prev_half_valid))
             else:
-                f3_plus4_mask[w].eq((f3_insts[w][0:2] == 3))
+                m.d.comb += f3_plus4_mask[w].eq((f3_insts[w][0:2] == 3))
 
             m.d.comb += f3_redirects[w].eq(f3_mask[w] & (
                 (br_sigs.cfi_type == CFIType.JAL)
-                | (br_sigs.cfi_type == CFIType.JALR)))
+                | (br_sigs.cfi_type == CFIType.JALR)
+                | (self.use_bpd & (br_sigs.cfi_type == CFIType.BR)
+                   & f3_bpd_resp.deq.bits.preds[w].taken)))
 
-            m.d.comb += f3_cfi_types[w].eq(br_sigs.cfi_type)
+            m.d.comb += [
+                f3_cfi_types[w].eq(br_sigs.cfi_type),
+                f3_br_mask[w].eq(f3_mask[w]
+                                 & (br_sigs.cfi_type == CFIType.BR)),
+            ]
 
             m.d.comb += [
                 f3_fetch_bundle.bp_exc_if[w].eq(bp_matcher.exc_if),
@@ -784,6 +1080,16 @@ class IFStage(HasCoreParams, Elaboratable):
             f3_fetch_bundle.cfi_valid.eq(~f3_prio_enc.n),
             f3_fetch_bundle.cfi_idx.eq(f3_prio_enc.o),
         ]
+        with m.Switch(f3_fetch_bundle.cfi_idx):
+            for w in range(self.fetch_width):
+                with m.Case(w):
+                    m.d.comb += f3_fetch_bundle.cfi_npc_plus4.eq(
+                        f3_plus4_mask[w])
+
+        m.d.comb += [
+            f3_fetch_bundle.ghist.eq(s3_ghist),
+            f3_fetch_bundle.bpd_meta.eq(f3_bpd_resp.deq.bits.meta),
+        ]
 
         f3_predicted_target = Signal(self.vaddr_bits_extended)
         m.d.comb += [
@@ -795,6 +1101,19 @@ class IFStage(HasCoreParams, Elaboratable):
                     next_fetch(f3_fetch_bundle.pc))),
             f3_fetch_bundle.next_pc.eq(f3_predicted_target),
         ]
+
+        f3_predicted_ghist = GlobalHistory(self.params)
+        f3_fetch_bundle.ghist.update(
+            m,
+            branches=f3_fetch_bundle.br_mask,
+            cfi_taken=f3_fetch_bundle.cfi_valid,
+            cfi_is_br=(f3_fetch_bundle.br_mask &
+                       (1 << f3_fetch_bundle.cfi_idx)).any(),
+            cfi_idx=f3_fetch_bundle.cfi_idx,
+            cfi_valid=f3_fetch_bundle.cfi_valid,
+            cfi_is_call=f3_fetch_bundle.cfi_is_call,
+            cfi_is_ret=f3_fetch_bundle.cfi_is_ret,
+            new_ghist=f3_predicted_ghist)
 
         with m.If(s3_valid & f4_ready):
             with m.If(f3_fetch_bundle.cfi_valid):
@@ -810,6 +1129,8 @@ class IFStage(HasCoreParams, Elaboratable):
                     s0_valid.eq(~(f3_fetch_bundle.exc_ae_if
                                   | f3_fetch_bundle.exc_pf_if)),
                     s0_vpc.eq(f3_predicted_target),
+                    s0_ghist.eq(f3_predicted_ghist),
+                    s0_is_replay.eq(0),
                 ]
 
         #
@@ -836,8 +1157,10 @@ class IFStage(HasCoreParams, Elaboratable):
             m.d.comb += fp.eq(rd)
 
         m.d.comb += [
-            ftq.deq_idx.eq(self.commit),
-            ftq.deq_valid.eq(self.commit_valid),
+            ftq.deq_idx.bits.eq(self.commit),
+            ftq.deq_idx.valid.eq(self.commit_valid),
+            ftq.br_update.eq(self.br_update),
+            bpd.update.eq(ftq.bpd_update),
         ]
 
         for a, b in zip(ftq.get_pc_idx, self.get_pc_idx):
@@ -868,9 +1191,10 @@ class IFStage(HasCoreParams, Elaboratable):
                 fb.flush.eq(1),
                 s0_valid.eq(self.redirect_valid),
                 s0_vpc.eq(self.redirect_pc),
+                s0_ghist.eq(self.redirect_ghist),
                 s0_is_replay.eq(0),
-                ftq.redirect_valid.eq(self.redirect_valid),
-                ftq.redirect_idx.eq(self.redirect_ftq_idx),
+                ftq.redirect_idx.valid.eq(self.redirect_valid),
+                ftq.redirect_idx.bits.eq(self.redirect_ftq_idx),
             ]
             m.d.sync += f3_prev_half_valid.eq(0)
 
