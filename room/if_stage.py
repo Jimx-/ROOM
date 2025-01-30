@@ -99,7 +99,7 @@ class FetchBundle(HasCoreParams):
         return ret
 
 
-class FetchBuffer(HasCoreParams, Elaboratable):
+class FetchBuffer(HasFrontendParams, Elaboratable):
 
     def __init__(self, params, sim_debug=False):
         super().__init__(params)
@@ -147,7 +147,7 @@ class FetchBuffer(HasCoreParams, Elaboratable):
         in_mask = Signal(self.fetch_width)
 
         for w in range(self.fetch_width):
-            pc = self.w_data.pc + (w << 1)
+            pc = self.fetch_align(self.w_data.pc) + (w << 1)
             m.d.comb += [
                 in_mask[w].eq(self.w_data.mask[w] & self.w_en),
                 in_uops[w].ftq_idx.eq(self.w_data.ftq_idx),
@@ -171,8 +171,8 @@ class FetchBuffer(HasCoreParams, Elaboratable):
             next_id = id_counter
 
             for w in range(self.fetch_width):
-                pc = self.w_data.pc + (w << 1) - Mux(in_uops[w].edge_inst, 2,
-                                                     0)
+                pc = self.fetch_align(self.w_data.pc) + (w << 1) - Mux(
+                    in_uops[w].edge_inst, 2, 0)
                 m.d.comb += [
                     in_uops[w].uop_id.eq(next_id),
                     self.if_debug[w].valid.eq(do_enq & in_mask[w]),
@@ -329,6 +329,8 @@ class FetchTargetQueue(HasFrontendParams, Elaboratable):
                 new_entry.cfi_idx.eq(self.w_data.cfi_idx),
                 new_entry.cfi_taken.eq(self.w_data.cfi_valid),
                 new_entry.cfi_type.eq(self.w_data.cfi_type),
+                new_entry.cfi_is_call.eq(self.w_data.cfi_is_call),
+                new_entry.cfi_is_ret.eq(self.w_data.cfi_is_ret),
                 new_entry.cfi_npc_plus4.eq(self.w_data.cfi_npc_plus4),
                 new_entry.br_mask.eq(self.w_data.br_mask),
             ]
@@ -658,6 +660,8 @@ class IFStage(HasFrontendParams, Elaboratable):
 
         bpd = m.submodules.bpd = BranchPredictor(self.params)
 
+        ras = Memory(width=self.vaddr_bits_extended, depth=self.n_ras_entries)
+
         #
         # F0 - Next PC select
         #
@@ -877,6 +881,13 @@ class IFStage(HasFrontendParams, Elaboratable):
             f3_bpd_resp.flush.eq(f3_clear),
         ]
 
+        ras_rport = m.submodules.ras_rport = ras.read_port(transparent=False)
+        ras_read_idx = Signal.like(ras_rport.addr)
+        m.d.comb += ras_rport.addr.eq(ras_read_idx)
+        with m.If(f3_w_en & f3_ready):
+            m.d.sync += ras_read_idx.eq(s2_ghist.ras_idx)
+            m.d.comb += ras_rport.addr.eq(s2_ghist.ras_idx)
+
         s3_valid = Signal()
         s3_pc = Signal.like(s2_vpc)
         s3_data = Signal(self.fetch_bytes * 8)
@@ -906,6 +917,8 @@ class IFStage(HasFrontendParams, Elaboratable):
             Signal(self.vaddr_bits_extended, name=f'f3_target{i}')
             for i in range(self.fetch_width))
         f3_plus4_mask = Signal(self.fetch_width)
+        f3_call_mask = Signal(self.fetch_width)
+        f3_ret_mask = Signal(self.fetch_width)
         f3_cfi_types = Array(
             Signal(CFIType, name=f'f3_cfi_type{i}')
             for i in range(self.fetch_width))
@@ -920,7 +933,7 @@ class IFStage(HasFrontendParams, Elaboratable):
         m.d.comb += [
             f3_fetch_bundle.mask.eq(f3_mask),
             f3_fetch_bundle.br_mask.eq(f3_br_mask),
-            f3_fetch_bundle.pc.eq(f3_aligned_pc),
+            f3_fetch_bundle.pc.eq(s3_pc),
             f3_fetch_bundle.exc_ae_if.eq(s3_exc_ae),
             f3_fetch_bundle.exc_pf_if.eq(s3_exc_pf),
         ]
@@ -1040,6 +1053,8 @@ class IFStage(HasFrontendParams, Elaboratable):
                 f3_cfi_types[w].eq(br_sigs.cfi_type),
                 f3_br_mask[w].eq(f3_mask[w]
                                  & (br_sigs.cfi_type == CFIType.BR)),
+                f3_call_mask[w].eq(br_sigs.is_call),
+                f3_ret_mask[w].eq(br_sigs.is_ret),
             ]
 
             m.d.comb += [
@@ -1071,8 +1086,11 @@ class IFStage(HasFrontendParams, Elaboratable):
         with m.Switch(f3_fetch_bundle.cfi_idx):
             for w in range(self.fetch_width):
                 with m.Case(w):
-                    m.d.comb += f3_fetch_bundle.cfi_npc_plus4.eq(
-                        f3_plus4_mask[w])
+                    m.d.comb += [
+                        f3_fetch_bundle.cfi_npc_plus4.eq(f3_plus4_mask[w]),
+                        f3_fetch_bundle.cfi_is_call.eq(f3_call_mask[w]),
+                        f3_fetch_bundle.cfi_is_ret.eq(f3_ret_mask[w]),
+                    ]
 
         m.d.comb += [
             f3_fetch_bundle.ghist.eq(s3_ghist),
@@ -1084,8 +1102,10 @@ class IFStage(HasFrontendParams, Elaboratable):
             f3_predicted_target.eq(
                 Mux(
                     f3_fetch_bundle.cfi_valid &
-                    (f3_fetch_bundle.cfi_type != CFIType.JALR),
-                    f3_targets[f3_fetch_bundle.cfi_idx],
+                    ((f3_fetch_bundle.cfi_type != CFIType.JALR)
+                     | f3_fetch_bundle.cfi_is_ret),
+                    Mux(f3_fetch_bundle.cfi_is_ret, ras_rport.data,
+                        f3_targets[f3_fetch_bundle.cfi_idx]),
                     self.next_fetch(f3_fetch_bundle.pc))),
             f3_fetch_bundle.next_pc.eq(f3_predicted_target),
         ]
@@ -1103,7 +1123,18 @@ class IFStage(HasFrontendParams, Elaboratable):
             cfi_is_ret=f3_fetch_bundle.cfi_is_ret,
             new_ghist=f3_predicted_ghist)
 
+        ras_wport = m.submodules.ras_wport = ras.write_port()
+        m.d.comb += [
+            ras_wport.addr.eq(
+                wrap_incr(f3_fetch_bundle.ghist.ras_idx, self.n_ras_entries)),
+            ras_wport.data.eq(f3_aligned_pc + (f3_fetch_bundle.cfi_idx << 1) +
+                              Mux(f3_fetch_bundle.cfi_npc_plus4, 4, 2)),
+        ]
+
         with m.If(s3_valid & f4_ready):
+            with m.If(f3_fetch_bundle.cfi_valid & f3_fetch_bundle.cfi_is_call):
+                m.d.comb += ras_wport.en.eq(1)
+
             with m.If(f3_fetch_bundle.cfi_valid):
                 m.d.sync += f3_prev_half_valid.eq(0)
 

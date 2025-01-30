@@ -28,6 +28,8 @@ class BranchSignals(Record):
 
     def __init__(self, vaddr_bits, name=None, src_loc_at=0):
         super().__init__([
+            ('is_call', 1),
+            ('is_ret', 1),
             ('cfi_type', CFIType),
             ('target', vaddr_bits),
         ],
@@ -68,6 +70,15 @@ class BranchDecoder(Elaboratable):
 
             with m.Case(OPV('BEQ')):
                 m.d.comb += self.out.cfi_type.eq(CFIType.BR)
+
+        m.d.comb += [
+            self.out.is_call.eq(((self.out.cfi_type == CFIType.JAL)
+                                 | (self.out.cfi_type == CFIType.JALR))
+                                & (self.inst[7:12] == 1)),
+            self.out.is_ret.eq((self.out.cfi_type == CFIType.JALR)
+                               & (self.inst[7:12] == 0)
+                               & (self.inst[15:20] == 1)),
+        ]
 
         m.d.comb += self.out.target.eq(
             Mux(self.out.cfi_type == CFIType.BR,

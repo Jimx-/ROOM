@@ -48,7 +48,8 @@ class GlobalHistory(HasCoreParams, Record):
                 cfi_valid & cfi_is_call,
                 wrap_incr(self.ras_idx, self.n_ras_entries),
                 Mux(cfi_valid & cfi_is_ret,
-                    wrap_decr(self.ras_idx, self.n_ras_entries), 0)))
+                    wrap_decr(self.ras_idx, self.n_ras_entries),
+                    self.ras_idx)))
 
 
 class FTQEntry(HasCoreParams, Record):
