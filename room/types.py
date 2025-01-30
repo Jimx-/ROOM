@@ -271,3 +271,23 @@ class MicroOp(HasCoreParams, Record):
 
     def fu_type_has(self, typ):
         return (self.fu_type & typ) != 0
+
+
+class HasFrontendParams(HasCoreParams):
+
+    def __init__(self, params, *args, **kwargs):
+        super().__init__(params)
+
+    def fetch_mask(self, addr):
+        off = (addr >> 1)[0:Shape.cast(range(self.fetch_width)).width]
+        return (((1 << self.fetch_width) - 1) << off)[0:self.fetch_width]
+
+    def fetch_align(self, addr):
+        lsb_width = Shape.cast(range(self.fetch_bytes)).width
+        return Cat(Const(0, lsb_width), addr[lsb_width:])
+
+    def fetch_index(self, addr):
+        return addr[log2_int(self.fetch_bytes):]
+
+    def next_fetch(self, addr):
+        return self.fetch_align(addr) + self.fetch_width * 2

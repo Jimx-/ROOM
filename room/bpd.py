@@ -6,7 +6,7 @@ from amaranth.lib.coding import PriorityEncoder
 import functools
 import operator
 
-from room.types import HasCoreParams
+from room.types import HasCoreParams, HasFrontendParams
 from room.branch import GlobalHistory
 
 from roomsoc.interconnect.stream import Valid
@@ -157,7 +157,7 @@ class BranchPredictionResponse(HasCoreParams):
                 for n in names]
 
 
-class BaseBranchPredictorBank(HasCoreParams, Elaboratable):
+class BaseBranchPredictorBank(HasFrontendParams, Elaboratable):
 
     def __init__(self, params):
         super().__init__(params)
@@ -180,7 +180,7 @@ class BaseBranchPredictorBank(HasCoreParams, Elaboratable):
 
         m.d.comb += self.resp.eq(self.resp_in)
 
-        self.s0_idx = self.f0_pc >> log2_int(self.fetch_bytes)
+        self.s0_idx = self.fetch_index(self.f0_pc)
         self.s1_idx = Signal.like(self.s0_idx)
         self.s2_idx = Signal.like(self.s0_idx)
         self.s3_idx = Signal.like(self.s0_idx)
@@ -215,7 +215,7 @@ class BaseBranchPredictorBank(HasCoreParams, Elaboratable):
         m.d.sync += self.s1_pc.eq(self.s0_pc)
 
         self.s0_update = self.update.bits
-        self.s0_update_idx = self.update.bits.pc[log2_int(self.fetch_bytes):]
+        self.s0_update_idx = self.fetch_index(self.update.bits.pc)
         self.s0_update_valid = self.update.valid
 
         self.s1_update = BranchPredictionUpdate(self.params)
@@ -264,7 +264,7 @@ class TageBranchPredictorBank(BaseBranchPredictorBank, HasTageParams):
                              name=name,
                              src_loc_at=src_loc_at + 1)
 
-    class TageTable(HasCoreParams, Elaboratable):
+    class TageTable(HasFrontendParams, Elaboratable):
 
         def __init__(self, params, n_sets, tag_size, hist_length,
                      u_bit_period):
@@ -313,7 +313,7 @@ class TageBranchPredictorBank(BaseBranchPredictorBank, HasTageParams):
                 for i in range(0, len(sig), n):
                     yield sig[i:i + n]
 
-            s1_req_idx = self.f1_req_pc[log2_int(self.fetch_bytes):]
+            s1_req_idx = self.fetch_index(self.f1_req_pc)
             idx_hist = functools.reduce(
                 operator.__xor__,
                 chunks(self.f1_req_ghist[:self.hist_length],
@@ -387,7 +387,7 @@ class TageBranchPredictorBank(BaseBranchPredictorBank, HasTageParams):
             m.d.comb += clear_u_idx.eq(
                 clear_u_counter[log2_int(self.u_bit_period):])
 
-            update_req_idx = self.update_pc[log2_int(self.fetch_bytes):]
+            update_req_idx = self.fetch_index(self.update_pc)
             update_idx_hist = functools.reduce(
                 operator.__xor__,
                 chunks(self.update_hist[:self.hist_length],
@@ -804,7 +804,7 @@ class NullBranchPredictorBank(BaseBranchPredictorBank):
         return m
 
 
-class BranchPredictor(HasCoreParams, Elaboratable):
+class BranchPredictor(HasFrontendParams, Elaboratable):
 
     def __init__(self, params):
         super().__init__(params)
@@ -820,21 +820,13 @@ class BranchPredictor(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        def fetch_mask(addr):
-            off = (addr >> 1)[0:Shape.cast(range(self.fetch_width)).width]
-            return (((1 << self.fetch_width) - 1) << off)[0:self.fetch_width]
-
-        def fetch_align(addr):
-            lsb_width = Shape.cast(range(self.fetch_bytes)).width
-            return Cat(Const(0, lsb_width), addr[lsb_width:])
-
         bank_cls = CompositeBranchPredictorBank if self.use_bpd else NullBranchPredictorBank
         bank = m.submodules.bank = bank_cls(self.params)
 
         m.d.comb += [
             bank.f0_valid.eq(self.f0_req.valid),
-            bank.f0_pc.eq(fetch_align(self.f0_req.bits.pc)),
-            bank.f0_mask.eq(fetch_mask(self.f0_req.bits.pc)),
+            bank.f0_pc.eq(self.fetch_align(self.f0_req.bits.pc)),
+            bank.f0_mask.eq(self.fetch_mask(self.f0_req.bits.pc)),
         ]
 
         m.d.sync += bank.f1_ghist.eq(self.f0_req.bits.ghist.history)

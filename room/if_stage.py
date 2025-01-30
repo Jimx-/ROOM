@@ -6,7 +6,7 @@ from amaranth.utils import log2_int
 from room.consts import *
 from room.rvc import RVCDecoder
 from room.id_stage import BranchDecoder, BranchSignals
-from room.types import HasCoreParams, MicroOp
+from room.types import HasCoreParams, MicroOp, HasFrontendParams
 from room.breakpoint import Breakpoint, BreakpointMatcher
 from room.exc import MStatus
 from room.icache import ICache
@@ -273,7 +273,7 @@ class FetchBuffer(HasCoreParams, Elaboratable):
         return m
 
 
-class FetchTargetQueue(HasCoreParams, Elaboratable):
+class FetchTargetQueue(HasFrontendParams, Elaboratable):
 
     def __init__(self, params):
         super().__init__(params)
@@ -300,8 +300,6 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        pc_lsb_w = Shape.cast(range(self.fetch_bytes)).width
-
         w_ptr = Signal(range(self.ftq_size), reset=1)
         deq_ptr = Signal(range(self.ftq_size))
         bpd_ptr = Signal(range(self.ftq_size))
@@ -310,7 +308,7 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
                 == bpd_ptr) | (wrap_incr(w_ptr, self.ftq_size) == bpd_ptr)
 
         pcs = Array(
-            Signal(self.vaddr_bits_extended - pc_lsb_w, name=f'pc{i}')
+            Signal(self.vaddr_bits_extended, name=f'pc{i}')
             for i in range(self.ftq_size))
         meta = Memory(width=self.bpd_meta_length, depth=self.ftq_size)
         mem = Array(
@@ -351,7 +349,7 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
                                   new_ghist=new_ghist)
 
             m.d.sync += [
-                pcs[w_ptr].eq(self.w_data.pc >> pc_lsb_w),
+                pcs[w_ptr].eq(self.w_data.pc),
                 mem[w_ptr].eq(new_entry),
                 w_ptr.eq(wrap_incr(w_ptr, self.ftq_size)),
             ]
@@ -504,7 +502,7 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
                 self.bpd_update.bits.is_mispredict_update.eq(
                     bpd_update_mispredict_d1),
                 self.bpd_update.bits.is_repair_update.eq(bpd_update_repair_d1),
-                self.bpd_update.bits.pc.eq(bpd_pc << pc_lsb_w),
+                self.bpd_update.bits.pc.eq(self.fetch_align(bpd_pc)),
                 self.bpd_update.bits.br_mask.eq(
                     Mux(bpd_entry.cfi_valid, cfi_mask & bpd_entry.br_mask,
                         bpd_entry.br_mask)),
@@ -563,18 +561,19 @@ class FetchTargetQueue(HasCoreParams, Elaboratable):
                 ]
 
             m.d.sync += [
-                get_pc.pc.eq(pcs[get_pc_idx] << pc_lsb_w),
-                get_pc.commit_pc.eq(pcs[Mux(self.deq_idx.valid, self.deq_idx.
-                                            bits, deq_ptr)] << pc_lsb_w),
+                get_pc.pc.eq(self.fetch_align(pcs[get_pc_idx])),
+                get_pc.commit_pc.eq(
+                    self.fetch_align(pcs[Mux(self.deq_idx.valid,
+                                             self.deq_idx.bits, deq_ptr)])),
                 get_pc.next_valid.eq((next_idx != w_ptr) | next_is_w),
-                get_pc.next_pc.eq(
-                    Mux(next_is_w, self.w_data.pc, pcs[next_idx] << pc_lsb_w)),
+                get_pc.next_pc.eq(Mux(next_is_w, self.w_data.pc,
+                                      pcs[next_idx])),
             ]
 
         return m
 
 
-class IFStage(HasCoreParams, Elaboratable):
+class IFStage(HasFrontendParams, Elaboratable):
 
     def __init__(self, ibus, params, sim_debug=False):
         super().__init__(params)
@@ -637,17 +636,6 @@ class IFStage(HasCoreParams, Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
-
-        def fetch_mask(addr):
-            off = (addr >> 1)[0:Shape.cast(range(self.fetch_width)).width]
-            return (((1 << self.fetch_width) - 1) << off)[0:self.fetch_width]
-
-        def fetch_align(addr):
-            lsb_width = Shape.cast(range(self.fetch_bytes)).width
-            return Cat(Const(0, lsb_width), addr[lsb_width:])
-
-        def next_fetch(addr):
-            return fetch_align(addr) + self.fetch_width * 2
 
         if self.enable_icache:
             icache = m.submodules.icache = ICache(self.ibus, self.params)
@@ -750,7 +738,7 @@ class IFStage(HasCoreParams, Elaboratable):
             ]
 
             f1_predicted_target = Signal(self.vaddr_bits_extended)
-            m.d.comb += f1_predicted_target.eq(next_fetch(s1_vpc))
+            m.d.comb += f1_predicted_target.eq(self.next_fetch(s1_vpc))
 
             with m.If(s1_valid & ~s1_tlb_miss):
                 m.d.comb += [
@@ -789,7 +777,7 @@ class IFStage(HasCoreParams, Elaboratable):
             ]
 
             f2_predicted_target = Signal(self.vaddr_bits_extended)
-            m.d.comb += f2_predicted_target.eq(next_fetch(s2_vpc))
+            m.d.comb += f2_predicted_target.eq(self.next_fetch(s2_vpc))
 
             with m.If((s2_valid & ~icache.resp.valid)
                       | (s2_valid & icache.resp.valid & ~f3_ready)):
@@ -907,7 +895,7 @@ class IFStage(HasCoreParams, Elaboratable):
         f3_prev_half_valid = Signal()
 
         f3_imemresp_mask = Signal(self.fetch_width)
-        f3_aligned_pc = fetch_align(s3_pc)
+        f3_aligned_pc = self.fetch_align(s3_pc)
         f3_insts = [Signal(32) for _ in range(self.fetch_width)]
         f3_exp_insts = [Signal(32) for _ in range(self.fetch_width)]
         f3_mask = Signal(self.fetch_width)
@@ -923,7 +911,7 @@ class IFStage(HasCoreParams, Elaboratable):
             for i in range(self.fetch_width))
         f3_fetch_bundle = FetchBundle(self.params, name='f3_fetch_bundle')
 
-        m.d.comb += f3_imemresp_mask.eq(fetch_mask(s3_pc))
+        m.d.comb += f3_imemresp_mask.eq(self.fetch_mask(s3_pc))
 
         for binst, inst in zip(f3_fetch_bundle.insts, f3_insts):
             m.d.comb += binst.eq(inst)
@@ -1098,7 +1086,7 @@ class IFStage(HasCoreParams, Elaboratable):
                     f3_fetch_bundle.cfi_valid &
                     (f3_fetch_bundle.cfi_type != CFIType.JALR),
                     f3_targets[f3_fetch_bundle.cfi_idx],
-                    next_fetch(f3_fetch_bundle.pc))),
+                    self.next_fetch(f3_fetch_bundle.pc))),
             f3_fetch_bundle.next_pc.eq(f3_predicted_target),
         ]
 
