@@ -22,6 +22,7 @@ _start:
     call main
 
 _hang:
+    wfi
     j _hang
 
 trap_vector:

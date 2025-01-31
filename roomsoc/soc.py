@@ -148,8 +148,12 @@ class BusHelper(Elaboratable):
             bridge_cls = {
                 (axi.AXILiteInterface, wishbone.Interface):
                 axi.AXILite2Wishbone,
+                (wishbone.Interface, axi.AXILiteInterface):
+                axi.Wishbone2AXILite,
                 (axi.AXILiteInterface, axi.AXIInterface): axi.AXILite2AXI,
+                (axi.AXIInterface, axi.AXILiteInterface): axi.AXI2AXILite,
                 (axi.AXIInterface, wishbone.Interface): axi.AXI2Wishbone,
+                (wishbone.Interface, axi.AXIInterface): axi.Wishbone2AXI,
                 (ahb.Interface, wishbone.Interface): ahb.AHB2Wishbone,
                 (apb.Interface, wishbone.Interface): apb.APB2Wishbone,
                 (tilelink.Interface, wishbone.Interface):
