@@ -260,6 +260,8 @@ class Top(Elaboratable):
 
         soc.add_peripheral('clint', clint)
 
+        core.pma_regions = list(soc.regions())
+
         dm_base = 0
 
         for res, start, size in soc.resources():
@@ -451,7 +453,7 @@ if __name__ == "__main__":
 
     f = open('trace.log', 'w')
 
-    sim.add_sync_process(process_sim_debug(cycles=600, log_file=f))
+    sim.add_sync_process(process_sim_debug(cycles=1000, log_file=f))
     # sim.add_sync_process(process)
     # sim.add_sync_process(process_debug, domain='debug')
     with sim.write_vcd('room.vcd'):

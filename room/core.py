@@ -189,6 +189,14 @@ class Core(HasCoreParams, Elaboratable):
         if sim_debug:
             self.core_debug = CoreDebug(params)
 
+    @property
+    def pma_regions(self):
+        return self.params.get('pma_regions')
+
+    @pma_regions.setter
+    def pma_regions(self, value):
+        self.params['pma_regions'] = value
+
     def elaborate(self, platform):
         m = Module()
 

@@ -844,13 +844,6 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             Signal(32, name=f's1_req_addr{i}') for i in range(self.mem_width)
         ]
 
-        s1_tlb_uncacheable = Signal(self.mem_width)
-        for w in range(self.mem_width):
-            for origin, size in self.io_regions.items():
-                with m.If((tlb.resp[w].bits.paddr >= origin)
-                          & (tlb.resp[w].bits.paddr < (origin + size))):
-                    m.d.comb += s1_tlb_uncacheable[w].eq(1)
-
         for w in range(self.mem_width):
             req_killed = self.br_update.uop_killed(self.exec_reqs[w].bits.uop)
 
@@ -947,11 +940,13 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             for w in range(self.mem_width)
         ]
         s1_tlb_miss = Signal(self.mem_width)
+        s1_tlb_uncacheable = Signal(self.mem_width)
         for w in range(self.mem_width):
             m.d.comb += [
                 s1_tlb_paddr[w].eq(tlb.resp[w].bits.paddr),
                 s1_tlb_miss[w].eq(tlb.resp[w].valid
                                   & tlb.resp[w].bits.miss),
+                s1_tlb_uncacheable[w].eq(~tlb.resp[w].bits.cacheable),
             ]
 
         s1_tlb_pf_ld = Signal(self.mem_width)

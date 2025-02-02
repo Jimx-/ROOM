@@ -410,6 +410,8 @@ class Top(Elaboratable):
 
         soc.add_peripheral('clint', clint)
 
+        core.pma_regions = list(soc.regions())
+
         dm_base = 0
 
         for res, start, size in soc.resources():

@@ -62,6 +62,14 @@ class Cluster(HasClusterParams, Elaboratable):
 
         self.periph_buses = [self.dbus_mmio, self.l2cache.out_bus]
 
+    @property
+    def pma_regions(self):
+        return self.params.get('pma_regions')
+
+    @pma_regions.setter
+    def pma_regions(self, value):
+        self.params['pma_regions'] = value
+
     def make_source(self, is_dbus, core_id, source):
         return Cat(source[:-(1 + self.core_bits)],
                    Const(core_id, self.core_bits), Const(int(not is_dbus), 1))
@@ -103,6 +111,7 @@ class Cluster(HasClusterParams, Elaboratable):
         for i in range(self.num_cores):
             core_params = self.core_params.copy()
             core_params['core_id'] = self.num_cores * self.cluster_id + i
+            core_params['pma_regions'] = self.pma_regions
 
             m.domains += ClockDomain(f'core{i}', local=True)
             m.d.comb += [
@@ -294,6 +303,14 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         self.l3cache = ResetInserter(~self.ctrl.cache_enable)(l3cache)
 
         self.periph_buses = [self.dbus_mmio, self.l3cache.out_bus]
+
+    @property
+    def pma_regions(self):
+        return self.params.get('pma_regions')
+
+    @pma_regions.setter
+    def pma_regions(self, value):
+        self.params['pma_regions'] = value
 
     def make_source(self, cluster_id, source):
         return Cat(source[:-self.cluster_bits],

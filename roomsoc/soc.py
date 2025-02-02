@@ -466,6 +466,10 @@ class SoC(Elaboratable):
                 size = res.end - res.start
                 yield res.resource, region.origin + res.start, size
 
+    def regions(self):
+        for _, region in self.bus.regions.items():
+            yield region.origin, region.size, region.mode, region.cacheable
+
     def generate_platform_header(self, macro_name='PLATFORM', file=None):
 
         def emit(s):

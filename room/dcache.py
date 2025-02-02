@@ -9,6 +9,7 @@ from room.alu import AMODataGen
 from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate, BranchKillableFIFO
 from room.utils import Arbiter
+from room.mmu import PMAChecker
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 from roomsoc.interconnect import tilelink as tl
@@ -1698,9 +1699,11 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                 ]
 
         req_uncacheable = Signal()
-        for origin, size in self.io_regions.items():
-            with m.If((req.addr >= origin) & (req.addr < (origin + size))):
-                m.d.comb += req_uncacheable.eq(1)
+        pma = m.submodules.pma = PMAChecker(self.params)
+        m.d.comb += [
+            pma.paddr.eq(req.addr),
+            req_uncacheable.eq(~pma.resp.cacheable),
+        ]
 
         #
         # Store data queue

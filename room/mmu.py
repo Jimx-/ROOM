@@ -287,3 +287,48 @@ class PageTableWalker(HasCoreParams, Elaboratable, AutoCSR):
             m.d.sync += r_pte.eq(pte)
 
         return m
+
+
+class PMAChecker(HasCoreParams, Elaboratable):
+
+    class Response(Record):
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__([
+                ('cacheable', 1),
+                ('r', 1),
+                ('w', 1),
+                ('x', 1),
+            ],
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
+
+    def __init__(self, params):
+        HasCoreParams.__init__(self, params)
+
+        self.paddr = Signal(self.paddr_bits)
+
+        self.resp = PMAChecker.Response()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        if self.pma_regions is None:
+            m.d.comb += [
+                self.resp.r.eq(1),
+                self.resp.w.eq(1),
+                self.resp.x.eq(1),
+            ]
+
+        else:
+            for origin, size, mode, cacheable in self.pma_regions:
+                with m.If((self.paddr >= origin)
+                          & (self.paddr < origin + size)):
+                    m.d.comb += [
+                        self.resp.cacheable.eq(cacheable),
+                        self.resp.r.eq(mode.count('r') > 0),
+                        self.resp.w.eq(mode.count('w') > 0),
+                        self.resp.x.eq(self.resp.r),
+                    ]
+
+        return m

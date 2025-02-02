@@ -4,7 +4,7 @@ from amaranth.utils import log2_int
 
 from room.consts import *
 from room.types import HasCoreParams
-from room.mmu import PTBR, PageTableWalker
+from room.mmu import PTBR, PageTableWalker, PMAChecker
 from room.exc import MStatus
 
 from roomsoc.interconnect.stream import Decoupled, Valid
@@ -56,6 +56,7 @@ class TLBResp(HasCoreParams, Record):
             ('pf', exc_layout),
             ('ae', exc_layout),
             ('ma', exc_layout),
+            ('cacheable', 1, Direction.FANOUT),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
@@ -84,6 +85,10 @@ class TLB(HasCoreParams, Elaboratable):
                 ('sr', 1, Direction.FANOUT),
                 ('sw', 1, Direction.FANOUT),
                 ('sx', 1, Direction.FANOUT),
+                ('pr', 1, Direction.FANOUT),
+                ('pw', 1, Direction.FANOUT),
+                ('px', 1, Direction.FANOUT),
+                ('c', 1, Direction.FANOUT),
             ]
 
             if superpage:
@@ -147,6 +152,11 @@ class TLB(HasCoreParams, Elaboratable):
         refill_done = self.use_vm & self.ptw_resp.valid
         refill_invalidated = Signal()
 
+        cacheable = Signal(self.req_width)
+        prot_r = Signal(self.req_width)
+        prot_w = Signal(self.req_width)
+        prot_x = Signal(self.req_width)
+
         new_entry = TLB.Entry(tag_bits, self.params)
         m.d.comb += [
             new_entry.tag.eq((r_refill_tag >> tag_off_bits)[:tag_bits]),
@@ -157,6 +167,10 @@ class TLB(HasCoreParams, Elaboratable):
             new_entry.sr.eq(self.ptw_resp.bits.pte.sr()),
             new_entry.sw.eq(self.ptw_resp.bits.pte.sw()),
             new_entry.sx.eq(self.ptw_resp.bits.pte.sx()),
+            new_entry.pr.eq(prot_r[0]),
+            new_entry.pw.eq(prot_w[0]),
+            new_entry.px.eq(prot_x[0]),
+            new_entry.c.eq(cacheable[0]),
         ]
 
         superpage_entries = [
@@ -184,6 +198,10 @@ class TLB(HasCoreParams, Elaboratable):
                             superpage_entries[w].sr.eq(new_entry.sr),
                             superpage_entries[w].sw.eq(new_entry.sw),
                             superpage_entries[w].sx.eq(new_entry.sx),
+                            superpage_entries[w].pr.eq(new_entry.pr),
+                            superpage_entries[w].pw.eq(new_entry.pw),
+                            superpage_entries[w].px.eq(new_entry.px),
+                            superpage_entries[w].c.eq(new_entry.c),
                             superpage_entries[w].level.eq(
                                 self.ptw_resp.bits.level),
                         ]
@@ -445,6 +463,32 @@ class TLB(HasCoreParams, Elaboratable):
         m.d.comb += self.miss_ready.eq(~refill_valid)
 
         #
+        # PMA checks
+        #
+
+        mpu_ppn = [
+            Mux(refill_done, self.ptw_resp.bits.pte.ppn,
+                s1_req[w].vaddr[self.pg_offset_bits:])
+            for w in range(self.req_width)
+        ]
+        mpu_paddr = [
+            Cat(s1_req[w].vaddr[:self.pg_offset_bits], mpu_ppn[w])
+            for w in range(self.req_width)
+        ]
+
+        for w in range(self.req_width):
+            pma = PMAChecker(self.params)
+            setattr(m.submodules, f'pma{w}', pma)
+
+            m.d.comb += [
+                pma.paddr.eq(mpu_paddr[w]),
+                cacheable[w].eq(pma.resp.cacheable),
+                prot_r[w].eq(pma.resp.r),
+                prot_w[w].eq(pma.resp.w),
+                prot_x[w].eq(pma.resp.x),
+            ]
+
+        #
         # Response
         #
 
@@ -478,6 +522,22 @@ class TLB(HasCoreParams, Elaboratable):
             Signal(len(all_entries[0]), name=f'x_ok{w}')
             for w in range(self.req_width)
         ]
+        pr_ok_array = [
+            Signal(len(all_entries[0]), name=f'pr_ok{w}')
+            for w in range(self.req_width)
+        ]
+        pw_ok_array = [
+            Signal(len(all_entries[0]), name=f'pw_ok{w}')
+            for w in range(self.req_width)
+        ]
+        px_ok_array = [
+            Signal(len(all_entries[0]), name=f'px_ok{w}')
+            for w in range(self.req_width)
+        ]
+        c_array = [
+            Signal(len(all_entries[0]), name=f'c_array{w}')
+            for w in range(self.req_width)
+        ]
 
         pf_ld_array = [
             Signal(len(all_entries[0]), name=f'pf_ld{w}')
@@ -489,6 +549,14 @@ class TLB(HasCoreParams, Elaboratable):
         ]
         pf_inst_array = [
             Signal(len(all_entries[0]), name=f'pf_inst{w}')
+            for w in range(self.req_width)
+        ]
+        ae_ld_array = [
+            Signal(len(all_entries[0]), name=f'ae_ld{w}')
+            for w in range(self.req_width)
+        ]
+        ae_st_array = [
+            Signal(len(all_entries[0]), name=f'ae_st{w}')
             for w in range(self.req_width)
         ]
         misaligned = Signal(self.req_width)
@@ -512,11 +580,17 @@ class TLB(HasCoreParams, Elaboratable):
                         (~priv_s | self.status.sum) & entry.u)
                                            | (priv_s & ~entry.u)),
                     priv_x_array[w][i].eq(~(priv_s & entry.u)),
+                    #
                     r_ok_array[w][i].eq(priv_rw_array[w][i]
                                         & (entry.sr
                                            | (self.status.mxr & entry.sx))),
                     w_ok_array[w][i].eq(priv_rw_array[w][i] & entry.sw),
                     x_ok_array[w][i].eq(priv_x_array[w][i] & entry.sx),
+                    #
+                    pr_ok_array[w][i].eq(entry.pr & ~ptw_ae_array[w][i]),
+                    pw_ok_array[w][i].eq(entry.pw & ~ptw_ae_array[w][i]),
+                    px_ok_array[w][i].eq(entry.px & ~ptw_ae_array[w][i]),
+                    c_array[w][i].eq(entry.c),
                     #
                     pf_ld_array[w]
                     [i].eq(cmd_read[w]
@@ -526,6 +600,9 @@ class TLB(HasCoreParams, Elaboratable):
                         & ~(w_ok_array[w][i] | ptw_ae_array[w][i])),
                     pf_inst_array[w][i].eq(~(x_ok_array[w][i]
                                              | ptw_ae_array[w][i])),
+                    #
+                    ae_ld_array[w][i].eq(cmd_read[w] & ~pr_ok_array[w][i]),
+                    ae_st_array[w][i].eq(cmd_write[w] & ~pw_ok_array[w][i]),
                 ]
 
         ppn = [
@@ -561,16 +638,31 @@ class TLB(HasCoreParams, Elaboratable):
                         (pf_st_array[w] & s1_hits[w]).any()),
                     self.resp[w].bits.pf.inst.eq(
                         (pf_inst_array[w] & s1_hits[w]).any()),
+                    #
+                    self.resp[w].bits.ae.ld.eq(
+                        (ae_ld_array[w] & s1_hits[w]).any()),
+                    self.resp[w].bits.ae.st.eq(
+                        (ae_st_array[w] & s1_hits[w]).any()),
+                    self.resp[w].bits.ae.inst.eq(
+                        (~px_ok_array[w] & s1_hits[w]).any()),
+                    #
                     self.resp[w].bits.ma.ld.eq(cmd_read[w] & misaligned[w]),
                     self.resp[w].bits.ma.st.eq(cmd_write[w] & misaligned[w]),
+                    #
                     self.resp[w].bits.miss.eq(refill_done | s1_tlb_miss[w]),
                     self.resp[w].bits.paddr.eq(
                         Cat(s1_req[w].vaddr[:self.pg_offset_bits], ppn[w])),
+                    self.resp[w].bits.cacheable.eq(
+                        (c_array[w] & s1_hits[w]).any()),
                 ]
 
             with m.Else():
                 m.d.comb += [
                     self.resp[w].bits.paddr.eq(s1_req[w].vaddr),
+                    self.resp[w].bits.ae.ld.eq(cmd_read[w] & ~prot_r[w]),
+                    self.resp[w].bits.ae.st.eq(cmd_write[w] & ~prot_w[w]),
+                    self.resp[w].bits.ae.inst.eq(~prot_x[w]),
+                    self.resp[w].bits.cacheable.eq(cacheable[w]),
                 ]
 
         return m

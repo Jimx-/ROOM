@@ -8,6 +8,7 @@ from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.dcache import DCache, DCacheReq, DCacheResp
 from room.lsu import LoadGen, StoreGen
+from room.mmu import PMAChecker
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -303,10 +304,13 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         s0_tlb_uncacheable = Signal(self.n_threads)
         for w in range(self.n_threads):
-            for origin, size in self.io_regions.items():
-                with m.If((self.exec_req.bits.addr[w] >= origin)
-                          & (self.exec_req.bits.addr[w] < (origin + size))):
-                    m.d.comb += s0_tlb_uncacheable[w].eq(1)
+            pma = PMAChecker(self.params)
+            setattr(m.submodules, f'pma{w}', pma)
+
+            m.d.comb += [
+                pma.paddr.eq(self.exec_req.bits.addr[w]),
+                s0_tlb_uncacheable[w].eq(~pma.resp.cacheable),
+            ]
 
         s0_addr_is_smem = Signal(self.n_threads)
         if self.use_smem:

@@ -23,6 +23,8 @@ class HasCoreParams:
 
         self.io_regions = params['io_regions']
 
+        self.pma_regions = params.get('pma_regions')
+
         #
         # Floating point
         #
