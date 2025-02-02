@@ -532,6 +532,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     & (w == 0)
                     & (stq_commit_e.committed
                        | (stq_commit_e.uop.is_amo & stq_commit_e.addr_valid
+                          & ~stq_commit_e.is_vaddr
                           & stq_commit_e.data_valid))),
             ]
 
