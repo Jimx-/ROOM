@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <iostream>
+#include <list>
+#include <queue>
 
 #include <verilated.h>
 
@@ -19,6 +21,18 @@
 #include <verilated_vcd_c.h>
 #elif defined(FST_OUTPUT)
 #include <verilated_fst_c.h>
+#endif
+
+#ifdef RAMULATOR
+#include "ramulator/src/Gem5Wrapper.h"
+#include "ramulator/src/Request.h"
+#include "ramulator/src/Statistics.h"
+
+#ifndef MEM_CYCLE_RATIO
+#define MEM_CYCLE_RATIO 0
+#endif
+
+#define MEM_BLOCK_BEATS 8
 #endif
 
 #ifndef TRACE_START_TIME
@@ -67,7 +81,7 @@ public:
         // turn off assertion before reset
         Verilated::assertOn(false);
 
-        register_ram(memory_addr, (uint64_t)memory_size);
+        ram_ = &register_ram(memory_addr, (uint64_t)memory_size);
 
         if (!bootrom.empty()) load_bootrom(bootrom);
 
@@ -90,6 +104,19 @@ public:
         dut_->trace(trace_, 99);
         trace_->open("trace.fst");
 #endif
+
+#ifdef RAMULATOR
+        ramulator::Config ram_config;
+        ram_config.add("standard", "DDR4");
+        ram_config.add("channels", "8");
+        ram_config.add("ranks", "1");
+        ram_config.add("speed", "DDR4_2400R");
+        ram_config.add("org", "DDR4_4Gb_x8");
+        ram_config.add("mapping", "defaultmapping");
+        ram_config.set_core_num(1);
+        dram_ = new ramulator::Gem5Wrapper(ram_config, 64);
+        Stats::statlist.output("ramulator.log");
+#endif
     }
 
     ~Impl()
@@ -97,6 +124,15 @@ public:
 #if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
         trace_->close();
         delete trace_;
+#endif
+
+#ifdef RAMULATOR
+        if (dram_) {
+            dram_->finish();
+            Stats::statlist.printall();
+            delete dram_;
+        }
+        dram_ = nullptr;
 #endif
     }
 
@@ -209,6 +245,31 @@ private:
 
     uint64_t ram_addr_;
 
+#ifdef RAMULATOR
+    struct MemoryRequest {
+        bool ready;
+        uint64_t data[MEM_BLOCK_BEATS];
+        uint8_t mask[MEM_BLOCK_BEATS];
+        uint64_t addr;
+        uint64_t tag;
+        bool write;
+        int beat;
+
+        MemoryRequest(uint64_t addr, uint64_t tag, bool write)
+            : addr(addr), tag(tag), write(write), ready(false), beat(0)
+        {}
+    };
+
+    ramulator::Gem5Wrapper* dram_;
+    std::queue<ramulator::Request> dram_queue_;
+    std::list<std::unique_ptr<MemoryRequest>> mem_req_queue_;
+    std::list<std::unique_ptr<MemoryRequest>> dram_write_queue_;
+    bool dram_rd_rsp_active_;
+    bool dram_rd_rsp_ready_;
+    bool dram_wr_rsp_active_;
+    bool dram_wr_rsp_ready_;
+#endif
+
     struct PhysMemoryRange {
         uint64_t addr;
         uint64_t size;
@@ -217,6 +278,7 @@ private:
     };
 
     std::vector<PhysMemoryRange> mem_map_;
+    PhysMemoryRange* ram_;
 
     PhysMemoryRange& register_ram(uint64_t addr, uint64_t size)
     {
@@ -262,15 +324,36 @@ private:
         return len;
     }
 
+#ifdef RAMULATOR
+    void reset_ram_bus()
+    {
+        dut_->ram_bus___05Faw___05Fready = 0;
+        dut_->ram_bus___05Fw___05Fready = 0;
+        dut_->ram_bus___05Far___05Fready = 0;
+        dut_->ram_bus___05Fr___05Fvalid = 0;
+        dut_->ram_bus___05Fb___05Fvalid = 0;
+    }
+#endif
+
     void reset()
     {
         dut_->rst = 1;
 
+#ifdef RAMULATOR
+        dram_rd_rsp_active_ = false;
+        dram_wr_rsp_active_ = false;
+
+        while (!dram_queue_.empty())
+            dram_queue_.pop();
+        mem_req_queue_.clear();
+        reset_ram_bus();
+#endif
+
         for (int i = 0; i < RESET_DELAY; i++) {
             dut_->clk = 0;
-            this->eval();
+            this->eval(false);
             dut_->clk = 1;
-            this->eval();
+            this->eval(true);
         }
 
         dut_->rst = 0;
@@ -291,22 +374,173 @@ private:
 #endif
 
         dut_->clk = 0;
-        this->eval();
+        this->eval(false);
 
         dut_->clk = 1;
-        this->eval();
+        this->eval(true);
     }
 
-    void eval()
+    void eval(bool clk)
     {
         dut_->eval();
+
+#ifdef RAMULATOR
+        eval_ram_bus(clk);
+#endif
+
 #if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
         if (sim_trace_enabled()) {
             trace_->dump(timestamp);
         }
 #endif
+
+#ifdef RAMULATOR
+        if (clk) {
+#if MEM_CYCLE_RATIO > 0
+            auto cycle = timestamp / 2;
+            if (cycle % MEM_CYCLE_RATIO == 0) dram_->tick();
+#else
+            for (int i = MEM_CYCLE_RATIO; i <= 0; i++)
+                dram_->tick();
+#endif
+
+            if (!dram_queue_.empty()) {
+                if (dram_->send(dram_queue_.front())) {
+                    dram_queue_.pop();
+                }
+            }
+        }
+#endif
+
         ++timestamp;
     }
+
+#ifdef RAMULATOR
+    void eval_ram_bus(bool clk)
+    {
+        if (!clk) {
+            dram_rd_rsp_ready_ = dut_->ram_bus___05Fr___05Fready;
+            dram_wr_rsp_ready_ = dut_->ram_bus___05Fb___05Fready;
+            return;
+        }
+
+        if (dram_rd_rsp_active_ && dut_->ram_bus___05Fr___05Fvalid &&
+            dram_rd_rsp_ready_) {
+            dram_rd_rsp_active_ = false;
+        }
+        if (!dram_rd_rsp_active_) {
+            if (!mem_req_queue_.empty() && mem_req_queue_.front()->ready &&
+                !mem_req_queue_.front()->write) {
+                auto& mreq = mem_req_queue_.front();
+                dut_->ram_bus___05Fr___05Fvalid = 1;
+                dut_->ram_bus___05Fr___05Fbits___05Fid = mreq->tag;
+                dut_->ram_bus___05Fr___05Fbits___05Fresp = 0;
+                dut_->ram_bus___05Fr___05Fbits___05Flast =
+                    mreq->beat == MEM_BLOCK_BEATS - 1;
+                dut_->ram_bus___05Fr___05Fbits___05Fdata =
+                    mreq->data[mreq->beat++];
+
+                if (mreq->beat == MEM_BLOCK_BEATS) {
+                    mem_req_queue_.pop_front();
+                }
+                dram_rd_rsp_active_ = true;
+            } else {
+                dut_->ram_bus___05Fr___05Fvalid = 0;
+            }
+        }
+
+        if (dram_wr_rsp_active_ && dut_->ram_bus___05Fb___05Fvalid &&
+            dram_wr_rsp_ready_) {
+            dram_wr_rsp_active_ = false;
+        }
+        if (!dram_wr_rsp_active_) {
+            if (!mem_req_queue_.empty() && mem_req_queue_.front()->ready &&
+                mem_req_queue_.front()->write) {
+                auto& mreq = mem_req_queue_.front();
+                dut_->ram_bus___05Fb___05Fvalid = 1;
+                dut_->ram_bus___05Fb___05Fbits___05Fid = mreq->tag;
+                dut_->ram_bus___05Fb___05Fbits___05Fresp = 0;
+
+                mem_req_queue_.pop_front();
+                dram_wr_rsp_active_ = true;
+            } else {
+                dut_->ram_bus___05Fb___05Fvalid = 0;
+            }
+        }
+
+        if (dut_->ram_bus___05Faw___05Fvalid ||
+            dut_->ram_bus___05Far___05Fvalid) {
+            uint64_t req_addr = dut_->ram_bus___05Faw___05Fvalid
+                                    ? dut_->ram_bus___05Faw___05Fbits___05Faddr
+                                    : dut_->ram_bus___05Far___05Fbits___05Faddr;
+
+            if (dut_->ram_bus___05Faw___05Fvalid) {
+                auto mem_req = std::make_unique<MemoryRequest>(
+                    req_addr, dut_->ram_bus___05Faw___05Fbits___05Fid, true);
+
+                dram_write_queue_.emplace_back(std::move(mem_req));
+            } else {
+                auto mem_req = std::make_unique<MemoryRequest>(
+                    req_addr, dut_->ram_bus___05Far___05Fbits___05Fid, false);
+                memcpy(mem_req->data, &ram_->phys_mem[req_addr],
+                       sizeof(mem_req->data));
+
+                dram_queue_.emplace(
+                    req_addr, ramulator::Request::Type::READ,
+                    [mreq = mem_req.get()](ramulator::Request& dram_req) {
+                        mreq->ready = true;
+                    });
+
+                mem_req_queue_.emplace_back(std::move(mem_req));
+            }
+        }
+
+        dut_->ram_bus___05Fw___05Fready = 1;
+
+        if (dut_->ram_bus___05Fw___05Fvalid) {
+            if (!dram_write_queue_.empty()) {
+                auto& mreq = dram_write_queue_.front();
+
+                mreq->data[mreq->beat] =
+                    dut_->ram_bus___05Fw___05Fbits___05Fdata;
+                mreq->mask[mreq->beat] =
+                    dut_->ram_bus___05Fw___05Fbits___05Fstrb;
+                mreq->beat++;
+
+                if (mreq->beat == MEM_BLOCK_BEATS) {
+                    auto* mem = reinterpret_cast<uint64_t*>(
+                        &ram_->phys_mem[mreq->addr]);
+
+                    for (int i = 0; i < MEM_BLOCK_BEATS; i++) {
+                        uint64_t wdata = 0;
+
+                        for (int j = 0; j < 8; j++) {
+                            if (mreq->mask[i] & (1 << j))
+                                wdata |= mreq->data[i] & (0xff << (j * 8));
+                            else
+                                wdata |= mem[i] & (0xff << (j * 8));
+                        }
+
+                        mem[i] = wdata;
+                    }
+
+                    mreq->ready = true;
+                    dram_queue_.emplace(mreq->addr,
+                                        ramulator::Request::Type::WRITE, 0);
+
+                    mem_req_queue_.emplace_back(
+                        std::move(dram_write_queue_.front()));
+                    dram_write_queue_.pop_front();
+                }
+            } else {
+                dut_->ram_bus___05Fw___05Fready = 0;
+            }
+        }
+
+        dut_->ram_bus___05Far___05Fready = 1;
+        dut_->ram_bus___05Faw___05Fready = 1;
+    }
+#endif
 };
 
 template <> SoC* Singleton<SoC>::m_singleton = nullptr;

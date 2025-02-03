@@ -292,6 +292,10 @@ class Top(Elaboratable):
                                                 addr_width=29,
                                                 name='axil_master')
 
+        self.ram_bus = axi.AXIInterface(data_width=64,
+                                        addr_width=30,
+                                        id_width=6)
+
         self.jtag = JTAGInterface()
 
         self.uart = UART(divisor=int(self.clk_freq // 115200))
@@ -301,7 +305,9 @@ class Top(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        soc = m.submodules.soc = SoC(bus_data_width=64, bus_addr_width=32)
+        soc = m.submodules.soc = SoC(bus_data_width=64,
+                                     bus_addr_width=32,
+                                     bus_standard='axi')
 
         core = Core(core_params, sim_debug=self.sim)
         soc.add_cpu(core)
@@ -390,13 +396,10 @@ class Top(Elaboratable):
             soc.bus.add_master(name='cpu_dbus', master=core.dbus)
 
         if self.sim:
-            sram = DromajoRAM(addr_width=25,
-                              data_width=64,
-                              ram_base=self.mem_map['sram'])
-            soc.add_peripheral('sram',
-                               sram,
-                               origin=self.mem_map['sram'],
-                               cacheable=True)
+            soc.add_bus(name='sram',
+                        bus=self.ram_bus,
+                        origin=self.mem_map['sram'],
+                        size=0x40000000)
         else:
             soc.add_ram(name='sram',
                         origin=self.mem_map['sram'],
@@ -471,38 +474,87 @@ if __name__ == "__main__":
 
     with open('/tmp/soc_wrapper.v', 'w') as f:
         f.write(
-            verilog.convert(top,
-                            ports=[
-                                top.axil_master.ar.valid,
-                                top.axil_master.ar.addr,
-                                top.axil_master.ar.ready,
-                                top.axil_master.r.valid,
-                                top.axil_master.r.data,
-                                top.axil_master.r.resp,
-                                top.axil_master.r.ready,
-                                top.axil_master.aw.valid,
-                                top.axil_master.aw.addr,
-                                top.axil_master.aw.ready,
-                                top.axil_master.w.valid,
-                                top.axil_master.w.data,
-                                top.axil_master.w.strb,
-                                top.axil_master.w.ready,
-                                top.axil_master.b.valid,
-                                top.axil_master.b.resp,
-                                top.axil_master.b.ready,
-                                top.jtag.tck,
-                                top.jtag.tdi,
-                                top.jtag.tdo,
-                                top.jtag.tms,
-                                top.uart.tx,
-                                top.uart.rx,
-                                top.sdc.sdio_clk,
-                                top.sdc.sdio_cmd_i,
-                                top.sdc.sdio_cmd_o,
-                                top.sdc.sdio_cmd_t,
-                                top.sdc.sdio_data_i,
-                                top.sdc.sdio_data_o,
-                                top.sdc.sdio_data_t,
-                            ],
-                            platform=platform,
-                            name='soc_wrapper'))
+            verilog.convert(
+                top,
+                ports=[
+                    top.axil_master.ar.valid,
+                    top.axil_master.ar.addr,
+                    top.axil_master.ar.ready,
+                    top.axil_master.r.valid,
+                    top.axil_master.r.data,
+                    top.axil_master.r.resp,
+                    top.axil_master.r.ready,
+                    top.axil_master.aw.valid,
+                    top.axil_master.aw.addr,
+                    top.axil_master.aw.ready,
+                    top.axil_master.w.valid,
+                    top.axil_master.w.data,
+                    top.axil_master.w.strb,
+                    top.axil_master.w.ready,
+                    top.axil_master.b.valid,
+                    top.axil_master.b.resp,
+                    top.axil_master.b.ready,
+                    #
+                    top.ram_bus.aw.bits.addr,
+                    top.ram_bus.aw.bits.burst,
+                    top.ram_bus.aw.bits.len,
+                    top.ram_bus.aw.bits.size,
+                    top.ram_bus.aw.bits.lock,
+                    top.ram_bus.aw.bits.prot,
+                    top.ram_bus.aw.bits.cache,
+                    top.ram_bus.aw.bits.qos,
+                    top.ram_bus.aw.bits.region,
+                    top.ram_bus.aw.bits.id,
+                    top.ram_bus.aw.bits.user,
+                    top.ram_bus.aw.valid,
+                    top.ram_bus.aw.ready,
+                    top.ram_bus.w.bits.data,
+                    top.ram_bus.w.bits.strb,
+                    top.ram_bus.w.bits.user,
+                    top.ram_bus.w.bits.last,
+                    top.ram_bus.w.valid,
+                    top.ram_bus.w.ready,
+                    top.ram_bus.b.bits.resp,
+                    top.ram_bus.b.bits.id,
+                    top.ram_bus.b.bits.user,
+                    top.ram_bus.b.valid,
+                    top.ram_bus.b.ready,
+                    top.ram_bus.ar.bits.addr,
+                    top.ram_bus.ar.bits.burst,
+                    top.ram_bus.ar.bits.len,
+                    top.ram_bus.ar.bits.size,
+                    top.ram_bus.ar.bits.lock,
+                    top.ram_bus.ar.bits.prot,
+                    top.ram_bus.ar.bits.cache,
+                    top.ram_bus.ar.bits.qos,
+                    top.ram_bus.ar.bits.region,
+                    top.ram_bus.ar.bits.id,
+                    top.ram_bus.ar.bits.user,
+                    top.ram_bus.ar.valid,
+                    top.ram_bus.ar.ready,
+                    top.ram_bus.r.bits.resp,
+                    top.ram_bus.r.bits.id,
+                    top.ram_bus.r.bits.user,
+                    top.ram_bus.r.bits.data,
+                    top.ram_bus.r.bits.last,
+                    top.ram_bus.r.valid,
+                    top.ram_bus.r.ready,
+                    #
+                    top.jtag.tck,
+                    top.jtag.tdi,
+                    top.jtag.tdo,
+                    top.jtag.tms,
+                    #
+                    top.uart.tx,
+                    top.uart.rx,
+                    #
+                    top.sdc.sdio_clk,
+                    top.sdc.sdio_cmd_i,
+                    top.sdc.sdio_cmd_o,
+                    top.sdc.sdio_cmd_t,
+                    top.sdc.sdio_data_i,
+                    top.sdc.sdio_data_o,
+                    top.sdc.sdio_data_t,
+                ],
+                platform=platform,
+                name='soc_wrapper'))

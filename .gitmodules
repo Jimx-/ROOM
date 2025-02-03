@@ -4,3 +4,6 @@
 [submodule "rtlsim/dromajo"]
 	path = rtlsim/dromajo
 	url = https://github.com/chipsalliance/dromajo.git
+[submodule "rtlsim/ramulator"]
+	path = rtlsim/ramulator
+	url = https://github.com/Jimx-/ramulator.git

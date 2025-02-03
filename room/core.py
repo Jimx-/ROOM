@@ -172,7 +172,7 @@ class Core(HasCoreParams, Elaboratable):
             self.dbus_mmio = tl.Interface(data_width=self.xlen,
                                           addr_width=32,
                                           size_width=3,
-                                          source_id_width=8,
+                                          source_id_width=1,
                                           name='dbus_mmio')
 
             self.periph_buses.append(self.dbus_mmio)
