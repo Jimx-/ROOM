@@ -14,9 +14,12 @@ SECTIONS
   .data : { *(.data) }
 
   .sdata : {
+    _sdata = .;
     __global_pointer$ = . + 0x800;
     *(.srodata.cst16) *(.srodata.cst8) *(.srodata.cst4) *(.srodata.cst2) *(.srodata*)
     *(.sdata .sdata.* .gnu.linkonce.s.*)
+    . = ALIGN(4);
+    _edata = .;
   }
 
   .sbss : {

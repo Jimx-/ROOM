@@ -17,6 +17,12 @@ _start:
     slli t0, t0, 12
     add  sp, sp, t0
 
+    la    a0, _edata
+    la    a2, _end
+    sub   a2, a2, a0
+    li    a1, 0
+    call  memset
+
     mv   fp, zero
 
     call main
