@@ -45,6 +45,9 @@ _resume:
     csrr    s1, dscratch1
     dret
 
+_hang:
+    j _hang
+
     .section .trampoline
 trampoline:
     nop
