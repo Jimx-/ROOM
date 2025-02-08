@@ -9,6 +9,7 @@ from room import Core
 
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi, wishbone, tilelink as tl
+from roomsoc.interconnect.stream import Decoupled
 from roomsoc.peripheral.l2cache import L2Cache
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
@@ -116,7 +117,7 @@ l2cache_params = dict(
     n_ways=8,
     block_bytes=64,
     in_bus=dict(
-        source_id_width=4,
+        source_id_width=7,
         sink_id_width=4,
         size_width=3,
     ),
@@ -288,9 +289,10 @@ class Top(Elaboratable):
         self.clk_freq = clk_freq
         self.sim = sim
 
-        self.axil_master = axi.AXILiteInterface(data_width=64,
-                                                addr_width=29,
-                                                name='axil_master')
+        self.axil_master = axi.AXILiteInterface(data_width=32, addr_width=32)
+        self.axi_master = axi.AXIInterface(data_width=64,
+                                           addr_width=32,
+                                           id_width=4)
 
         self.ram_bus = axi.AXIInterface(data_width=64,
                                         addr_width=30,
@@ -343,12 +345,28 @@ class Top(Elaboratable):
         soc.add_peripheral('dm', debug_module)
 
         if l2cache_params is not None:
-            l2c_in_bus = tl.Interface(data_width=core.xlen,
-                                      addr_width=32,
-                                      size_width=3,
-                                      source_id_width=4,
-                                      sink_id_width=4,
-                                      has_bce=True)
+            axi_frag = m.submodules.axi_frag = axi.AXIFragmenter(
+                self.axi_master, max_size=64, max_flights=2)
+            axi_bus = axi_frag.out_bus
+            axi_tl = axi.AXI2Tilelink.get_adapted_interface(axi_bus,
+                                                            max_flights=2)
+            m.submodules.axi_bridge = axi.AXI2Tilelink(axi_bus,
+                                                       axi_tl,
+                                                       max_flights=2)
+            tl_serializer = m.submodules.tl_serializer = tl.Serializer(axi_tl)
+
+            l2cache = L2Cache(l2cache_params)
+
+            #
+            # Cached & uncached core bus
+            #
+
+            core_l2c_bus = tl.Interface(data_width=core.xlen,
+                                        addr_width=32,
+                                        size_width=3,
+                                        source_id_width=4,
+                                        sink_id_width=4,
+                                        has_bce=True)
 
             mmio_bus = tl.Interface(data_width=core.xlen,
                                     addr_width=32,
@@ -365,16 +383,16 @@ class Top(Elaboratable):
 
             m.d.comb += [
                 core.core_bus.connect(mmio_bus),
-                core.core_bus.connect(l2c_in_bus),
-                l2c_in_bus.a.valid.eq(core.core_bus.a.valid & ~mmio_valid),
+                core.core_bus.connect(core_l2c_bus),
+                core_l2c_bus.a.valid.eq(core.core_bus.a.valid & ~mmio_valid),
                 mmio_bus.a.valid.eq(core.core_bus.a.valid & mmio_valid),
                 core.core_bus.a.ready.eq(
-                    Mux(mmio_valid, mmio_bus.a.ready, l2c_in_bus.a.ready)),
-                core.core_bus.d.valid.eq(l2c_in_bus.d.valid
+                    Mux(mmio_valid, mmio_bus.a.ready, core_l2c_bus.a.ready)),
+                core.core_bus.d.valid.eq(core_l2c_bus.d.valid
                                          | mmio_bus.d.valid),
                 mmio_bus.d.ready.eq(core.core_bus.d.ready),
-                l2c_in_bus.d.ready.eq(core.core_bus.d.ready
-                                      & ~mmio_bus.d.valid),
+                core_l2c_bus.d.ready.eq(core.core_bus.d.ready
+                                        & ~mmio_bus.d.valid),
                 mmio_bus.c.valid.eq(0),
                 mmio_bus.e.valid.eq(0),
             ]
@@ -382,10 +400,46 @@ class Top(Elaboratable):
             with m.If(mmio_bus.d.valid):
                 m.d.comb += core.core_bus.d.bits.eq(mmio_bus.d.bits)
             with m.Else():
-                m.d.comb += core.core_bus.d.bits.eq(l2c_in_bus.d.bits)
+                m.d.comb += core.core_bus.d.bits.eq(core_l2c_bus.d.bits)
 
-            l2cache = L2Cache(l2cache_params)
-            m.d.comb += l2c_in_bus.connect(l2cache.in_bus)
+            #
+            # AXI bus master & cached core bus
+            #
+
+            a_arbiter = m.submodules.a_arbiter = tl.Arbiter(
+                tl.ChannelA,
+                data_width=64,
+                addr_width=32,
+                size_width=3,
+                source_id_width=l2cache.in_source_id_width)
+
+            bus_master_a = Decoupled(
+                tl.ChannelA,
+                data_width=64,
+                addr_width=32,
+                size_width=3,
+                source_id_width=l2cache.in_source_id_width)
+
+            m.d.comb += [
+                tl_serializer.out_bus.a.connect(bus_master_a),
+                bus_master_a.bits.source[-1].eq(1),
+            ]
+
+            a_arbiter.add(core_l2c_bus.a)
+            a_arbiter.add(bus_master_a)
+
+            m.d.comb += [
+                a_arbiter.bus.connect(l2cache.in_bus.a),
+                l2cache.in_bus.b.connect(core_l2c_bus.b),
+                core_l2c_bus.c.connect(l2cache.in_bus.c),
+                core_l2c_bus.e.connect(l2cache.in_bus.e),
+            ]
+
+            with m.If(l2cache.in_bus.d.bits.source[-1]):
+                m.d.comb += l2cache.in_bus.d.connect(tl_serializer.out_bus.d)
+            with m.Else():
+                m.d.comb += l2cache.in_bus.d.connect(core_l2c_bus.d)
+
             soc.bus.add_master(name='l2c_dbus', master=l2cache.out_bus)
             soc.bus.add_master(name='cpu_mmio_bus', master=mmio_bus)
             soc.add_peripheral('l2cache', l2cache)
@@ -395,16 +449,10 @@ class Top(Elaboratable):
             soc.bus.add_master(name='cpu_ibus', master=core.ibus)
             soc.bus.add_master(name='cpu_dbus', master=core.dbus)
 
-        if self.sim:
-            soc.add_bus(name='sram',
-                        bus=self.ram_bus,
-                        origin=self.mem_map['sram'],
-                        size=0x40000000)
-        else:
-            soc.add_ram(name='sram',
-                        origin=self.mem_map['sram'],
-                        size=0x20000,
-                        init=self.ram_image)
+        soc.add_bus(name='sram',
+                    bus=self.ram_bus,
+                    origin=self.mem_map['sram'],
+                    size=0x40000000)
 
         soc.add_controller()
 
@@ -477,23 +525,70 @@ if __name__ == "__main__":
             verilog.convert(
                 top,
                 ports=[
-                    top.axil_master.ar.valid,
-                    top.axil_master.ar.addr,
-                    top.axil_master.ar.ready,
-                    top.axil_master.r.valid,
-                    top.axil_master.r.data,
-                    top.axil_master.r.resp,
-                    top.axil_master.r.ready,
-                    top.axil_master.aw.valid,
                     top.axil_master.aw.addr,
+                    top.axil_master.aw.prot,
+                    top.axil_master.aw.valid,
                     top.axil_master.aw.ready,
-                    top.axil_master.w.valid,
                     top.axil_master.w.data,
                     top.axil_master.w.strb,
+                    top.axil_master.w.valid,
                     top.axil_master.w.ready,
-                    top.axil_master.b.valid,
                     top.axil_master.b.resp,
+                    top.axil_master.b.valid,
                     top.axil_master.b.ready,
+                    top.axil_master.ar.addr,
+                    top.axil_master.ar.prot,
+                    top.axil_master.ar.valid,
+                    top.axil_master.ar.ready,
+                    top.axil_master.r.data,
+                    top.axil_master.r.resp,
+                    top.axil_master.r.valid,
+                    top.axil_master.r.ready,
+                    #
+                    top.axi_master.aw.bits.addr,
+                    top.axi_master.aw.bits.burst,
+                    top.axi_master.aw.bits.len,
+                    top.axi_master.aw.bits.size,
+                    top.axi_master.aw.bits.lock,
+                    top.axi_master.aw.bits.prot,
+                    top.axi_master.aw.bits.cache,
+                    top.axi_master.aw.bits.qos,
+                    top.axi_master.aw.bits.region,
+                    top.axi_master.aw.bits.id,
+                    top.axi_master.aw.bits.user,
+                    top.axi_master.aw.valid,
+                    top.axi_master.aw.ready,
+                    top.axi_master.w.bits.data,
+                    top.axi_master.w.bits.strb,
+                    top.axi_master.w.bits.user,
+                    top.axi_master.w.bits.last,
+                    top.axi_master.w.valid,
+                    top.axi_master.w.ready,
+                    top.axi_master.b.bits.resp,
+                    top.axi_master.b.bits.id,
+                    top.axi_master.b.bits.user,
+                    top.axi_master.b.valid,
+                    top.axi_master.b.ready,
+                    top.axi_master.ar.bits.addr,
+                    top.axi_master.ar.bits.burst,
+                    top.axi_master.ar.bits.len,
+                    top.axi_master.ar.bits.size,
+                    top.axi_master.ar.bits.lock,
+                    top.axi_master.ar.bits.prot,
+                    top.axi_master.ar.bits.cache,
+                    top.axi_master.ar.bits.qos,
+                    top.axi_master.ar.bits.region,
+                    top.axi_master.ar.bits.id,
+                    top.axi_master.ar.bits.user,
+                    top.axi_master.ar.valid,
+                    top.axi_master.ar.ready,
+                    top.axi_master.r.bits.resp,
+                    top.axi_master.r.bits.id,
+                    top.axi_master.r.bits.user,
+                    top.axi_master.r.bits.data,
+                    top.axi_master.r.bits.last,
+                    top.axi_master.r.valid,
+                    top.axi_master.r.ready,
                     #
                     top.ram_bus.aw.bits.addr,
                     top.ram_bus.aw.bits.burst,
