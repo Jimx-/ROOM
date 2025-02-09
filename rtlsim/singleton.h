@@ -10,7 +10,7 @@ public:
     Singleton(const Singleton<T>&) = delete;
     Singleton<T>& operator=(const Singleton<T>&) = delete;
 
-    ~Singleton() { m_singleton = nullptr; }
+    virtual ~Singleton() { m_singleton = nullptr; }
 
     static T& get_singleton() { return *m_singleton; }
 

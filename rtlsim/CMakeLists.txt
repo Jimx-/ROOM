@@ -28,6 +28,7 @@ set(SOURCE_FILES main.cpp
                  uart.cpp
                  sdcard.cpp
                  tracer.cpp
+                 snapshot.cpp
                  jtagdpi/tcp_server.c
                  jtagdpi/jtagdpi.c)
 

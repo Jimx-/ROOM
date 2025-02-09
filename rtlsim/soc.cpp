@@ -12,8 +12,8 @@
 
 #include "uart.h"
 #include "sdcard.h"
-
 #include "tracer.h"
+#include "snapshot.h"
 
 #include "spdlog/spdlog.h"
 
@@ -72,7 +72,7 @@ class SoC::Impl {
 public:
     Impl(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
          std::string_view bootrom, std::string_view dtb,
-         std::string_view trace_log)
+         std::string_view trace_log, bool enable_fork, size_t fork_interval)
         : ram_addr_(memory_addr)
     {
         Verilated::randReset(VERILATOR_RESET_VALUE);
@@ -93,16 +93,12 @@ public:
         (void)new Tracer(memory_addr, memory_size, bootrom, dtb, trace_log);
 #endif
 
-#ifdef VCD_OUTPUT
-        Verilated::traceEverOn(true);
-        trace_ = new VerilatedVcdC();
-        dut_->trace(trace_, 99);
-        trace_->open("trace.vcd");
-#elif defined(FST_OUTPUT)
-        Verilated::traceEverOn(true);
-        trace_ = new VerilatedFstC();
-        dut_->trace(trace_, 99);
-        trace_->open("trace.fst");
+#if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
+        trace_ = nullptr;
+
+        if (!enable_fork) {
+            init_waveform();
+        }
 #endif
 
 #ifdef RAMULATOR
@@ -117,13 +113,19 @@ public:
         dram_ = new ramulator::Gem5Wrapper(ram_config, 64);
         Stats::statlist.output("ramulator.log");
 #endif
+
+        if (enable_fork) {
+            fork_snapshot_ = std::make_unique<ForkSnapshot>(fork_interval);
+        }
     }
 
     ~Impl()
     {
 #if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
-        trace_->close();
-        delete trace_;
+        if (trace_) {
+            trace_->close();
+            delete trace_;
+        }
 #endif
 
 #ifdef RAMULATOR
@@ -146,18 +148,35 @@ public:
             if (i && (i % 10000 == 0)) {
                 spdlog::trace("Cycle {}/{}", i, N);
 #if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
-                trace_->flush();
+                if (trace_) {
+                    trace_->flush();
+                }
 #endif
             }
 
             this->tick();
 
+            if (fork_snapshot_ && fork_snapshot_->should_stop()) {
+                break;
+            }
+
 #ifdef ITRACE
             if (Tracer::get_singleton().should_stop()) {
-                spdlog::info("Tracer stopped at cycle {}", i);
+                if (!fork_snapshot_ || !fork_snapshot_->is_child()) {
+                    spdlog::info("Tracer stopped at cycle {}", i);
+                }
+
+                if (fork_snapshot_) {
+                    fork_snapshot_->continue_from_child();
+                }
+
                 break;
             }
 #endif
+        }
+
+        if (fork_snapshot_) {
+            fork_snapshot_->finalize();
         }
 
         return 0;
@@ -242,6 +261,7 @@ private:
 #elif defined(FST_OUTPUT)
     VerilatedFstC* trace_;
 #endif
+    std::unique_ptr<ForkSnapshot> fork_snapshot_;
 
     uint64_t ram_addr_;
 
@@ -324,6 +344,21 @@ private:
         return len;
     }
 
+    void init_waveform()
+    {
+#ifdef VCD_OUTPUT
+        Verilated::traceEverOn(true);
+        trace_ = new VerilatedVcdC();
+        dut_->trace(trace_, 99);
+        trace_->open("trace.vcd");
+#elif defined(FST_OUTPUT)
+        Verilated::traceEverOn(true);
+        trace_ = new VerilatedFstC();
+        dut_->trace(trace_, 99);
+        trace_->open("trace.fst");
+#endif
+    }
+
 #ifdef RAMULATOR
     void reset_ram_bus()
     {
@@ -338,6 +373,18 @@ private:
     void reset()
     {
         dut_->rst = 1;
+
+        dut_->axil_master___05Faw___05Fvalid = 0;
+        dut_->axil_master___05Fw___05Fvalid = 0;
+        dut_->axil_master___05Fb___05Fready = 0;
+        dut_->axil_master___05Far___05Fvalid = 0;
+        dut_->axil_master___05Fr___05Fready = 0;
+
+        dut_->axi_master___05Faw___05Fvalid = 0;
+        dut_->axi_master___05Fw___05Fvalid = 0;
+        dut_->axi_master___05Fb___05Fready = 0;
+        dut_->axi_master___05Far___05Fvalid = 0;
+        dut_->axi_master___05Fr___05Fready = 0;
 
 #ifdef RAMULATOR
         dram_rd_rsp_active_ = false;
@@ -378,6 +425,17 @@ private:
 
         dut_->clk = 1;
         this->eval(true);
+
+        if (fork_snapshot_) {
+            if (fork_snapshot_->tick() && fork_snapshot_->is_child()) {
+                dut_->atClone();
+
+                if (!fork_snapshot_->should_stop()) {
+                    init_waveform();
+                    trace_enabled = true;
+                }
+            }
+        }
     }
 
     void eval(bool clk)
@@ -389,7 +447,7 @@ private:
 #endif
 
 #if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
-        if (sim_trace_enabled()) {
+        if (trace_ && sim_trace_enabled()) {
             trace_->dump(timestamp);
         }
 #endif
@@ -547,9 +605,9 @@ template <> SoC* Singleton<SoC>::m_singleton = nullptr;
 
 SoC::SoC(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
          std::string_view bootrom, std::string_view dtb,
-         std::string_view trace_log)
-    : impl_(
-          new Impl(sd_image, memory_addr, memory_size, bootrom, dtb, trace_log))
+         std::string_view trace_log, bool enable_fork, size_t fork_interval)
+    : impl_(new Impl(sd_image, memory_addr, memory_size, bootrom, dtb,
+                     trace_log, enable_fork, fork_interval))
 {}
 
 SoC::~SoC() { delete impl_; }

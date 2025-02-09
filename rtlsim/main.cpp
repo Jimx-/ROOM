@@ -19,6 +19,8 @@ cxxopts::ParseResult parse_arguments(int argc, char* argv[])
             ("b,bootrom", "Path to boot ROM", cxxopts::value<std::string>()->default_value(""))
             ("d,dtb", "Path to device tree blob", cxxopts::value<std::string>()->default_value(""))
             ("t,trace", "Path to trace log file", cxxopts::value<std::string>()->default_value(""))
+            ("f,fork", "Enable fork snapshot", cxxopts::value<bool>()->default_value("false"))
+            ("I,interval", "Fork interval", cxxopts::value<size_t>()->default_value("10000"))
             ("h,help", "Print help");
         // clang-format on
 
@@ -50,6 +52,8 @@ int main(int argc, char* argv[])
     std::string bootrom;
     std::string dtb;
     std::string trace_log;
+    bool enable_fork;
+    size_t fork_interval;
 
     try {
         sd_image = options["sd-image"].as<std::string>();
@@ -58,13 +62,15 @@ int main(int argc, char* argv[])
         bootrom = options["bootrom"].as<std::string>();
         dtb = options["dtb"].as<std::string>();
         trace_log = options["trace"].as<std::string>();
+        enable_fork = options["fork"].as<bool>();
+        fork_interval = options["interval"].as<size_t>();
     } catch (const cxxopts::exceptions::exception& e) {
         spdlog::error("Failed to parse options: {}", e.what());
         exit(EXIT_FAILURE);
     }
 
     room::SoC soc(sd_image, memory_addr, (size_t)memory_size_mb << 20UL,
-                  bootrom, dtb, trace_log);
+                  bootrom, dtb, trace_log, enable_fork, fork_interval);
 
     try {
         soc.run();
