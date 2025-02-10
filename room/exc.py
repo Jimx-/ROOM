@@ -53,24 +53,24 @@ class Cause(IntEnum):
 def mstatus_layout(xlen):
     layout = [
         ("uie", 1, CSRAccess.RO),  # User Interrupt Enable
-        ("sie", 1, CSRAccess.RO),  # Supervisor Interrupt Enable
+        ("sie", 1, CSRAccess.RW),  # Supervisor Interrupt Enable
         ("zero0", 1, CSRAccess.RO),
         ("mie", 1, CSRAccess.RW),  # Machine Interrupt Enable
         ("upie", 1, CSRAccess.RO),  # User Previous Interrupt Enable
-        ("spie", 1, CSRAccess.RO),  # Supervisor Previous Interrupt Enable
+        ("spie", 1, CSRAccess.RW),  # Supervisor Previous Interrupt Enable
         ("ube", 1, CSRAccess.RO),
         ("mpie", 1, CSRAccess.RW),  # Machine Previous Interrupt Enable
-        ("spp", 1, CSRAccess.RO),  # Supervisor Previous Privilege
+        ("spp", 1, CSRAccess.RW),  # Supervisor Previous Privilege
         ("vs", 2, CSRAccess.RO),
         ("mpp", 2, CSRAccess.RW),  # Machine Previous Privilege
         ("fs", 2, CSRAccess.RW),  # FPU Status
         ("xs", 2, CSRAccess.RO),  # user-mode eXtensions Status
-        ("mprv", 1, CSRAccess.RO),  # Modify PRiVilege
-        ("sum", 1, CSRAccess.RO),  # Supervisor User Memory access
-        ("mxr", 1, CSRAccess.RO),  # Make eXecutable Readable
-        ("tvm", 1, CSRAccess.RO),  # Trap Virtual Memory
-        ("tw", 1, CSRAccess.RO),  # Timeout Wait
-        ("tsr", 1, CSRAccess.RO),  # Trap SRET
+        ("mprv", 1, CSRAccess.RW),  # Modify PRiVilege
+        ("sum", 1, CSRAccess.RW),  # Supervisor User Memory access
+        ("mxr", 1, CSRAccess.RW),  # Make eXecutable Readable
+        ("tvm", 1, CSRAccess.RW),  # Trap Virtual Memory
+        ("tw", 1, CSRAccess.RW),  # Timeout Wait
+        ("tsr", 1, CSRAccess.RW),  # Trap SRET
     ]
 
     if xlen == 32:
@@ -215,6 +215,8 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.medeleg = CSR(csrnames.medeleg,
                            [('value', self.xlen, CSRAccess.RW)])
 
+        self.sstatus = CSR(csrnames.sstatus, mstatus_layout(self.xlen))
+        self.sip = CSR(csrnames.sip, mip_layout(self.xlen))
         self.scause = CSR(csrnames.scause, mcause_layout(self.xlen))
         self.sepc = CSR(csrnames.sepc, [('value', self.xlen, CSRAccess.RW)])
         self.stvec = CSR(csrnames.stvec, mtvec_layout(self.xlen))
@@ -255,15 +257,15 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
             self.interrupt_cause.eq(interrupt_cause),
         ]
 
-        m.d.comb += [
-            self.dcsr.r.xdebugver.eq(4),
-            self.dcsr.r.prv.eq(3),
-        ]
+        m.d.comb += self.dcsr.r.xdebugver.eq(4)
+        self.dcsr.r.prv.reset = PrivilegeMode.M
         with m.If(self.dcsr.we):
             m.d.sync += [
                 self.dcsr.r.step.eq(self.dcsr.w.step),
                 self.dcsr.r.ebreakm.eq(self.dcsr.w.ebreakm),
             ]
+            if self.use_user:
+                m.d.sync += self.dcsr.r.prv.eq(self.dcsr.w.prv)
         with m.If(self.dpc.we):
             m.d.sync += self.dpc.r.eq(self.dpc.w)
         with m.If(self.dscratch0.we):
@@ -398,6 +400,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                         self.debug_mode.eq(1),
                         self.dcsr.r.cause.eq(
                             Mux(single_stepped, 4, Mux(is_debug_int, 3, 1))),
+                        self.dcsr.r.prv.eq(self.prv),
                         self.dpc.r.eq(epc_sext),
                         self.prv.eq(PrivilegeMode.M),
                     ]
@@ -425,7 +428,10 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
         with m.If(insn_ret):
             with m.If(insn_dret):
-                m.d.sync += self.debug_mode.eq(0)
+                m.d.sync += [
+                    self.debug_mode.eq(0),
+                    self.prv.eq(self.dcsr.r.prv),
+                ]
                 m.d.comb += self.exc_vector.eq(self.dpc.r)
 
             with m.Elif(insn_mret):
@@ -475,6 +481,35 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
             m.d.comb += self.mstatus.r.sxl.eq(log2_int(self.xlen) - 4)
         if self.use_user:
             m.d.comb += self.mstatus.r.uxl.eq(log2_int(self.xlen) - 4)
+
+        m.d.comb += [
+            self.sstatus.r.sd.eq(self.mstatus.r.sd),
+            self.sstatus.r.uxl.eq(self.mstatus.r.uxl),
+            self.sstatus.r.mxr.eq(self.mstatus.r.mxr),
+            self.sstatus.r.sum.eq(self.mstatus.r.sum),
+            self.sstatus.r.xs.eq(self.mstatus.r.xs),
+            self.sstatus.r.fs.eq(self.mstatus.r.fs),
+            self.sstatus.r.vs.eq(self.mstatus.r.vs),
+            self.sstatus.r.spp.eq(self.mstatus.r.spp),
+            self.sstatus.r.spie.eq(self.mstatus.r.spie),
+            self.sstatus.r.sie.eq(self.mstatus.r.sie),
+        ]
+
+        if self.use_supervisor:
+            with m.If(self.sstatus.we):
+                m.d.sync += [
+                    self.mstatus.r.spp.eq(self.sstatus.w.spp),
+                    self.mstatus.r.spie.eq(self.sstatus.w.spie),
+                    self.mstatus.r.sie.eq(self.sstatus.w.sie),
+                    self.mstatus.r.fs.eq(self.sstatus.w.fs),
+                    self.mstatus.r.vs.eq(self.sstatus.w.vs),
+                ]
+
+                if self.use_vm:
+                    m.d.sync += [
+                        self.mstatus.r.mxr.eq(self.sstatus.w.mxr),
+                        self.mstatus.r.sum.eq(self.sstatus.w.sum),
+                    ]
 
         with m.If(self.stvec.we):
             m.d.sync += [
