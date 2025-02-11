@@ -1075,6 +1075,7 @@ class Core(HasCoreParams, Elaboratable):
             (exc_unit.cause == Cause.FETCH_PAGE_FAULT))
 
         commit_exc_pc_lsb_d1 = Signal.like(rob.commit_exc.bits.pc_lsb)
+        commit_exc_inst_d1 = Signal.like(rob.commit_exc.bits.inst)
         commit_exc_badaddr_d1 = Signal.like(rob.commit_exc.bits.badaddr)
         commit_exc_edge_inst_d1 = Signal()
         m.d.comb += [
@@ -1085,11 +1086,16 @@ class Core(HasCoreParams, Elaboratable):
             exc_unit.system_insn.eq(csr_port.cmd == CSRCommand.I),
             exc_unit.system_insn_imm.eq(csr_port.addr),
             exc_unit.commit.eq(rob.commit_req.valids[0]),
-            exc_unit.tval.eq(Mux(tval_valid, commit_exc_badaddr_d1, 0)),
+            exc_unit.tval.eq(
+                Mux(
+                    tval_valid, commit_exc_badaddr_d1,
+                    Mux(exc_unit.cause == Cause.ILLEGAL_INSTRUCTION,
+                        commit_exc_inst_d1, 0))),
         ]
 
         m.d.sync += [
             commit_exc_pc_lsb_d1.eq(rob.commit_exc.bits.pc_lsb),
+            commit_exc_inst_d1.eq(rob.commit_exc.bits.inst),
             commit_exc_badaddr_d1.eq(rob.commit_exc.bits.badaddr),
             commit_exc_edge_inst_d1.eq(rob.commit_exc.bits.edge_inst),
             exc_unit.exception.eq(rob.commit_exc.valid),

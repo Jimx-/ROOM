@@ -171,6 +171,7 @@ class Top(Elaboratable):
         m.d.comb += [
             core.interrupts.msip.eq(clint.msip[0]),
             core.interrupts.mtip.eq(clint.mtip[0]),
+            clint.rtc_tick.eq(1),
         ]
 
         if self.sim_debug:

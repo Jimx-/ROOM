@@ -367,6 +367,11 @@ class RegReadDecoder(Elaboratable):
                      & (self.rrd_uop.mem_cmd == MemoryCommand.LR))):
             m.d.comb += self.rrd_uop.imm_packed.eq(0)
 
+        with m.If(((self.iss_uop.csr_cmd == CSRCommand.S)
+                   | (self.iss_uop.csr_cmd == CSRCommand.C))
+                  & (self.iss_uop.prs1 == 0)):
+            m.d.comb += self.rrd_uop.csr_cmd.eq(CSRCommand.R)
+
         return m
 
 

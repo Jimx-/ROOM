@@ -107,11 +107,13 @@ class CSRFile(HasCoreParams, Elaboratable):
         self.misa = CSR(csrnames.misa, misa_layout(self.width))
         self.mscratch = CSR(csrnames.mscratch,
                             [('value', self.width, CSRAccess.RW)])
+        self.sscratch = CSR(csrnames.sscratch,
+                            [('value', self.width, CSRAccess.RW)])
 
         self.mcycle = CSR(csrnames.mcycle,
                           [('value', self.width, CSRAccess.RW)])
 
-        self.add_csrs([self.mhartid, self.misa, self.mscratch])
+        self.add_csrs([self.mhartid, self.misa, self.mscratch, self.sscratch])
         self.add_csrs([self.mcycle])
 
         if self.width == 32:
@@ -159,6 +161,8 @@ class CSRFile(HasCoreParams, Elaboratable):
 
         with m.If(self.mscratch.we):
             m.d.sync += self.mscratch.r.eq(self.mscratch.w)
+        with m.If(self.sscratch.we):
+            m.d.sync += self.sscratch.r.eq(self.sscratch.w)
 
         cycles = Signal(64)
         m.d.sync += cycles.eq(cycles + 1)
@@ -188,9 +192,11 @@ class CSRFile(HasCoreParams, Elaboratable):
             csr_addr = dec.inst[20:]
             csr_mode = csr_addr[8:10]
             csr_prv_ok = self.prv >= csr_mode
+            csr_is_time = (csr_addr == csrnames.time) | (csr_addr
+                                                         == csrnames.timeh)
 
             m.d.comb += [
-                dec.read_illegal.eq(~csr_prv_ok),
+                dec.read_illegal.eq(~csr_prv_ok | csr_is_time),
                 dec.write_illegal.eq(csr_addr[10:12].all()),
             ]
 

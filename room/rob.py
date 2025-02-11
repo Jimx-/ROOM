@@ -61,6 +61,7 @@ class CommitExceptionReq(HasCoreParams, Record):
             ('is_rvc', 1),
             ('cause', self.xlen),
             ('badaddr', self.xlen),
+            ('inst', 32),
             ('flush_type', FlushType),
         ],
                         name=name,
@@ -311,6 +312,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
             self.commit_exc.bits.pc_lsb.eq(commit_exc_uop.pc_lsb),
             self.commit_exc.bits.is_rvc.eq(commit_exc_uop.is_rvc),
             self.commit_exc.bits.cause.eq(commit_exc_uop.exc_cause),
+            self.commit_exc.bits.inst.eq(commit_exc_uop.inst),
             self.commit_exc.bits.badaddr.eq(r_exc_badaddr.as_signed()),
         ]
 
