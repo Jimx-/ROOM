@@ -215,17 +215,12 @@ class TLB(HasCoreParams, Elaboratable):
             Signal(self.vpn_bits, name=f's0_vpn{w}')
             for w in range(self.req_width)
         ]
-        s0_vm_enabled = Signal(self.req_width)
-
         for w in range(self.req_width):
             m.d.comb += [
                 self.req[w].ready.eq(1),
                 s0_valid[w].eq(self.req[w].fire),
                 s0_vpn[w].eq(self.req[w].bits.vaddr[self.pg_offset_bits:self.
                                                     vaddr_bits]),
-                s0_vm_enabled[w].eq(self.use_vm & priv_use_vm
-                                    & self.ptbr.mode[-1]
-                                    & ~self.req[w].bits.passthru),
             ]
 
         s0_bank = [
@@ -410,7 +405,6 @@ class TLB(HasCoreParams, Elaboratable):
         s1_tlb_hit = Signal(self.req_width)
         s1_tlb_miss = Signal(self.req_width)
 
-        m.d.sync += s1_vm_enabled.eq(s0_vm_enabled)
         for i in range(self.req_width):
             m.d.sync += [
                 s1_valid[i].eq(s0_valid[i]),
@@ -420,6 +414,9 @@ class TLB(HasCoreParams, Elaboratable):
             ]
 
             m.d.comb += [
+                s1_vm_enabled[i].eq(self.use_vm & priv_use_vm
+                                    & self.ptbr.mode[-1]
+                                    & ~s1_req[i].passthru),
                 s1_tag_match_way[i].eq(
                     Cat((s1_data[i][w].tag ==
                          (s1_vpn[i] >> tag_off_bits)[:tag_bits])
