@@ -9,7 +9,21 @@ namespace room {
 void Subprocess::wait()
 {
     int status;
-    ::waitpid(pid, &status, 0);
+
+    for (;;) {
+        int ret = ::waitpid(pid, &status, 0);
+
+        if (ret == -1) {
+            if (errno == EINTR) continue;
+
+            if (errno != ECHILD) {
+                spdlog::error("Failed to wait for child process to exit: {}",
+                              strerror(errno));
+            }
+        }
+
+        break;
+    }
 }
 
 void Subprocess::send(ExitStatus status)
