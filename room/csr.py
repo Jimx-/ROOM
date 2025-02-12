@@ -102,6 +102,8 @@ class CSRFile(HasCoreParams, Elaboratable):
             CSRDecode(name=f'decode{w}') for w in range(self.core_width)
         ]
 
+        self.seip = Signal()
+
         self.mhartid = CSR(csrnames.mhartid,
                            [('value', self.width, CSRAccess.RO)])
         self.misa = CSR(csrnames.misa, misa_layout(self.width))
@@ -181,6 +183,10 @@ class CSRFile(HasCoreParams, Elaboratable):
                             csr.re.eq(p.cmd[1]),
                             p.r_data.eq(csr.r),
                         ]
+
+                        if self.use_supervisor and ((addr == csrnames.mip) or
+                                                    (addr == csrnames.sip)):
+                            m.d.comb += p.r_data.eq(csr.r | (self.seip << 9))
 
                         m.d.comb += csr.we.eq(p.cmd[2] & p.cmd[:2].any())
                         for i in range(min(self.width, len(csr.w))):

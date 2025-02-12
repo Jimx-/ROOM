@@ -201,6 +201,7 @@ class Core(HasCoreParams, Elaboratable):
         m = Module()
 
         csr = m.submodules.csr = CSRFile(self.params, width=self.xlen)
+        m.d.comb += csr.seip.eq(self.interrupts.seip)
 
         #
         # Exception
