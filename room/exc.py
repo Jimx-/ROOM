@@ -468,7 +468,16 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                 ]
 
         with m.If(insn_ret):
-            with m.If(insn_dret):
+            with m.If(self.use_supervisor & insn_sret):
+                m.d.sync += [
+                    self.mstatus.r.sie.eq(self.mstatus.r.spie),
+                    self.mstatus.r.spie.eq(1),
+                    self.mstatus.r.spp.eq(PrivilegeMode.U),
+                    self.prv.eq(self.mstatus.r.spp),
+                ]
+                m.d.comb += self.exc_vector.eq(self.sepc.r)
+
+            with m.Elif(insn_dret):
                 m.d.sync += [
                     self.debug_mode.eq(0),
                     self.prv.eq(self.dcsr.r.prv),
