@@ -390,6 +390,7 @@ class TLB(HasCoreParams, Elaboratable):
             for w in range(self.req_width)
         ]
         s1_vm_enabled = Signal(self.req_width)
+        s1_nack = Signal(self.req_width)
         s1_tag_match_way = [
             Signal(self.n_ways, name=f's1_tag_match_way{w}')
             for w in range(self.req_width)
@@ -405,6 +406,7 @@ class TLB(HasCoreParams, Elaboratable):
         s1_tlb_hit = Signal(self.req_width)
         s1_tlb_miss = Signal(self.req_width)
 
+        m.d.sync += s1_nack.eq(s0_nack)
         for i in range(self.req_width):
             m.d.sync += [
                 s1_valid[i].eq(s0_valid[i]),
@@ -420,7 +422,8 @@ class TLB(HasCoreParams, Elaboratable):
                 s1_tag_match_way[i].eq(
                     Cat((s1_data[i][w].tag ==
                          (s1_vpn[i] >> tag_off_bits)[:tag_bits])
-                        & s1_entry_valid[i][w] for w in range(self.n_ways))),
+                        & s1_entry_valid[i][w] & ~s1_nack[i]
+                        for w in range(self.n_ways))),
                 s1_hits[i].eq(Cat(s1_tag_match_way[i], s1_superpage_hit[i])),
                 s1_tlb_hit[i].eq(s1_hits[i].any()),
                 s1_tlb_miss[i].eq(s1_vm_enabled[i] & ~s1_tlb_hit[i]),
@@ -434,7 +437,8 @@ class TLB(HasCoreParams, Elaboratable):
         m.d.sync += refill_done_d1.eq(refill_done)
 
         for w in range(self.req_width):
-            with m.If(s1_valid[w] & s1_tlb_miss[w] & ~refill_valid
+            with m.If(s1_valid[w] & ~s1_nack[w] & s1_tlb_miss[w]
+                      & ~refill_valid
                       & ~refill_done_d1):
                 m.d.comb += [
                     self.ptw_req.valid.eq(1),
