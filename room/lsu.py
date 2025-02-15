@@ -550,8 +550,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         exec_tlb_valid = Signal(self.mem_width)
         for w in range(self.mem_width):
-            # Cat(tlb_avail, dc_avail, cam_avail)
-            avail_flags = Const(0b111, 3)
+            # Cat(tlb_avail, dc_avail, cam_avail, rob_avail)
+            avail_flags = Const(0b1111, 4)
 
             def sched(can_fire, use_flags, avail_flags, will_fire):
                 m.d.comb += will_fire.eq((can_fire.replicate(len(avail_flags))
@@ -564,27 +564,27 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     & ~(will_fire.replicate(len(avail_flags)) & use_flags))
                 return new_avail_flags
 
-            avail_flags = sched(can_fire_load_incoming[w], Const(0b111, 3),
+            avail_flags = sched(can_fire_load_incoming[w], Const(0b0111, 4),
                                 avail_flags, will_fire_load_incoming[w])
-            avail_flags = sched(can_fire_stad_incoming[w], Const(0b101, 3),
+            avail_flags = sched(can_fire_stad_incoming[w], Const(0b1101, 4),
                                 avail_flags, will_fire_stad_incoming[w])
-            avail_flags = sched(can_fire_sta_incoming[w], Const(0b101, 3),
+            avail_flags = sched(can_fire_sta_incoming[w], Const(0b1101, 4),
                                 avail_flags, will_fire_sta_incoming[w])
-            avail_flags = sched(can_fire_std_incoming[w], Const(0b000, 3),
+            avail_flags = sched(can_fire_std_incoming[w], Const(0b1000, 4),
                                 avail_flags, will_fire_std_incoming[w])
-            avail_flags = sched(can_fire_sfence[w], Const(0b001, 3),
+            avail_flags = sched(can_fire_sfence[w], Const(0b1001, 4),
                                 avail_flags, will_fire_sfence[w])
-            avail_flags = sched(can_fire_core_incoming[w], Const(0b011, 3),
+            avail_flags = sched(can_fire_core_incoming[w], Const(0b0011, 4),
                                 avail_flags, will_fire_core_incoming[w])
-            avail_flags = sched(can_fire_core_retry[w], Const(0b011, 3),
+            avail_flags = sched(can_fire_core_retry[w], Const(0b0011, 4),
                                 avail_flags, will_fire_core_retry[w])
-            avail_flags = sched(can_fire_load_retry[w], Const(0b111, 3),
+            avail_flags = sched(can_fire_load_retry[w], Const(0b0111, 4),
                                 avail_flags, will_fire_load_retry[w])
-            avail_flags = sched(can_fire_sta_retry[w], Const(0b101, 3),
+            avail_flags = sched(can_fire_sta_retry[w], Const(0b1101, 4),
                                 avail_flags, will_fire_sta_retry[w])
-            avail_flags = sched(can_fire_load_wakeup[w], Const(0b110, 3),
+            avail_flags = sched(can_fire_load_wakeup[w], Const(0b0110, 4),
                                 avail_flags, will_fire_load_wakeup[w])
-            avail_flags = sched(can_fire_store_commit[w], Const(0b010, 3),
+            avail_flags = sched(can_fire_store_commit[w], Const(0b0010, 4),
                                 avail_flags, will_fire_store_commit[w])
 
             m.d.comb += exec_tlb_valid[w].eq(~avail_flags[0])
