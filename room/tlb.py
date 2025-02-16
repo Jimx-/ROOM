@@ -284,24 +284,6 @@ class TLB(HasCoreParams, Elaboratable):
                 with m.If(s0_pipe_selection[w][i]):
                     m.d.comb += s0_bank_selection[w].eq(s0_bank[i])
 
-        s0_superpage_hit = [
-            Signal(self.n_superpage_entries, name=f's0_superpage_hit{w}')
-            for w in range(self.req_width)
-        ]
-        for w in range(self.req_width):
-            req_vpn = self.req[w].bits.vaddr[self.pg_offset_bits:self.
-                                             vaddr_bits]
-
-            for i in range(self.n_superpage_entries):
-                tag_match = self.use_vm & superpage_valid[i]
-                for l in range(self.pg_levels):
-                    base = (self.pg_levels - l - 1) * self.pg_level_bits
-                    tag_match &= (l > superpage_entries[i].level) | (
-                        base >= self.vpn_bits) | (
-                            ((superpage_entries[i].tag ^ req_vpn) >>
-                             base)[:self.pg_level_bits] == 0)
-                m.d.comb += s0_superpage_hit[w][i].eq(tag_match)
-
         #
         # Memory banks
         #
@@ -406,13 +388,25 @@ class TLB(HasCoreParams, Elaboratable):
         s1_tlb_hit = Signal(self.req_width)
         s1_tlb_miss = Signal(self.req_width)
 
+        for w in range(self.req_width):
+            req_vpn = s1_req[w].vaddr[self.pg_offset_bits:self.vaddr_bits]
+
+            for i in range(self.n_superpage_entries):
+                tag_match = self.use_vm & superpage_valid[i]
+                for l in range(self.pg_levels):
+                    base = (self.pg_levels - l - 1) * self.pg_level_bits
+                    tag_match &= (l > superpage_entries[i].level) | (
+                        base >= self.vpn_bits) | (
+                            ((superpage_entries[i].tag ^ req_vpn) >>
+                             base)[:self.pg_level_bits] == 0)
+                m.d.comb += s1_superpage_hit[w][i].eq(tag_match)
+
         m.d.sync += s1_nack.eq(s0_nack)
         for i in range(self.req_width):
             m.d.sync += [
                 s1_valid[i].eq(s0_valid[i]),
                 s1_req[i].eq(self.req[i].bits),
                 s1_vpn[i].eq(s0_vpn[i]),
-                s1_superpage_hit[i].eq(s0_superpage_hit[i]),
             ]
 
             m.d.comb += [
