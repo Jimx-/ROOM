@@ -35,6 +35,8 @@ class CommitReq(HasCoreParams):
             for i in range(self.core_width)
         ]
 
+        self.fflags = Valid(Signal, 5)
+
         self.rollback = Signal(name=f'{name}_rollback')
         self.rollback_valids = Signal(self.core_width,
                                       name=f'{name}_rollback_valids')
@@ -43,6 +45,7 @@ class CommitReq(HasCoreParams):
         return [
             getattr(self, name).eq(getattr(rhs, name)) for name in (
                 'valids',
+                'fflags',
                 'rollback',
                 'rollback_valids',
             )
@@ -374,6 +377,17 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 m.d.comb += self.flush.bits.flush_type.eq(FlushType.REFETCH)
             with m.Else():
                 m.d.comb += self.flush.bits.flush_type.eq(FlushType.NEXT)
+
+        #
+        # FP update
+        #
+
+        fflags_valid = Signal(self.core_width)
+        for w in range(self.core_width):
+            m.d.comb += fflags_valid[w].eq(self.commit_req.valids[w]
+                                           & self.commit_req.uops[w].fp_valid
+                                           & ~self.commit_req.uops[w].uses_stq)
+        m.d.comb += self.commit_req.fflags.valid.eq(fflags_valid.any())
 
         do_enq = Signal()
         do_deq = Signal()

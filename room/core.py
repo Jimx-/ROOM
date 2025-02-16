@@ -1092,6 +1092,7 @@ class Core(HasCoreParams, Elaboratable):
                     tval_valid, commit_exc_badaddr_d1,
                     Mux(exc_unit.cause == Cause.ILLEGAL_INSTRUCTION,
                         commit_exc_inst_d1, 0))),
+            exc_unit.set_fs_dirty.eq(rob.commit_req.fflags.valid),
         ]
 
         m.d.sync += [

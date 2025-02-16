@@ -1176,7 +1176,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 stdf_clr_bsy_valid.eq(
                     stq[stq_idx].valid
                     & stq[stq_idx].addr_valid
-                    & ~stq[stq_idx].is_vaddr
+                    & ~stq_is_vaddr[stq_idx]
                     & ~self.br_update.uop_killed(fired_stdf_uop)),
                 stdf_clr_bsy_rob_idx.eq(fired_stdf_uop.rob_idx),
                 stdf_clr_bsy_br_mask.eq(

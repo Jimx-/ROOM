@@ -219,6 +219,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.epc = Signal(self.vaddr_bits_extended)
         self.prv = Signal(PrivilegeMode, reset=PrivilegeMode.M)
 
+        self.set_fs_dirty = Signal()
         self.single_step = Signal()
         self.csr_stall = Signal()
 
@@ -492,6 +493,9 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                     self.prv.eq(self.mstatus.r.mpp),
                 ]
                 m.d.comb += self.exc_vector.eq(self.mepc.r)
+
+        with m.If(self.set_fs_dirty):
+            m.d.sync += self.mstatus.r.fs.eq(3)
 
         with m.If(self.mstatus.we):
             m.d.sync += [
