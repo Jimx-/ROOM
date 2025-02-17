@@ -10,6 +10,7 @@ from roomsoc.peripheral.l2cache import L2Cache
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.sdc import MockSDController
 from roomsoc.peripheral.clint import CLINT
+from roomsoc.peripheral.plic import PLIC
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 
 import argparse
@@ -174,6 +175,12 @@ class Top(Elaboratable):
             clint.rtc_tick.eq(1),
         ]
 
+        plic = PLIC(n_harts=2, n_devices=7)
+        m.d.comb += [
+            core.interrupts.meip.eq(plic.hart_ints[0]),
+            core.interrupts.seip.eq(plic.hart_ints[1]),
+        ]
+
         if self.sim_debug:
             m.d.comb += self.core_debug.eq(core.core_debug)
 
@@ -260,6 +267,8 @@ class Top(Elaboratable):
         soc.add_peripheral('sdc', sdc)
 
         soc.add_peripheral('clint', clint)
+
+        soc.add_peripheral('plic', plic)
 
         core.pma_regions = list(soc.regions())
 

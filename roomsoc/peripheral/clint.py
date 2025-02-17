@@ -1,7 +1,4 @@
 from amaranth import *
-from amaranth.lib.fifo import SyncFIFO
-
-from amaranth_stdio.serial import AsyncSerial
 
 from .peripheral import Peripheral
 
