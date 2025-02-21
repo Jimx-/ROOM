@@ -269,7 +269,10 @@ class CacheState(IntEnum):
         dirtier_state = Mux(sec_is_write, next_state_sec, next_state_pri)
         dirtier_cmd = Mux(sec_is_write, cmd_sec, cmd_pri)
 
-        return hit_again, dirtier_state, dirtier_cmd
+        need_sec_acq = MemoryCommand.is_write(
+            cmd_sec) & ~MemoryCommand.is_write(cmd_pri)
+
+        return need_sec_acq, hit_again, dirtier_state, dirtier_cmd
 
     @staticmethod
     def on_shrink(m, state, param):
@@ -1240,10 +1243,10 @@ class MSHR(HasDCacheParams, Elaboratable):
         grant_state = CacheState.on_grant(m, req.uop.mem_cmd,
                                           self.mem_grant.bits.param)
 
-        is_hit_again, dirtier_state, dirtier_cmd = CacheState.on_sec_access(
+        need_sec_acq, is_hit_again, dirtier_state, dirtier_cmd = CacheState.on_sec_access(
             m, new_state, req.uop.mem_cmd, self.req.uop.mem_cmd)
         block_sec_req = Signal()
-        sec_ready = ~self.req_is_probe & ~block_sec_req
+        sec_ready = ~need_sec_acq & ~self.req_is_probe & ~block_sec_req
 
         m.d.comb += self.req_sec_ready.eq(sec_ready & rpq.w_rdy)
 

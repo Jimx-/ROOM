@@ -962,7 +962,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 with m.If(s1_tlb_miss[w] | s1_tlb_uncacheable[w]
                           | s1_tlb_pf_ld[w] | s1_tlb_ae_ld[w]):
                     m.d.comb += [
-                        dcache.s1_kill[w].eq(1),
+                        dcache.s1_kill[w].eq(dmem_req_fired[w]),
                         s1_set_executed[ldq_idx].eq(0),
                     ]
                 with m.If(~s1_tlb_miss[w]):
