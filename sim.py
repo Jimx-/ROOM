@@ -14,7 +14,6 @@ from roomsoc.peripheral.plic import PLIC
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
 
 import argparse
-import struct
 
 
 def read_mem_image(filename, word_len=32):
@@ -25,7 +24,10 @@ def read_mem_image(filename, word_len=32):
             w = f.read(4)
             if not w:
                 break
-            image.append(struct.unpack('I', w)[0])
+            val = 0
+            for i in range(len(w)):
+                val |= w[i] << (8 * i)
+            image.append(val)
 
     if word_len == 64:
         if len(image) & 1:
