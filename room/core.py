@@ -346,7 +346,7 @@ class Core(HasCoreParams, Elaboratable):
                                                self.params,
                                                sim_debug=self.sim_debug)
         m.d.comb += [
-            lsu.prv.eq(exc_unit.prv),
+            lsu.prv.eq(exc_unit.dprv),
             lsu.status.eq(exc_unit.mstatus.r),
         ]
 

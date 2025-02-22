@@ -218,6 +218,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.tval = Signal(self.xlen)
         self.epc = Signal(self.vaddr_bits_extended)
         self.prv = Signal(PrivilegeMode, reset=PrivilegeMode.M)
+        self.dprv = Signal(PrivilegeMode)
 
         self.set_fs_dirty = Signal()
         self.single_step = Signal()
@@ -469,34 +470,49 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                 ]
 
         with m.If(insn_ret):
+            ret_prv = Signal.like(self.prv)
+
             with m.If(self.use_supervisor & insn_sret):
                 m.d.sync += [
                     self.mstatus.r.sie.eq(self.mstatus.r.spie),
                     self.mstatus.r.spie.eq(1),
                     self.mstatus.r.spp.eq(PrivilegeMode.U),
-                    self.prv.eq(self.mstatus.r.spp),
                 ]
-                m.d.comb += self.exc_vector.eq(self.sepc.r)
+                m.d.comb += [
+                    ret_prv.eq(self.mstatus.r.spp),
+                    self.exc_vector.eq(self.sepc.r),
+                ]
 
             with m.Elif(insn_dret):
-                m.d.sync += [
-                    self.debug_mode.eq(0),
-                    self.prv.eq(self.dcsr.r.prv),
+                m.d.sync += self.debug_mode.eq(0)
+                m.d.comb += [
+                    ret_prv.eq(self.dcsr.r.prv),
+                    self.exc_vector.eq(self.dpc.r),
                 ]
-                m.d.comb += self.exc_vector.eq(self.dpc.r)
 
             with m.Elif(insn_mret):
                 m.d.sync += [
                     self.mstatus.r.mie.eq(self.mstatus.r.mpie),
                     self.mstatus.r.mpie.eq(1),
                     self.mstatus.r.mpp.eq(PrivilegeMode.U),
-                    self.prv.eq(self.mstatus.r.mpp),
                 ]
-                m.d.comb += self.exc_vector.eq(self.mepc.r)
+                m.d.comb += [
+                    ret_prv.eq(self.mstatus.r.mpp),
+                    self.exc_vector.eq(self.mepc.r),
+                ]
+
+            if self.use_user:
+                with m.If(ret_prv <= PrivilegeMode.S):
+                    m.d.sync += self.mstatus.r.mprv.eq(0)
+
+            m.d.sync += self.prv.eq(ret_prv)
 
         with m.If(self.set_fs_dirty):
             m.d.sync += self.mstatus.r.fs.eq(3)
 
+        m.d.comb += self.dprv.eq(
+            Mux(self.mstatus.r.mprv & ~self.debug_mode, self.mstatus.r.mpp,
+                self.prv))
         with m.If(self.mstatus.we):
             m.d.sync += [
                 self.mstatus.r.mie.eq(self.mstatus.w.mie),
