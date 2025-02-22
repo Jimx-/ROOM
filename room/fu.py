@@ -6,6 +6,7 @@ from room.types import HasCoreParams, MicroOp
 from room.branch import GetPCResp, BranchResolution, BranchUpdate
 from room.alu import ALU, Multiplier, IntDiv
 from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
+from room.exc import Cause
 from room.tlb import SFenceReq
 from room.utils import sign_extend, generate_imm, generate_imm_type, generate_imm_rm, Pipe
 
@@ -44,10 +45,11 @@ class ExecResp(HasCoreParams):
         self.data = Signal(data_width, name=f'{name}_data')
         self.addr = Signal(self.vaddr_bits + 1, name=f'{name}_addr')
 
+        self.mem_exc = Valid(Signal, Cause)
         self.sfence = Valid(SFenceReq, params)
 
     def eq(self, rhs):
-        attrs = ['uop', 'addr', 'data', 'sfence']
+        attrs = ['uop', 'addr', 'data', 'mem_exc', 'sfence']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
@@ -315,6 +317,26 @@ class AddrGenUnit(PipelinedFunctionalUnit):
             self.resp.bits.addr.eq(eff_addr),
             self.resp.bits.data.eq(self.req.bits.rs2_data),
         ]
+
+        misaligned = Signal()
+        with m.Switch(self.req.bits.uop.mem_size):
+            with m.Case(1):
+                m.d.comb += misaligned.eq(eff_addr[0])
+            with m.Case(2):
+                m.d.comb += misaligned.eq(eff_addr[0:2].any())
+            with m.Case(3):
+                m.d.comb += misaligned.eq(eff_addr[0:3].any())
+
+        ma_ld = self.req.valid & (self.req.bits.uop.opcode
+                                  == UOpCode.LD) & misaligned
+        ma_st = self.req.valid & (
+            (self.req.bits.uop.opcode == UOpCode.STA) |
+            (self.req.bits.uop.opcode == UOpCode.AMO_AG)) & misaligned
+        m.d.comb += self.resp.bits.mem_exc.valid.eq(ma_ld | ma_st)
+        with m.If(ma_ld):
+            m.d.comb += self.resp.bits.mem_exc.bits.eq(Cause.LOAD_MISALIGNED)
+        with m.Elif(ma_st):
+            m.d.comb += self.resp.bits.mem_exc.bits.eq(Cause.STORE_MISALIGNED)
 
         m.d.comb += [
             self.resp.bits.sfence.valid.eq(self.req.valid & (
