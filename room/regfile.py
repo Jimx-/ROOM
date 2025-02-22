@@ -98,9 +98,11 @@ class RegisterFile(Elaboratable):
         return m
 
 
-class RegReadDecoder(Elaboratable):
+class RegReadDecoder(HasCoreParams, Elaboratable):
 
     def __init__(self, params):
+        super().__init__(params)
+
         self.iss_uop = MicroOp(params)
         self.iss_valid = Signal()
 
@@ -367,10 +369,16 @@ class RegReadDecoder(Elaboratable):
                      & (self.rrd_uop.mem_cmd == MemoryCommand.LR))):
             m.d.comb += self.rrd_uop.imm_packed.eq(0)
 
-        with m.If(((self.iss_uop.csr_cmd == CSRCommand.S)
-                   | (self.iss_uop.csr_cmd == CSRCommand.C))
-                  & (self.iss_uop.prs1 == 0)):
-            m.d.comb += self.rrd_uop.csr_cmd.eq(CSRCommand.R)
+        if hasattr(self, 'num_pregs'):
+            with m.If(((self.iss_uop.csr_cmd == CSRCommand.S)
+                       | (self.iss_uop.csr_cmd == CSRCommand.C))
+                      & (self.iss_uop.prs1 == 0)):
+                m.d.comb += self.rrd_uop.csr_cmd.eq(CSRCommand.R)
+        else:
+            with m.If(((self.iss_uop.csr_cmd == CSRCommand.S)
+                       | (self.iss_uop.csr_cmd == CSRCommand.C))
+                      & (self.iss_uop.lrs1 == 0)):
+                m.d.comb += self.rrd_uop.csr_cmd.eq(CSRCommand.R)
 
         return m
 
