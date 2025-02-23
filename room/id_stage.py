@@ -8,7 +8,7 @@ from room.exc import Cause
 from room.csr import CSRDecode
 from room.fpu import FPFormat
 
-from roomsoc.interconnect.stream import Valid
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class IDDebug(HasCoreParams, Record):
@@ -869,6 +869,8 @@ class DecodeStage(HasCoreParams, Elaboratable):
             CSRDecode(name=f'csr_decode{w}') for w in range(self.core_width)
         ]
 
+        self.get_pc_idx = Decoupled(Signal, range(self.ftq_size))
+
         if sim_debug:
             self.id_debug = [
                 Valid(IDDebug, params, name=f'id_debug{i}')
@@ -928,9 +930,21 @@ class DecodeStage(HasCoreParams, Elaboratable):
                 uop.br_mask.eq(br_mask_alloc.br_mask[w]),
             ]
 
+        #
+        # Decode exception
+        #
+
+        for w in reversed(range(self.core_width)):
+            with m.If(self.valids[w] & self.uops[w].exception):
+                m.d.comb += [
+                    self.get_pc_idx.valid.eq(1),
+                    self.get_pc_idx.bits.eq(self.uops[w].ftq_idx),
+                ]
+        dec_exc_stall = self.get_pc_idx.valid & ~self.get_pc_idx.ready
+
         dec_hazards = [
             (valid &
-             (~self.dis_ready | br_mask_full | self.rollback |
+             (~self.dis_ready | br_mask_full | self.rollback | dec_exc_stall |
               (self.br_update.mispredict_mask != 0)
               | self.br_update.br_res.mispredict | self.redirect_flush))
             for valid, br_mask_full in zip(self.valids, br_mask_alloc.full)

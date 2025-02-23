@@ -104,6 +104,8 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         self.enq_valids = Signal(self.core_width)
         self.enq_partial_stalls = Signal()
 
+        self.exc_fetch_pc = Signal(self.vaddr_bits_extended)
+
         self.wb_resps = [
             Valid(ExecResp,
                   max(self.xlen, self.flen),
@@ -322,6 +324,11 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         next_exc_uop = MicroOp(self.params)
         m.d.comb += next_exc_uop.eq(r_exc_uop)
 
+        enq_exceptions = Signal(self.core_width)
+        for w in range(self.core_width):
+            m.d.comb += enq_exceptions[w].eq(self.enq_valids[w]
+                                             & self.enq_uops[w].exception)
+
         with m.If(~(self.flush.valid | exception_thrown) & ~state_is_rollback):
             with m.If(self.lsu_exc.valid):
                 with m.If(~r_exc_valid
@@ -335,6 +342,16 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                         next_exc_uop.eq(self.lsu_exc.bits.uop),
                         next_exc_uop.exc_cause.eq(self.lsu_exc.bits.cause),
                     ]
+
+            with m.Elif(~r_exc_valid & enq_exceptions.any()):
+                m.d.sync += [
+                    r_exc_valid.eq(1),
+                    r_exc_badaddr.eq(self.exc_fetch_pc + next_exc_uop.pc_lsb),
+                ]
+
+                for w in reversed(range(self.core_width)):
+                    with m.If(enq_exceptions[w]):
+                        m.d.comb += next_exc_uop.eq(self.enq_uops[w])
 
         m.d.sync += [
             r_exc_uop.eq(next_exc_uop),

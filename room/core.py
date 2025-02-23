@@ -856,6 +856,11 @@ class Core(HasCoreParams, Elaboratable):
             m.d.comb += if_stage.get_pc_idx[0].eq(rob.flush.bits.ftq_idx)
         with m.Elif(jmp_pc_valid):
             m.d.comb += if_stage.get_pc_idx[0].eq(jmp_pc_req)
+        with m.Elif(dec_stage.get_pc_idx.valid):
+            m.d.comb += [
+                if_stage.get_pc_idx[0].eq(dec_stage.get_pc_idx.bits),
+                dec_stage.get_pc_idx.ready.eq(1),
+            ]
 
         for eu, iss_uop, iss_valid in zip(exec_units, iss_uops, iss_valids):
             if not eu.has_jmp_unit: continue
@@ -870,6 +875,8 @@ class Core(HasCoreParams, Elaboratable):
                 eu.get_pc.next_valid.eq(if_stage.get_pc[0].next_valid),
                 eu.get_pc.next_pc.eq(if_stage.get_pc[0].next_pc),
             ]
+
+        m.d.comb += rob.exc_fetch_pc.eq(if_stage.get_pc[0].pc)
 
         #
         # Load/store unit
