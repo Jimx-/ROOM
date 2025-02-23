@@ -117,7 +117,7 @@ class ICache(HasICacheParams, Elaboratable):
         tag_rdata = [
             Signal(tag_bits, name=f'tag_rdata{i}') for i in range(self.n_ways)
         ]
-        tag_read = m.submodules.tag_read = tag_mem.read_port()
+        tag_read = m.submodules.tag_read = tag_mem.read_port(transparent=False)
         m.d.comb += tag_read.addr.eq(s0_vaddr[block_off_bits:untag_bits])
         for i in range(self.n_ways):
             m.d.comb += tag_rdata[i].eq(tag_read.data[i * tag_bits:(i + 1) *
@@ -176,7 +176,7 @@ class ICache(HasICacheParams, Elaboratable):
         ]
 
         for i in range(self.n_ways):
-            rport = data_ways[i].read_port()
+            rport = data_ways[i].read_port(transparent=False)
             wport = data_ways[i].write_port()
 
             m.submodules += [rport, wport]
@@ -184,8 +184,8 @@ class ICache(HasICacheParams, Elaboratable):
             row_addr = s0_vaddr[block_off_bits -
                                 log2_int(refill_cycles):untag_bits]
 
-            m.d.sync += rport.addr.eq(row_addr)
-            m.d.comb += s2_dout[i].eq(rport.data)
+            m.d.comb += rport.addr.eq(row_addr)
+            m.d.sync += s2_dout[i].eq(rport.data)
 
             m.d.comb += [
                 wport.addr.eq((refill_index << len(refill_counter))
