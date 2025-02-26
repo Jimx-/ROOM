@@ -623,7 +623,10 @@ class TLB(HasCoreParams, Elaboratable):
                         m.d.comb += ppn[w].eq(entry.ppn)
 
         for w in range(self.req_width):
-            m.d.comb += self.resp[w].valid.eq(s1_valid[w]),
+            m.d.comb += [
+                self.resp[w].valid.eq(s1_valid[w]),
+                self.resp[w].bits.miss.eq(refill_done | s1_tlb_miss[w]),
+            ]
 
             with m.If(s1_vm_enabled[w]):
                 m.d.comb += [
@@ -644,7 +647,6 @@ class TLB(HasCoreParams, Elaboratable):
                     self.resp[w].bits.ma.ld.eq(cmd_read[w] & misaligned[w]),
                     self.resp[w].bits.ma.st.eq(cmd_write[w] & misaligned[w]),
                     #
-                    self.resp[w].bits.miss.eq(refill_done | s1_tlb_miss[w]),
                     self.resp[w].bits.paddr.eq(
                         Cat(s1_req[w].vaddr[:self.pg_offset_bits], ppn[w])),
                     self.resp[w].bits.cacheable.eq(
