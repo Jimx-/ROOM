@@ -130,6 +130,7 @@ class Core(HasCoreParams, Elaboratable):
 
         self.interrupts = CoreInterrupts()
         self.debug_entry = Signal(32)
+        self.debug_exception = Signal(32)
 
         self.periph_buses = []
 
@@ -1091,6 +1092,7 @@ class Core(HasCoreParams, Elaboratable):
                             commit_exc_pc_lsb_d1 -
                             Mux(commit_exc_edge_inst_d1, 2, 0)),
             exc_unit.debug_entry.eq(self.debug_entry),
+            exc_unit.debug_exception.eq(self.debug_exception),
             exc_unit.system_insn.eq(csr_port.cmd == CSRCommand.I),
             exc_unit.system_insn_imm.eq(csr_port.addr),
             exc_unit.commit.eq(rob.commit_req.valids[0]),

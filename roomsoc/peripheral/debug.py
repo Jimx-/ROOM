@@ -400,6 +400,7 @@ class DebugModuleCSR(IntEnum):
     HALTED = 0x0
     GOING = 0x4
     RESUMING = 0x8
+    EXCEPTION = 0xc
 
     TRAMPOLINE = 0x300
     PROGBUF = 0x340
@@ -677,6 +678,7 @@ class DebugController(Elaboratable):
         self.progbuf_size = progbuf_size
         self.data_count = data_count
 
+        self.ndreset = Signal()
         self.debug_int = Signal()
 
         self.dmstatus = debugrf.reg_port(DebugReg.DMSTATUS)
@@ -699,6 +701,7 @@ class DebugController(Elaboratable):
         self._halted = csr_bank.csr(32, 'w', addr=DebugModuleCSR.HALTED)
         self._going = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.GOING)
         self._resuming = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.RESUMING)
+        self._exception = csr_bank.csr(32, 'rw', addr=DebugModuleCSR.EXCEPTION)
         self._trampoline = csr_bank.csr(32,
                                         'r',
                                         addr=DebugModuleCSR.TRAMPOLINE)
@@ -747,6 +750,8 @@ class DebugController(Elaboratable):
                     'resumereq',
                 )
             ]
+
+        m.d.comb += self.ndreset.eq(self.dmcontrol.w.ndmreset)
 
         #
         # Halt request
@@ -944,6 +949,9 @@ class DebugController(Elaboratable):
                 with m.If(~go_req & self._halted.w_stb):
                     # EBREAK
                     m.next = 'CMD_DONE'
+                with m.If(self._exception.w_stb):
+                    m.d.comb += cmderr_exception.eq(1)
+                    m.next = 'CMD_DONE'
 
             with m.State('CMD_DONE'):
                 m.d.sync += self.abstractcs.w.busy.eq(0)
@@ -1080,6 +1088,7 @@ class DebugModule(Peripheral, Elaboratable):
         self.rom_init = rom_init
 
         self.jtag = JTAGInterface()
+        self.ndreset = Signal()
         self.debug_int = Signal()
 
         self.dbus = wishbone.Interface(addr_width=30,
@@ -1125,7 +1134,10 @@ class DebugModule(Peripheral, Elaboratable):
             regfile.dmi_resp_ready.eq(dtm.dmi_resp_ready),
         ]
 
-        m.d.comb += self.debug_int.eq(controller.debug_int)
+        m.d.comb += [
+            self.ndreset.eq(controller.ndreset),
+            self.debug_int.eq(controller.debug_int),
+        ]
 
         m.d.comb += sba.bus.connect(self.dbus)
 

@@ -282,7 +282,10 @@ class Top(Elaboratable):
 
             print(res.name, hex(start), size)
 
-        m.d.comb += core.debug_entry.eq(dm_base + 0x800)
+        m.d.comb += [
+            core.debug_entry.eq(dm_base + 0x800),
+            core.debug_exception.eq(dm_base + 0x808),
+        ]
 
         return m
 

@@ -4,6 +4,7 @@
     #define HALTED      -0x800
     #define GOING       -(0x800 - 4)
     #define RESUMING    -(0x800 - 8)
+    #define EXCEPTION   -(0x800 - 12)
 
     #define FLAGS       -0x400
     #define FLAG_GO     0x1
@@ -13,6 +14,10 @@
 entry:
     csrw dscratch1, s1
     j    _entry
+
+exception:
+    csrrw s1, dscratch1, s1
+    sw zero, EXCEPTION(s1)
 
 _entry:
     csrw dscratch0, s0

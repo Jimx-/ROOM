@@ -208,6 +208,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
         self.debug_mode = Signal()
         self.debug_entry = Signal(self.paddr_bits)
+        self.debug_exception = Signal(self.paddr_bits)
 
         self.system_insn = Signal()
         self.system_insn_imm = Signal(12)
@@ -330,6 +331,11 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         is_debug_break = ~cause.interrupt & insn_break
         trap_to_debug = single_stepped | is_debug_int | is_debug_trigger | is_debug_break | self.debug_mode
 
+        debug_vector = Mux(
+            self.debug_mode,
+            Mux(insn_break, self.debug_entry, self.debug_exception),
+            self.debug_entry)
+
         with m.If(self.mtvec.we):
             m.d.sync += [
                 self.mtvec.r.mode.eq(self.mtvec.w.mode & 1),
@@ -416,8 +422,7 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         trap_vector = Mux(vector_mode, int_vector, tvec_csr.base << 2)
 
         m.d.comb += [
-            self.exc_vector.eq(
-                Mux(trap_to_debug, self.debug_entry, trap_vector)),
+            self.exc_vector.eq(Mux(trap_to_debug, debug_vector, trap_vector)),
             self.single_step.eq(self.dcsr.r.step & ~self.debug_mode),
         ]
 
