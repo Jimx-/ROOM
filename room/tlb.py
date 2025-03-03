@@ -656,9 +656,11 @@ class TLB(HasCoreParams, Elaboratable):
             with m.Else():
                 m.d.comb += [
                     self.resp[w].bits.paddr.eq(s1_req[w].vaddr),
-                    self.resp[w].bits.ae.ld.eq(cmd_read[w] & ~prot_r[w]),
-                    self.resp[w].bits.ae.st.eq(cmd_write[w] & ~prot_w[w]),
-                    self.resp[w].bits.ae.inst.eq(~prot_x[w]),
+                    self.resp[w].bits.ae.ld.eq(cmd_read[w] & ~prot_r[w]
+                                               & ~refill_done),
+                    self.resp[w].bits.ae.st.eq(cmd_write[w] & ~prot_w[w]
+                                               & ~refill_done),
+                    self.resp[w].bits.ae.inst.eq(~prot_x[w] & ~refill_done),
                     self.resp[w].bits.cacheable.eq(cacheable[w]),
                 ]
 
