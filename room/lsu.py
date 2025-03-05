@@ -252,8 +252,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         s1_exc_valid = Signal()
 
         dcache_cls = DCache if self.enable_dcache else SimpleDCache
-        dcache = m.submodules.dcache = dcache_cls(self.dbus, self.dbus_mmio,
-                                                  self.params)
+        dcache = m.submodules.dcache = DomainRenamer('dcache')(dcache_cls(
+            self.dbus, self.dbus_mmio, self.params))
 
         tlb = m.submodules.tlb = TLB(req_width=self.mem_width,
                                      params=self.params,

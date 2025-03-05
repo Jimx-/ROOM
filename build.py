@@ -314,7 +314,21 @@ class Top(Elaboratable):
                                      bus_addr_width=32,
                                      bus_standard='axi')
 
-        core = Core(core_params, sim_debug=self.sim)
+        ndreset = Signal()
+        m.domains += ClockDomain('core', local=True)
+        m.d.comb += [
+            ClockSignal('core').eq(ClockSignal()),
+            ResetSignal('core').eq(ResetSignal() | ndreset),
+        ]
+
+        m.domains += ClockDomain('dcache', local=True)
+        m.d.comb += [
+            ClockSignal('dcache').eq(ClockSignal()),
+            ResetSignal('dcache').eq(ResetSignal()),
+        ]
+
+        raw_core = Core(core_params, sim_debug=self.sim)
+        core = DomainRenamer('core')(raw_core)
         soc.add_cpu(core)
         m.d.comb += core.reset_vector.eq(0x10000)
 
@@ -334,8 +348,16 @@ class Top(Elaboratable):
         if self.sim:
             generate_trace_if(m, core, '/tmp')
 
+        m.domains += ClockDomain('dmi', local=True)
+        m.d.comb += ClockSignal('dmi').eq(ClockSignal())
+
         debug_module = DebugModule(self.debug_rom_image)
-        m.d.comb += core.interrupts.debug.eq(debug_module.debug_int)
+        debug_module = DomainRenamer('dmi')(debug_module)
+        m.d.comb += [
+            ndreset.eq(debug_module.ndreset),
+            core.interrupts.debug.eq(debug_module.debug_int),
+            debug_module.hart_in_reset.eq(ResetSignal() | ndreset),
+        ]
 
         if self.sim:
             jtag_dpi = m.submodules.jtag_dpi = JTAGDPI()
@@ -473,7 +495,7 @@ class Top(Elaboratable):
 
         soc.add_peripheral('plic', plic)
 
-        core.pma_regions = list(soc.regions())
+        raw_core.pma_regions = list(soc.regions())
 
         dm_base = 0
 

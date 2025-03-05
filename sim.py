@@ -164,9 +164,25 @@ class Top(Elaboratable):
             self.jtag.tck.eq(ClockSignal('debug')),
         ]
 
-        soc = m.submodules.soc = SoC(bus_data_width=64, bus_addr_width=32)
+        soc = m.submodules.soc = SoC(bus_data_width=64,
+                                     bus_addr_width=32,
+                                     bus_standard='axi')
 
-        core = Core(self.core_params, sim_debug=self.sim_debug)
+        ndreset = Signal()
+        m.domains += ClockDomain('core', local=True)
+        m.d.comb += [
+            ClockSignal('core').eq(ClockSignal()),
+            ResetSignal('core').eq(ResetSignal() | ndreset),
+        ]
+
+        m.domains += ClockDomain('dcache', local=True)
+        m.d.comb += [
+            ClockSignal('dcache').eq(ClockSignal()),
+            ResetSignal('dcache').eq(ResetSignal()),
+        ]
+
+        raw_core = Core(self.core_params, sim_debug=self.sim_debug)
+        core = DomainRenamer('core')(raw_core)
         soc.add_cpu(core)
         m.d.comb += core.reset_vector.eq(0x10000)
 
@@ -189,6 +205,8 @@ class Top(Elaboratable):
         debug_module = DebugModule(self.debug_rom_image)
         m.d.comb += [
             debug_module.jtag.connect(self.jtag),
+            ndreset.eq(debug_module.ndreset),
+            debug_module.hart_in_reset.eq(ResetSignal() | ndreset),
             core.interrupts.debug.eq(debug_module.debug_int),
         ]
 
@@ -272,7 +290,7 @@ class Top(Elaboratable):
 
         soc.add_peripheral('plic', plic)
 
-        core.pma_regions = list(soc.regions())
+        raw_core.pma_regions = list(soc.regions())
 
         dm_base = 0
 
@@ -433,6 +451,13 @@ if __name__ == "__main__":
         r = yield from dut.jtag.read_dmi(0x11)
         print(hex(r))
 
+        for _ in range(100):
+            yield
+
+        yield from dut.jtag.write_dmi(0x10, 0x00000001)
+        for _ in range(100):
+            yield
+
         # Write 0x4 to DCSR
         # yield from dut.jtag.write_dmi(0x4, 0x4)
         # for _ in range(100):
@@ -442,12 +467,20 @@ if __name__ == "__main__":
         #     yield
 
         # Write 0x0 to DPC
-        yield from dut.jtag.write_dmi(0x4, 0x39b8)
+        yield from dut.jtag.write_dmi(0x20, 0x100f)
         for _ in range(100):
             yield
-        yield from dut.jtag.write_dmi(0x17, 0x002307b1)
-        for _ in range(200):
+        yield from dut.jtag.write_dmi(0x21, 0x000f)
+        for _ in range(100):
             yield
+        yield from dut.jtag.write_dmi(0x22, 0x100073)
+        for _ in range(100):
+            yield
+        yield from dut.jtag.write_dmi(0x17, 0x241000)
+        for _ in range(100):
+            yield
+            r = yield from dut.jtag.read_dmi(0x16)
+            print(hex(r))
 
         yield from dut.jtag.write_dmi(0x10, 0x40000001)
         for _ in range(100):
