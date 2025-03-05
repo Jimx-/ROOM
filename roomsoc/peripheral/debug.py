@@ -680,6 +680,7 @@ class DebugController(Elaboratable):
 
         self.ndreset = Signal()
         self.debug_int = Signal()
+        self.hart_in_reset = Signal()
 
         self.dmstatus = debugrf.reg_port(DebugReg.DMSTATUS)
         self.dmcontrol = debugrf.reg_port(DebugReg.DMCONTROL)
@@ -757,10 +758,34 @@ class DebugController(Elaboratable):
         # Halt request
         #
 
+        debug_int_halt = Signal()
         with m.If(~self.dmcontrol.w.dmactive):
-            m.d.sync += self.debug_int.eq(0)
+            m.d.sync += debug_int_halt.eq(0)
         with m.Elif(self.dmcontrol.update):
-            m.d.sync += self.debug_int.eq(self.dmcontrol.r.haltreq)
+            m.d.sync += debug_int_halt.eq(self.dmcontrol.r.haltreq)
+
+        #
+        # Hart reset
+        #
+
+        debug_int_reset = Signal()
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += debug_int_reset.eq(0)
+        with m.Else():
+            m.d.sync += debug_int_reset.eq(self.hart_in_reset
+                                           | (debug_int_reset & ~hart_halted))
+
+        hart_have_reset = Signal()
+        with m.If(~self.dmcontrol.w.dmactive):
+            m.d.sync += hart_have_reset.eq(0)
+        with m.Else():
+            with m.If(self.dmcontrol.update & self.dmcontrol.r.ackhavereset):
+                m.d.sync += hart_have_reset.eq(self.hart_in_reset)
+            with m.Else():
+                m.d.sync += hart_have_reset.eq(hart_have_reset
+                                               | self.hart_in_reset)
+
+        m.d.comb += self.debug_int.eq(debug_int_halt | debug_int_reset)
 
         #
         # Resume request
@@ -771,13 +796,17 @@ class DebugController(Elaboratable):
         with m.If(~self.dmcontrol.w.dmactive):
             m.d.sync += hart_resuming.eq(0)
         with m.Else():
+            m.d.sync += hart_resuming.eq(hart_resuming & ~self.hart_in_reset)
+
             with m.If(self._halted.w_stb):
-                m.d.sync += hart_halted.eq(1)
+                m.d.sync += hart_halted.eq(~self.hart_in_reset)
             with m.Elif(self._resuming.w_stb):
                 m.d.sync += hart_halted.eq(0)
+            with m.Else():
+                m.d.sync += hart_halted.eq(hart_halted & ~self.hart_in_reset)
 
             with m.If(resume_req):
-                m.d.sync += hart_resuming.eq(1)
+                m.d.sync += hart_resuming.eq(~self.hart_in_reset)
             with m.Elif(self._resuming.w_stb):
                 m.d.sync += hart_resuming.eq(0)
 
@@ -795,6 +824,8 @@ class DebugController(Elaboratable):
             self.dmstatus.w.anyhalted.eq(hart_halted),
             self.dmstatus.w.anyresumeack.eq(hart_resume_ack),
             self.dmstatus.w.allresumeack.eq(hart_resume_ack),
+            self.dmstatus.w.anyhavereset.eq(hart_have_reset),
+            self.dmstatus.w.allhavereset.eq(hart_have_reset),
             self.haltsum0.w[0].eq(self.dmstatus.w.allhalted),
         ]
 
@@ -1090,6 +1121,7 @@ class DebugModule(Peripheral, Elaboratable):
         self.jtag = JTAGInterface()
         self.ndreset = Signal()
         self.debug_int = Signal()
+        self.hart_in_reset = Signal()
 
         self.dbus = wishbone.Interface(addr_width=30,
                                        data_width=32,
@@ -1137,6 +1169,7 @@ class DebugModule(Peripheral, Elaboratable):
         m.d.comb += [
             self.ndreset.eq(controller.ndreset),
             self.debug_int.eq(controller.debug_int),
+            controller.hart_in_reset.eq(self.hart_in_reset),
         ]
 
         m.d.comb += sba.bus.connect(self.dbus)
