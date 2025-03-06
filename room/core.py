@@ -36,6 +36,19 @@ class CommitDebug(Record):
                          src_loc_at=1 + src_loc_at)
 
 
+class ExceptionDebug(HasCoreParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('cause', self.xlen),
+            ('inst', 32),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
 class CoreDebug(HasCoreParams):
 
     def __init__(self, params):
@@ -81,6 +94,8 @@ class CoreDebug(HasCoreParams):
             for i in range(self.core_width)
         ]
 
+        self.exc_debug = Valid(ExceptionDebug, params)
+
         self.branch_resolve = Signal(self.max_br_count)
         self.branch_mispredict = Signal(self.max_br_count)
         self.flush_pipeline = Signal()
@@ -111,6 +126,7 @@ class CoreDebug(HasCoreParams):
             ret.append(l.eq(r))
 
         ret += [
+            self.exc_debug.eq(rhs.exc_debug),
             self.branch_resolve.eq(rhs.branch_resolve),
             self.branch_mispredict.eq(rhs.branch_mispredict),
             self.flush_pipeline.eq(rhs.flush_pipeline),
@@ -513,6 +529,13 @@ class Core(HasCoreParams, Elaboratable):
                     commit_debug.valid.eq(rob.commit_req.valids[w]),
                     commit_debug.bits.uop_id.eq(rob.commit_req.uops[w].uop_id),
                 ]
+
+            exc_debug = self.core_debug.exc_debug
+            m.d.comb += [
+                exc_debug.valid.eq(rob.commit_exc.valid),
+                exc_debug.bits.cause.eq(rob.commit_exc.bits.cause),
+                exc_debug.bits.inst.eq(rob.commit_exc.bits.inst),
+            ]
 
         #
         # Frontend redirect

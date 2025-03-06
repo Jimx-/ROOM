@@ -422,6 +422,13 @@ if __name__ == "__main__":
                         id = yield com_debug.bits.uop_id
                         print(f'C {id}', file=log_file)
 
+                exc_debug = dut.core_debug.exc_debug
+                valid = yield exc_debug.valid
+                if valid:
+                    cause = yield exc_debug.bits.cause
+                    inst = yield exc_debug.bits.inst
+                    print(f'EXC {cause} {inst:x}', file=log_file)
+
                 mispredict_mask = yield dut.core_debug.branch_mispredict
                 if mispredict_mask != 0:
                     print(f'BRK {mispredict_mask:x}', file=log_file)

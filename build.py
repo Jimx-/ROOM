@@ -184,6 +184,11 @@ def generate_trace_if(m, core, output_dir):
         signals[f'i_commit_debug{i}_valid'] = com_debug.valid
         signals[f'i_commit_debug{i}_uop_id'] = com_debug.bits.uop_id
 
+    exc_debug = core.core_debug.exc_debug
+    signals['i_exc_debug_valid'] = exc_debug.valid
+    signals['i_exc_debug_cause'] = exc_debug.bits.cause
+    signals['i_exc_debug_inst'] = exc_debug.bits.inst
+
     signals['i_branch_resolve'] = core.core_debug.branch_resolve
     signals['i_branch_mispredict'] = core.core_debug.branch_mispredict
     signals['i_flush_pipeline'] = core.core_debug.flush_pipeline

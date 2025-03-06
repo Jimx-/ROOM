@@ -11,6 +11,33 @@ PREG_COLORS = [
     for r, g, b in distinctipy.get_colors(NUM_PREGS)
 ]
 
+EXCEPTION_CAUSE = {
+    0x0: 'Misaligned fetch',
+    0x1: 'Fetch access fault',
+    0x2: 'Illegal instruction',
+    0x3: 'Breakpoint',
+    0x4: 'Misaligned load',
+    0x5: 'Load access fault',
+    0x6: 'Misaligned store',
+    0x7: 'Store access fault',
+    0x8: 'Ecall (U)',
+    0x9: 'Ecall (S)',
+    0xA: 'Ecall (VS)',
+    0xB: 'Ecall (M)',
+    0xC: 'Fetch page fault',
+    0xD: 'Load page fault',
+    0xF: 'Store page fault',
+}
+
+INTERRUPT_CAUSE = {
+    0x1: 'SSIP',
+    0x3: 'MSIP',
+    0x5: 'STIP',
+    0x7: 'MTIP',
+    0x9: 'SEIP',
+    0xB: 'MEIP',
+}
+
 
 class Instruction:
 
@@ -535,6 +562,20 @@ class TraceParser:
                     csv_file.write(f'"{uop_id}","{pc}","{uop}","{note}"\n')
 
                 self.insts.pop(id)
+
+            elif cmd == 'EXC':
+                cause = int(args[0])
+                inst = int(args[1], base=16)
+
+                if cause & (1 << 63):
+                    cause = cause & 63
+                    cause_str = f'Interrupt {INTERRUPT_CAUSE.get(cause, str(cause))}'
+                else:
+                    cause_str = EXCEPTION_CAUSE.get(cause, f'Cause {cause}')
+
+                exc = Text(f'Exception ({cause_str})',
+                           style='bold italic red underline')
+                table.add_row('', '', exc, '')
 
             elif cmd == 'X':
                 self.insts.clear()

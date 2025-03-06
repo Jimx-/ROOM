@@ -29,6 +29,7 @@ public:
                    int prs1, int prs2);
     void trace_wb(int uop_id, int pdst, uint64_t data);
     void trace_commit(int uop_id);
+    void trace_exception(int64_t cause);
     void trace_branch_mispredict(int mispredict_mask);
     void trace_branch_resolve(int resolve_mask);
     void trace_flush();

@@ -6,6 +6,7 @@ import "DPI-C" function void dpi_trace_ex(int uop_id, int opcode, int prs1, long
 import "DPI-C" function void dpi_trace_mem(int uop_id, int opcode, longint addr, longint data, int prs1, int prs2);
 import "DPI-C" function void dpi_trace_wb(int uop_id, int pdst, longint data);
 import "DPI-C" function void dpi_trace_commit(int uop_id);
+import "DPI-C" function void dpi_trace_exception(longint cause, int insn);
 import "DPI-C" function void dpi_trace_branch_mispredict(int mispredict_mask);
 import "DPI-C" function void dpi_trace_branch_resolve(int resolve_mask);
 import "DPI-C" function void dpi_trace_flush();
@@ -73,6 +74,11 @@ module vl_trace_if
    input wire [{{UOP_ID_WIDTH}}-1:0]              commit_debug{{i}}_uop_id,
    // {% endfor %}
 
+   // Exception
+   input wire                                     exc_debug_valid,
+   input wire [63:0]                              exc_debug_cause,
+   input wire [31:0]                              exc_debug_inst,
+
    input wire [{{core.max_br_count}}-1:0]         branch_resolve,
    input wire [{{core.max_br_count}}-1:0]         branch_mispredict,
 
@@ -135,6 +141,10 @@ module vl_trace_if
             dpi_trace_commit(commit_debug{{i}}_uop_id);
          end
          // {% endfor %}
+
+         if (exc_debug_valid) begin
+            dpi_trace_exception(exc_debug_cause, exc_debug_inst);
+         end
 
          if (branch_mispredict != {{core.max_br_count}}'b0) begin
             dpi_trace_branch_mispredict(branch_mispredict);
