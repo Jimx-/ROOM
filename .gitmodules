@@ -1,9 +1,9 @@
 [submodule "zsbl/fat"]
 	path = zsbl/fat
 	url = https://github.com/ultraembedded/fat_io_lib.git
-[submodule "rtlsim/dromajo"]
-	path = rtlsim/dromajo
-	url = https://github.com/chipsalliance/dromajo.git
 [submodule "rtlsim/ramulator"]
 	path = rtlsim/ramulator
 	url = https://github.com/Jimx-/ramulator.git
+[submodule "rtlsim/dromajo"]
+	path = rtlsim/dromajo
+	url = https://github.com/Jimx-/dromajo.git
