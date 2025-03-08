@@ -261,22 +261,52 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
             self.mip.r.msip.eq(self.interrupts.msip),
         ]
 
-        interrupts = Signal(16)
-        m.d.comb += [
-            interrupts[Cause.DEBUG_INTERRUPT].eq(self.interrupts.debug)
+        pending_interrupts = self.mip.r & self.mie.r
+        d_interrupts = Signal(self.xlen)
+        m_interrupts = Signal(self.xlen)
+        s_interrupts = Signal(self.xlen)
+        m.d.comb += d_interrupts[Cause.DEBUG_INTERRUPT].eq(
+            self.interrupts.debug)
+
+        with m.If((self.prv <= PrivilegeMode.S) | self.mstatus.r.mie):
+            m.d.comb += m_interrupts.eq(pending_interrupts & ~self.mideleg)
+
+        with m.If((self.prv < PrivilegeMode.S)
+                  | ((self.prv == PrivilegeMode.S) & self.mstatus.r.sie)):
+            m.d.comb += s_interrupts.eq(pending_interrupts & self.mideleg)
+
+        priority = [
+            Cause.DEBUG_INTERRUPT,
+            Cause.M_EXTERNAL_INTERRUPT,
+            Cause.M_SOFTWARE_INTERRUPT,
+            Cause.M_TIMER_INTERRUPT,
+            Cause.S_EXTERNAL_INTERRUPT,
+            Cause.S_SOFTWARE_INTERRUPT,
+            Cause.S_TIMER_INTERRUPT,
+            Cause.U_EXTERNAL_INTERRUPT,
+            Cause.U_SOFTWARE_INTERRUPT,
+            Cause.U_TIMER_INTERRUPT,
         ]
 
-        interrupt_pe = m.submodules.interrupt_pe = PriorityEncoder(16)
-        m.d.comb += interrupt_pe.i.eq(interrupts)
+        any_interrupt = Signal()
+        which_interrupt = Signal(Cause)
+        for mask in [s_interrupts, m_interrupts, d_interrupts]:
+            for i in reversed(priority):
+                if i < len(mask):
+                    with m.If(mask[i]):
+                        m.d.comb += [
+                            any_interrupt.eq(1),
+                            which_interrupt.eq(i),
+                        ]
 
-        interrupt_cause = Record([l[:2] for l in mcause_layout(self.xlen)])
+        interrupt_cause = MCause(self.xlen)
         m.d.comb += [
             interrupt_cause.interrupt.eq(1),
-            interrupt_cause.ecode.eq(interrupt_pe.o),
+            interrupt_cause.ecode.eq(which_interrupt),
         ]
 
         m.d.comb += [
-            self.interrupt.eq(~interrupt_pe.n & ~self.debug_mode),
+            self.interrupt.eq(any_interrupt & ~self.debug_mode),
             self.interrupt_cause.eq(interrupt_cause),
         ]
 
