@@ -72,6 +72,7 @@ class SoC::Impl {
 public:
     Impl(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
          std::string_view bootrom, std::string_view dtb,
+         std::string_view initrd, off_t initrd_offset,
          std::string_view trace_log, bool enable_fork, size_t fork_interval)
         : ram_addr_(memory_addr)
     {
@@ -84,13 +85,15 @@ public:
         ram_ = &register_ram(memory_addr, (uint64_t)memory_size);
 
         if (!bootrom.empty()) load_bootrom(bootrom);
+        if (!initrd.empty()) load_initrd(initrd, initrd_offset);
 
         dut_.reset(new Vsoc_wrapper());
 
         if (!sd_image.empty()) sdcard_.reset(new SDCard(sd_image));
 
 #ifdef ITRACE
-        (void)new Tracer(memory_addr, memory_size, bootrom, dtb, trace_log);
+        (void)new Tracer(memory_addr, memory_size, bootrom, dtb, initrd,
+                         trace_log);
 #endif
 
 #if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
@@ -140,11 +143,11 @@ public:
 
     int run()
     {
-        int N = 2000000;
+        size_t N = std::numeric_limits<size_t>::max();
 
         this->reset();
 
-        for (int i = 0; i < N; i++) {
+        for (size_t i = 0; i < N; i++) {
             if (i && (i % 10000 == 0)) {
                 spdlog::trace("Cycle {}/{}", i, N);
 #if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
@@ -336,6 +339,22 @@ private:
         if (!f) {
             spdlog::error("Failed to open boot ROM \"{}\"", bootrom_name);
             throw std::runtime_error("Failed to open boot ROM");
+        }
+
+        size_t len = ::fread((char*)ram_ptr, 1, ~0U, f);
+
+        ::fclose(f);
+        return len;
+    }
+
+    size_t load_initrd(std::string_view initrd_name, off_t initrd_offset)
+    {
+        auto* ram_ptr = get_ram_ptr(ram_addr_ + initrd_offset);
+        FILE* f = ::fopen(initrd_name.data(), "rb");
+
+        if (!f) {
+            spdlog::error("Failed to open init ramdisk \"{}\"", initrd_name);
+            throw std::runtime_error("Failed to open init ramdisk");
         }
 
         size_t len = ::fread((char*)ram_ptr, 1, ~0U, f);
@@ -605,9 +624,10 @@ template <> SoC* Singleton<SoC>::m_singleton = nullptr;
 
 SoC::SoC(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
          std::string_view bootrom, std::string_view dtb,
+         std::string_view initrd, off_t initrd_offset,
          std::string_view trace_log, bool enable_fork, size_t fork_interval)
-    : impl_(new Impl(sd_image, memory_addr, memory_size, bootrom, dtb,
-                     trace_log, enable_fork, fork_interval))
+    : impl_(new Impl(sd_image, memory_addr, memory_size, bootrom, dtb, initrd,
+                     initrd_offset, trace_log, enable_fork, fork_interval))
 {}
 
 SoC::~SoC() { delete impl_; }

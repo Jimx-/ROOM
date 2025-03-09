@@ -58,7 +58,7 @@ static void dromajo_error_log(int hartid, const char* fmt, ...)
 
 Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
                std::string_view bootrom, std::string_view dtb,
-               std::string_view trace_log_path)
+               std::string_view initrd, std::string_view trace_log_path)
     : should_stop_(false), cycle_(0), last_commit_cycle_(0)
 {
     if (!trace_log_path.empty()) {
@@ -83,6 +83,8 @@ Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
     fputs("\"machine\":\"riscv64\",\n", cfg_file);
     fprintf(cfg_file, "\"memory_size\": %lu,\n", (uint64_t)memory_size >> 20UL);
     fprintf(cfg_file, "\"memory_base_addr\": 0x%lx,\n", memory_addr);
+    if (!initrd.empty())
+        fprintf(cfg_file, "\"initrd\": \"%s\",\n", initrd.data());
     fprintf(cfg_file, "\"bios\": \"%s\"\n", bootrom.data());
     fputs("}\n", cfg_file);
 
@@ -95,6 +97,8 @@ Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
         argv.push_back((char*)"--dtb");
         argv.push_back(dtb_str.data());
     }
+
+    argv.push_back((char*)"--ctrlc");
 
     argv.push_back(tempname);
 
