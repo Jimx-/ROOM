@@ -282,6 +282,7 @@ class Top(Elaboratable):
 
         uart = UART(divisor=int(self.clk_freq // 115200))
         soc.add_peripheral('uart', uart)
+        m.d.comb += plic.interrupts[0].eq(uart.irq)
 
         sdc = MockSDController()
         soc.add_peripheral('sdc', sdc)
@@ -484,7 +485,7 @@ if __name__ == "__main__":
         for _ in range(100):
             yield
         yield from dut.jtag.write_dmi(0x17, 0x241000)
-        for _ in range(100):
+        for _ in range(10):
             yield
             r = yield from dut.jtag.read_dmi(0x16)
             print(hex(r))

@@ -494,6 +494,8 @@ class Top(Elaboratable):
         soc.add_controller()
 
         soc.add_peripheral('uart', self.uart)
+        m.d.comb += plic.interrupts[0].eq(self.uart.irq)
+
         soc.add_peripheral('sdc', self.sdc)
 
         soc.add_peripheral('clint', clint)

@@ -21,8 +21,13 @@ class UART(Peripheral, Elaboratable):
         self._status = bank.csr(3 + len(self._phy.rx.err), 'r')
         self._divisor = bank.csr(self._phy.divisor.width, "rw")
 
+        self._rx_ready_ev = self.event(mode='level')
+        self._rx_error_ev = self.event(mode='rise')
+        self._tx_empty_ev = self.event(mode='rise')
+
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
+        self.irq = self._bridge.irq
 
         self.rx = Signal()
         self.tx = Signal()
@@ -58,6 +63,11 @@ class UART(Peripheral, Elaboratable):
             self._phy.tx.data.eq(self._tx_fifo.r_data),
             self._phy.tx.ack.eq(self._tx_fifo.r_rdy),
             self._tx_fifo.r_en.eq(self._phy.tx.rdy),
+            #
+            self._rx_ready_ev.stb.eq(self._rx_fifo.r_rdy),
+            self._rx_error_ev.stb.eq(self._phy.rx.err.any()),
+            self._tx_empty_ev.stb.eq(~self._tx_fifo.r_rdy),
+            #
             self.tx.eq(self._phy.tx.o),
             self._phy.rx.i.eq(self.rx),
         ]

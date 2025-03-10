@@ -6,6 +6,7 @@ from amaranth_soc import wishbone, csr
 from amaranth_soc.memory import MemoryMap
 
 from roomsoc.interconnect.csr import WishboneCSRBridge
+from .event import *
 
 
 class Peripheral:
@@ -16,8 +17,10 @@ class Peripheral:
 
         self._csr_banks = []
         self._windows = []
+        self._events = []
 
         self._bus = None
+        self._irq = None
 
     @property
     def bus(self):
@@ -33,6 +36,21 @@ class Peripheral:
                 "Bus interface must be an instance of wishbone.Interface, not {!r}"
                 .format(bus))
         self._bus = bus
+
+    @property
+    def irq(self):
+        if self._irq is None:
+            raise NotImplementedError(
+                "Peripheral {!r} does not have an IRQ line".format(self))
+        return self._irq
+
+    @irq.setter
+    def irq(self, irq):
+        if not isinstance(irq, IRQLine):
+            raise TypeError(
+                "IRQ line must be an instance of IRQLine, not {!r}".format(
+                    irq))
+        self._irq = irq
 
     def csr_bank(self, *, addr=None, alignment=None):
         bank = CSRBank(prefix=self.name)
@@ -57,6 +75,11 @@ class Peripheral:
         self._windows.append((window, addr, sparse))
         return window
 
+    def event(self, *, mode="level", name=None, src_loc_at=0):
+        event = EventSource(mode=mode, name=name, src_loc_at=1 + src_loc_at)
+        self._events.append(event)
+        return event
+
     def bridge(self, *, data_width=8, granularity=None, alignment=0):
         return PeripheralBridge(self,
                                 data_width=data_width,
@@ -70,6 +93,10 @@ class Peripheral:
     def iter_windows(self):
         for window, addr, sparse in self._windows:
             yield window, addr, sparse
+
+    def iter_events(self):
+        for event in self._events:
+            yield event
 
 
 class CSRBank:
@@ -134,6 +161,26 @@ class PeripheralBridge(Elaboratable):
                                  sparse=window_sparse,
                                  extend=True)
 
+        events = list(periph.iter_events())
+        if len(events) > 0:
+            self.int_src = InterruptSource(events, name=periph.name)
+            self.irq = self.int_src.irq
+
+            csr_mux = csr.Multiplexer(addr_width=1,
+                                      data_width=8,
+                                      alignment=alignment,
+                                      name="ev")
+            csr_mux.add(self.int_src.status, extend=True)
+            csr_mux.add(self.int_src.pending, extend=True)
+            csr_mux.add(self.int_src.enable, extend=True)
+
+            csr_bridge = WishboneCSRBridge(csr_mux.bus, data_width=data_width)
+            self.bus_decoder.add(csr_bridge.wb_bus, extend=True)
+            self.csr_subs.append((csr_mux, csr_bridge))
+        else:
+            self.int_src = None
+            self.irq = None
+
         self.bus = self.bus_decoder.bus
 
     def elaborate(self, platform):
@@ -142,6 +189,9 @@ class PeripheralBridge(Elaboratable):
         for i, (csr_mux, csr_bridge) in enumerate(self.csr_subs):
             m.submodules["csr_mux_{}".format(i)] = csr_mux
             m.submodules["csr_bridge_{}".format(i)] = csr_bridge
+
+        if self.int_src is not None:
+            m.submodules.int_src = self.int_src
 
         m.submodules.bus_decoder = self.bus_decoder
 
