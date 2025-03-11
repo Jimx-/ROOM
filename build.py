@@ -497,6 +497,7 @@ class Top(Elaboratable):
         m.d.comb += plic.interrupts[0].eq(self.uart.irq)
 
         soc.add_peripheral('sdc', self.sdc)
+        m.d.comb += plic.interrupts[1].eq(self.sdc.irq)
 
         soc.add_peripheral('clint', clint)
 

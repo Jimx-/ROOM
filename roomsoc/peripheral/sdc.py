@@ -3,6 +3,7 @@ from amaranth.lib.fifo import SyncFIFO
 from enum import IntEnum
 
 from .peripheral import Peripheral
+from .event import IRQLine
 
 
 class SDControllerReg(IntEnum):
@@ -759,6 +760,7 @@ class SDControllerBase(Peripheral, Elaboratable):
 
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
+        self.irq = IRQLine()
 
     def elaborate(self, platform):
         m = Module()
@@ -882,11 +884,17 @@ class SDController(SDControllerBase):
         with m.If(self._cmd_isr.w_stb):
             m.d.sync += cmd_int_rst.eq(1)
 
+        with m.If(self._cmd_ier.w_stb):
+            m.d.sync += self._cmd_ier.r_data.eq(self._cmd_ier.w_data)
+
         data_int_rst = Signal()
         with m.If(clock_posedge):
             m.d.sync += data_int_rst.eq(0)
         with m.If(self._data_isr.w_stb):
             m.d.sync += data_int_rst.eq(1)
+
+        with m.If(self._data_ier.w_stb):
+            m.d.sync += self._data_ier.r_data.eq(self._data_ier.w_data)
 
         with m.If(self._blksize.w_stb):
             m.d.sync += self._blksize.r_data.eq(self._blksize.w_data)
@@ -1021,6 +1029,10 @@ class SDController(SDControllerBase):
         m.d.comb += self._buffer.r_data.eq(data_fifo.r_data)
         with m.If(self._buffer.r_stb):
             m.d.comb += data_fifo.r_en.eq(1)
+
+        m.d.comb += self.irq.eq(
+            (self._cmd_isr.r_data & self._cmd_ier.r_data).any()
+            | (self._data_isr.r_data & self._data_ier.r_data).any())
 
         return m
 

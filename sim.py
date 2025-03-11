@@ -286,6 +286,7 @@ class Top(Elaboratable):
 
         sdc = MockSDController()
         soc.add_peripheral('sdc', sdc)
+        m.d.comb += plic.interrupts[1].eq(sdc.irq)
 
         soc.add_peripheral('clint', clint)
 
