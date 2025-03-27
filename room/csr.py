@@ -173,8 +173,10 @@ class CSRFile(HasCoreParams, Elaboratable):
             m.d.comb += self.mcycleh.r.eq(cycles[32:])
 
         for p in self._ports:
+            rmw_data = Signal(self.width)
+
             with m.Switch(p.addr):
-                w_data = (Mux(p.cmd[1], p.r_data, 0)
+                w_data = (Mux(p.cmd[1], rmw_data, 0)
                           | p.w_data) & ~Mux(p.cmd[0] & p.cmd[1], p.w_data, 0)
 
                 for addr, csr in self._csr_map.items():
@@ -182,6 +184,7 @@ class CSRFile(HasCoreParams, Elaboratable):
                         m.d.comb += [
                             csr.re.eq(p.cmd[1]),
                             p.r_data.eq(csr.r),
+                            rmw_data.eq(csr.r),
                         ]
 
                         if self.use_supervisor and ((addr == csrnames.mip) or
