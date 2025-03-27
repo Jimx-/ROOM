@@ -96,15 +96,15 @@ def mstatus_layout(xlen):
 def mip_layout(xlen):
     return [
         ("usip", 1, CSRAccess.RO),
-        ("ssip", 1, CSRAccess.RO),
+        ("ssip", 1, CSRAccess.RW),
         ("zero0", 1, CSRAccess.RO),
         ("msip", 1, CSRAccess.RW),
         ("utip", 1, CSRAccess.RO),
-        ("stip", 1, CSRAccess.RO),
+        ("stip", 1, CSRAccess.RW),
         ("zero1", 1, CSRAccess.RO),
         ("mtip", 1, CSRAccess.RW),
         ("ueip", 1, CSRAccess.RO),
-        ("seip", 1, CSRAccess.RO),
+        ("seip", 1, CSRAccess.RW),
         ("zero2", 1, CSRAccess.RO),
         ("meip", 1, CSRAccess.RW),
         ("zero3", xlen - 12, CSRAccess.RO),
@@ -261,7 +261,13 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
             self.mip.r.msip.eq(self.interrupts.msip),
         ]
 
-        pending_interrupts = self.mip.r & self.mie.r
+        mip_r = MIP(self.xlen)
+        m.d.comb += [
+            mip_r.eq(self.mip.r),
+            mip_r.seip.eq(self.mip.r.seip | self.interrupts.seip),
+        ]
+
+        pending_interrupts = mip_r & self.mie.r
         d_interrupts = Signal(self.xlen)
         m_interrupts = Signal(self.xlen)
         s_interrupts = Signal(self.xlen)
@@ -269,11 +275,11 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
             self.interrupts.debug)
 
         with m.If((self.prv <= PrivilegeMode.S) | self.mstatus.r.mie):
-            m.d.comb += m_interrupts.eq(pending_interrupts & ~self.mideleg)
+            m.d.comb += m_interrupts.eq(pending_interrupts & ~self.mideleg.r)
 
         with m.If((self.prv < PrivilegeMode.S)
                   | ((self.prv == PrivilegeMode.S) & self.mstatus.r.sie)):
-            m.d.comb += s_interrupts.eq(pending_interrupts & self.mideleg)
+            m.d.comb += s_interrupts.eq(pending_interrupts & self.mideleg.r)
 
         priority = [
             Cause.DEBUG_INTERRUPT,
