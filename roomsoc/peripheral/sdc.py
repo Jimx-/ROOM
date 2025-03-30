@@ -665,7 +665,7 @@ class SDDataPHY(Elaboratable):
                                 self.fifo_we.eq((data_index[:3] == 7)
                                                 |
                                                 ((xfr_count == data_cycles - 1)
-                                                 & ~block_count)),
+                                                 & ~block_count.any())),
                                 data_out[31 - (data_index[:3] << 2)].eq(
                                     data_in[3]),
                                 data_out[30 - (data_index[:3] << 2)].eq(
@@ -680,7 +680,7 @@ class SDDataPHY(Elaboratable):
                                 self.fifo_we.eq((data_index == 31)
                                                 |
                                                 ((xfr_count == data_cycles - 1)
-                                                 & ~block_count)),
+                                                 & ~block_count.any())),
                                 data_out[31 - data_index].eq(data_in[0]),
                             ]
 
