@@ -54,7 +54,7 @@ private:
     int resp_count_;
 
     DataState data_state_;
-    std::unique_ptr<char[]> data_buf_;
+    std::unique_ptr<unsigned char[]> data_buf_;
     int data_count_;
     int data_xfr_count_;
     int data_crc_[4];
@@ -71,12 +71,14 @@ private:
     void handle_cmd3();
     void handle_cmd7(uint32_t arg);
     void handle_cmd8(uint32_t arg);
+    void handle_cmd9(uint32_t arg);
     void handle_cmd16(uint32_t arg);
     void handle_cmd17(uint32_t arg);
     void handle_cmd55(uint32_t arg);
 
     void handle_acmd6(uint32_t arg);
     void handle_acmd41(uint32_t arg);
+    void handle_acmd51(uint32_t arg);
 };
 
 } // namespace room

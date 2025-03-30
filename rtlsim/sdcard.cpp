@@ -35,9 +35,9 @@ SDCard::SDCard(std::string_view image)
         throw std::runtime_error("Failed to open SD image");
     }
 
-    data_buf_ = std::make_unique<char[]>(512);
+    data_buf_ = std::make_unique<unsigned char[]>(512);
 
-    card_status_ = 0;
+    card_status_ = 0x120;
 }
 
 SDCard::~SDCard()
@@ -171,6 +171,9 @@ void SDCard::handle_command()
         case 41:
             handle_acmd41(argument);
             break;
+        case 51:
+            handle_acmd51(argument);
+            break;
         }
 
         cmd_is_app_ = false;
@@ -187,6 +190,9 @@ void SDCard::handle_command()
             break;
         case 8:
             handle_cmd8(argument);
+            break;
+        case 9:
+            handle_cmd9(argument);
             break;
         case 16:
             handle_cmd16(argument);
@@ -228,6 +234,13 @@ void SDCard::handle_cmd8(uint32_t arg)
     resp_status_ = 0x1aa;
 }
 
+void SDCard::handle_cmd9(uint32_t arg)
+{
+    resp_type_ = MMC_RSP_R2;
+    resp_r2_[0] = 0x5b590001400e0032UL;
+    resp_r2_[1] = 0xa404000dbd37f80UL;
+}
+
 void SDCard::handle_cmd16(uint32_t arg)
 {
     block_len = arg;
@@ -252,7 +265,20 @@ void SDCard::handle_acmd6(uint32_t arg)
 void SDCard::handle_acmd41(uint32_t arg)
 {
     resp_type_ = MMC_RSP_R3;
-    resp_status_ = 1UL << 31;
+    resp_status_ = 0x40ff8000 | (arg == 0 ? 0 : (1UL << 31));
+}
+
+void SDCard::handle_acmd51(uint32_t arg)
+{
+    resp_type_ = MMC_RSP_R1;
+    resp_status_ = 0;
+
+    data_buf_[0] = 0x02;
+    data_buf_[1] = 0x45;
+    data_buf_[2] = 0x80;
+    data_buf_[3] = 0x43;
+    data_buf_[4] = data_buf_[5] = data_buf_[6] = data_buf_[7] = 0;
+    data_count_ = 8;
 }
 
 void SDCard::handle_cmd17(uint32_t arg)
@@ -261,7 +287,7 @@ void SDCard::handle_cmd17(uint32_t arg)
     resp_status_ = 0;
 
     image_.seekg(arg * 512, std::ios::beg);
-    image_.read(data_buf_.get(), 512);
+    image_.read((char*)data_buf_.get(), 512);
     data_count_ = 512;
 }
 
