@@ -127,3 +127,34 @@ class Arbiter(Elaboratable):
             ready &= ~(self.inp[i].fire)
 
         return m
+
+
+class PopCount(Elaboratable):
+
+    def __init__(self, n):
+        self.n = n
+
+        self.inp = Signal(n)
+        self.out = Signal(range(n + 1))
+
+    def elaborate(self, platform):
+        m = Module()
+
+        def subcount(x):
+            count = Signal.like(self.out)
+
+            match len(x):
+                case 0:
+                    m.d.comb += count.eq(0)
+                case 1:
+                    m.d.comb += count.eq(x)
+                case _:
+                    left = subcount(x[:len(x) // 2])
+                    right = subcount(x[len(x) // 2:])
+                    m.d.comb += count.eq(left + right)
+
+            return count
+
+        m.d.comb += self.out.eq(subcount(self.inp))
+
+        return m
