@@ -255,6 +255,8 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
     def elaborate(self, platform):
         m = Module()
 
+        self.mstatus.r.mpp.reset = PrivilegeMode.M
+
         m.d.comb += [
             self.mip.r.meip.eq(self.interrupts.meip),
             self.mip.r.mtip.eq(self.interrupts.mtip),
