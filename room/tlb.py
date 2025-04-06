@@ -574,7 +574,7 @@ class TLB(HasCoreParams, Elaboratable):
                     priv_rw_array[w][i].eq((
                         (~priv_s | self.status.sum) & entry.u)
                                            | (priv_s & ~entry.u)),
-                    priv_x_array[w][i].eq(~(priv_s & entry.u)),
+                    priv_x_array[w][i].eq(priv_s ^ entry.u),
                     #
                     r_ok_array[w][i].eq(priv_rw_array[w][i]
                                         & (entry.sr
