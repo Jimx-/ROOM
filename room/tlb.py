@@ -461,15 +461,18 @@ class TLB(HasCoreParams, Elaboratable):
         # PMA checks
         #
 
-        mpu_ppn = [
-            Mux(refill_done, self.ptw_resp.bits.pte.ppn,
-                s1_req[w].vaddr[self.pg_offset_bits:])
-            for w in range(self.req_width)
-        ]
         mpu_paddr = [
-            Cat(s1_req[w].vaddr[:self.pg_offset_bits], mpu_ppn[w])
+            Signal(self.paddr_bits, name=f'mpu_paddr{w}')
             for w in range(self.req_width)
         ]
+
+        for w in range(self.req_width):
+            m.d.comb += mpu_paddr[w].eq(s1_req[w].vaddr)
+
+            with m.If(refill_done):
+                m.d.comb += mpu_paddr[w].eq(
+                    Cat(Const(0, self.pg_offset_bits),
+                        self.ptw_resp.bits.pte.ppn))
 
         for w in range(self.req_width):
             pma = PMAChecker(self.params)
