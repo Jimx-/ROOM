@@ -1308,6 +1308,11 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                                   for w in range(self.mem_width))
             load_forward_stq_idx = Signal(range(self.stq_size))
 
+            m.d.comb += load_forward_stq_idx.eq(ldq[i].forward_stq_idx)
+            for w in range(self.mem_width):
+                with m.If(load_forwarders[w]):
+                    m.d.comb += load_forward_stq_idx.eq(s2_forward_stq_idx[w])
+
             for w in range(self.mem_width):
                 with m.If(do_st_search[w] & ldq[i].valid & ldq[i].addr_valid
                           & (ldq[i].executed | ldq[i].succeeded
