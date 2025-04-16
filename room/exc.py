@@ -476,7 +476,8 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         wfi_active = Signal()
         with m.If(insn_wfi & ~self.single_step & ~self.debug_mode):
             m.d.sync += wfi_active.eq(1)
-        with m.If(self.interrupts.debug | exception):
+        with m.If(pending_interrupts.any() | self.interrupts.debug
+                  | exception):
             m.d.sync += wfi_active.eq(0)
 
         with m.If(exception):
