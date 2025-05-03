@@ -200,7 +200,7 @@ class Ipv4Checksum(Elaboratable):
             acc = subsum[i] + self.data_in.bits.data[i * 16:(i + 1) * 16]
             acc = (acc + (acc >> 16)) & 0xffff
 
-            with m.If(~self.skip_checksum | (idx != 5)):
+            with m.If((not self.skip_checksum) | (idx != 5)):
                 with m.If((idx >> 1) < Mux(
                         count == 0, self.data_in.bits.data[:4], header_len)):
                     m.d.comb += subsum_next[i].eq(acc)
