@@ -8,7 +8,7 @@ from room.fu import ExecResp
 from room.branch import BranchUpdate
 from room.rob import CommitReq, Exception
 from room.exc import Cause, MStatus
-from room.utils import wrap_incr, is_older
+from room.utils import wrap_incr, is_older, sign_extend
 from room.dcache import LoadGen, StoreGen, DCache, SimpleDCache
 from room.mmu import PTBR, PageTableWalker, CoreMemRequest, CoreMemResponse
 from room.tlb import TLB
@@ -381,7 +381,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     lsu_debug.valid.eq(req.valid),
                     lsu_debug.bits.uop_id.eq(req.bits.uop.uop_id),
                     lsu_debug.bits.opcode.eq(req.bits.uop.opcode),
-                    lsu_debug.bits.addr.eq(req.bits.addr),
+                    lsu_debug.bits.addr.eq(
+                        sign_extend(req.bits.addr, self.xlen)),
                     lsu_debug.bits.data.eq(req.bits.data),
                     lsu_debug.bits.prs1.eq(req.bits.uop.prs1),
                     lsu_debug.bits.prs2.eq(req.bits.uop.prs2),
