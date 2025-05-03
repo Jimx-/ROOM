@@ -238,11 +238,15 @@ void Tracer::trace_commit(int uop_id)
     }
 }
 
-void Tracer::trace_exception(int64_t cause)
+void Tracer::trace_exception(int64_t cause, uint32_t insn)
 {
 #ifdef DROMAJO
     dromajo_cosim_raise_trap(dromajo_state_, 0, cause);
 #endif
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("EXC {} {:x}", cause, insn) << std::endl;
+    }
 }
 
 void Tracer::trace_branch_mispredict(int mispredict_mask)
@@ -372,7 +376,7 @@ extern "C" void dpi_trace_exception(int64_t cause, uint32_t insn)
 {
     spdlog::trace("EXC cause={} insn={:#x}", cause, insn);
 #ifdef ITRACE
-    room::Tracer::get_singleton().trace_exception(cause);
+    room::Tracer::get_singleton().trace_exception(cause, insn);
 #endif
 }
 
