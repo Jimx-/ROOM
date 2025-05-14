@@ -315,7 +315,10 @@ class Core(HasCoreParams, Elaboratable):
         exec_units = m.submodules.exec_units = ExecUnits(
             False, self.params, sim_debug=self.sim_debug)
 
-        num_int_iss_wakeup_ports = exec_units.irf_write_ports + self.mem_width
+        num_fast_wakeup_ports = len([eu for eu in exec_units if eu.can_bypass])
+        num_always_bypass = len([eu for eu in exec_units if eu.always_bypass])
+
+        num_int_iss_wakeup_ports = exec_units.irf_write_ports + self.mem_width + num_fast_wakeup_ports - num_always_bypass
         num_int_ren_wakeup_ports = num_int_iss_wakeup_ports
         num_fp_wakeup_ports = len(fp_pipeline.wakeups) if self.use_fpu else 0
 
@@ -695,6 +698,20 @@ class Core(HasCoreParams, Elaboratable):
         # Wakeup (issue & rename)
         #
 
+        iqs_mem_int = [
+            issue_units[typ]
+            for typ in (IssueQueueType.MEM, IssueQueueType.INT)
+        ]
+
+        iss_uops = []
+        iss_fu_types = []
+        iss_valids = Signal(
+            sum([p['issue_width'] for p in self.issue_params.values()]))
+        for iq in iqs_mem_int:
+            iss_uops.extend(iq.iss_uops)
+            iss_fu_types.extend(iq.fu_types)
+        m.d.comb += iss_valids.eq(Cat(iq.iss_valids for iq in iqs_mem_int))
+
         mem_wbarb = m.submodules.mem_wbarb = Arbiter(1 + self.use_fpu,
                                                      ExecResp, self.xlen,
                                                      self.params)
@@ -713,7 +730,7 @@ class Core(HasCoreParams, Elaboratable):
             arb_wakeup.valid.eq(
                 mem_wbarb.out.fire
                 & mem_wbarb.out.bits.uop.rf_wen()
-                & mem_wbarb.out.bits.uop.dst_rtype == RegisterType.FIX),
+                & (mem_wbarb.out.bits.uop.dst_rtype == RegisterType.FIX)),
         ]
 
         int_iss_wakeups.append(arb_wakeup)
@@ -725,33 +742,55 @@ class Core(HasCoreParams, Elaboratable):
             wakeup = Valid(ExecResp,
                            self.xlen,
                            self.params,
-                           name=f'iss_ren_wakeup{w}')
+                           name=f'iss_ren_slow_wakeup{w}')
             m.d.comb += [
                 wakeup.bits.uop.eq(resp.bits.uop),
                 wakeup.valid.eq(resp.valid & resp.bits.uop.rf_wen()
-                                & resp.bits.uop.dst_rtype == RegisterType.FIX),
+                                &
+                                (resp.bits.uop.dst_rtype == RegisterType.FIX)),
             ]
 
             int_iss_wakeups.append(wakeup)
             int_ren_wakeups.append(wakeup)
 
-        for i, eu in enumerate(exec_units, self.mem_width):
+        for i, eu in enumerate(exec_units):
             if eu.irf_write:
                 resp = eu.iresp
 
-                wakeup = Valid(ExecResp,
-                               self.xlen,
-                               self.params,
-                               name=f'iss_ren_wakeup{i}')
-                m.d.comb += [
-                    wakeup.bits.uop.eq(resp.bits.uop),
-                    wakeup.valid.eq(
-                        resp.valid & resp.bits.uop.rf_wen()
-                        & resp.bits.uop.dst_rtype == RegisterType.FIX),
-                ]
+                if eu.can_bypass:
+                    fast_wakeup = Valid(
+                        ExecResp,
+                        self.xlen,
+                        self.params,
+                        name=f'iss_ren_fast_wakeup{self.mem_width + i}')
+                    m.d.comb += [
+                        fast_wakeup.bits.uop.eq(iss_uops[i]),
+                        fast_wakeup.valid.eq(
+                            iss_valids[i]
+                            & iss_uops[i].bypassable
+                            & (iss_uops[i].dst_rtype == RegisterType.FIX)
+                            & iss_uops[i].ldst_valid),
+                    ]
 
-                int_iss_wakeups.append(wakeup)
-                int_ren_wakeups.append(wakeup)
+                    int_iss_wakeups.append(fast_wakeup)
+                    int_ren_wakeups.append(fast_wakeup)
+
+                if not eu.always_bypass:
+                    slow_wakeup = Valid(
+                        ExecResp,
+                        self.xlen,
+                        self.params,
+                        name=f'iss_ren_slow_wakeup{self.mem_width + i}')
+                    m.d.comb += [
+                        slow_wakeup.bits.uop.eq(resp.bits.uop),
+                        slow_wakeup.valid.eq(
+                            resp.valid & resp.bits.uop.rf_wen()
+                            & ~resp.bits.uop.bypassable
+                            & (resp.bits.uop.dst_rtype == RegisterType.FIX)),
+                    ]
+
+                    int_iss_wakeups.append(slow_wakeup)
+                    int_ren_wakeups.append(slow_wakeup)
 
         for rwp, wu in zip(ren_stage.wakeup_ports, int_ren_wakeups):
             m.d.comb += rwp.eq(wu)
@@ -771,31 +810,20 @@ class Core(HasCoreParams, Elaboratable):
         # Register read
         #
 
-        iqs_mem_int = [
-            issue_units[typ]
-            for typ in (IssueQueueType.MEM, IssueQueueType.INT)
-        ]
-
-        iss_uops = []
-        iss_fu_types = []
-        iss_valids = Signal(
-            sum([p['issue_width'] for p in self.issue_params.values()]))
-        for iq in iqs_mem_int:
-            iss_uops.extend(iq.iss_uops)
-            iss_fu_types.extend(iq.fu_types)
-        m.d.comb += iss_valids.eq(Cat([iq.iss_valids for iq in iqs_mem_int]))
-
         iregfile = m.submodules.iregfile = RegisterFile(
             rports=exec_units.irf_read_ports,
             wports=exec_units.irf_write_ports + self.mem_width,
             num_regs=self.num_int_pregs,
-            data_width=self.xlen)
+            data_width=self.xlen,
+            bypassable_mask=[False] * self.mem_width +
+            exec_units.bypassable_mask)
 
         iregread = m.submodules.iregread = RegisterRead(
             issue_width=sum(
                 [p['issue_width'] for p in self.issue_params.values()]),
             num_rports=exec_units.irf_read_ports,
             rports_array=[2] * exec_units.irf_readers,
+            num_bypass_ports=exec_units.bypass_ports,
             reg_width=self.xlen,
             params=self.params)
 
@@ -843,12 +871,18 @@ class Core(HasCoreParams, Elaboratable):
         # Execute
         #
 
+        bypass_idx = 0
         for eu, req in zip([eu for eu in exec_units if eu.irf_read],
                            iregread.exec_reqs):
             m.d.comb += [
                 req.connect(eu.req),
                 eu.req.bits.kill.eq(rob_flush_d1.valid),
             ]
+
+            if eu.can_bypass:
+                for byp in eu.bypass:
+                    m.d.comb += iregread.bypass[bypass_idx].eq(byp)
+                    bypass_idx += 1
 
         br_infos = [
             BranchResolution(self.params, name=f'br_res{i}')

@@ -216,6 +216,7 @@ class MicroOp(HasCoreParams, Record):
             ('bp_exc_if', 1),
             ('exception', 1),
             ('exc_cause', self.xlen),
+            ('bypassable', 1),
             ('ldst', 5),
             ('lrs1', 5),
             ('lrs2', 5),

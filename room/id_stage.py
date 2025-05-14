@@ -255,6 +255,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                     uop.fu_type.eq(FUType.ALU),
                     uop.dst_rtype.eq(RegisterType.FIX),
                     uop.lrs1_rtype.eq(RegisterType.FIX),
+                    uop.bypassable.eq(1),
                     IMM_SEL_I,
                 ]
 
@@ -341,6 +342,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                         m.d.comb += [
                             UOPC(getattr(UOpCode, name)),
                             uop.fu_type.eq(FUType.ALU),
+                            uop.bypassable.eq(1),
                         ]
 
                 for name in ['MUL', 'MULH', 'MULHU', 'MULHSU']:

@@ -120,6 +120,7 @@ class FPPipeline(HasCoreParams, Elaboratable):
             issue_width=issue_unit.issue_width,
             num_rports=exec_units.frf_read_ports,
             rports_array=[3] * exec_units.frf_readers,
+            num_bypass_ports=0,
             reg_width=self.flen,
             params=self.params)
 

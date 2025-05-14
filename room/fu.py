@@ -55,13 +55,24 @@ class ExecResp(HasCoreParams):
 
 class FunctionalUnit(HasCoreParams, Elaboratable):
 
-    def __init__(self, data_width, params, is_jmp=False, is_alu=False):
+    def __init__(self,
+                 data_width,
+                 num_bypass_stages,
+                 params,
+                 is_jmp=False,
+                 is_alu=False):
         super().__init__(params)
 
+        self.num_bypass_stages = num_bypass_stages
         self.is_jmp = is_jmp
 
         self.req = Decoupled(ExecReq, data_width, params)
         self.resp = Decoupled(ExecResp, data_width, params)
+
+        self.bypass = [
+            Valid(ExecResp, data_width, self.params, name=f'bypass{i}')
+            for i in range(num_bypass_stages)
+        ]
 
         self.br_update = BranchUpdate(params)
 
@@ -76,6 +87,7 @@ class PipelinedFunctionalUnit(FunctionalUnit):
 
     def __init__(self,
                  num_stages,
+                 num_bypass_stages,
                  data_width,
                  params,
                  is_jmp=False,
@@ -83,7 +95,11 @@ class PipelinedFunctionalUnit(FunctionalUnit):
         self.params = params
         self.num_stages = num_stages
 
-        super().__init__(data_width, params, is_jmp=is_jmp, is_alu=is_alu)
+        super().__init__(data_width,
+                         num_bypass_stages,
+                         params,
+                         is_jmp=is_jmp,
+                         is_alu=is_alu)
 
     def elaborate(self, platform):
         m = Module()
@@ -128,6 +144,13 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                     self.br_update.get_new_br_mask(self.uops[self.num_stages -
                                                              1].br_mask)),
             ]
+
+            if self.num_bypass_stages > 0:
+                m.d.comb += self.bypass[0].bits.uop.eq(self.req.bits.uop)
+
+                for i in range(1, self.num_bypass_stages):
+                    m.d.comb += self.bypass[i].bits.uop.eq(self.uops[i - 1])
+
         else:
             m.d.comb += [
                 self.resp.valid.eq(
@@ -146,6 +169,7 @@ class ALUUnit(PipelinedFunctionalUnit):
 
     def __init__(self, data_width, params, is_jmp=False, num_stages=1):
         super().__init__(num_stages,
+                         num_stages,
                          data_width,
                          params,
                          is_jmp=is_jmp,
@@ -295,13 +319,27 @@ class ALUUnit(PipelinedFunctionalUnit):
             self.resp.bits.data.eq(data[self.num_stages - 1]),
         ]
 
+        #
+        # Bypass
+        #
+
+        m.d.comb += [
+            self.bypass[0].valid.eq(self.req.valid),
+            self.bypass[0].bits.data.eq(alu.out),
+        ]
+        for i in range(1, self.num_stages):
+            m.d.comb += [
+                self.bypass[i].valid.eq(self.valids[i - 1]),
+                self.bypass[i].bits.data.eq(data[i - 1]),
+            ]
+
         return m
 
 
 class AddrGenUnit(PipelinedFunctionalUnit):
 
     def __init__(self, params):
-        super().__init__(0, params['xlen'], params)
+        super().__init__(0, 0, params['xlen'], params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -355,7 +393,7 @@ class MultiplierUnit(PipelinedFunctionalUnit):
         self.width = width
         self.latency = latency
 
-        super().__init__(latency, width, params)
+        super().__init__(latency, 0, width, params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -381,7 +419,7 @@ class IterativeFunctionalUnit(FunctionalUnit):
 
         self.do_kill = Signal()
 
-        super().__init__(data_width, params)
+        super().__init__(data_width, 0, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -443,7 +481,7 @@ class IntToFPUnit(PipelinedFunctionalUnit):
         self.width = width
         self.latency = latency
 
-        super().__init__(latency, width, params)
+        super().__init__(latency, 0, width, params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -496,7 +534,7 @@ class FPUUnit(PipelinedFunctionalUnit):
     def __init__(self, width, params):
         self.width = width
 
-        super().__init__(params['fma_latency'], width, params)
+        super().__init__(params['fma_latency'], 0, width, params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)

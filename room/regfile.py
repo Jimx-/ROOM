@@ -3,10 +3,10 @@ from amaranth.hdl.rec import DIR_FANIN, DIR_FANOUT
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
-from room.fu import ExecReq
+from room.fu import ExecReq, ExecResp
 from room.branch import BranchUpdate
 
-from roomsoc.interconnect.stream import Decoupled
+from roomsoc.interconnect.stream import Decoupled, Valid
 
 
 class WritebackDebug(HasCoreParams, Record):
@@ -51,10 +51,16 @@ class RFWritePort(Record):
 
 class RegisterFile(Elaboratable):
 
-    def __init__(self, rports, wports, num_regs=32, data_width=32):
+    def __init__(self,
+                 rports,
+                 wports,
+                 num_regs=32,
+                 data_width=32,
+                 bypassable_mask=None):
         self.num_regs = num_regs
         addr_width = Shape.cast(range(num_regs)).width
         self.data_width = data_width
+        self.bypassable_mask = bypassable_mask
 
         self.read_ports = [
             RFReadPort(addr_width, self.data_width, name=f'read_port{i}')
@@ -94,6 +100,19 @@ class RegisterFile(Elaboratable):
                 mwp.en.eq(wp.valid),
                 wp.ready.eq(1),
             ]
+
+        assert self.bypassable_mask is None or len(
+            self.bypassable_mask) == len(self.write_ports)
+
+        if self.bypassable_mask is not None and any(self.bypassable_mask):
+            for rp in self.read_ports:
+                raddr = Signal.like(rp.addr)
+                m.d.sync += raddr.eq(rp.addr)
+
+                for wp, b in zip(self.write_ports, self.bypassable_mask):
+                    if b:
+                        with m.If(wp.valid & (wp.bits.addr == raddr)):
+                            m.d.comb += rp.data.eq(wp.bits.data)
 
         return m
 
@@ -385,8 +404,8 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
 
 class RegisterRead(HasCoreParams, Elaboratable):
 
-    def __init__(self, issue_width, num_rports, rports_array, reg_width,
-                 params):
+    def __init__(self, issue_width, num_rports, rports_array, num_bypass_ports,
+                 reg_width, params):
         super().__init__(params)
 
         self.issue_width = issue_width
@@ -407,6 +426,11 @@ class RegisterRead(HasCoreParams, Elaboratable):
         self.exec_reqs = [
             Decoupled(ExecReq, reg_width, self.params, name=f'exec_req{i}')
             for i in range(self.issue_width)
+        ]
+
+        self.bypass = [
+            Valid(ExecResp, reg_width, self.params, name=f'bypass{i}')
+            for i in range(num_bypass_ports)
         ]
 
         self.br_update = BranchUpdate(params)
@@ -475,9 +499,38 @@ class RegisterRead(HasCoreParams, Elaboratable):
 
             idx += nrps
 
+        bypass_rs1_data = [
+            Signal(self.data_width, name=f'bypass_rs1_data{i}')
+            for i in range(self.issue_width)
+        ]
+        bypass_rs2_data = [
+            Signal(self.data_width, name=f'bypass_rs2_data{i}')
+            for i in range(self.issue_width)
+        ]
+
+        for rrd_uop, bypass_data, rs1_data in zip(rrd_uops, bypass_rs1_data,
+                                                  rrd_rs1_data):
+            m.d.comb += bypass_data.eq(rs1_data)
+            for byp in self.bypass:
+                with m.If(byp.valid & (rrd_uop.prs1 == byp.bits.uop.pdst)
+                          & (rrd_uop.prs1 != 0)
+                          & (byp.bits.uop.dst_rtype == RegisterType.FIX)
+                          & (rrd_uop.lrs1_rtype == RegisterType.FIX)):
+                    m.d.comb += bypass_data.eq(byp.bits.data)
+
+        for rrd_uop, bypass_data, rs2_data in zip(rrd_uops, bypass_rs2_data,
+                                                  rrd_rs2_data):
+            m.d.comb += bypass_data.eq(rs2_data)
+            for byp in self.bypass:
+                with m.If(byp.valid & (rrd_uop.prs2 == byp.bits.uop.pdst)
+                          & (rrd_uop.prs2 != 0)
+                          & (byp.bits.uop.dst_rtype == RegisterType.FIX)
+                          & (rrd_uop.lrs2_rtype == RegisterType.FIX)):
+                    m.d.comb += bypass_data.eq(byp.bits.data)
+
         for nrps, req, rs1_data, rs2_data, rs3_data in zip(
-                self.rports_array, self.exec_reqs, rrd_rs1_data, rrd_rs2_data,
-                rrd_rs3_data):
+                self.rports_array, self.exec_reqs, bypass_rs1_data,
+                bypass_rs2_data, rrd_rs3_data):
             if nrps > 0:
                 m.d.sync += req.bits.rs1_data.eq(rs1_data)
             if nrps > 1:

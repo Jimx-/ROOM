@@ -30,6 +30,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
 
     def __init__(self,
                  data_width,
+                 num_bypass_stages,
                  params,
                  irf_read=False,
                  irf_write=False,
@@ -37,6 +38,8 @@ class ExecUnit(HasCoreParams, Elaboratable):
                  frf_write=False,
                  mem_irf_write=False,
                  mem_frf_write=False,
+                 can_bypass=False,
+                 always_bypass=False,
                  has_jmp_unit=False,
                  has_alu=False,
                  has_mul=False,
@@ -51,12 +54,15 @@ class ExecUnit(HasCoreParams, Elaboratable):
         super().__init__(params)
 
         self.data_width = data_width
+        self.num_bypass_stages = num_bypass_stages
         self.irf_read = irf_read
         self.irf_write = irf_write
         self.frf_read = frf_read
         self.frf_write = frf_write
         self.mem_irf_write = mem_irf_write
         self.mem_frf_write = mem_frf_write
+        self.can_bypass = can_bypass
+        self.always_bypass = always_bypass
         self.has_jmp_unit = has_jmp_unit
         self.has_alu = has_alu
         self.has_mul = has_mul
@@ -84,6 +90,11 @@ class ExecUnit(HasCoreParams, Elaboratable):
 
         if self.mem_frf_write:
             self.mem_fresp = Decoupled(ExecResp, self.data_width, params)
+
+        self.bypass = [
+            Valid(ExecResp, self.data_width, self.params, name=f'bypass{i}')
+            for i in range(num_bypass_stages)
+        ]
 
         self.br_update = BranchUpdate(params)
 
@@ -132,10 +143,12 @@ class ALUExecUnit(ExecUnit):
                  sim_debug=False,
                  name=None):
         super().__init__(params['xlen'],
+                         3 if has_alu and has_mul else (1 if has_alu else 0),
                          params,
                          irf_read=True,
                          irf_write=has_alu,
                          mem_frf_write=has_ifpu,
+                         can_bypass=has_alu,
                          has_jmp_unit=has_jmp_unit,
                          has_alu=has_alu,
                          has_mul=has_mul,
@@ -191,6 +204,9 @@ class ALUExecUnit(ExecUnit):
                 alu.br_update.eq(self.br_update),
                 self.br_res.eq(alu.br_res),
             ]
+
+            for byp, alu_byp in zip(self.bypass, alu.bypass):
+                m.d.comb += byp.eq(alu_byp)
 
             if self.has_jmp_unit:
                 m.d.comb += alu.get_pc.eq(self.get_pc)
@@ -297,6 +313,7 @@ class FPUExecUnit(ExecUnit):
                  sim_debug=False,
                  name=None):
         super().__init__(params['flen'],
+                         0,
                          params,
                          frf_read=True,
                          frf_write=True,
@@ -498,6 +515,15 @@ class ExecUnits(HasCoreParams, Elaboratable):
 
         self.frf_read_ports = self.frf_readers * 3
         self.frf_write_ports = self.frf_writers
+
+        self.bypass_ports = 0
+        for eu in self.exec_units:
+            if eu.can_bypass:
+                self.bypass_ports += eu.num_bypass_stages
+
+        self.bypassable_mask = [
+            eu.can_bypass for eu in self.exec_units if eu.irf_write
+        ]
 
     def __getitem__(self, key):
         return self.exec_units[key]
