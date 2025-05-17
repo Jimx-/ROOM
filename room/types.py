@@ -235,6 +235,7 @@ class MicroOp(HasCoreParams, Record):
                 ('pc', 32),
                 ('tmask', self.n_threads),
                 ('stall_warp', 1),
+                ('lsq_cid', range(self.n_cores)),
                 ('lsq_wid', range(self.n_warps)),
                 ('lsq_tid', range(self.n_threads)),
             ]

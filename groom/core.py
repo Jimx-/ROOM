@@ -9,6 +9,7 @@ from groom.ex_stage import ALUExecUnit
 from groom.fu import ExecResp
 from groom.csr import CSRFile
 from groom.lsu import LoadStoreUnit
+from room.dcache import DCacheReq, DCacheResp
 from groom.fp_pipeline import FPPipeline
 from groom.raster import RasterRequest
 
@@ -26,8 +27,22 @@ class Core(HasCoreParams, Elaboratable):
         super().__init__(params)
 
         self.reset_vector = Signal(32)
-        self.cache_enable = Signal()
         self.busy = Signal()
+
+        self.dcache_req = [
+            Decoupled(DCacheReq, params, name=f'dcache_req{i}')
+            for i in range(self.n_threads)
+        ]
+
+        self.dcache_resp = [
+            Valid(DCacheResp, self.params, name=f'dcache_resp{i}')
+            for i in range(self.n_threads)
+        ]
+
+        self.dcache_nack = [
+            Valid(DCacheReq, self.params, name=f'dcache_nack{i}')
+            for i in range(self.n_threads)
+        ]
 
         if self.use_raster:
             self.raster_req = Decoupled(RasterRequest, self.params)
@@ -39,21 +54,7 @@ class Core(HasCoreParams, Elaboratable):
                                  sink_id_width=4,
                                  name='ibus')
 
-        self.dbus = tl.Interface(data_width=64,
-                                 addr_width=32,
-                                 size_width=3,
-                                 source_id_width=8,
-                                 sink_id_width=4,
-                                 has_bce=True,
-                                 name='dbus')
-
-        self.dbus_mmio = tl.Interface(data_width=64,
-                                      addr_width=32,
-                                      size_width=3,
-                                      source_id_width=8,
-                                      name='dbus_mmio')
-
-        self.periph_buses = [self.ibus, self.dbus, self.dbus_mmio]
+        self.periph_buses = [self.ibus]
 
     def elaborate(self, platform):
         m = Module()
@@ -206,12 +207,17 @@ class Core(HasCoreParams, Elaboratable):
         #
         # Load/store unit
         #
-        lsu = m.submodules.lsu = LoadStoreUnit(self.dbus, self.dbus_mmio,
-                                               self.params)
-        m.d.comb += [
-            exec_unit.lsu_req.connect(lsu.exec_req),
-            lsu.cache_enable.eq(self.cache_enable),
-        ]
+        lsu = m.submodules.lsu = LoadStoreUnit(self.params)
+        m.d.comb += exec_unit.lsu_req.connect(lsu.exec_req)
+
+        for dcache_req, lsu_dcache_req in zip(self.dcache_req, lsu.dcache_req):
+            m.d.comb += lsu_dcache_req.connect(dcache_req)
+        for dcache_resp, lsu_dcache_resp in zip(self.dcache_resp,
+                                                lsu.dcache_resp):
+            m.d.comb += lsu_dcache_resp.eq(dcache_resp)
+        for dcache_nack, lsu_dcache_nack in zip(self.dcache_nack,
+                                                lsu.dcache_nack):
+            m.d.comb += lsu_dcache_nack.eq(dcache_nack)
 
         if self.use_fpu:
             m.d.comb += [
