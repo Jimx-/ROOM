@@ -6,7 +6,7 @@ from groom.fu import ExecResp
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
-from room.dcache import DCache, DCacheReq, DCacheResp
+from room.dcache import DCacheReq, DCacheResp
 from room.lsu import LoadGen, StoreGen
 from room.mmu import PMAChecker
 
@@ -269,13 +269,8 @@ class LSQEntry(HasCoreParams):
 
 class LoadStoreUnit(HasCoreParams, Elaboratable):
 
-    def __init__(self, dbus, dbus_mmio, params):
+    def __init__(self, params):
         super().__init__(params)
-
-        self.cache_enable = Signal()
-
-        self.dbus = dbus
-        self.dbus_mmio = dbus_mmio
 
         self.exec_req = Decoupled(ExecResp, self.xlen, params)
 
@@ -285,17 +280,24 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         self.fp_std = Decoupled(ExecResp, self.xlen, params)
 
+        self.dcache_req = [
+            Decoupled(DCacheReq, params, name=f'dcache_req{i}')
+            for i in range(self.n_threads)
+        ]
+
+        self.dcache_resp = [
+            Valid(DCacheResp, self.params, name=f'dcache_resp{i}')
+            for i in range(self.n_threads)
+        ]
+
+        self.dcache_nack = [
+            Valid(DCacheReq, self.params, name=f'dcache_nack{i}')
+            for i in range(self.n_threads)
+        ]
+
     def elaborate(self, platform):
         m = Module()
 
-        m.domains += ClockDomain('dcache', local=True)
-        m.d.comb += [
-            ClockSignal('dcache').eq(ClockSignal()),
-            ResetSignal('dcache').eq(~self.cache_enable),
-        ]
-
-        dcache = m.submodules.dcache = DomainRenamer('dcache')(DCache(
-            self.dbus, self.dbus_mmio, self.params))
         if self.use_smem:
             smem = m.submodules.smem = SharedMemory(self.params)
 
@@ -490,12 +492,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     s0_block_req[lsq_wakeup_idx][w].eq(dmem_req.fire),
                 ]
 
-            m.d.comb += dmem_req.connect(dcache.req[w])
+            m.d.comb += dmem_req.connect(self.dcache_req[w])
             if self.use_smem:
                 with m.If(dmem_is_smem):
                     m.d.comb += [
                         dmem_req.connect(smem.req[w]),
-                        dcache.req[w].valid.eq(0),
+                        self.dcache_req[w].valid.eq(0),
                     ]
 
         for i in range(self.n_warps):
@@ -508,24 +510,24 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         #
 
         for w in range(self.n_threads):
-            with m.If(dcache.nack[w].valid):
-                lsq_wid = dcache.nack[w].bits.uop.lsq_wid
+            with m.If(self.dcache_nack[w].valid):
+                lsq_wid = self.dcache_nack[w].bits.uop.lsq_wid
 
-                with m.Switch(dcache.nack[w].bits.uop.lsq_tid):
+                with m.Switch(self.dcache_nack[w].bits.uop.lsq_tid):
                     for t in range(self.n_threads):
                         with m.Case(t):
                             m.d.sync += lsq[lsq_wid].executed[t].eq(0)
 
-            with m.If(dcache.resp[w].valid):
-                lsq_wid = dcache.resp[w].bits.uop.lsq_wid
+            with m.If(self.dcache_resp[w].valid):
+                lsq_wid = self.dcache_resp[w].bits.uop.lsq_wid
 
-                with m.Switch(dcache.resp[w].bits.uop.lsq_tid):
+                with m.Switch(self.dcache_resp[w].bits.uop.lsq_tid):
                     for t in range(self.n_threads):
                         with m.Case(t):
                             m.d.sync += lsq[lsq_wid].succeeded[t].eq(1)
                             with m.If(lsq[lsq_wid].uop.is_load):
                                 m.d.sync += lsq[lsq_wid].data[t].eq(
-                                    dcache.resp[w].bits.data)
+                                    self.dcache_resp[w].bits.data)
 
             if self.use_smem:
                 with m.If(smem.nack[w].valid):

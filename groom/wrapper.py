@@ -1,5 +1,6 @@
 from amaranth import *
 
+from room.dcache import DCache
 from groom.core import Core
 from groom.ctrl import GroomController
 from groom.raster import RasterUnit
@@ -83,6 +84,10 @@ class Cluster(HasClusterParams, Elaboratable):
 
         m.submodules.l2cache = self.l2cache
 
+        #
+        # Cores
+        #
+
         cores = []
 
         a_arbiter = m.submodules.a_arbiter = tl.Arbiter(
@@ -91,22 +96,6 @@ class Cluster(HasClusterParams, Elaboratable):
             addr_width=32,
             size_width=3,
             source_id_width=self.l2cache.in_source_id_width)
-        mmio_a_arbiter = m.submodules.mmio_a_arbiter = tl.Arbiter(
-            tl.ChannelA,
-            data_width=64,
-            addr_width=32,
-            size_width=3,
-            source_id_width=5)
-
-        c_arbiter = m.submodules.c_arbiter = tl.Arbiter(
-            tl.ChannelC,
-            data_width=64,
-            addr_width=32,
-            size_width=3,
-            source_id_width=self.l2cache.in_source_id_width)
-
-        e_arbiter = m.submodules.e_arbiter = tl.Arbiter(
-            tl.ChannelE, sink_id_width=self.l2cache.in_sink_id_width)
 
         for i in range(self.num_cores):
             core_params = self.core_params.copy()
@@ -123,66 +112,107 @@ class Cluster(HasClusterParams, Elaboratable):
             setattr(m.submodules, f'core{i}', core)
             cores.append(core)
 
-            m.d.comb += [
-                core.reset_vector.eq(self.reset_vector),
-                core.cache_enable.eq(self.cache_enable),
-            ]
+            m.d.comb += core.reset_vector.eq(self.reset_vector)
 
             ibus_a = Decoupled(tl.ChannelA,
                                data_width=core.ibus.data_width,
                                addr_width=core.ibus.addr_width,
                                size_width=core.ibus.size_width,
                                source_id_width=core.ibus.source_id_width)
-            dbus_a = Decoupled(tl.ChannelA,
-                               data_width=core.dbus.data_width,
-                               addr_width=core.dbus.addr_width,
-                               size_width=core.dbus.size_width,
-                               source_id_width=core.dbus.source_id_width)
-            dbus_mmio_a = Decoupled(
-                tl.ChannelA,
-                data_width=core.dbus_mmio.data_width,
-                addr_width=core.dbus_mmio.addr_width,
-                size_width=core.dbus_mmio.size_width,
-                source_id_width=core.dbus_mmio.source_id_width)
             m.d.comb += [
                 core.ibus.a.connect(ibus_a),
                 ibus_a.bits.source.eq(
                     self.make_source(is_dbus=False,
                                      core_id=i,
                                      source=core.ibus.a.bits.source)),
-                core.dbus.a.connect(dbus_a),
-                dbus_a.bits.source.eq(
-                    self.make_source(is_dbus=True,
-                                     core_id=i,
-                                     source=core.dbus.a.bits.source)),
-                core.dbus_mmio.a.connect(dbus_mmio_a),
-                dbus_mmio_a.bits.source.eq(
-                    self.make_source(is_dbus=True,
-                                     core_id=i,
-                                     source=core.dbus_mmio.a.bits.
-                                     source[:self.dbus_mmio.source_id_width])),
             ]
 
             a_arbiter.add(ibus_a)
-            a_arbiter.add(dbus_a)
-            mmio_a_arbiter.add(dbus_mmio_a)
 
-            dbus_c = Decoupled(tl.ChannelC,
-                               data_width=core.dbus.data_width,
-                               addr_width=core.dbus.addr_width,
-                               size_width=core.dbus.size_width,
-                               source_id_width=core.dbus.source_id_width)
-            m.d.comb += [
-                core.dbus.c.connect(dbus_c),
-                dbus_c.bits.source.eq(
-                    self.make_source(is_dbus=True,
-                                     core_id=i,
-                                     source=core.dbus.c.bits.source)),
-            ]
+        #
+        # L1 data cache
+        #
 
-            c_arbiter.add(dbus_c)
+        m.domains += ClockDomain('dcache', local=True)
+        m.d.comb += [
+            ClockSignal('dcache').eq(ClockSignal()),
+            ResetSignal('dcache').eq(~self.cache_enable),
+        ]
 
-            e_arbiter.add(core.dbus.e)
+        dcache_bus = tl.Interface(data_width=64,
+                                  addr_width=32,
+                                  size_width=3,
+                                  source_id_width=8,
+                                  sink_id_width=4,
+                                  has_bce=True,
+                                  name='dache_bus')
+
+        dcache_params = self.core_params.copy()
+        dcache_params['pma_regions'] = self.pma_regions
+        dcache = m.submodules.dcache = DomainRenamer('dcache')(DCache(
+            dcache_bus, self.dbus_mmio, dcache_params))
+
+        dcache_bus_a = Decoupled(tl.ChannelA,
+                                 data_width=dcache_bus.data_width,
+                                 addr_width=dcache_bus.addr_width,
+                                 size_width=dcache_bus.size_width,
+                                 source_id_width=dcache_bus.source_id_width)
+        m.d.comb += [
+            dcache_bus.a.connect(dcache_bus_a),
+            dcache_bus_a.bits.source.eq(
+                self.make_source(is_dbus=True,
+                                 core_id=0,
+                                 source=dcache_bus.a.bits.source)),
+        ]
+        a_arbiter.add(dcache_bus_a)
+
+        #
+        # Data cache arbitration
+        #
+
+        dcache_request = Signal(self.num_cores)
+        for i, core in enumerate(cores):
+            m.d.comb += dcache_request[i].eq(
+                Cat(r.valid for r in core.dcache_req).any())
+
+        dcache_grant = Signal(range(self.num_cores))
+        dcache_last_grant = Signal.like(dcache_grant)
+        m.d.sync += dcache_last_grant.eq(dcache_grant)
+        m.d.comb += dcache_grant.eq(dcache_last_grant)
+        with m.Switch(dcache_last_grant):
+            for i in range(len(dcache_request)):
+                with m.Case(i):
+                    for pred in reversed(range(i)):
+                        with m.If(dcache_request[pred]):
+                            m.d.comb += dcache_grant.eq(pred)
+                    for succ in reversed(range(i + 1, self.num_cores)):
+                        with m.If(dcache_request[succ]):
+                            m.d.comb += dcache_grant.eq(succ)
+
+        with m.Switch(dcache_grant):
+            for i, core in enumerate(cores):
+                with m.Case(i):
+                    for dcache_req, core_dcache_req in zip(
+                            dcache.req, core.dcache_req):
+                        m.d.comb += core_dcache_req.connect(dcache_req)
+        for dcache_req in dcache.req:
+            m.d.comb += dcache_req.bits.uop.lsq_cid.eq(dcache_grant)
+
+        for w, dcache_resp in enumerate(dcache.resp):
+            with m.Switch(dcache_resp.bits.uop.lsq_cid):
+                for i, core in enumerate(cores):
+                    with m.Case(i):
+                        m.d.comb += core.dcache_resp[w].eq(dcache_resp)
+
+        for w, dcache_nack in enumerate(dcache.nack):
+            with m.Switch(dcache_nack.bits.uop.lsq_cid):
+                for i, core in enumerate(cores):
+                    with m.Case(i):
+                        m.d.comb += core.dcache_nack[w].eq(dcache_nack)
+
+        #
+        # Raster unit
+        #
 
         if self.raster_params is not None:
             m.domains += ClockDomain(f'raster', local=True)
@@ -217,38 +247,30 @@ class Cluster(HasClusterParams, Elaboratable):
             for rr, core in zip(raster_unit.req, cores):
                 m.d.comb += core.raster_req.connect(rr)
 
+        #
+        # Data bus arbitration
+        #
+
         m.d.comb += [
             a_arbiter.bus.connect(self.l2cache.in_bus.a),
-            mmio_a_arbiter.bus.connect(self.dbus_mmio.a),
-            c_arbiter.bus.connect(self.l2cache.in_bus.c),
-            e_arbiter.bus.connect(self.l2cache.in_bus.e),
+            self.l2cache.in_bus.b.connect(dcache_bus.b),
+            dcache_bus.c.connect(self.l2cache.in_bus.c),
+            dcache_bus.e.connect(self.l2cache.in_bus.e),
         ]
-
-        _, b_core_id, b_source_id = self.unpack_source(
-            self.l2cache.in_bus.b.bits.source)
-
-        with m.Switch(b_core_id):
-            for i, core in enumerate(cores):
-                with m.Case(i):
-                    m.d.comb += [
-                        self.l2cache.in_bus.b.connect(core.dbus.b),
-                        core.dbus.b.bits.source.eq(b_source_id),
-                    ]
 
         with m.If(~self.l2cache.in_bus.d.bits.source.all()):
             d_is_dbus, d_core_id, d_source_id = self.unpack_source(
                 self.l2cache.in_bus.d.bits.source)
 
-            with m.Switch(d_core_id):
-                for i, core in enumerate(cores):
-                    with m.Case(i):
-                        with m.If(d_is_dbus):
-                            m.d.comb += [
-                                self.l2cache.in_bus.d.connect(core.dbus.d),
-                                core.dbus.d.bits.source.eq(d_source_id),
-                            ]
-
-                        with m.Else():
+            with m.If(d_is_dbus):
+                m.d.comb += [
+                    self.l2cache.in_bus.d.connect(dcache_bus.d),
+                    dcache_bus.d.bits.source.eq(d_source_id),
+                ]
+            with m.Else():
+                with m.Switch(d_core_id):
+                    for i, core in enumerate(cores):
+                        with m.Case(i):
                             m.d.comb += [
                                 self.l2cache.in_bus.d.connect(core.ibus.d),
                                 core.ibus.d.bits.source.eq(d_source_id),
@@ -259,16 +281,9 @@ class Cluster(HasClusterParams, Elaboratable):
                 m.d.comb += self.l2cache.in_bus.d.connect(
                     raster_unit.mem_bus.d)
 
-        _, mmio_d_core_id, mmio_d_source_id = self.unpack_source(
-            self.dbus_mmio.d.bits.source)
-
-        with m.Switch(mmio_d_core_id):
-            for i, core in enumerate(cores):
-                with m.Case(i):
-                    m.d.comb += [
-                        self.dbus_mmio.d.connect(core.dbus_mmio.d),
-                        core.dbus_mmio.d.bits.source.eq(mmio_d_source_id),
-                    ]
+        #
+        # Status
+        #
 
         m.d.comb += self.busy.eq(Cat(c.busy for c in cores).any())
 
