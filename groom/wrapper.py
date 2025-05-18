@@ -18,11 +18,10 @@ class HasClusterParams:
         self.num_cores = params['n_cores_per_cluster']
         self.num_clusters = params['n_clusters']
         self.core_bits = Shape.cast(range(self.num_cores)).width
-        self.cluster_bits = Shape.cast(range(self.num_clusters)).width
+        self.cluster_bits = Shape.cast(range(self.num_clusters + 1)).width
 
         self.core_params = params['core_params']
         self.l2cache_params = params['l2cache_params']
-        self.l3cache_params = params['l3cache_params']
 
         self.io_regions = params['io_regions']
 
@@ -48,20 +47,25 @@ class Cluster(HasClusterParams, Elaboratable):
         self.raster_prim_addr = Signal(32)
         self.raster_prim_stride = Signal(16)
 
+        l2_in_source_width = self.l2cache_params['in_bus']['source_id_width']
+        self.source_id_width = l2_in_source_width - self.cluster_bits
+        self.sink_id_width = self.l2cache_params['in_bus']['sink_id_width']
+
+        self.dbus = tl.Interface(data_width=64,
+                                 addr_width=32,
+                                 size_width=3,
+                                 source_id_width=self.source_id_width,
+                                 sink_id_width=self.sink_id_width,
+                                 has_bce=True,
+                                 name='dbus')
+
         self.dbus_mmio = tl.Interface(data_width=64,
                                       addr_width=32,
                                       size_width=3,
-                                      source_id_width=5,
+                                      source_id_width=self.source_id_width,
                                       name='dbus_mmio')
 
-        self.l2cache_params['client_source_map'] = dict(
-            (i, (self.make_source(True, i, Const(0, 8)),
-                 self.make_source(True, i, Const(~0, 8))))
-            for i in range(self.num_cores))
-        l2cache = L2Cache(self.l2cache_params)
-        self.l2cache = ResetInserter(~self.cache_enable)(l2cache)
-
-        self.periph_buses = [self.dbus_mmio, self.l2cache.out_bus]
+        self.periph_buses = [self.dbus, self.dbus_mmio]
 
     @property
     def pma_regions(self):
@@ -72,17 +76,17 @@ class Cluster(HasClusterParams, Elaboratable):
         self.params['pma_regions'] = value
 
     def make_source(self, is_dbus, core_id, source):
+        assert len(source) == self.source_id_width
         return Cat(source[:-(1 + self.core_bits)],
                    Const(core_id, self.core_bits), Const(int(not is_dbus), 1))
 
     def unpack_source(self, source):
+        assert len(source) == self.source_id_width
         return ~source[-1], source[-(1 + self.core_bits):-1], source[:-(
             1 + self.core_bits)]
 
     def elaborate(self, platform):
         m = Module()
-
-        m.submodules.l2cache = self.l2cache
 
         #
         # Cores
@@ -95,7 +99,7 @@ class Cluster(HasClusterParams, Elaboratable):
             data_width=64,
             addr_width=32,
             size_width=3,
-            source_id_width=self.l2cache.in_source_id_width)
+            source_id_width=self.source_id_width)
 
         for i in range(self.num_cores):
             core_params = self.core_params.copy()
@@ -108,7 +112,10 @@ class Cluster(HasClusterParams, Elaboratable):
                 ResetSignal(f'core{i}').eq(ResetSignal() | ~self.core_enable),
             ]
 
-            core = DomainRenamer(f'core{i}')(Core(core_params))
+            core = DomainRenamer(f'core{i}')(Core(
+                core_params,
+                ibus_source_width=self.source_id_width,
+                ibus_sink_width=self.sink_id_width))
             setattr(m.submodules, f'core{i}', core)
             cores.append(core)
 
@@ -118,7 +125,7 @@ class Cluster(HasClusterParams, Elaboratable):
                                data_width=core.ibus.data_width,
                                addr_width=core.ibus.addr_width,
                                size_width=core.ibus.size_width,
-                               source_id_width=core.ibus.source_id_width)
+                               source_id_width=self.source_id_width)
             m.d.comb += [
                 core.ibus.a.connect(ibus_a),
                 ibus_a.bits.source.eq(
@@ -142,8 +149,8 @@ class Cluster(HasClusterParams, Elaboratable):
         dcache_bus = tl.Interface(data_width=64,
                                   addr_width=32,
                                   size_width=3,
-                                  source_id_width=8,
-                                  sink_id_width=4,
+                                  source_id_width=self.source_id_width,
+                                  sink_id_width=self.sink_id_width,
                                   has_bce=True,
                                   name='dache_bus')
 
@@ -156,7 +163,7 @@ class Cluster(HasClusterParams, Elaboratable):
                                  data_width=dcache_bus.data_width,
                                  addr_width=dcache_bus.addr_width,
                                  size_width=dcache_bus.size_width,
-                                 source_id_width=dcache_bus.source_id_width)
+                                 source_id_width=self.source_id_width)
         m.d.comb += [
             dcache_bus.a.connect(dcache_bus_a),
             dcache_bus_a.bits.source.eq(
@@ -230,12 +237,11 @@ class Cluster(HasClusterParams, Elaboratable):
                 raster_unit.prim_stride.eq(self.raster_prim_stride),
             ]
 
-            mem_bus_a = Decoupled(
-                tl.ChannelA,
-                data_width=raster_unit.mem_bus.data_width,
-                addr_width=raster_unit.mem_bus.addr_width,
-                size_width=raster_unit.mem_bus.size_width,
-                source_id_width=self.l2cache.in_source_id_width)
+            mem_bus_a = Decoupled(tl.ChannelA,
+                                  data_width=raster_unit.mem_bus.data_width,
+                                  addr_width=raster_unit.mem_bus.addr_width,
+                                  size_width=raster_unit.mem_bus.size_width,
+                                  source_id_width=self.source_id_width)
 
             m.d.comb += [
                 raster_unit.mem_bus.a.connect(mem_bus_a),
@@ -252,19 +258,19 @@ class Cluster(HasClusterParams, Elaboratable):
         #
 
         m.d.comb += [
-            a_arbiter.bus.connect(self.l2cache.in_bus.a),
-            self.l2cache.in_bus.b.connect(dcache_bus.b),
-            dcache_bus.c.connect(self.l2cache.in_bus.c),
-            dcache_bus.e.connect(self.l2cache.in_bus.e),
+            a_arbiter.bus.connect(self.dbus.a),
+            self.dbus.b.connect(dcache_bus.b),
+            dcache_bus.c.connect(self.dbus.c),
+            dcache_bus.e.connect(self.dbus.e),
         ]
 
-        with m.If(~self.l2cache.in_bus.d.bits.source.all()):
+        with m.If(~self.dbus.d.bits.source.all()):
             d_is_dbus, d_core_id, d_source_id = self.unpack_source(
-                self.l2cache.in_bus.d.bits.source)
+                self.dbus.d.bits.source)
 
             with m.If(d_is_dbus):
                 m.d.comb += [
-                    self.l2cache.in_bus.d.connect(dcache_bus.d),
+                    self.dbus.d.connect(dcache_bus.d),
                     dcache_bus.d.bits.source.eq(d_source_id),
                 ]
             with m.Else():
@@ -272,14 +278,13 @@ class Cluster(HasClusterParams, Elaboratable):
                     for i, core in enumerate(cores):
                         with m.Case(i):
                             m.d.comb += [
-                                self.l2cache.in_bus.d.connect(core.ibus.d),
+                                self.dbus.d.connect(core.ibus.d),
                                 core.ibus.d.bits.source.eq(d_source_id),
                             ]
 
         if self.raster_params is not None:
-            with m.If(self.l2cache.in_bus.d.bits.source.all()):
-                m.d.comb += self.l2cache.in_bus.d.connect(
-                    raster_unit.mem_bus.d)
+            with m.If(self.dbus.d.bits.source.all()):
+                m.d.comb += self.dbus.d.connect(raster_unit.mem_bus.d)
 
         #
         # Status
@@ -296,9 +301,6 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         super().__init__(params)
         self.bus_master = bus_master
 
-        if bus_master is not None:
-            self.cluster_bits = Shape.cast(range(self.num_clusters + 1)).width
-
         self.reset_vector = Signal(32)
         self.busy = Signal()
 
@@ -307,17 +309,23 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         self.dbus_mmio = tl.Interface(data_width=64,
                                       addr_width=32,
                                       size_width=3,
-                                      source_id_width=5 + self.cluster_bits,
+                                      source_id_width=8,
                                       name='dbus_mmio')
 
-        self.l3cache_params['client_source_map'] = dict(
-            (i, (self.make_source(i, Const(0, 8)),
-                 self.make_source(i, Const(~0, 8))))
-            for i in range(self.num_clusters))
-        l3cache = L2Cache(self.l3cache_params)
-        self.l3cache = ResetInserter(~self.ctrl.cache_enable)(l3cache)
+        l2_in_source_width = self.l2cache_params['in_bus']['source_id_width']
 
-        self.periph_buses = [self.dbus_mmio, self.l3cache.out_bus]
+        self.l2cache_params['client_source_map'] = dict(
+            (i, (self.make_source(
+                i, Const(0, l2_in_source_width - self.cluster_bits)),
+                 self.make_source(
+                     i,
+                     Cat(Const(~0, l2_in_source_width - self.cluster_bits -
+                               1), Const(0, 1)))))
+            for i in range(self.num_clusters))
+        l2cache = L2Cache(self.l2cache_params)
+        self.l2cache = ResetInserter(~self.ctrl.cache_enable)(l2cache)
+
+        self.periph_buses = [self.dbus_mmio, self.l2cache.out_bus]
 
     @property
     def pma_regions(self):
@@ -328,16 +336,19 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         self.params['pma_regions'] = value
 
     def make_source(self, cluster_id, source):
-        return Cat(source[:-self.cluster_bits],
-                   Const(cluster_id, self.cluster_bits))
+        if hasattr(self, 'l2cache'):
+            assert len(
+                source) + self.cluster_bits == self.l2cache.in_source_id_width
+        return Cat(source, Const(cluster_id, self.cluster_bits))
 
     def unpack_source(self, source):
+        assert len(source) == self.l2cache.in_source_id_width
         return source[-self.cluster_bits:], source[:-self.cluster_bits]
 
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.l3cache = self.l3cache
+        m.submodules.l2cache = self.l2cache
         m.submodules.ctrl = self.ctrl
 
         clusters = []
@@ -347,23 +358,23 @@ class GroomWrapper(HasClusterParams, Elaboratable):
             data_width=64,
             addr_width=32,
             size_width=3,
-            source_id_width=self.l3cache.in_source_id_width)
+            source_id_width=self.l2cache.in_source_id_width)
         mmio_a_arbiter = m.submodules.mmio_a_arbiter = tl.Arbiter(
             tl.ChannelA,
             data_width=64,
             addr_width=32,
             size_width=3,
-            source_id_width=5 + self.cluster_bits)
+            source_id_width=8)
 
         c_arbiter = m.submodules.c_arbiter = tl.Arbiter(
             tl.ChannelC,
             data_width=64,
             addr_width=32,
             size_width=3,
-            source_id_width=self.l3cache.in_source_id_width)
+            source_id_width=self.l2cache.in_source_id_width)
 
         e_arbiter = m.submodules.e_arbiter = tl.Arbiter(
-            tl.ChannelE, sink_id_width=self.l3cache.in_sink_id_width)
+            tl.ChannelE, sink_id_width=self.l2cache.in_sink_id_width)
 
         for i in range(self.num_clusters):
             cluster_params = self.params.copy()
@@ -383,51 +394,46 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                 cluster.raster_prim_stride.eq(self.ctrl.raster_prim_stride),
             ]
 
-            dbus_a = Decoupled(
-                tl.ChannelA,
-                data_width=cluster.l2cache.out_bus.data_width,
-                addr_width=cluster.l2cache.out_bus.addr_width,
-                size_width=cluster.l2cache.out_bus.size_width,
-                source_id_width=cluster.l2cache.out_bus.source_id_width)
+            dbus_a = Decoupled(tl.ChannelA,
+                               data_width=cluster.dbus.data_width,
+                               addr_width=cluster.dbus.addr_width,
+                               size_width=cluster.dbus.size_width,
+                               source_id_width=self.l2cache.in_source_id_width)
             dbus_mmio_a = Decoupled(
                 tl.ChannelA,
                 data_width=cluster.dbus_mmio.data_width,
                 addr_width=cluster.dbus_mmio.addr_width,
                 size_width=cluster.dbus_mmio.size_width,
-                source_id_width=cluster.dbus_mmio.source_id_width +
-                self.cluster_bits)
+                source_id_width=self.dbus_mmio.source_id_width)
             m.d.comb += [
-                cluster.l2cache.out_bus.a.connect(dbus_a),
+                cluster.dbus.a.connect(dbus_a),
                 dbus_a.bits.source.eq(
-                    self.make_source(
-                        cluster_id=i,
-                        source=cluster.l2cache.out_bus.a.bits.source)),
+                    self.make_source(cluster_id=i,
+                                     source=cluster.dbus.a.bits.source)),
                 cluster.dbus_mmio.a.connect(dbus_mmio_a),
                 dbus_mmio_a.bits.source.eq(
-                    Cat(cluster.dbus_mmio.a.bits.source,
-                        Const(i, self.cluster_bits))),
+                    self.make_source(cluster_id=i,
+                                     source=cluster.dbus_mmio.a.bits.source)),
             ]
 
             a_arbiter.add(dbus_a)
             mmio_a_arbiter.add(dbus_mmio_a)
 
-            dbus_c = Decoupled(
-                tl.ChannelC,
-                data_width=cluster.l2cache.out_bus.data_width,
-                addr_width=cluster.l2cache.out_bus.addr_width,
-                size_width=cluster.l2cache.out_bus.size_width,
-                source_id_width=cluster.l2cache.out_bus.source_id_width)
+            dbus_c = Decoupled(tl.ChannelC,
+                               data_width=cluster.dbus.data_width,
+                               addr_width=cluster.dbus.addr_width,
+                               size_width=cluster.dbus.size_width,
+                               source_id_width=self.l2cache.in_source_id_width)
             m.d.comb += [
-                cluster.l2cache.out_bus.c.connect(dbus_c),
+                cluster.dbus.c.connect(dbus_c),
                 dbus_c.bits.source.eq(
-                    self.make_source(
-                        cluster_id=i,
-                        source=cluster.l2cache.out_bus.c.bits.source)),
+                    self.make_source(cluster_id=i,
+                                     source=cluster.dbus.c.bits.source)),
             ]
 
             c_arbiter.add(dbus_c)
 
-            e_arbiter.add(cluster.l2cache.out_bus.e)
+            e_arbiter.add(cluster.dbus.e)
 
         if self.bus_master is not None:
             bus_master_a = Decoupled(
@@ -435,54 +441,53 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                 data_width=64,
                 addr_width=32,
                 size_width=3,
-                source_id_width=self.l3cache.in_source_id_width)
+                source_id_width=self.l2cache.in_source_id_width)
+            bus_master_a_raw_source = Signal(self.l2cache.in_source_id_width -
+                                             self.cluster_bits)
             m.d.comb += [
+                bus_master_a_raw_source.eq(self.bus_master.a.bits.source),
                 self.bus_master.a.connect(bus_master_a),
                 bus_master_a.bits.source.eq(
                     self.make_source(
                         cluster_id=self.num_clusters,
-                        source=Cat(
-                            self.bus_master.a.bits.source,
-                            Const(0,
-                                  8 - len(self.bus_master.a.bits.source))))),
+                        source=bus_master_a_raw_source,
+                    )),
             ]
             a_arbiter.add(bus_master_a)
 
         m.d.comb += [
-            a_arbiter.bus.connect(self.l3cache.in_bus.a),
+            a_arbiter.bus.connect(self.l2cache.in_bus.a),
             mmio_a_arbiter.bus.connect(self.dbus_mmio.a),
-            c_arbiter.bus.connect(self.l3cache.in_bus.c),
-            e_arbiter.bus.connect(self.l3cache.in_bus.e),
+            c_arbiter.bus.connect(self.l2cache.in_bus.c),
+            e_arbiter.bus.connect(self.l2cache.in_bus.e),
         ]
 
         b_cluster_id, b_source_id = self.unpack_source(
-            self.l3cache.in_bus.b.bits.source)
+            self.l2cache.in_bus.b.bits.source)
 
         with m.Switch(b_cluster_id):
             for i, cluster in enumerate(clusters):
                 with m.Case(i):
                     m.d.comb += [
-                        self.l3cache.in_bus.b.connect(
-                            cluster.l2cache.out_bus.b),
-                        cluster.l2cache.out_bus.b.bits.source.eq(b_source_id),
+                        self.l2cache.in_bus.b.connect(cluster.dbus.b),
+                        cluster.dbus.b.bits.source.eq(b_source_id),
                     ]
 
         d_cluster_id, d_source_id = self.unpack_source(
-            self.l3cache.in_bus.d.bits.source)
+            self.l2cache.in_bus.d.bits.source)
 
         with m.Switch(d_cluster_id):
             for i, cluster in enumerate(clusters):
                 with m.Case(i):
                     m.d.comb += [
-                        self.l3cache.in_bus.d.connect(
-                            cluster.l2cache.out_bus.d),
-                        cluster.l2cache.out_bus.d.bits.source.eq(d_source_id),
+                        self.l2cache.in_bus.d.connect(cluster.dbus.d),
+                        cluster.dbus.d.bits.source.eq(d_source_id),
                     ]
 
             if self.bus_master is not None:
                 with m.Case(self.num_clusters):
                     m.d.comb += [
-                        self.l3cache.in_bus.d.connect(self.bus_master.d),
+                        self.l2cache.in_bus.d.connect(self.bus_master.d),
                         self.bus_master.d.bits.source.eq(d_source_id),
                     ]
 

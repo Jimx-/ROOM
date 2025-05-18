@@ -23,7 +23,7 @@ from roomsoc.interconnect.stream import Valid, Decoupled
 
 class Core(HasCoreParams, Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, *, ibus_source_width=8, ibus_sink_width=4):
         super().__init__(params)
 
         self.reset_vector = Signal(32)
@@ -50,8 +50,8 @@ class Core(HasCoreParams, Elaboratable):
         self.ibus = tl.Interface(data_width=64,
                                  addr_width=32,
                                  size_width=3,
-                                 source_id_width=8,
-                                 sink_id_width=4,
+                                 source_id_width=ibus_source_width,
+                                 sink_id_width=ibus_sink_width,
                                  name='ibus')
 
         self.periph_buses = [self.ibus]
