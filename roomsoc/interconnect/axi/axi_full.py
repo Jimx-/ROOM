@@ -974,8 +974,10 @@ class AXIIDWidthConverter(Elaboratable):
                 m.d.sync += wid.eq(self.in_bus.aw.bits.id)
 
             m.d.comb += [
+                self.out_bus.ar.valid.eq(self.in_bus.ar.valid & rd_lock.ready),
                 self.in_bus.ar.ready.eq(self.out_bus.ar.ready & rd_lock.ready),
                 self.in_bus.r.bits.id.eq(rid),
+                self.out_bus.aw.valid.eq(self.in_bus.aw.valid & wr_lock.ready),
                 self.in_bus.aw.ready.eq(self.out_bus.aw.ready & wr_lock.ready),
                 self.in_bus.b.bits.id.eq(wid),
             ]
