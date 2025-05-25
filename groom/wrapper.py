@@ -304,7 +304,7 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         self.reset_vector = Signal(32)
         self.busy = Signal()
 
-        self.ctrl = GroomController()
+        self.ctrl = GroomController(num_clusters=self.num_clusters)
 
         self.dbus_mmio = tl.Interface(data_width=64,
                                       addr_width=32,
@@ -387,7 +387,7 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                 cluster.reset_vector.eq(self.reset_vector),
                 cluster.core_enable.eq(self.ctrl.core_enable),
                 cluster.cache_enable.eq(self.ctrl.cache_enable),
-                cluster.raster_enable.eq(self.ctrl.raster_enable),
+                cluster.raster_enable.eq(self.ctrl.raster_enable[i]),
                 cluster.raster_tile_count.eq(self.ctrl.raster_tile_count),
                 cluster.raster_tile_addr.eq(self.ctrl.raster_tile_addr),
                 cluster.raster_prim_addr.eq(self.ctrl.raster_prim_addr),

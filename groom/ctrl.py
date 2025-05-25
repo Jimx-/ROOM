@@ -5,14 +5,15 @@ from roomsoc.peripheral import Peripheral
 
 class GroomController(Peripheral, Elaboratable):
 
-    def __init__(self, name=None):
+    def __init__(self, num_clusters, name=None):
         super().__init__(name=name)
+        self.num_clusters = num_clusters
 
         self.core_busy = Signal()
 
         self.core_enable = Signal()
         self.cache_enable = Signal()
-        self.raster_enable = Signal()
+        self.raster_enable = Signal(num_clusters)
 
         self.raster_tile_count = Signal(16)
         self.raster_tile_addr = Signal(32)
@@ -34,12 +35,20 @@ class GroomController(Peripheral, Elaboratable):
         m = Module()
         m.submodules.bridge = self._bridge
 
-        m.d.comb += self._enable.r_data.eq(
-            Cat(self.core_enable, self.cache_enable, self.raster_enable,
-                Const(0, 28), self.core_busy))
+        m.d.comb += [
+            self._enable.r_data[0].eq(self.core_enable),
+            self._enable.r_data[1].eq(self.cache_enable),
+            self._enable.r_data[16:16 + self.num_clusters].eq(
+                self.raster_enable),
+            self._enable.r_data[31].eq(self.core_busy),
+        ]
         with m.If(self._enable.w_stb):
-            m.d.sync += Cat(self.core_enable, self.cache_enable,
-                            self.raster_enable).eq(self._enable.w_data)
+            m.d.sync += [
+                self.core_enable.eq(self._enable.w_data[0]),
+                self.cache_enable.eq(self._enable.w_data[1]),
+                self.raster_enable.eq(self._enable.w_data[16:16 +
+                                                          self.num_clusters]),
+            ]
 
         self._scratch.r_data.reset = 0x12345678
         with m.If(self._scratch.w_stb):
