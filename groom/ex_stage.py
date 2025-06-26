@@ -107,6 +107,16 @@ class ALUExecUnit(ExecUnit, AutoCSR):
             self.br_res.eq(alu.br_res),
         ]
 
+        gpu = m.submodules.gpu = GPUControlUnit(self.params)
+        iresp_units.append(gpu)
+        m.d.comb += [
+            self.req.connect(gpu.req),
+            gpu.req.valid.eq(self.req.valid
+                             & (self.req.bits.uop.fu_type == FUType.GPU)
+                             & (self.req.bits.uop.opcode != UOpCode.GPU_RAST)),
+            self.warp_ctrl.eq(gpu.warp_ctrl),
+        ]
+
         imul = m.submodules.imul = MultiplierUnit(self.data_width, 3,
                                                   self.params)
         imul_queue = m.submodules.imul_queue = Queue(6,
@@ -162,16 +172,6 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                              & self.req.bits.uop.fu_type_has(FUType.MEM)),
             self.lsu_req.valid.eq(agu.resp.valid),
             self.lsu_req.bits.eq(agu.resp.bits),
-        ]
-
-        gpu = m.submodules.gpu = GPUControlUnit(self.params)
-        iresp_units.append(gpu)
-        m.d.comb += [
-            self.req.connect(gpu.req),
-            gpu.req.valid.eq(self.req.valid
-                             & (self.req.bits.uop.fu_type == FUType.GPU)
-                             & (self.req.bits.uop.opcode != UOpCode.GPU_RAST)),
-            self.warp_ctrl.eq(gpu.warp_ctrl),
         ]
 
         div = m.submodules.div = DivUnit(self.data_width, self.params)
