@@ -105,6 +105,7 @@ core_params = dict(
         ],
         u_bit_period=2048,
     ),
+    use_zicond=True,
 )
 
 l2cache_params = dict(
@@ -510,7 +511,7 @@ if __name__ == "__main__":
 
     f = open('trace.log', 'w')
 
-    sim.add_sync_process(process_sim_debug(cycles=1000, log_file=f))
+    sim.add_sync_process(process_sim_debug(cycles=500, log_file=f))
     # sim.add_sync_process(process)
     # sim.add_sync_process(process_debug, domain='debug')
     with sim.write_vcd('room.vcd'):

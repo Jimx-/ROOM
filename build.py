@@ -113,6 +113,7 @@ core_params = dict(
         ],
         u_bit_period=2048,
     ),
+    use_zicond=True,
 )
 
 l2cache_params = dict(
@@ -345,6 +346,7 @@ class Top(Elaboratable):
         ]
 
         plic = PLIC(n_harts=2, n_devices=7)
+        plic = DomainRenamer('core')(plic)
         m.d.comb += [
             core.interrupts.meip.eq(plic.hart_ints[0]),
             core.interrupts.seip.eq(plic.hart_ints[1]),

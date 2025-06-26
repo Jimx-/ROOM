@@ -37,6 +37,12 @@ class HasCoreParams:
 
         self.lrsc_cycles = params.get('lrsc_cycles', 80)
 
+        #
+        # Extensions
+        #
+
+        self.use_zicond = params.get('use_zicond', False)
+
         if not self.is_groom:
             self.core_width = params['core_width']
 

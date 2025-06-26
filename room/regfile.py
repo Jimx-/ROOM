@@ -374,6 +374,18 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
                     IMM_I,
                 ]
 
+            if self.use_zicond:
+                for uopc, alu_op in (
+                    (UOpCode.CZERO_EQZ, ALUOperator.CZEQZ),
+                    (UOpCode.CZERO_NEZ, ALUOperator.CZNEZ),
+                ):
+                    with m.Case(uopc):
+                        m.d.comb += [
+                            F(alu_op),
+                            OPA_RS1,
+                            OPB_RS2,
+                        ]
+
         m.d.comb += [
             self.rrd_uop.is_load.eq(self.iss_uop.opcode == UOpCode.LD),
             self.rrd_uop.is_sta.eq((self.iss_uop.opcode == UOpCode.STA)

@@ -135,6 +135,9 @@ class UOpCode(IntEnum):
     GPU_PRED = 113
     GPU_RAST = 114
 
+    CZERO_EQZ = 160
+    CZERO_NEZ = 161
+
 
 class RegisterType(IntEnum):
     X = 0
@@ -195,6 +198,8 @@ class ALUOperator(IntEnum):
     SR = 5
     OR = 6
     AND = 7
+    CZEQZ = 8
+    CZNEZ = 9
     SUB = 10
     SRA = 11
     SLT = 12

@@ -216,7 +216,7 @@ class ALUUnit(PipelinedFunctionalUnit):
         # ALU
         #
 
-        alu = m.submodules.alu = ALU(self.xlen)
+        alu = m.submodules.alu = ALU(self.xlen, use_zicond=self.use_zicond)
         m.d.comb += [
             alu.in1.eq(opa_data),
             alu.in2.eq(opb_data),

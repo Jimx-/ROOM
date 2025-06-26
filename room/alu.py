@@ -8,8 +8,10 @@ from roomsoc.interconnect.stream import Valid, Decoupled
 
 class ALU(Elaboratable):
 
-    def __init__(self, width):
+    def __init__(self, width, use_zicond=False):
         self.width = width
+
+        self.use_zicond = use_zicond
 
         self.fn = Signal(ALUOperator)
         self.dw = Signal(ALUWidth)
@@ -89,10 +91,18 @@ class ALU(Elaboratable):
 
         shift_logic = (is_cmp & slt) | logic | shout
 
+        shift_logic_cond = shift_logic
+        if self.use_zicond:
+            in2_nez = self.in2.any()
+            cond = Mux(((self.fn == ALUOperator.CZEQZ) & in2_nez) |
+                       ((self.fn == ALUOperator.CZNEZ) & ~in2_nez), self.in1,
+                       0)
+            shift_logic_cond = shift_logic | cond
+
         out = Signal.like(self.out)
         m.d.comb += out.eq(
             Mux((self.fn == ALUOperator.ADD) | (self.fn == ALUOperator.SUB),
-                adder_out, shift_logic))
+                adder_out, shift_logic_cond))
 
         m.d.comb += self.out.eq(out)
         if self.width > 32:

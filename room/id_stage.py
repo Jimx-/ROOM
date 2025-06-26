@@ -361,6 +361,21 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             uop.fu_type.eq(FUType.DIV),
                         ]
 
+                if self.use_zicond:
+                    with m.If(inuop.inst[25:31] == 0b0000111):  # czero
+                        m.d.comb += [
+                            uop.fu_type.eq(FUType.ALU),
+                            uop.bypassable.eq(1),
+                        ]
+
+                        with m.Switch(inuop.inst[12:15]):
+                            with m.Case(0b101):  # czero.eqz
+                                m.d.comb += UOPC(UOpCode.CZERO_EQZ)
+                            with m.Case(0b111):  # czero.nez
+                                m.d.comb += UOPC(UOpCode.CZERO_NEZ)
+                            with m.Default():
+                                m.d.comb += ILL_INSN
+
             if self.xlen == 64:
                 # OP-32
                 with m.Case(0b0111011):
