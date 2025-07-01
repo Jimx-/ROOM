@@ -137,6 +137,14 @@ class UOpCode(IntEnum):
 
     CZERO_EQZ = 160
     CZERO_NEZ = 161
+    ADD_UW = 162
+    SH1ADD = 163
+    SH1ADD_UW = 164
+    SH2ADD = 165
+    SH2ADD_UW = 166
+    SH3ADD = 167
+    SH3ADD_UW = 168
+    SLLI_UW = 169
 
 
 class RegisterType(IntEnum):
@@ -170,6 +178,7 @@ class OpA(IntEnum):
     RS1 = 0
     ZERO = 1
     PC = 2
+    RS1SHL = 3
 
 
 class OpB(IntEnum):

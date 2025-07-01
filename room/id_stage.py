@@ -308,9 +308,14 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             m.d.comb += UOPC(UOpCode.ADDIW)
 
                         with m.Case(F3('SLLI')):
-                            m.d.comb += UOPC(UOpCode.SLLIW)
-                            with m.If(inuop.inst[25:32] != 0):
-                                m.d.comb += ILL_INSN
+                            with m.Switch(inuop.inst[25:32]):
+                                with m.Case(0b000000):  # slliw
+                                    m.d.comb += UOPC(UOpCode.SLLIW)
+                                if self.use_zba:
+                                    with m.Case(0b000010):
+                                        m.d.comb += UOPC(UOpCode.SLLI_UW)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
 
                         with m.Case(F3('SRLI')):
                             with m.Switch(inuop.inst[25:32]):
@@ -361,6 +366,21 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             uop.fu_type.eq(FUType.DIV),
                         ]
 
+                if self.use_zba:
+                    with m.If(inuop.inst[25:31] == 0b0010000):  # shxadd
+                        m.d.comb += [
+                            uop.fu_type.eq(FUType.ALU),
+                            uop.bypassable.eq(1),
+                        ]
+
+                        with m.Switch(inuop.inst[12:15]):
+                            with m.Case(0b010):  # sh1add
+                                m.d.comb += UOPC(UOpCode.SH1ADD)
+                            with m.Case(0b100):  # sh2add
+                                m.d.comb += UOPC(UOpCode.SH2ADD)
+                            with m.Case(0b110):  # sh3add
+                                m.d.comb += UOPC(UOpCode.SH3ADD)
+
                 if self.use_zicond:
                     with m.If(inuop.inst[25:31] == 0b0000111):  # czero
                         m.d.comb += [
@@ -408,6 +428,25 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 UOPC(getattr(UOpCode, name + 'W')),
                                 uop.fu_type.eq(FUType.DIV),
                             ]
+
+                    if self.use_zba:
+                        with m.If((inuop.inst[25:31] == 0b0000100)
+                                  & (inuop.inst[12:15] == 0b000)):  # add.uw
+                            m.d.comb += [
+                                UOPC(UOpCode.ADD_UW),
+                                uop.fu_type.eq(FUType.ALU),
+                            ]
+
+                        with m.If(inuop.inst[25:31] == 0b0010000):  # shxadd.uw
+                            m.d.comb += uop.fu_type.eq(FUType.ALU)
+
+                            with m.Switch(inuop.inst[12:15]):
+                                with m.Case(0b010):  # sh1add.uw
+                                    m.d.comb += UOPC(UOpCode.SH1ADD_UW)
+                                with m.Case(0b100):  # sh2add.uw
+                                    m.d.comb += UOPC(UOpCode.SH2ADD_UW)
+                                with m.Case(0b110):  # sh3add.uw
+                                    m.d.comb += UOPC(UOpCode.SH3ADD_UW)
 
             #
             # System

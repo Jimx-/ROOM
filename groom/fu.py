@@ -196,9 +196,17 @@ class ALUUnit(PipelinedFunctionalUnit):
         ]
 
         for i in range(self.n_threads):
+            opa_data_shl = Signal(self.xlen, name=f'opa_data_shl{i}')
+            if self.use_zba:
+                m.d.comb += opa_data_shl.eq(
+                    Mux(uop.opa_is_uw, self.req.bits.rs1_data[i][:32],
+                        self.req.bits.rs1_data[i]) << uop.opa_shamt)
+
             m.d.comb += opa_data[i].eq(
-                Mux(uop.opa_sel == OpA.RS1, self.req.bits.rs1_data[i],
-                    Mux(uop.opa_sel == OpA.PC, uop.pc, 0)))
+                Mux(
+                    uop.opa_sel == OpA.RS1, self.req.bits.rs1_data[i],
+                    Mux(uop.opa_sel == OpA.PC, uop.pc,
+                        Mux(uop.opa_sel == OpA.RS1SHL, opa_data_shl, 0))))
 
             m.d.comb += opb_data[i].eq(
                 Mux(

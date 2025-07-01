@@ -143,6 +143,7 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
         OPA_RS1 = self.rrd_uop.opa_sel.eq(OpA.RS1)
         OPA_PC = self.rrd_uop.opa_sel.eq(OpA.PC)
         OPA_ZERO = self.rrd_uop.opa_sel.eq(OpA.ZERO)
+        OPA_RS1SHL = self.rrd_uop.opa_sel.eq(OpA.RS1SHL)
 
         OPB_RS2 = self.rrd_uop.opb_sel.eq(OpB.RS2)
         OPB_IMM = self.rrd_uop.opb_sel.eq(OpB.IMM)
@@ -373,6 +374,34 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
                     OPB_IMMC,
                     IMM_I,
                 ]
+
+            if self.use_zba:
+                for uopc, alu_op, shamt, is_uw in (
+                    (UOpCode.ADD_UW, ALUOperator.ADD, 0, 1),
+                    (UOpCode.SH1ADD, ALUOperator.ADD, 1, 0),
+                    (UOpCode.SH1ADD_UW, ALUOperator.ADD, 1, 1),
+                    (UOpCode.SH2ADD, ALUOperator.ADD, 2, 0),
+                    (UOpCode.SH2ADD_UW, ALUOperator.ADD, 2, 1),
+                    (UOpCode.SH3ADD, ALUOperator.ADD, 3, 0),
+                    (UOpCode.SH3ADD_UW, ALUOperator.ADD, 3, 1),
+                ):
+                    with m.Case(uopc):
+                        m.d.comb += [
+                            F(alu_op),
+                            OPA_RS1SHL,
+                            OPB_RS2,
+                            self.rrd_uop.opa_shamt.eq(shamt),
+                            self.rrd_uop.opa_is_uw.eq(is_uw),
+                        ]
+
+                with m.Case(UOpCode.SLLI_UW):
+                    m.d.comb += [
+                        F(ALUOperator.SL),
+                        OPA_RS1SHL,
+                        OPB_IMM,
+                        IMM_I,
+                        self.rrd_uop.opa_is_uw.eq(1),
+                    ]
 
             if self.use_zicond:
                 for uopc, alu_op in (

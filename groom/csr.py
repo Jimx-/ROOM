@@ -195,7 +195,7 @@ class CSRFile(HasCoreParams, Elaboratable):
 
         isa_string = 'IMX' + ('F' if self.use_fpu and self.flen >= 32 else
                               '') + ('D' if self.use_fpu and self.flen >= 64
-                                     else '')
+                                     else '') + ('B' if self.use_zba else '')
         isa_ext = 0
         for c in isa_string:
             isa_ext |= 1 << (ord(c) - ord('A'))

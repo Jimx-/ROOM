@@ -41,6 +41,7 @@ class HasCoreParams:
         # Extensions
         #
 
+        self.use_zba = params.get('use_zba', False)
         self.use_zicond = params.get('use_zicond', False)
 
         if not self.is_groom:
@@ -195,6 +196,8 @@ class MicroOp(HasCoreParams, Record):
             ('imm_sel', ImmSel),
             ('alu_fn', ALUOperator),
             ('alu_dw', ALUWidth),
+            ('opa_shamt', 2),
+            ('opa_is_uw', 1),
             ('csr_addr', 12),
             ('csr_cmd', CSRCommand),
             ('is_load', 1),

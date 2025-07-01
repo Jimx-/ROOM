@@ -191,17 +191,26 @@ class ALUUnit(PipelinedFunctionalUnit):
         opa_data = Signal(self.xlen)
         opb_data = Signal(self.xlen)
 
-        if self.is_jmp:
-            uop_pc = (self.get_pc.pc | uop.pc_lsb) - Mux(uop.edge_inst, 2, 0)
-            uop_pc_sext = sign_extend(uop_pc[:self.vaddr_bits_extended],
-                                      self.xlen)
+        opa_data_shl = Signal(self.xlen)
+        if self.use_zba:
+            m.d.comb += opa_data_shl.eq(
+                Mux(uop.opa_is_uw, self.req.bits.rs1_data[:32],
+                    self.req.bits.rs1_data) << uop.opa_shamt)
 
-            m.d.comb += opa_data.eq(
-                Mux(uop.opa_sel == OpA.RS1, self.req.bits.rs1_data,
-                    Mux(uop.opa_sel == OpA.PC, uop_pc_sext, 0)))
-        else:
-            m.d.comb += opa_data.eq(
-                Mux(uop.opa_sel == OpA.RS1, self.req.bits.rs1_data, 0))
+        with m.Switch(uop.opa_sel):
+            with m.Case(OpA.RS1):
+                m.d.comb += opa_data.eq(self.req.bits.rs1_data)
+
+            if self.is_jmp:
+                uop_pc = (self.get_pc.pc | uop.pc_lsb) - Mux(
+                    uop.edge_inst, 2, 0)
+                uop_pc_sext = sign_extend(uop_pc[:self.vaddr_bits_extended],
+                                          self.xlen)
+                with m.Case(OpA.PC):
+                    m.d.comb += opa_data.eq(uop_pc_sext)
+
+            with m.Case(OpA.RS1SHL):
+                m.d.comb += opa_data.eq(opa_data_shl)
 
         m.d.comb += opb_data.eq(
             Mux(
