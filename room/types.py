@@ -42,6 +42,7 @@ class HasCoreParams:
         #
 
         self.use_zba = params.get('use_zba', False)
+        self.use_zbb = params.get('use_zbb', False)
         self.use_zicond = params.get('use_zicond', False)
 
         if not self.is_groom:

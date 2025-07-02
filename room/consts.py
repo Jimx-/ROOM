@@ -135,8 +135,11 @@ class UOpCode(IntEnum):
     GPU_PRED = 113
     GPU_RAST = 114
 
+    # Zicond
     CZERO_EQZ = 160
     CZERO_NEZ = 161
+
+    # Zba
     ADD_UW = 162
     SH1ADD = 163
     SH1ADD_UW = 164
@@ -145,6 +148,12 @@ class UOpCode(IntEnum):
     SH3ADD = 167
     SH3ADD_UW = 168
     SLLI_UW = 169
+
+    # Zbb
+    MAX = 170
+    MIN = 171
+    MAXU = 172
+    MINU = 173
 
 
 class RegisterType(IntEnum):
@@ -215,6 +224,19 @@ class ALUOperator(IntEnum):
     SGE = 13
     SLTU = 14
     SGEU = 15
+    UNARY = 16
+    ROL = 17
+    ROR = 18
+    BEXT = 19
+
+    ANDN = 24
+    ORN = 25
+    XNOR = 26
+
+    MAX = 28
+    MIN = 29
+    MAXU = 30
+    MINU = 31
 
     MUL = ADD
     MULH = SL

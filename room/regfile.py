@@ -403,6 +403,20 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
                         self.rrd_uop.opa_is_uw.eq(1),
                     ]
 
+            if self.use_zbb:
+                for uopc, alu_op in (
+                    (UOpCode.MAX, ALUOperator.MAX),
+                    (UOpCode.MIN, ALUOperator.MIN),
+                    (UOpCode.MAXU, ALUOperator.MAXU),
+                    (UOpCode.MINU, ALUOperator.MINU),
+                ):
+                    with m.Case(uopc):
+                        m.d.comb += [
+                            F(alu_op),
+                            OPA_RS1,
+                            OPB_RS2,
+                        ]
+
             if self.use_zicond:
                 for uopc, alu_op in (
                     (UOpCode.CZERO_EQZ, ALUOperator.CZEQZ),

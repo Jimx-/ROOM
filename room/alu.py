@@ -8,9 +8,10 @@ from roomsoc.interconnect.stream import Valid, Decoupled
 
 class ALU(Elaboratable):
 
-    def __init__(self, width, use_zicond=False):
+    def __init__(self, width, use_zbb=False, use_zicond=False):
         self.width = width
 
+        self.use_zbb = use_zbb
         self.use_zicond = use_zicond
 
         self.fn = Signal(ALUOperator)
@@ -46,6 +47,7 @@ class ALU(Elaboratable):
             adder_out[self.width - 1],
             Mux(is_cmp_unsigned, self.in2[self.width - 1],
                 self.in1[self.width - 1]))
+        cmp_out = self.fn[0] ^ Mux(self.fn[3], slt, ~in1_xor_in2.any())
 
         #
         # SLL, SRL, SRA
@@ -57,7 +59,7 @@ class ALU(Elaboratable):
             shamt = self.in2[:5]
             m.d.comb += shin_r.eq(self.in1)
         else:
-            shin_hi_32 = Repl(is_sub & self.in1[31], 32)
+            shin_hi_32 = (is_sub & self.in1[31]).replicate(32)
             shin_hi = Mux(self.dw == ALUWidth.DW_XLEN, self.in1[32:64],
                           shin_hi_32)
             shamt = Cat(self.in2[:5],
@@ -99,15 +101,25 @@ class ALU(Elaboratable):
                        0)
             shift_logic_cond = shift_logic | cond
 
+        minmax = Mux(cmp_out, self.in2, self.in1)
+
         out = Signal.like(self.out)
-        m.d.comb += out.eq(
-            Mux((self.fn == ALUOperator.ADD) | (self.fn == ALUOperator.SUB),
-                adder_out, shift_logic_cond))
+        with m.Switch(self.fn):
+            with m.Case(ALUOperator.ADD, ALUOperator.SUB):
+                m.d.comb += out.eq(adder_out)
+
+            if self.use_zbb:
+                with m.Case(ALUOperator.MAX, ALUOperator.MIN, ALUOperator.MAXU,
+                            ALUOperator.MINU):
+                    m.d.comb += out.eq(minmax)
+
+            with m.Default():
+                m.d.comb += out.eq(shift_logic_cond)
 
         m.d.comb += self.out.eq(out)
         if self.width > 32:
             with m.If(self.dw == ALUWidth.DW_32):
-                m.d.comb += self.out.eq(Cat(out[:32], Repl(out[31], 32)))
+                m.d.comb += self.out.eq(Cat(out[:32], out[31].replicate(32)))
 
         return m
 

@@ -114,6 +114,7 @@ core_params = dict(
         u_bit_period=2048,
     ),
     use_zba=True,
+    use_zbb=True,
     use_zicond=True,
 )
 

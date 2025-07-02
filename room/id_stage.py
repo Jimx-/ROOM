@@ -381,6 +381,27 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             with m.Case(0b110):  # sh3add
                                 m.d.comb += UOPC(UOpCode.SH3ADD)
 
+                if self.use_zbb:
+                    with m.If(inuop.inst[25:31] == 0b0000101):  # minmax/clmul
+                        m.d.comb += [
+                            uop.fu_type.eq(FUType.ALU),
+                            uop.bypassable.eq(1),
+                        ]
+
+                        with m.Switch(inuop.inst[12:15]):
+                            if self.use_zbb:
+                                with m.Case(0b110):  # max
+                                    m.d.comb += UOPC(UOpCode.MAX)
+                                with m.Case(0b111):  # maxu
+                                    m.d.comb += UOPC(UOpCode.MAXU)
+                                with m.Case(0b100):  # min
+                                    m.d.comb += UOPC(UOpCode.MIN)
+                                with m.Case(0b101):  # minu
+                                    m.d.comb += UOPC(UOpCode.MINU)
+
+                            with m.Default():
+                                m.d.comb += ILL_INSN
+
                 if self.use_zicond:
                     with m.If(inuop.inst[25:31] == 0b0000111):  # czero
                         m.d.comb += [

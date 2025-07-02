@@ -148,10 +148,11 @@ class CSRFile(HasCoreParams, Elaboratable):
         m = Module()
 
         isa_string = 'IMAC' + (
-            'F' if self.use_fpu and self.flen >= 32 else ''
-        ) + ('D' if self.use_fpu and self.flen >= 64 else
-             '') + ('S' if self.use_supervisor else '') + (
-                 'U' if self.use_user else '') + ('B' if self.use_zba else '')
+            'F' if self.use_fpu and self.flen >= 32 else
+            '') + ('D' if self.use_fpu and self.flen >= 64 else
+                   '') + ('S' if self.use_supervisor else
+                          '') + ('U' if self.use_user else '') + (
+                              'B' if self.use_zba or self.use_zbb else '')
 
         isa_ext = 0
         for c in isa_string:

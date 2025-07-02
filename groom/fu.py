@@ -222,7 +222,9 @@ class ALUUnit(PipelinedFunctionalUnit):
 
         alus = []
         for i in range(self.n_threads):
-            alu = ALU(self.xlen, use_zicond=self.use_zicond)
+            alu = ALU(self.xlen,
+                      use_zbb=self.use_zbb,
+                      use_zicond=self.use_zicond)
             setattr(m.submodules, f'alu{i}', alu)
             m.d.comb += [
                 alu.in1.eq(opa_data[i]),
