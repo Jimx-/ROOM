@@ -24,7 +24,7 @@ class ALU(Elaboratable):
         m = Module()
 
         is_sub = self.fn[3]
-        is_cmp = self.fn >= ALUOperator.SLT
+        is_cmp = (self.fn >= ALUOperator.SLT) & (self.fn <= ALUOperator.SGEU)
         is_cmp_unsigned = self.fn[1]
 
         #
@@ -42,6 +42,7 @@ class ALU(Elaboratable):
         #
 
         in1_xor_in2 = self.in1 ^ in2_inv
+        in1_and_in2 = self.in1 & in2_inv
         slt = Mux(
             self.in1[self.width - 1] == self.in2[self.width - 1],
             adder_out[self.width - 1],
@@ -86,10 +87,13 @@ class ALU(Elaboratable):
         # AND, OR, XOR
         #
 
-        logic = Mux((self.fn == ALUOperator.XOR) |
-                    (self.fn == ALUOperator.OR), in1_xor_in2, 0) | Mux(
-                        (self.fn == ALUOperator.AND) |
-                        (self.fn == ALUOperator.OR), self.in1 & self.in2, 0)
+        logic = Mux(
+            (self.fn == ALUOperator.XOR) | (self.fn == ALUOperator.OR) |
+            (self.fn == ALUOperator.ORN) |
+            (self.fn == ALUOperator.XNOR), in1_xor_in2, 0) | Mux(
+                (self.fn == ALUOperator.AND) | (self.fn == ALUOperator.OR) |
+                (self.fn == ALUOperator.ORN) |
+                (self.fn == ALUOperator.ANDN), in1_and_in2, 0)
 
         shift_logic = (is_cmp & slt) | logic | shout
 

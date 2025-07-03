@@ -154,6 +154,9 @@ class UOpCode(IntEnum):
     MIN = 171
     MAXU = 172
     MINU = 173
+    ANDN = 174
+    ORN = 175
+    XNOR = 176
 
 
 class RegisterType(IntEnum):

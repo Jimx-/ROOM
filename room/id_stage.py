@@ -402,6 +402,23 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             with m.Default():
                                 m.d.comb += ILL_INSN
 
+                if self.use_zbb:
+                    with m.If(inuop.inst[25:31] == 0b0100000):  # andn
+                        m.d.comb += [
+                            uop.fu_type.eq(FUType.ALU),
+                            uop.bypassable.eq(1),
+                        ]
+
+                        with m.Switch(inuop.inst[12:15]):
+                            with m.Case(0b111):  # andn
+                                m.d.comb += UOPC(UOpCode.ANDN)
+                            with m.Case(0b110):  # orn
+                                m.d.comb += UOPC(UOpCode.ORN)
+                            with m.Case(0b100):  # xnor
+                                m.d.comb += UOPC(UOpCode.XNOR)
+                            with m.Default():
+                                m.d.comb += ILL_INSN
+
                 if self.use_zicond:
                     with m.If(inuop.inst[25:31] == 0b0000111):  # czero
                         m.d.comb += [

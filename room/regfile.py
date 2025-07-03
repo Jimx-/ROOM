@@ -405,6 +405,9 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
 
             if self.use_zbb:
                 for uopc, alu_op in (
+                    (UOpCode.ANDN, ALUOperator.ANDN),
+                    (UOpCode.ORN, ALUOperator.ORN),
+                    (UOpCode.XNOR, ALUOperator.XNOR),
                     (UOpCode.MAX, ALUOperator.MAX),
                     (UOpCode.MIN, ALUOperator.MIN),
                     (UOpCode.MAXU, ALUOperator.MAXU),
