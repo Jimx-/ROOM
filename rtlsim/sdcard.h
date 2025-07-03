@@ -55,8 +55,8 @@ private:
 
     DataState data_state_;
     std::unique_ptr<unsigned char[]> data_buf_;
-    int data_count_;
-    int data_xfr_count_;
+    int data_count_{0};
+    int data_xfr_count_{0};
     int data_crc_[4];
 
     void update_resp_crc(int bit);
