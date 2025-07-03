@@ -274,10 +274,20 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                         m.d.comb += UOPC(UOpCode.ANDI)
 
                     with m.Case(F3('SLLI')):
-                        m.d.comb += UOPC(UOpCode.SLLI)
-                        with m.If((inuop.inst[26:32] != 0) | (
-                            (self.xlen == 32) & (inuop.inst[25] != 0))):
-                            m.d.comb += ILL_INSN
+                        with m.Switch(inuop.inst[25:32]):
+                            with m.Case(0b0000000):  # slli
+                                m.d.comb += UOPC(UOpCode.SLLI)
+
+                            if self.xlen != 32:
+                                with m.Case(0b0000001):  # slli
+                                    m.d.comb += UOPC(UOpCode.SLLI)
+
+                            if self.use_zbb:
+                                with m.Case(0b0110000):  # clz/ctz/cpop
+                                    m.d.comb += UOPC(UOpCode.UNARY)
+
+                            with m.Default():
+                                m.d.comb += ILL_INSN
 
                     with m.Case(F3('SRLI')):
                         with m.If((inuop.inst[26:30] != 0) | (
@@ -309,11 +319,14 @@ class DecodeUnit(HasCoreParams, Elaboratable):
 
                         with m.Case(F3('SLLI')):
                             with m.Switch(inuop.inst[25:32]):
-                                with m.Case(0b000000):  # slliw
+                                with m.Case(0b0000000):  # slliw
                                     m.d.comb += UOPC(UOpCode.SLLIW)
                                 if self.use_zba:
-                                    with m.Case(0b000010):
+                                    with m.Case(0b0000010):
                                         m.d.comb += UOPC(UOpCode.SLLI_UW)
+                                if self.use_zbb:
+                                    with m.Case(0b0110000):
+                                        m.d.comb += UOPC(UOpCode.UNARYW)
                                 with m.Default():
                                     m.d.comb += ILL_INSN
 
@@ -338,101 +351,116 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                     uop.lrs2_rtype.eq(RegisterType.FIX),
                 ]
 
-                for name in [
-                        'ADD', 'SUB', 'SLT', 'SLTU', 'XOR', 'OR', 'AND', 'SLL',
-                        'SRL', 'SRA'
-                ]:
-                    with m.If((inuop.inst[25:31] == F7(name))
-                              & (inuop.inst[12:15] == F3(name))):
-                        m.d.comb += [
-                            UOPC(getattr(UOpCode, name)),
-                            uop.fu_type.eq(FUType.ALU),
-                            uop.bypassable.eq(1),
-                        ]
-
-                for name in ['MUL', 'MULH', 'MULHU', 'MULHSU']:
-                    with m.If((inuop.inst[25:31] == F7(name))
-                              & (inuop.inst[12:15] == F3(name))):
-                        m.d.comb += [
-                            UOPC(getattr(UOpCode, name)),
-                            uop.fu_type.eq(FUType.MUL),
-                        ]
-
-                for name in ['DIV', 'DIVU', 'REM', 'REMU']:
-                    with m.If((inuop.inst[25:31] == F7(name))
-                              & (inuop.inst[12:15] == F3(name))):
-                        m.d.comb += [
-                            UOPC(getattr(UOpCode, name)),
-                            uop.fu_type.eq(FUType.DIV),
-                        ]
-
-                if self.use_zba:
-                    with m.If(inuop.inst[25:31] == 0b0010000):  # shxadd
-                        m.d.comb += [
-                            uop.fu_type.eq(FUType.ALU),
-                            uop.bypassable.eq(1),
-                        ]
-
+                with m.Switch(inuop.inst[25:32]):
+                    with m.Case(F7('ADD')):
                         with m.Switch(inuop.inst[12:15]):
-                            with m.Case(0b010):  # sh1add
-                                m.d.comb += UOPC(UOpCode.SH1ADD)
-                            with m.Case(0b100):  # sh2add
-                                m.d.comb += UOPC(UOpCode.SH2ADD)
-                            with m.Case(0b110):  # sh3add
-                                m.d.comb += UOPC(UOpCode.SH3ADD)
+                            for name in [
+                                    'ADD', 'SLT', 'SLTU', 'XOR', 'OR', 'AND',
+                                    'SLL', 'SRL'
+                            ]:
+                                with m.Case(F3(name)):
+                                    assert F7(name) == F7('ADD')
+                                    m.d.comb += [
+                                        UOPC(getattr(UOpCode, name)),
+                                        uop.fu_type.eq(FUType.ALU),
+                                        uop.bypassable.eq(1),
+                                    ]
 
-                if self.use_zbb:
-                    with m.If(inuop.inst[25:31] == 0b0000101):  # minmax/clmul
-                        m.d.comb += [
-                            uop.fu_type.eq(FUType.ALU),
-                            uop.bypassable.eq(1),
-                        ]
-
+                    with m.Case(F7('SUB')):
                         with m.Switch(inuop.inst[12:15]):
+                            for name in ['SUB', 'SRA']:
+                                with m.Case(F3(name)):
+                                    assert F7(name) == F7('SUB')
+                                    m.d.comb += [
+                                        UOPC(getattr(UOpCode, name)),
+                                        uop.fu_type.eq(FUType.ALU),
+                                        uop.bypassable.eq(1),
+                                    ]
+
                             if self.use_zbb:
-                                with m.Case(0b110):  # max
-                                    m.d.comb += UOPC(UOpCode.MAX)
-                                with m.Case(0b111):  # maxu
-                                    m.d.comb += UOPC(UOpCode.MAXU)
-                                with m.Case(0b100):  # min
-                                    m.d.comb += UOPC(UOpCode.MIN)
-                                with m.Case(0b101):  # minu
-                                    m.d.comb += UOPC(UOpCode.MINU)
+                                with m.Case(0b111):  # andn
+                                    m.d.comb += UOPC(UOpCode.ANDN)
+                                with m.Case(0b110):  # orn
+                                    m.d.comb += UOPC(UOpCode.ORN)
+                                with m.Case(0b100):  # xnor
+                                    m.d.comb += UOPC(UOpCode.XNOR)
 
                             with m.Default():
                                 m.d.comb += ILL_INSN
 
-                if self.use_zbb:
-                    with m.If(inuop.inst[25:31] == 0b0100000):  # andn
-                        m.d.comb += [
-                            uop.fu_type.eq(FUType.ALU),
-                            uop.bypassable.eq(1),
-                        ]
-
+                    with m.Case(F7('MUL')):
                         with m.Switch(inuop.inst[12:15]):
-                            with m.Case(0b111):  # andn
-                                m.d.comb += UOPC(UOpCode.ANDN)
-                            with m.Case(0b110):  # orn
-                                m.d.comb += UOPC(UOpCode.ORN)
-                            with m.Case(0b100):  # xnor
-                                m.d.comb += UOPC(UOpCode.XNOR)
-                            with m.Default():
-                                m.d.comb += ILL_INSN
+                            for name in ['MUL', 'MULH', 'MULHU', 'MULHSU']:
+                                with m.Case(F3(name)):
+                                    assert F7(name) == F7('MUL')
+                                    m.d.comb += [
+                                        UOPC(getattr(UOpCode, name)),
+                                        uop.fu_type.eq(FUType.MUL),
+                                    ]
 
-                if self.use_zicond:
-                    with m.If(inuop.inst[25:31] == 0b0000111):  # czero
-                        m.d.comb += [
-                            uop.fu_type.eq(FUType.ALU),
-                            uop.bypassable.eq(1),
-                        ]
+                            for name in ['DIV', 'DIVU', 'REM', 'REMU']:
+                                with m.Case(F3(name)):
+                                    assert F7(name) == F7('MUL')
+                                    m.d.comb += [
+                                        UOPC(getattr(UOpCode, name)),
+                                        uop.fu_type.eq(FUType.DIV),
+                                    ]
 
-                        with m.Switch(inuop.inst[12:15]):
-                            with m.Case(0b101):  # czero.eqz
-                                m.d.comb += UOPC(UOpCode.CZERO_EQZ)
-                            with m.Case(0b111):  # czero.nez
-                                m.d.comb += UOPC(UOpCode.CZERO_NEZ)
-                            with m.Default():
-                                m.d.comb += ILL_INSN
+                    if self.use_zba:
+                        with m.Case(0b0010000):  # shxadd
+                            m.d.comb += [
+                                uop.fu_type.eq(FUType.ALU),
+                                uop.bypassable.eq(1),
+                            ]
+
+                            with m.Switch(inuop.inst[12:15]):
+                                with m.Case(0b010):  # sh1add
+                                    m.d.comb += UOPC(UOpCode.SH1ADD)
+                                with m.Case(0b100):  # sh2add
+                                    m.d.comb += UOPC(UOpCode.SH2ADD)
+                                with m.Case(0b110):  # sh3add
+                                    m.d.comb += UOPC(UOpCode.SH3ADD)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
+                    if self.use_zbb:
+                        with m.Case(0b0000101):  # minmax/clmul
+                            m.d.comb += [
+                                uop.fu_type.eq(FUType.ALU),
+                                uop.bypassable.eq(1),
+                            ]
+
+                            with m.Switch(inuop.inst[12:15]):
+                                if self.use_zbb:
+                                    with m.Case(0b110):  # max
+                                        m.d.comb += UOPC(UOpCode.MAX)
+                                    with m.Case(0b111):  # maxu
+                                        m.d.comb += UOPC(UOpCode.MAXU)
+                                    with m.Case(0b100):  # min
+                                        m.d.comb += UOPC(UOpCode.MIN)
+                                    with m.Case(0b101):  # minu
+                                        m.d.comb += UOPC(UOpCode.MINU)
+
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
+                    if self.use_zicond:
+                        with m.Case(0b0000111):  # czero
+                            m.d.comb += [
+                                uop.fu_type.eq(FUType.ALU),
+                                uop.bypassable.eq(1),
+                            ]
+
+                            with m.Switch(inuop.inst[12:15]):
+                                with m.Case(0b101):  # czero.eqz
+                                    m.d.comb += UOPC(UOpCode.CZERO_EQZ)
+                                with m.Case(0b111):  # czero.nez
+                                    m.d.comb += UOPC(UOpCode.CZERO_NEZ)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
+                    with m.Default():
+                        m.d.comb += ILL_INSN
 
             if self.xlen == 64:
                 # OP-32
