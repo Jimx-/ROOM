@@ -420,6 +420,23 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
                             OPB_RS2,
                         ]
 
+                with m.Case(UOpCode.UNARY):
+                    m.d.comb += [
+                        F(ALUOperator.UNARY),
+                        OPA_RS1,
+                        OPB_IMM,
+                        IMM_I,
+                    ]
+
+                with m.Case(UOpCode.UNARYW):
+                    m.d.comb += [
+                        F(ALUOperator.UNARY),
+                        OPA_RS1,
+                        OPB_IMM,
+                        IMM_I,
+                        DW_32,
+                    ]
+
             if self.use_zicond:
                 for uopc, alu_op in (
                     (UOpCode.CZERO_EQZ, ALUOperator.CZEQZ),

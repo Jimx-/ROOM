@@ -2,6 +2,7 @@ from amaranth import *
 from amaranth import tracer
 
 from room.consts import *
+from room.utils import PopCount
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -105,6 +106,44 @@ class ALU(Elaboratable):
                        0)
             shift_logic_cond = shift_logic | cond
 
+        #
+        # CLZ, CTZ, CPOP
+        #
+
+        if self.use_zbb:
+            unary = Signal(self.width)
+
+            ctlz_in = Signal(self.width)
+            with m.Switch(Cat(self.in2[0], self.dw == ALUWidth.DW_32)):
+                with m.Case(0b00):  # clz
+                    m.d.comb += ctlz_in.eq(self.in1[::-1])
+                with m.Case(0b01):  # ctz
+                    m.d.comb += ctlz_in.eq(self.in1)
+                with m.Case(0b10):  # clzw
+                    m.d.comb += ctlz_in.eq(Cat(self.in1[31::-1], Const(1, 1)))
+                with m.Case(0b11):  # ctzw
+                    m.d.comb += ctlz_in.eq(Cat(self.in1[:32], Const(1, 1)))
+
+            cpop_in = Signal(self.width)
+            with m.If(self.in2[1]):
+                m.d.comb += cpop_in.eq(
+                    Mux(self.dw == ALUWidth.DW_32, self.in1[:32], self.in1))
+            with m.Else():
+                m.d.comb += cpop_in.eq(~0)
+                for i in reversed(range(self.width)):
+                    with m.If(ctlz_in[i]):
+                        m.d.comb += cpop_in.eq((1 << i) - 1)
+
+            popcount = m.submodules.popcount = PopCount(self.width)
+            m.d.comb += [
+                popcount.inp.eq(cpop_in),
+                unary.eq(popcount.out),
+            ]
+
+        #
+        # MIN, MAX
+        #
+
         minmax = Mux(cmp_out, self.in2, self.in1)
 
         out = Signal.like(self.out)
@@ -113,6 +152,9 @@ class ALU(Elaboratable):
                 m.d.comb += out.eq(adder_out)
 
             if self.use_zbb:
+                with m.Case(ALUOperator.UNARY):
+                    m.d.comb += out.eq(unary)
+
                 with m.Case(ALUOperator.MAX, ALUOperator.MIN, ALUOperator.MAXU,
                             ALUOperator.MINU):
                     m.d.comb += out.eq(minmax)

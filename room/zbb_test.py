@@ -764,6 +764,163 @@ def test_zbb_xnor(xlen):
         run_test(dut, alu_unittest(dut, a, b, ALUOperator.XNOR, expected))
 
 
+CPOP_CASES_32 = [
+    0x55555555, 0x7fffffff, 0xbfffffff, 0xdfffffff, 0xefffffff, 0xf7ffffff,
+    0xfbffffff, 0xfdffffff, 0xfeffffff, 0xff7fffff, 0xffbfffff, 0xffdfffff,
+    0xffefffff, 0xfff7ffff, 0xfffbffff, 0xfffdffff, 0xfffeffff, 0xffff7fff,
+    0xffffbfff, 0xffffdfff, 0xffffefff, 0xfffff7ff, 0xfffffbff, 0xfffffdff,
+    0xfffffeff, 0xffffff7f, 0xffffffbf, 0xffffffdf, 0xffffffef, 0xfffffff7,
+    0xfffffffb, 0x0, 0xfffffffe, 0x80000000, 0x40000000, 0x1, 0xaaaaaaaa,
+    0x20000000, 0x10000000, 0x8000000, 0x4000000, 0x2000000, 0x1000000,
+    0x800000, 0x400000, 0x200000, 0x100000, 0x80000, 0x40000, 0x20000, 0x10000,
+    0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x400, 0x200, 0x100, 0x80, 0x40,
+    0x20, 0x10, 0x8, 0x4, 0x2, 0xfffffffd, 0xfffffffe
+]
+
+CPOP_CASES_64 = [
+    0x5555555555555555, 0x7fffffffffffffff, 0xbfffffffffffffff,
+    0xdfffffffffffffff, 0xefffffffffffffff, 0xf7ffffffffffffff,
+    0xfbffffffffffffff, 0xfdffffffffffffff, 0xfeffffffffffffff,
+    0xff7fffffffffffff, 0xffbfffffffffffff, 0xffdfffffffffffff,
+    0xffefffffffffffff, 0xfff7ffffffffffff, 0xfffbffffffffffff,
+    0xfffdffffffffffff, 0xfffeffffffffffff, 0xffff7fffffffffff,
+    0xffffbfffffffffff, 0xffffdfffffffffff, 0xffffefffffffffff,
+    0xfffff7ffffffffff, 0xfffffbffffffffff, 0xfffffdffffffffff,
+    0xfffffeffffffffff, 0xffffff7fffffffff, 0xffffffbfffffffff,
+    0xffffffdfffffffff, 0xffffffefffffffff, 0xfffffff7ffffffff,
+    0xfffffffbffffffff, 0x0, 0xfffffffeffffffff, 0xffffffff7fffffff,
+    0xffffffffbfffffff, 0xffffffffdfffffff, 0xffffffffefffffff,
+    0xfffffffff7ffffff, 0xfffffffffbffffff, 0xfffffffffdffffff,
+    0xfffffffffeffffff, 0xffffffffff7fffff, 0xffffffffffbfffff,
+    0xffffffffffdfffff, 0xffffffffffefffff, 0xfffffffffff7ffff,
+    0xfffffffffffbffff, 0xfffffffffffdffff, 0xfffffffffffeffff,
+    0xffffffffffff7fff, 0xffffffffffffbfff, 0xffffffffffffdfff,
+    0xffffffffffffefff, 0xfffffffffffff7ff, 0xfffffffffffffbff,
+    0xfffffffffffffdff, 0xfffffffffffffeff, 0xffffffffffffff7f,
+    0xffffffffffffffbf, 0xffffffffffffffdf, 0xffffffffffffffef,
+    0xfffffffffffffff7, 0xfffffffffffffffb, 0xfffffffffffffffd,
+    0xfffffffffffffffe, 0x8000000000000000, 0x4000000000000000, 0x1,
+    0xaaaaaaaaaaaaaaaa, 0x2000000000000000, 0x1000000000000000,
+    0x800000000000000, 0x400000000000000, 0x200000000000000, 0x100000000000000,
+    0x80000000000000, 0x40000000000000, 0x20000000000000, 0x10000000000000,
+    0x8000000000000, 0x4000000000000, 0x2000000000000, 0x1000000000000,
+    0x800000000000, 0x400000000000, 0x200000000000, 0x100000000000,
+    0x80000000000, 0x40000000000, 0x20000000000, 0x10000000000, 0x8000000000,
+    0x4000000000, 0x2000000000, 0x1000000000, 0x800000000, 0x400000000,
+    0x200000000, 0x100000000, 0x80000000, 0x40000000, 0x20000000, 0x10000000,
+    0x8000000, 0x4000000, 0x2000000, 0x1000000, 0x800000, 0x400000, 0x200000,
+    0x100000, 0x80000, 0x40000, 0x20000, 0x10000, 0x8000, 0x4000, 0x2000,
+    0x1000, 0x800, 0x400, 0x200, 0x100, 0x80, 0x40, 0x20, 0x10, 0x8, 0x4, 0x2,
+    0xfffffffdffffffff, 0xfffffffeffffffff
+]
+
+
+def test_zbb_clz_32():
+    dut = ALU(32, use_zbb=True)
+
+    for a in CPOP_CASES_32:
+        a = mask_xlen(a, 32)
+        expected = f'{a:032b}1'.index('1')
+
+        run_test(dut, alu_unittest(dut, a, 0, ALUOperator.UNARY, expected))
+
+
+def test_zbb_clz_64():
+    dut = ALU(64, use_zbb=True)
+
+    for a in CPOP_CASES_64:
+        a = mask_xlen(a, 64)
+        expected = f'{a:064b}1'.index('1')
+
+        run_test(dut, alu_unittest(dut, a, 0, ALUOperator.UNARY, expected))
+
+
+def test_zbb_clzw():
+    dut = ALU(64, use_zbb=True)
+
+    for a in CPOP_CASES_64:
+        a = mask_xlen(a, 64)
+        expected = f'{mask_xlen(a, 32):032b}1'.index('1')
+
+        run_test(
+            dut, alu_unittest(dut,
+                              a,
+                              0,
+                              ALUOperator.UNARY,
+                              expected,
+                              dw32=True))
+
+
+def test_zbb_ctz_32():
+    dut = ALU(32, use_zbb=True)
+
+    for a in CPOP_CASES_32:
+        a = mask_xlen(a, 32)
+        expected = f'1{a:032b}'[::-1].index('1')
+
+        run_test(dut, alu_unittest(dut, a, 1, ALUOperator.UNARY, expected))
+
+
+def test_zbb_ctz_64():
+    dut = ALU(64, use_zbb=True)
+
+    for a in CPOP_CASES_64:
+        a = mask_xlen(a, 64)
+        expected = f'1{a:064b}'[::-1].index('1')
+
+        run_test(dut, alu_unittest(dut, a, 1, ALUOperator.UNARY, expected))
+
+
+def test_zbb_ctzw():
+    dut = ALU(64, use_zbb=True)
+
+    for a in CPOP_CASES_64:
+        expected = f'1{mask_xlen(a, 32):032b}'[::-1].index('1')
+
+        run_test(
+            dut, alu_unittest(dut,
+                              a,
+                              1,
+                              ALUOperator.UNARY,
+                              expected,
+                              dw32=True))
+
+
+def test_zbb_cpop_32():
+    dut = ALU(32, use_zbb=True)
+
+    for a in CPOP_CASES_32:
+        a = mask_xlen(a, 32)
+        expected = a.bit_count()
+
+        run_test(dut, alu_unittest(dut, a, 2, ALUOperator.UNARY, expected))
+
+
+def test_zbb_cpop_64():
+    dut = ALU(64, use_zbb=True)
+
+    for a in CPOP_CASES_64:
+        a = mask_xlen(a, 64)
+        expected = a.bit_count()
+
+        run_test(dut, alu_unittest(dut, a, 2, ALUOperator.UNARY, expected))
+
+
+def test_zbb_cpopw():
+    dut = ALU(64, use_zbb=True)
+
+    for a in CPOP_CASES_64:
+        expected = mask_xlen(a, 32).bit_count()
+
+        run_test(
+            dut, alu_unittest(dut,
+                              a,
+                              2,
+                              ALUOperator.UNARY,
+                              expected,
+                              dw32=True))
+
+
 def test_zbb_max_32():
     dut = ALU(32, use_zbb=True)
 

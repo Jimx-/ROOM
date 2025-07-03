@@ -157,6 +157,8 @@ class UOpCode(IntEnum):
     ANDN = 174
     ORN = 175
     XNOR = 176
+    UNARY = 177
+    UNARYW = 178
 
 
 class RegisterType(IntEnum):
