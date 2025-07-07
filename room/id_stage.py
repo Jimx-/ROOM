@@ -285,7 +285,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                     m.d.comb += UOPC(UOpCode.SLLI)
 
                             if self.use_zbb:
-                                with m.Case(0b0110000):  # clz/ctz/cpop
+                                with m.Case(0b0110000):  # clz/ctz/cpop/sext
                                     m.d.comb += UOPC(UOpCode.UNARY)
 
                             with m.Default():
@@ -429,6 +429,15 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                     m.d.comb += ILL_INSN
 
                     if self.use_zbb:
+                        if self.xlen == 32:
+                            with m.Case(0b0000100):  # zext.h
+                                m.d.comb += [
+                                    UOPC(UOpCode.UNARY),
+                                    uop.fu_type.eq(FUType.ALU),
+                                    uop.bypassable.eq(1),
+                                    IMM_SEL_I,
+                                ]
+
                         with m.Case(0b0000101):  # minmax/clmul
                             m.d.comb += [
                                 uop.fu_type.eq(FUType.ALU),
@@ -521,17 +530,28 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 with m.Default():
                                     m.d.comb += ILL_INSN
 
-                        if self.use_zba:
+                        if self.use_zba or self.use_zbb:
                             with m.Case(0b0000100):
-                                with m.If(
-                                        inuop.inst[12:15] == 0b000):  # add.uw
-                                    m.d.comb += [
-                                        UOPC(UOpCode.ADD_UW),
-                                        uop.fu_type.eq(FUType.ALU),
-                                    ]
-                                with m.Else():
-                                    m.d.comb += ILL_INSN
+                                with m.Switch(inuop.inst[12:15]):
+                                    if self.use_zba:
+                                        with m.Case(0b000):  # add.uw
+                                            m.d.comb += [
+                                                UOPC(UOpCode.ADD_UW),
+                                                uop.fu_type.eq(FUType.ALU),
+                                            ]
 
+                                    if self.use_zbb:
+                                        with m.Case(0b100):  # zext.h
+                                            m.d.comb += [
+                                                UOPC(UOpCode.UNARY),
+                                                uop.fu_type.eq(FUType.ALU),
+                                                IMM_SEL_I,
+                                            ]
+
+                                    with m.Default():
+                                        m.d.comb += ILL_INSN
+
+                        if self.use_zba:
                             with m.Case(0b0010000):  # shxadd.uw
                                 m.d.comb += uop.fu_type.eq(FUType.ALU)
 

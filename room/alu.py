@@ -1,8 +1,7 @@
 from amaranth import *
-from amaranth import tracer
 
 from room.consts import *
-from room.utils import PopCount
+from room.utils import PopCount, sign_extend
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -135,10 +134,18 @@ class ALU(Elaboratable):
                         m.d.comb += cpop_in.eq((1 << i) - 1)
 
             popcount = m.submodules.popcount = PopCount(self.width)
-            m.d.comb += [
-                popcount.inp.eq(cpop_in),
-                unary.eq(popcount.out),
-            ]
+            m.d.comb += popcount.inp.eq(cpop_in)
+
+            with m.Switch(self.in2[:12]):
+                with m.Case(0x080):  # zext.h
+                    m.d.comb += unary.eq(self.in1[:16])
+                with m.Case(0x604):  # sext.b
+                    m.d.comb += unary.eq(sign_extend(self.in1[:8], self.width))
+                with m.Case(0x605):  # sext.h
+                    m.d.comb += unary.eq(sign_extend(self.in1[:16],
+                                                     self.width))
+                with m.Default():
+                    m.d.comb += unary.eq(popcount.out)
 
         #
         # MIN, MAX
