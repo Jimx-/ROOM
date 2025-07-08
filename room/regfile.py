@@ -412,6 +412,8 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
                     (UOpCode.MIN, ALUOperator.MIN),
                     (UOpCode.MAXU, ALUOperator.MAXU),
                     (UOpCode.MINU, ALUOperator.MINU),
+                    (UOpCode.ROL, ALUOperator.ROL),
+                    (UOpCode.ROR, ALUOperator.ROR),
                 ):
                     with m.Case(uopc):
                         m.d.comb += [
@@ -420,22 +422,42 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
                             OPB_RS2,
                         ]
 
-                with m.Case(UOpCode.UNARY):
-                    m.d.comb += [
-                        F(ALUOperator.UNARY),
-                        OPA_RS1,
-                        OPB_IMM,
-                        IMM_I,
-                    ]
+                for uopc, alu_op in (
+                    (UOpCode.ROLW, ALUOperator.ROL),
+                    (UOpCode.RORW, ALUOperator.ROR),
+                ):
+                    with m.Case(uopc):
+                        m.d.comb += [
+                            F(alu_op),
+                            OPA_RS1,
+                            OPB_RS2,
+                            DW_32,
+                        ]
 
-                with m.Case(UOpCode.UNARYW):
-                    m.d.comb += [
-                        F(ALUOperator.UNARY),
-                        OPA_RS1,
-                        OPB_IMM,
-                        IMM_I,
-                        DW_32,
-                    ]
+                for uopc, alu_op in (
+                    (UOpCode.UNARY, ALUOperator.UNARY),
+                    (UOpCode.RORI, ALUOperator.ROR),
+                ):
+                    with m.Case(uopc):
+                        m.d.comb += [
+                            F(alu_op),
+                            OPA_RS1,
+                            OPB_IMM,
+                            IMM_I,
+                        ]
+
+                for uopc, alu_op in (
+                    (UOpCode.UNARYW, ALUOperator.UNARY),
+                    (UOpCode.RORIW, ALUOperator.ROR),
+                ):
+                    with m.Case(uopc):
+                        m.d.comb += [
+                            F(alu_op),
+                            OPA_RS1,
+                            OPB_IMM,
+                            IMM_I,
+                            DW_32,
+                        ]
 
             if self.use_zicond:
                 for uopc, alu_op in (

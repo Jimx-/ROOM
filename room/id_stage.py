@@ -292,17 +292,19 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 m.d.comb += ILL_INSN
 
                     with m.Case(F3('SRLI')):
-                        with m.If((inuop.inst[26:30] != 0) | (
-                            (self.xlen == 32) & (inuop.inst[25] != 0))):
-                            m.d.comb += ILL_INSN
-                        with m.Else():
-                            with m.Switch(inuop.inst[30:32]):
-                                with m.Case(0b00):
-                                    m.d.comb += UOPC(UOpCode.SRLI)
-                                with m.Case(0b01):
-                                    m.d.comb += UOPC(UOpCode.SRAI)
-                                with m.Default():
-                                    m.d.comb += ILL_INSN
+                        with m.Switch(inuop.inst[25:32]):
+                            with m.Case('000000' +
+                                        ('0' if self.xlen == 32 else '-')):
+                                m.d.comb += UOPC(UOpCode.SRLI)
+                            with m.Case('010000' +
+                                        ('0' if self.xlen == 32 else '-')):
+                                m.d.comb += UOPC(UOpCode.SRAI)
+                            if self.use_zbb:
+                                with m.Case('011000' +
+                                            ('0' if self.xlen == 32 else '-')):
+                                    m.d.comb += UOPC(UOpCode.RORI)
+                            with m.Default():
+                                m.d.comb += ILL_INSN
 
             if self.xlen == 64:
                 # OP-IMM-32
@@ -338,6 +340,9 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                     m.d.comb += UOPC(UOpCode.SRLIW)
                                 with m.Case(F7('SRAI')):
                                     m.d.comb += UOPC(UOpCode.SRAIW)
+                                if self.use_zbb:
+                                    with m.Case(0b0110000):
+                                        m.d.comb += UOPC(UOpCode.RORIW)
                                 with m.Default():
                                     m.d.comb += ILL_INSN
 
@@ -458,6 +463,20 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 with m.Default():
                                     m.d.comb += ILL_INSN
 
+                        with m.Case(0b0110000):  # rol/ror
+                            m.d.comb += [
+                                uop.fu_type.eq(FUType.ALU),
+                                uop.bypassable.eq(1),
+                            ]
+
+                            with m.Switch(inuop.inst[12:15]):
+                                with m.Case(0b001):
+                                    m.d.comb += UOPC(UOpCode.ROL)
+                                with m.Case(0b101):
+                                    m.d.comb += UOPC(UOpCode.ROR)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
                     if self.use_zicond:
                         with m.Case(0b0000111):  # czero
                             m.d.comb += [
@@ -562,6 +581,18 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                         m.d.comb += UOPC(UOpCode.SH2ADD_UW)
                                     with m.Case(0b110):  # sh3add.uw
                                         m.d.comb += UOPC(UOpCode.SH3ADD_UW)
+                                    with m.Default():
+                                        m.d.comb += ILL_INSN
+
+                        if self.use_zbb:
+                            with m.Case(0b0110000):  # rolw/rorw
+                                m.d.comb += uop.fu_type.eq(FUType.ALU)
+
+                                with m.Switch(inuop.inst[12:15]):
+                                    with m.Case(0b001):
+                                        m.d.comb += UOPC(UOpCode.ROLW)
+                                    with m.Case(0b101):
+                                        m.d.comb += UOPC(UOpCode.RORW)
                                     with m.Default():
                                         m.d.comb += ILL_INSN
 

@@ -71,8 +71,8 @@ class ALU(Elaboratable):
         for a, b in zip(shin_l, reversed(shin_r)):
             m.d.comb += a.eq(b)
 
-        shin = Mux((self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA),
-                   shin_r, shin_l)
+        shin = Mux((self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA) |
+                   (self.fn == ALUOperator.ROR), shin_r, shin_l)
 
         shout_r = Signal(self.width)
         shout_l = Signal(self.width)
@@ -153,6 +153,17 @@ class ALU(Elaboratable):
 
         minmax = Mux(cmp_out, self.in2, self.in1)
 
+        #
+        # ROL, ROR
+        #
+
+        rot_shamt = Mux(self.dw == ALUWidth.DW_32, 32, self.width) - shamt
+        rotin = Mux(self.fn[0], shin_r, shin_r[::-1])
+        rotout_r = (rotin >> rot_shamt.as_unsigned())[:self.width]
+        rotout_l = rotout_r[::-1]
+        rotout = Mux(self.fn[0], rotout_r, rotout_l) | Mux(
+            self.fn[0], shout_l, shout_r)
+
         out = Signal.like(self.out)
         with m.Switch(self.fn):
             with m.Case(ALUOperator.ADD, ALUOperator.SUB):
@@ -165,6 +176,9 @@ class ALU(Elaboratable):
                 with m.Case(ALUOperator.MAX, ALUOperator.MIN, ALUOperator.MAXU,
                             ALUOperator.MINU):
                     m.d.comb += out.eq(minmax)
+
+                with m.Case(ALUOperator.ROL, ALUOperator.ROR):
+                    m.d.comb += out.eq(rotout)
 
             with m.Default():
                 m.d.comb += out.eq(shift_logic_cond)

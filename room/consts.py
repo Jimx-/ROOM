@@ -159,6 +159,12 @@ class UOpCode(IntEnum):
     XNOR = 176
     UNARY = 177
     UNARYW = 178
+    ROL = 179
+    ROLW = 180
+    ROR = 181
+    RORI = 182
+    RORW = 183
+    RORIW = 184
 
 
 class RegisterType(IntEnum):
