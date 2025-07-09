@@ -303,6 +303,22 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 with m.Case('011000' +
                                             ('0' if self.xlen == 32 else '-')):
                                     m.d.comb += UOPC(UOpCode.RORI)
+
+                                with m.Case('0010100'):
+                                    with m.Switch(inuop.inst[20:25]):
+                                        with m.Case(0b00111):  # orc.b
+                                            m.d.comb += UOPC(UOpCode.UNARY)
+                                        with m.Default():
+                                            m.d.comb += ILL_INSN
+
+                                with m.Case('011010' +
+                                            ('0' if self.xlen == 32 else '1')):
+                                    with m.Switch(inuop.inst[20:25]):
+                                        with m.Case(0b11000):  # rev8
+                                            m.d.comb += UOPC(UOpCode.UNARY)
+                                        with m.Default():
+                                            m.d.comb += ILL_INSN
+
                             with m.Default():
                                 m.d.comb += ILL_INSN
 
@@ -377,15 +393,16 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                     ]
 
                     with m.Case(F7('SUB')):
+                        m.d.comb += [
+                            uop.fu_type.eq(FUType.ALU),
+                            uop.bypassable.eq(1),
+                        ]
+
                         with m.Switch(inuop.inst[12:15]):
                             for name in ['SUB', 'SRA']:
                                 with m.Case(F3(name)):
                                     assert F7(name) == F7('SUB')
-                                    m.d.comb += [
-                                        UOPC(getattr(UOpCode, name)),
-                                        uop.fu_type.eq(FUType.ALU),
-                                        uop.bypassable.eq(1),
-                                    ]
+                                    m.d.comb += UOPC(getattr(UOpCode, name))
 
                             if self.use_zbb:
                                 with m.Case(0b111):  # andn

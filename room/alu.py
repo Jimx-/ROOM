@@ -106,7 +106,7 @@ class ALU(Elaboratable):
             shift_logic_cond = shift_logic | cond
 
         #
-        # CLZ, CTZ, CPOP
+        # CLZ, CTZ, CPOP, UNARY
         #
 
         if self.use_zbb:
@@ -136,7 +136,15 @@ class ALU(Elaboratable):
             popcount = m.submodules.popcount = PopCount(self.width)
             m.d.comb += popcount.inp.eq(cpop_in)
 
+            in1_bytes = [self.in1[i:i + 8] for i in range(0, self.width, 8)]
+            orc = Cat(x.any().replicate(8) for x in in1_bytes)
+            rev8 = Cat(in1_bytes[::-1])
+
             with m.Switch(self.in2[:12]):
+                with m.Case(0x287):  # orc.b
+                    m.d.comb += unary.eq(orc)
+                with m.Case(0x698 if self.width == 32 else 0x6b8):  # rev8
+                    m.d.comb += unary.eq(rev8)
                 with m.Case(0x080):  # zext.h
                     m.d.comb += unary.eq(self.in1[:16])
                 with m.Case(0x604):  # sext.b
