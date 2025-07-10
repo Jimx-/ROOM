@@ -8,10 +8,11 @@ from roomsoc.interconnect.stream import Valid, Decoupled
 
 class ALU(Elaboratable):
 
-    def __init__(self, width, use_zbb=False, use_zicond=False):
+    def __init__(self, width, use_zbb=False, use_zbs=False, use_zicond=False):
         self.width = width
 
         self.use_zbb = use_zbb
+        self.use_zbs = use_zbs
         self.use_zicond = use_zicond
 
         self.fn = Signal(ALUOperator)
@@ -71,8 +72,10 @@ class ALU(Elaboratable):
         for a, b in zip(shin_l, reversed(shin_r)):
             m.d.comb += a.eq(b)
 
-        shin = Mux((self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA) |
-                   (self.fn == ALUOperator.ROR), shin_r, shin_l)
+        shin = Mux(
+            (self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA) |
+            (self.fn == ALUOperator.ROR) | (self.fn == ALUOperator.BEXT),
+            shin_r, shin_l)
 
         shout_r = Signal(self.width)
         shout_l = Signal(self.width)
@@ -80,8 +83,9 @@ class ALU(Elaboratable):
             Cat(shin, is_sub & shin[self.width - 1]).as_signed() >> shamt)
         for a, b in zip(shout_l, reversed(shout_r)):
             m.d.comb += a.eq(b)
-        shout = Mux((self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA),
-                    shout_r, 0) | Mux(self.fn == ALUOperator.SL, shout_l, 0)
+        shout = Mux((self.fn == ALUOperator.SR) | (self.fn == ALUOperator.SRA)
+                    | (self.fn == ALUOperator.BEXT), shout_r, 0) | Mux(
+                        self.fn == ALUOperator.SL, shout_l, 0)
 
         #
         # AND, OR, XOR
@@ -95,7 +99,13 @@ class ALU(Elaboratable):
                 (self.fn == ALUOperator.ORN) |
                 (self.fn == ALUOperator.ANDN), in1_and_in2, 0)
 
-        shift_logic = (is_cmp & slt) | logic | shout
+        bext_mask = Signal(self.width)
+        m.d.comb += bext_mask.eq(~0)
+        if self.use_zbs:
+            with m.If(self.fn == ALUOperator.BEXT):
+                m.d.comb += bext_mask.eq(1)
+
+        shift_logic = (is_cmp & slt) | logic | (shout & bext_mask)
 
         shift_logic_cond = shift_logic
         if self.use_zicond:

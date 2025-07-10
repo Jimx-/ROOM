@@ -1,5 +1,6 @@
 from amaranth import *
 from amaranth import tracer
+from amaranth.utils import log2_int
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
@@ -212,14 +213,22 @@ class ALUUnit(PipelinedFunctionalUnit):
             with m.Case(OpA.RS1SHL):
                 m.d.comb += opa_data.eq(opa_data_shl)
 
-        m.d.comb += opb_data.eq(
-            Mux(
-                uop.opb_sel == OpB.IMM, imm,
-                Mux(
-                    uop.opb_sel == OpB.IMMC, self.req.bits.uop.prs1[:5],
-                    Mux(uop.opb_sel == OpB.RS2, self.req.bits.rs2_data,
-                        Mux(uop.opb_sel == OpB.NEXT, Mux(uop.is_rvc, 2, 4),
-                            0)))))
+        with m.Switch(uop.opb_sel):
+            with m.Case(OpB.IMM):
+                m.d.comb += opb_data.eq(imm)
+            with m.Case(OpB.IMMC):
+                m.d.comb += opb_data.eq(self.req.bits.uop.prs1[:5])
+            with m.Case(OpB.RS2):
+                m.d.comb += opb_data.eq(self.req.bits.rs2_data)
+            with m.Case(OpB.NEXT):
+                m.d.comb += opb_data.eq(Mux(uop.is_rvc, 2, 4))
+
+            if self.use_zbs:
+                with m.Case(OpB.RS2OH):
+                    m.d.comb += opb_data.eq(
+                        1 << self.req.bits.rs2_data[:log2_int(self.xlen)])
+                with m.Case(OpB.IMMOH):
+                    m.d.comb += opb_data.eq(1 << imm[:log2_int(self.xlen)])
 
         #
         # ALU
@@ -227,6 +236,7 @@ class ALUUnit(PipelinedFunctionalUnit):
 
         alu = m.submodules.alu = ALU(self.xlen,
                                      use_zbb=self.use_zbb,
+                                     use_zbs=self.use_zbs,
                                      use_zicond=self.use_zicond)
         m.d.comb += [
             alu.in1.eq(opa_data),

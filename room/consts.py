@@ -166,6 +166,16 @@ class UOpCode(IntEnum):
     RORW = 183
     RORIW = 184
 
+    # Zbs
+    BCLR = 185
+    BCLRI = 186
+    BEXT = 187
+    BEXTI = 188
+    BINV = 189
+    BINVI = 190
+    BSET = 191
+    BSETI = 192
+
 
 class RegisterType(IntEnum):
     X = 0
@@ -207,6 +217,8 @@ class OpB(IntEnum):
     ZERO = 2
     NEXT = 3
     IMMC = 4
+    RS2OH = 5
+    IMMOH = 6
 
 
 class ImmSel(IntEnum):

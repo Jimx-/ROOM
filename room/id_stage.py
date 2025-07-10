@@ -277,7 +277,8 @@ class DecodeUnit(HasCoreParams, Elaboratable):
 
                     with m.Case(F3('SLLI')):
                         with m.Switch(inuop.inst[25:32]):
-                            with m.Case(0b0000000):  # slli
+                            with m.Case('000000' + (
+                                    '0' if self.xlen == 32 else '-')):  # slli
                                 m.d.comb += UOPC(UOpCode.SLLI)
 
                             if self.xlen != 32:
@@ -287,6 +288,19 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             if self.use_zbb:
                                 with m.Case(0b0110000):  # clz/ctz/cpop/sext
                                     m.d.comb += UOPC(UOpCode.UNARY)
+
+                            if self.use_zbs:
+                                with m.Case('010010' +
+                                            ('0' if self.xlen == 32 else '-')):
+                                    m.d.comb += UOPC(UOpCode.BCLRI)
+
+                                with m.Case('011010' +
+                                            ('0' if self.xlen == 32 else '-')):
+                                    m.d.comb += UOPC(UOpCode.BINVI)
+
+                                with m.Case('001010' +
+                                            ('0' if self.xlen == 32 else '-')):
+                                    m.d.comb += UOPC(UOpCode.BSETI)
 
                             with m.Default():
                                 m.d.comb += ILL_INSN
@@ -318,6 +332,11 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                             m.d.comb += UOPC(UOpCode.UNARY)
                                         with m.Default():
                                             m.d.comb += ILL_INSN
+
+                            if self.use_zbs:
+                                with m.Case('010010' +
+                                            ('0' if self.xlen == 32 else '-')):
+                                    m.d.comb += UOPC(UOpCode.BEXTI)
 
                             with m.Default():
                                 m.d.comb += ILL_INSN
@@ -491,6 +510,45 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                     m.d.comb += UOPC(UOpCode.ROL)
                                 with m.Case(0b101):
                                     m.d.comb += UOPC(UOpCode.ROR)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
+                    if self.use_zbs:
+                        with m.Case(0b0100100):  # bclr/bext
+                            m.d.comb += [
+                                uop.fu_type.eq(FUType.ALU),
+                                uop.bypassable.eq(1),
+                            ]
+
+                            with m.Switch(inuop.inst[12:15]):
+                                with m.Case(0b001):  # bclr
+                                    m.d.comb += UOPC(UOpCode.BCLR)
+                                with m.Case(0b101):  # bext
+                                    m.d.comb += UOPC(UOpCode.BEXT)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
+                        with m.Case(0b0110100):  # binv
+                            m.d.comb += [
+                                uop.fu_type.eq(FUType.ALU),
+                                uop.bypassable.eq(1),
+                            ]
+
+                            with m.Switch(inuop.inst[12:15]):
+                                with m.Case(0b001):  # binv
+                                    m.d.comb += UOPC(UOpCode.BINV)
+                                with m.Default():
+                                    m.d.comb += ILL_INSN
+
+                        with m.Case(0b0010100):  # bset
+                            m.d.comb += [
+                                uop.fu_type.eq(FUType.ALU),
+                                uop.bypassable.eq(1),
+                            ]
+
+                            with m.Switch(inuop.inst[12:15]):
+                                with m.Case(0b001):  # bset
+                                    m.d.comb += UOPC(UOpCode.BSET)
                                 with m.Default():
                                     m.d.comb += ILL_INSN
 

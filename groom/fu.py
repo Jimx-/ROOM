@@ -1,6 +1,7 @@
 from amaranth import *
 from amaranth import tracer
 from amaranth.hdl.ast import ValueCastable
+from amaranth.utils import log2_int
 
 from groom.if_stage import BranchResolution, WarpControlReq
 from groom.raster import RasterRequest, Fragment
@@ -208,13 +209,24 @@ class ALUUnit(PipelinedFunctionalUnit):
                     Mux(uop.opa_sel == OpA.PC, uop.pc,
                         Mux(uop.opa_sel == OpA.RS1SHL, opa_data_shl, 0))))
 
-            m.d.comb += opb_data[i].eq(
-                Mux(
-                    uop.opb_sel == OpB.IMM, imm,
-                    Mux(
-                        uop.opb_sel == OpB.IMMC, self.req.bits.uop.lrs1,
-                        Mux(uop.opb_sel == OpB.RS2, self.req.bits.rs2_data[i],
-                            Mux(uop.opb_sel == OpB.NEXT, 4, 0)))))
+            with m.Switch(uop.opb_sel):
+                with m.Case(OpB.IMM):
+                    m.d.comb += opb_data[i].eq(imm)
+                with m.Case(OpB.IMMC):
+                    m.d.comb += opb_data[i].eq(self.req.bits.uop.lrs1)
+                with m.Case(OpB.RS2):
+                    m.d.comb += opb_data[i].eq(self.req.bits.rs2_data[i])
+                with m.Case(OpB.NEXT):
+                    m.d.comb += opb_data[i].eq(4)
+
+                if self.use_zbs:
+                    with m.Case(OpB.RS2OH):
+                        m.d.comb += opb_data[i].eq(
+                            1 << self.req.bits.rs2_data[i]
+                            [:log2_int(self.xlen)])
+                    with m.Case(OpB.IMMOH):
+                        m.d.comb += opb_data[i].eq(
+                            1 << imm[:log2_int(self.xlen)])
 
         #
         # ALU
@@ -224,6 +236,7 @@ class ALUUnit(PipelinedFunctionalUnit):
         for i in range(self.n_threads):
             alu = ALU(self.xlen,
                       use_zbb=self.use_zbb,
+                      use_zbs=self.use_zbs,
                       use_zicond=self.use_zicond)
             setattr(m.submodules, f'alu{i}', alu)
             m.d.comb += [

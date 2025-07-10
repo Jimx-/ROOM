@@ -115,6 +115,7 @@ core_params = dict(
     ),
     use_zba=True,
     use_zbb=True,
+    use_zbs=True,
     use_zicond=True,
 )
 

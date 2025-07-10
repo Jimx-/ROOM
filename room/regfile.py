@@ -150,6 +150,8 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
         OPB_NEXT = self.rrd_uop.opb_sel.eq(OpB.NEXT)
         OPB_ZERO = self.rrd_uop.opb_sel.eq(OpB.ZERO)
         OPB_IMMC = self.rrd_uop.opb_sel.eq(OpB.IMMC)
+        OPB_RS2OH = self.rrd_uop.opb_sel.eq(OpB.RS2OH)
+        OPB_IMMOH = self.rrd_uop.opb_sel.eq(OpB.IMMOH)
 
         IMM_I = self.rrd_uop.imm_sel.eq(ImmSel.I)
         IMM_J = self.rrd_uop.imm_sel.eq(ImmSel.J)
@@ -458,6 +460,47 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
                             IMM_I,
                             DW_32,
                         ]
+
+            if self.use_zbs:
+                for uopc, alu_op in (
+                    (UOpCode.BCLR, ALUOperator.ANDN),
+                    (UOpCode.BINV, ALUOperator.XOR),
+                    (UOpCode.BSET, ALUOperator.OR),
+                ):
+                    with m.Case(uopc):
+                        m.d.comb += [
+                            F(alu_op),
+                            OPA_RS1,
+                            OPB_RS2OH,
+                        ]
+
+                for uopc, alu_op in (
+                    (UOpCode.BCLRI, ALUOperator.ANDN),
+                    (UOpCode.BINVI, ALUOperator.XOR),
+                    (UOpCode.BSETI, ALUOperator.OR),
+                ):
+                    with m.Case(uopc):
+                        m.d.comb += [
+                            F(alu_op),
+                            OPA_RS1,
+                            OPB_IMMOH,
+                            IMM_I,
+                        ]
+
+                with m.Case(UOpCode.BEXT):
+                    m.d.comb += [
+                        F(ALUOperator.BEXT),
+                        OPA_RS1,
+                        OPB_RS2,
+                    ]
+
+                with m.Case(UOpCode.BEXTI):
+                    m.d.comb += [
+                        F(ALUOperator.BEXT),
+                        OPA_RS1,
+                        OPB_IMM,
+                        IMM_I,
+                    ]
 
             if self.use_zicond:
                 for uopc, alu_op in (
