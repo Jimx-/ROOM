@@ -287,6 +287,10 @@ class MicroOp(HasCoreParams, Record):
     def fu_type_has(self, typ):
         return (self.fu_type & typ) != 0
 
+    def is_unsafe(self):
+        return self.uses_ldq | (self.uses_stq
+                                & ~self.is_fence) | self.is_jalr | self.is_br
+
 
 class HasFrontendParams(HasCoreParams):
 

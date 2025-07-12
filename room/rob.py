@@ -124,6 +124,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         self.commit_exc = Valid(CommitExceptionReq, params)
 
         self.head_idx = Signal(range(self.core_width * self.num_rob_rows))
+        self.pnr_idx = Signal(range(self.core_width * self.num_rob_rows))
         self.tail_idx = Signal(range(self.core_width * self.num_rob_rows))
 
         self.br_update = BranchUpdate(params)
@@ -157,14 +158,19 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         rob_head = Signal(range(self.num_rob_rows))
         rob_head_lsb = Signal(range(self.core_width))
 
+        rob_pnr = Signal(range(self.num_rob_rows))
+        rob_pnr_lsb = Signal(range(self.core_width))
+
         rob_tail = Signal(range(self.num_rob_rows))
         rob_tail_lsb = Signal(range(self.core_width))
 
         if self.core_width == 1:
             rob_head_idx = rob_head
+            rob_pnr_idx = rob_pnr
             rob_tail_idx = rob_tail
         else:
             rob_head_idx = Cat(rob_head_lsb, rob_head)
+            rob_pnr_idx = Cat(rob_pnr_lsb, rob_pnr)
             rob_tail_idx = Cat(rob_tail_lsb, rob_tail)
 
         maybe_full = Signal()
@@ -184,6 +190,8 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         rob_head_valids = Signal(self.core_width)
         rob_head_busy = Signal(self.core_width)
         rob_head_uses_ldq = Signal(self.core_width)
+        rob_pnr_unsafe = Signal(self.core_width)
+        rob_tail_valids = Signal(self.core_width)
 
         for w in range(self.core_width):
             rob_valid = Array(
@@ -191,6 +199,9 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 for i in range(self.num_rob_rows))
             rob_busy = Array(
                 Signal(name=f'rob_bank{w}_busy{i}')
+                for i in range(self.num_rob_rows))
+            rob_unsafe = Array(
+                Signal(name=f'rob_bank{w}_unsafe{i}')
                 for i in range(self.num_rob_rows))
             rob_uop = Array(
                 MicroOp(self.params, name=f'rob_bank{w}_uop{i}')
@@ -204,6 +215,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                     rob_valid[rob_tail].eq(1),
                     rob_busy[rob_tail].eq(~(self.enq_uops[w].is_fence
                                             | self.enq_uops[w].is_fencei)),
+                    rob_unsafe[rob_tail].eq(self.enq_uops[w].is_unsafe()),
                     rob_uop[rob_tail].eq(self.enq_uops[w]),
                     rob_exception[rob_tail].eq(self.enq_uops[w].exception),
                 ]
@@ -212,11 +224,17 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 uop = wb.bits.uop
                 row_idx = get_row(uop.rob_idx)
                 with m.If(wb.valid & (get_bank(uop.rob_idx) == w)):
-                    m.d.sync += rob_busy[row_idx].eq(0)
+                    m.d.sync += [
+                        rob_busy[row_idx].eq(0),
+                        rob_unsafe[row_idx].eq(0),
+                    ]
 
             for clr in self.lsu_clear_busy:
                 with m.If(clr.valid & (get_bank(clr.bits) == w)):
-                    m.d.sync += rob_busy[get_row(clr.bits)].eq(0)
+                    m.d.sync += [
+                        rob_busy[get_row(clr.bits)].eq(0),
+                        rob_unsafe[get_row(clr.bits)].eq(0),
+                    ]
 
             with m.If(self.lsu_exc.valid
                       & (get_bank(self.lsu_exc.bits.uop.rob_idx) == w)):
@@ -261,6 +279,10 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 rob_head_valids[w].eq(rob_valid[rob_head]),
                 rob_head_busy[w].eq(rob_busy[rob_head]),
                 rob_head_uses_ldq[w].eq(rob_uop[rob_head].uses_ldq),
+                rob_pnr_unsafe[w].eq(rob_valid[rob_pnr]
+                                     & (rob_unsafe[rob_pnr]
+                                        | rob_exception[rob_pnr])),
+                rob_tail_valids[w].eq(rob_valid[rob_tail]),
             ]
 
         exception_thrown = Signal()
@@ -445,6 +467,10 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 rob_tail_lsb.eq(0),
             ]
             m.d.comb += do_enq.eq(1)
+        with m.Elif(self.enq_valids != 0):
+            for w in range(self.core_width - 1):
+                with m.If(self.enq_valids[w]):
+                    m.d.sync += rob_tail_lsb.eq(w + 1)
 
         m.d.sync += maybe_full.eq(~do_deq & (do_enq | maybe_full)
                                   | (self.br_update.mispredict_mask != 0))
@@ -452,6 +478,43 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
             full.eq((rob_tail == rob_head) & maybe_full),
             empty.eq((rob_tail == rob_head) & (rob_head_valids == 0))
         ]
+
+        #
+        # Point-of-No-Return
+        #
+
+        pnr_maybe_at_tail = Signal()
+        safe_to_inc_pnr = state_is_normal | state_is_wait_empty
+        pnr_inc_row = ~rob_pnr_unsafe.any() & ((rob_pnr != rob_tail) |
+                                               (full & ~pnr_maybe_at_tail))
+        with m.If(empty & (self.enq_valids.any())):
+            m.d.sync += rob_pnr.eq(rob_head)
+            for w in reversed(range(self.core_width)):
+                with m.If(self.enq_valids[w]):
+                    m.d.sync += rob_pnr_lsb.eq(w)
+        with m.Elif(safe_to_inc_pnr & pnr_inc_row):
+            m.d.sync += [
+                rob_pnr.eq(wrap_incr(rob_pnr, self.num_rob_rows)),
+                rob_pnr_lsb.eq(0),
+            ]
+        with m.Elif(safe_to_inc_pnr
+                    & ((rob_pnr != rob_tail) | (full & ~pnr_maybe_at_tail))):
+            for w in reversed(range(self.core_width)):
+                with m.If(rob_pnr_unsafe[w]):
+                    m.d.sync += rob_pnr_lsb.eq(w)
+        with m.Elif(safe_to_inc_pnr & ~full & ~empty):
+            tail_valid_mask = Signal(self.core_width)
+            for w in range(self.core_width):
+                with m.If(rob_tail_valids[w]):
+                    m.d.comb += tail_valid_mask.eq((1 << (w + 1)) - 1)
+            for w in reversed(range(self.core_width)):
+                with m.If(rob_pnr_unsafe[w] | ~rob_tail_valids[w]):
+                    m.d.sync += rob_pnr_lsb.eq(w)
+        with m.Elif(full | pnr_maybe_at_tail):
+            m.d.sync += rob_pnr_lsb.eq(0)
+
+        m.d.sync += pnr_maybe_at_tail.eq(~do_deq
+                                         & (pnr_inc_row | pnr_maybe_at_tail))
 
         with m.FSM():
             with m.State('NORMAL'):
@@ -481,6 +544,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
 
         m.d.comb += [
             self.head_idx.eq(rob_head_idx),
+            self.pnr_idx.eq(rob_pnr_idx),
             self.tail_idx.eq(rob_tail_idx),
             self.ready.eq(state_is_normal & ~full & ~r_exc_valid),
             self.empty.eq(empty),
