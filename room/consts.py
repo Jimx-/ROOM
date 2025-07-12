@@ -176,6 +176,11 @@ class UOpCode(IntEnum):
     BSET = 191
     BSETI = 192
 
+    # V
+    VSETVL = 193
+    VSETVLI = 194
+    VSETIVLI = 195
+
 
 class RegisterType(IntEnum):
     X = 0
@@ -188,6 +193,7 @@ class IssueQueueType(IntEnum):
     INT = 1
     MEM = 2
     FP = 4
+    VEC = 8
 
     FMEM = FP | MEM
 
@@ -228,6 +234,7 @@ class ImmSel(IntEnum):
     B = 3
     U = 4
     J = 5
+    V = 6
 
 
 class ALUOperator(IntEnum):
@@ -298,6 +305,7 @@ class FUType(IntEnum):
     F2I = 512
     F2IMEM = F2I | MEM
     GPU = 1024
+    VEC = 2048
 
 
 class PCSel(IntEnum):

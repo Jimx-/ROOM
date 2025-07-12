@@ -50,6 +50,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
                  has_fdiv=False,
                  has_ifpu=False,
                  has_fpiu=False,
+                 has_vec=False,
                  sim_debug=False):
         super().__init__(params)
 
@@ -73,6 +74,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.has_fdiv = has_fdiv
         self.has_ifpu = has_ifpu
         self.has_fpiu = has_fpiu
+        self.has_vec = has_vec
         self.sim_debug = sim_debug
 
         self.fu_types = Signal(FUType)
@@ -140,14 +142,15 @@ class ALUExecUnit(ExecUnit):
                  has_mem=False,
                  has_csr=False,
                  has_ifpu=False,
+                 has_vec=False,
                  sim_debug=False,
                  name=None):
         super().__init__(params['xlen'],
                          3 if has_alu and has_mul else (1 if has_alu else 0),
                          params,
                          irf_read=True,
-                         irf_write=has_alu,
-                         mem_frf_write=has_ifpu,
+                         irf_write=has_alu or has_vec,
+                         mem_frf_write=has_ifpu or has_vec,
                          can_bypass=has_alu,
                          has_jmp_unit=has_jmp_unit,
                          has_alu=has_alu,
@@ -156,6 +159,7 @@ class ALUExecUnit(ExecUnit):
                          has_mem=has_mem,
                          has_csr=has_csr,
                          has_ifpu=has_ifpu,
+                         has_vec=has_vec,
                          sim_debug=sim_debug)
         self.name = name
 
@@ -176,13 +180,20 @@ class ALUExecUnit(ExecUnit):
             with m.If(~ifpu_busy):
                 m.d.comb += fu_type_ifpu.eq(FUType.I2F)
 
+        vec_busy = Signal()
+        fu_type_vec = Signal(FUType)
+        if self.has_vec:
+            with m.If(~vec_busy):
+                m.d.comb += fu_type_vec.eq(FUType.VEC)
+
         m.d.comb += self.fu_types.eq((FUType.ALU if self.has_alu else 0)
                                      | (FUType.MUL if self.has_mul else 0)
                                      | fu_type_div
                                      | (FUType.JMP if self.has_jmp_unit else 0)
                                      | (FUType.MEM if self.has_mem else 0)
                                      | (FUType.CSR if self.has_csr else 0)
-                                     | fu_type_ifpu)
+                                     | fu_type_ifpu
+                                     | fu_type_vec)
 
         iresp_units = []
 
@@ -487,6 +498,19 @@ class ExecUnits(HasCoreParams, Elaboratable):
                                  has_ifpu=(i == (4 % int_width)),
                                  sim_debug=sim_debug,
                                  name=f'alu_int{i}')
+                self.exec_units.append(eu)
+                self.irf_readers += eu.irf_read
+                self.irf_writers += eu.irf_write
+
+                if sim_debug:
+                    self.exec_debug.append(eu.exec_debug)
+
+            if self.use_vector:
+                eu = ALUExecUnit(params,
+                                 has_alu=False,
+                                 has_vec=True,
+                                 sim_debug=sim_debug,
+                                 name='vec')
                 self.exec_units.append(eu)
                 self.irf_readers += eu.irf_read
                 self.irf_writers += eu.irf_write

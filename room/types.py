@@ -16,6 +16,7 @@ class HasCoreParams:
         self.xlen = params['xlen']
         self.flen = params['flen']
         self.use_fpu = params['use_fpu']
+        self.use_vector = params.get('use_vector', False)
 
         self.vaddr_bits = params['vaddr_bits']
         self.vaddr_bits_extended = self.vaddr_bits + (self.vaddr_bits
@@ -176,6 +177,9 @@ class HasCoreParams:
             #
 
             self.use_raster = params['use_raster']
+
+        if self.use_vector:
+            self.vlen = params['vlen']
 
 
 class MicroOp(HasCoreParams, Record):
