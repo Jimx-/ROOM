@@ -78,7 +78,7 @@ class CoreDebug(HasCoreParams):
 
         self.wb_debug = [
             Valid(WritebackDebug, params, name=f'wb_debug{i}')
-            for i in range(self.mem_width + int_width)
+            for i in range(self.mem_width + int_width + self.use_vector)
         ]
 
         if self.use_fpu:
@@ -318,7 +318,9 @@ class Core(HasCoreParams, Elaboratable):
         num_fast_wakeup_ports = len([eu for eu in exec_units if eu.can_bypass])
         num_always_bypass = len([eu for eu in exec_units if eu.always_bypass])
 
-        num_int_iss_wakeup_ports = exec_units.irf_write_ports + self.mem_width + num_fast_wakeup_ports - num_always_bypass
+        num_vec_wakeup_ports = 1 if self.use_vector else 0
+
+        num_int_iss_wakeup_ports = exec_units.irf_write_ports + self.mem_width + num_fast_wakeup_ports - num_always_bypass + num_vec_wakeup_ports
         num_int_ren_wakeup_ports = num_int_iss_wakeup_ports
         num_fp_wakeup_ports = len(fp_pipeline.wakeups) if self.use_fpu else 0
 
@@ -374,7 +376,8 @@ class Core(HasCoreParams, Elaboratable):
 
         issue_units = dict()
         for typ, qp in self.issue_params.items():
-            if typ != IssueQueueType.FP:
+            if typ != IssueQueueType.FP and (self.use_vector
+                                             or typ != IssueQueueType.VEC):
                 iq = IssueUnit(qp['issue_width'], qp['num_entries'],
                                qp['dispatch_width'], num_int_iss_wakeup_ports,
                                typ, self.params)
@@ -681,7 +684,7 @@ class Core(HasCoreParams, Elaboratable):
                         fp_pipeline.dis_valids.eq(dvalids),
                         dready.eq(fp_pipeline.iq_ready),
                     ]
-            else:
+            elif self.use_vector or typ != IssueQueueType.VEC:
                 iq = issue_units[typ]
 
                 for quop, duop in zip(iq.dis_uops, duops):
@@ -702,6 +705,8 @@ class Core(HasCoreParams, Elaboratable):
             issue_units[typ]
             for typ in (IssueQueueType.MEM, IssueQueueType.INT)
         ]
+        if self.use_vector:
+            iqs_mem_int.append(issue_units[IssueQueueType.VEC])
 
         iss_uops = []
         iss_fu_types = []

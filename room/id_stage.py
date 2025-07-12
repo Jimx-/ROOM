@@ -140,6 +140,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
         IMM_SEL_J = imm_sel.eq(ImmSel.J)
         IMM_SEL_B = imm_sel.eq(ImmSel.B)
         IMM_SEL_U = imm_sel.eq(ImmSel.U)
+        IMM_SEL_V = imm_sel.eq(ImmSel.V)
 
         with m.Switch(inuop.inst[0:7]):
 
@@ -1065,6 +1066,37 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                 if self.xlen != 64:
                     with m.If(uop.mem_size == 3):
                         m.d.comb += ILL_INSN
+
+            if self.use_vector:
+                with m.Case(0b1010111):
+                    with m.Switch(inuop.inst[12:15]):
+                        with m.Case(0b111):  # vset{i}vl{i}
+                            m.d.comb += [
+                                uop.iq_type.eq(IssueQueueType.VEC),
+                                uop.fu_type.eq(FUType.VEC),
+                                uop.dst_rtype.eq(RegisterType.FIX),
+                            ]
+
+                            with m.Switch(inuop.inst[30:32]):
+                                with m.Case('0-'):  # vsetvli
+                                    m.d.comb += [
+                                        UOPC(UOpCode.VSETVLI),
+                                        uop.lrs1_rtype.eq(RegisterType.FIX),
+                                        IMM_SEL_V,
+                                    ]
+                                with m.Case('10'):  # vsetvl
+                                    m.d.comb += [
+                                        UOPC(UOpCode.VSETVL),
+                                        uop.lrs1_rtype.eq(RegisterType.FIX),
+                                        uop.lrs2_rtype.eq(RegisterType.FIX),
+                                    ]
+                                with m.Case('11'):  # vsetivli
+                                    m.d.comb += [
+                                        UOPC(UOpCode.VSETIVLI), IMM_SEL_V
+                                    ]
+
+                        with m.Default():
+                            m.d.comb += ILL_INSN
 
             with m.Default():
                 m.d.comb += ILL_INSN
