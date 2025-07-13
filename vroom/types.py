@@ -13,6 +13,7 @@ class HasVectorParams(HasCoreParams):
         vector_params = params['vector_params']
         self.fetch_buffer_size = self.ftq_size = vector_params[
             'fetch_buffer_size']
+        self.issue_queue_depth = vector_params['issue_queue_depth']
 
     @property
     def max_vlmax(self):
@@ -40,10 +41,18 @@ class VMicroOp(HasVectorParams, Record):
             ('inst', 32),
             ('ftq_idx', range(self.ftq_size)),
             ('scalar_data', self.xlen),
+            ('vlmul_mag', 2),
+            ('vlmul_sign', 1),
+            ('vsew', 3),
+            ('vta', 1),
+            ('vma', 1),
+            ('vill', 1),
             ('ldst', 5),
             ('lrs1', 5),
             ('lrs2', 5),
             ('lrs3', 5),
+            ('expd_idx', 3),
+            ('expd_end', 1),
             ('ldst_valid', 1),
             ('dst_rtype', RegisterType),
             ('lrs1_rtype', RegisterType),

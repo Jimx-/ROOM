@@ -786,33 +786,54 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                         ]
 
             #
-            # Floating-point unit
+            # Floating-point/vector load/store
             #
 
-            if self.use_fpu:
+            if self.use_fpu or self.use_vector:
                 #
                 # FSW/FSD
                 #
 
                 with m.Case(0b0100111):
-                    m.d.comb += [
-                        uop.fp_valid.eq(1),
-                        UOPC(UOpCode.STA),
-                        uop.iq_type.eq(IssueQueueType.FMEM),
-                        uop.fu_type.eq(FUType.F2IMEM),
-                        uop.lrs1_rtype.eq(RegisterType.FIX),
-                        uop.lrs2_rtype.eq(RegisterType.FLT),
-                        IMM_SEL_S,
-                        uop.uses_stq.eq(1),
-                        uop.mem_cmd.eq(MemoryCommand.WRITE),
-                        uop.mem_size.eq(inuop.inst[12:14]),
-                    ]
+                    with m.Switch(inuop.inst[12:15]):
 
-                    with m.Switch(uop.mem_size):
-                        with m.Case(0b010):
-                            m.d.comb += uop.fp_single.eq(1)
-                        with m.Case(0b011):
-                            pass
+                        if self.use_fpu:
+                            with m.Case('01-'):
+                                m.d.comb += [
+                                    uop.fp_valid.eq(1),
+                                    UOPC(UOpCode.STA),
+                                    uop.iq_type.eq(IssueQueueType.FMEM),
+                                    uop.fu_type.eq(FUType.F2IMEM),
+                                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                                    uop.lrs2_rtype.eq(RegisterType.FLT),
+                                    IMM_SEL_S,
+                                    uop.uses_stq.eq(1),
+                                    uop.mem_cmd.eq(MemoryCommand.WRITE),
+                                    uop.mem_size.eq(inuop.inst[12:14]),
+                                ]
+
+                                with m.Switch(uop.mem_size):
+                                    with m.Case(0b010):
+                                        m.d.comb += uop.fp_single.eq(1)
+                                    with m.Case(0b011):
+                                        pass
+                                    with m.Default():
+                                        m.d.comb += ILL_INSN
+
+                        if self.use_vector:
+                            with m.Case('000', '101', '110',
+                                        '111'):  # vs*8, vs*16, vs*32, vs*64
+                                m.d.comb += [
+                                    UOPC(UOpCode.VEC),
+                                    uop.iq_type.eq(IssueQueueType.VEC),
+                                    uop.fu_type.eq(FUType.VEC),
+                                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                                ]
+
+                                with m.If(inuop.inst[26:28] == 0b10):  # vss*
+                                    m.d.comb += uop.lrs2_rtype.eq(
+                                        RegisterType.FIX),
+
                         with m.Default():
                             m.d.comb += ILL_INSN
 
@@ -821,28 +842,54 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                 #
 
                 with m.Case(0b0000111):
-                    m.d.comb += [
-                        uop.fp_valid.eq(1),
-                        UOPC(UOpCode.LD),
-                        uop.iq_type.eq(IssueQueueType.MEM),
-                        uop.fu_type.eq(FUType.MEM),
-                        uop.dst_rtype.eq(RegisterType.FLT),
-                        uop.lrs1_rtype.eq(RegisterType.FIX),
-                        IMM_SEL_I,
-                        uop.uses_ldq.eq(1),
-                        uop.mem_cmd.eq(MemoryCommand.READ),
-                        uop.mem_size.eq(inuop.inst[12:14]),
-                        uop.mem_signed.eq(~inuop.inst[14]),
-                    ]
+                    with m.Switch(inuop.inst[12:15]):
 
-                    with m.Switch(uop.mem_size):
-                        with m.Case(0b010):
-                            m.d.comb += uop.fp_single.eq(1)
-                        with m.Case(0b011):
-                            pass
+                        if self.use_fpu:
+                            with m.Case('01-'):
+                                m.d.comb += [
+                                    uop.fp_valid.eq(1),
+                                    UOPC(UOpCode.LD),
+                                    uop.iq_type.eq(IssueQueueType.MEM),
+                                    uop.fu_type.eq(FUType.MEM),
+                                    uop.dst_rtype.eq(RegisterType.FLT),
+                                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                                    IMM_SEL_I,
+                                    uop.uses_ldq.eq(1),
+                                    uop.mem_cmd.eq(MemoryCommand.READ),
+                                    uop.mem_size.eq(inuop.inst[12:14]),
+                                    uop.mem_signed.eq(~inuop.inst[14]),
+                                ]
+
+                                with m.Switch(uop.mem_size):
+                                    with m.Case(0b010):
+                                        m.d.comb += uop.fp_single.eq(1)
+                                    with m.Case(0b011):
+                                        pass
+                                    with m.Default():
+                                        m.d.comb += ILL_INSN
+
+                        if self.use_vector:
+                            with m.Case('000', '101', '110',
+                                        '111'):  # vl*8, vl*16, vl*32, vl*64
+                                m.d.comb += [
+                                    UOPC(UOpCode.VEC),
+                                    uop.iq_type.eq(IssueQueueType.VEC),
+                                    uop.fu_type.eq(FUType.VEC),
+                                    uop.dst_rtype.eq(RegisterType.VEC),
+                                    uop.lrs1_rtype.eq(RegisterType.FIX),
+                                ]
+
+                                with m.If(inuop.inst[26:28] == 0b10):  # vls*
+                                    m.d.comb += uop.lrs2_rtype.eq(
+                                        RegisterType.FIX),
+
                         with m.Default():
                             m.d.comb += ILL_INSN
+            #
+            # Floating-point unit
+            #
 
+            if self.use_fpu:
                 #
                 # Floating point arithmetic
                 #

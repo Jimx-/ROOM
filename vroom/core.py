@@ -2,7 +2,8 @@ from amaranth import *
 
 from vroom.types import HasVectorParams
 from vroom.if_stage import IFStage
-from vroom.id_stage import DecodeStage
+from vroom.id_stage import DecodeStage, VOpExpander
+from vroom.dispatch import Dispatcher
 
 from room.branch import BranchUpdate
 from room.fu import ExecReq, ExecResp
@@ -83,6 +84,27 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             dec_stage.fetch_packet.valid.eq(if_stage.fetch_packet.valid),
             dec_stage.fetch_packet.bits.eq(if_stage.fetch_packet.bits),
             if_stage.fetch_packet.ready.eq(dec_stage.fetch_packet.ready),
+            dec_stage.vtype.eq(if_stage.vtype),
         ]
+
+        expander = m.submodules.expander = VOpExpander(self.params)
+        m.d.comb += [
+            expander.dec_valid.eq(dec_stage.valid),
+            expander.dec_uop.eq(dec_stage.uop),
+            dec_stage.ready.eq(expander.dec_ready),
+        ]
+
+        #
+        # Dispatch
+        #
+
+        dispatcher = m.submodules.dispatcher = Dispatcher(self.params)
+        m.d.comb += [
+            dispatcher.expd_valid.eq(expander.expd_valid),
+            dispatcher.expd_uop.eq(expander.expd_uop),
+            expander.expd_ready.eq(dispatcher.expd_ready),
+        ]
+
+        m.d.comb += dispatcher.dis_ready.eq(1)
 
         return m

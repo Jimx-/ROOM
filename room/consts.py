@@ -180,6 +180,7 @@ class UOpCode(IntEnum):
     VSETVL = 193
     VSETVLI = 194
     VSETIVLI = 195
+    VEC = 196
 
 
 class RegisterType(IntEnum):
@@ -187,6 +188,7 @@ class RegisterType(IntEnum):
     FIX = 1
     FLT = 2
     PAS = 3
+    VEC = 4
 
 
 class IssueQueueType(IntEnum):
