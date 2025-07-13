@@ -1175,6 +1175,16 @@ class Core(HasCoreParams, Elaboratable):
             exc_unit.cause.eq(rob.commit_exc.bits.cause),
         ]
 
+        if self.use_vector:
+            vec_eu = [eu for eu in exec_units if eu.has_vec][0]
+            m.d.comb += [
+                vec_eu.rob_head_idx.eq(rob.head_idx),
+                vec_eu.rob_pnr_idx.eq(rob.pnr_idx),
+                vec_eu.exception.eq(exc_unit.exception),
+            ]
+
+            csr.add_csrs(vec_eu.iter_csrs())
+
         #
         # Virtual memory
         #

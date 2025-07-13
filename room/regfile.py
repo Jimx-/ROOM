@@ -157,6 +157,7 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
         IMM_J = self.rrd_uop.imm_sel.eq(ImmSel.J)
         IMM_B = self.rrd_uop.imm_sel.eq(ImmSel.B)
         IMM_U = self.rrd_uop.imm_sel.eq(ImmSel.U)
+        IMM_V = self.rrd_uop.imm_sel.eq(ImmSel.V)
 
         DW_32 = self.rrd_uop.alu_dw.eq(ALUWidth.DW_32)
 
@@ -513,6 +514,26 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
                             OPA_RS1,
                             OPB_RS2,
                         ]
+
+            if self.use_vector:
+                with m.Case(UOpCode.VSETVL):
+                    m.d.comb += [
+                        OPA_RS1,
+                        OPB_RS2,
+                    ]
+
+                with m.Case(UOpCode.VSETVLI):
+                    m.d.comb += [
+                        OPA_RS1,
+                        OPB_IMM,
+                        IMM_V,
+                    ]
+
+                with m.Case(UOpCode.VSETIVLI):
+                    m.d.comb += [
+                        OPB_IMM,
+                        IMM_V,
+                    ]
 
         m.d.comb += [
             self.rrd_uop.is_load.eq(self.iss_uop.opcode == UOpCode.LD),

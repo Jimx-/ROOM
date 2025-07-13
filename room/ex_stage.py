@@ -5,6 +5,9 @@ from room.fu import ExecReq, ExecResp, ALUUnit, AddrGenUnit, MultiplierUnit, Div
 from room.branch import GetPCResp, BranchResolution, BranchUpdate, BranchKillableFIFO
 from room.types import HasCoreParams, MicroOp
 from room.utils import Arbiter, generate_imm
+from room.csr import AutoCSR
+
+from vroom.core import VectorUnit
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -111,6 +114,13 @@ class ExecUnit(HasCoreParams, Elaboratable):
         if has_mem:
             self.lsu_req = Valid(ExecResp, self.data_width, params)
 
+        if has_vec:
+            self.rob_head_idx = Signal(
+                range(self.core_width * self.num_rob_rows))
+            self.rob_pnr_idx = Signal(
+                range(self.core_width * self.num_rob_rows))
+            self.exception = Signal()
+
         if sim_debug:
             self.exec_debug = Valid(ExecDebug, params, name='ex_debug')
 
@@ -131,7 +141,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         return m
 
 
-class ALUExecUnit(ExecUnit):
+class ALUExecUnit(ExecUnit, AutoCSR):
 
     def __init__(self,
                  params,
@@ -162,6 +172,9 @@ class ALUExecUnit(ExecUnit):
                          has_vec=has_vec,
                          sim_debug=sim_debug)
         self.name = name
+
+        if has_vec:
+            self._vec_unit = VectorUnit(self.params, sim_debug=self.sim_debug)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -295,6 +308,24 @@ class ALUExecUnit(ExecUnit):
                 agu.br_update.eq(self.br_update),
                 self.lsu_req.eq(agu.resp),
             ]
+
+        if self.has_vec:
+            vec = m.submodules.vec = self._vec_unit
+
+            m.d.comb += [
+                self.req.connect(vec.req),
+                vec.req.valid.eq(self.req.valid
+                                 &
+                                 (self.req.bits.uop.fu_type_has(FUType.VEC))),
+                vec.resp.ready.eq(1),
+                vec.rob_head_idx.eq(self.rob_head_idx),
+                vec.rob_pnr_idx.eq(self.rob_pnr_idx),
+                vec.br_update.eq(self.br_update),
+                vec.exception.eq(self.exception),
+                vec_busy.eq(~vec.req.ready),
+            ]
+
+            iresp_units.append(vec)
 
         if self.irf_write:
             for iu in reversed(iresp_units):

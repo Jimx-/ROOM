@@ -39,7 +39,8 @@ def generate_imm(ip, sel):
     i5_10 = Mux(sel == ImmSel.U, 0, ip[14:19])
     i1_4 = Mux(sel == ImmSel.U, 0, ip[9:14])
     i0 = Mux((sel == ImmSel.S) | (sel == ImmSel.I), ip[8], 0)
-    return Cat(i0, i1_4, i5_10, i11, i12_19, i20_30, sign)
+    return Mux(sel == ImmSel.V, Cat(ip[3:18], Const(0, 16)),
+               Cat(i0, i1_4, i5_10, i11, i12_19, i20_30, sign))
 
 
 def generate_imm_type(ip):

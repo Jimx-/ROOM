@@ -1092,7 +1092,8 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                     ]
                                 with m.Case('11'):  # vsetivli
                                     m.d.comb += [
-                                        UOPC(UOpCode.VSETIVLI), IMM_SEL_V
+                                        UOPC(UOpCode.VSETIVLI),
+                                        IMM_SEL_V,
                                     ]
 
                         with m.Default():

@@ -180,6 +180,7 @@ class HasCoreParams:
 
         if self.use_vector:
             self.vlen = params['vlen']
+            self.elen = params['elen']
 
 
 class MicroOp(HasCoreParams, Record):
