@@ -1,6 +1,8 @@
 from amaranth import *
 from amaranth.utils import log2_int
 
+from vroom.consts import *
+
 from room.consts import RegisterType
 from room.types import HasCoreParams
 
@@ -47,16 +49,22 @@ class VMicroOp(HasVectorParams, Record):
             ('vta', 1),
             ('vma', 1),
             ('vill', 1),
+            ('vm', 1),
+            ('fu_type', VFUType),
+            ('funct6', 6),
+            ('funct3', 3),
             ('ldst', 5),
             ('lrs1', 5),
             ('lrs2', 5),
-            ('lrs3', 5),
-            ('expd_idx', 3),
-            ('expd_end', 1),
             ('ldst_valid', 1),
             ('dst_rtype', RegisterType),
             ('lrs1_rtype', RegisterType),
             ('lrs2_rtype', RegisterType),
+            ('lrs3_rtype', RegisterType),
+            ('expd_idx', 3),
+            ('expd_end', 1),
+            ('is_ld', 1),
+            ('is_st', 1),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)

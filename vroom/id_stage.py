@@ -1,5 +1,6 @@
 from amaranth import *
 
+from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp, VType
 
 from room.consts import RegisterType
@@ -30,13 +31,23 @@ class DecodeUnit(HasVectorParams, Elaboratable):
             uop.vta.eq(self.vtype.vta),
             uop.vma.eq(self.vtype.vma),
             uop.vill.eq(self.vtype.vill),
+            uop.vm.eq(inuop.inst[25]),
+            uop.funct6.eq(inuop.inst[26:32]),
+            uop.funct3.eq(inuop.inst[12:15]),
             uop.ldst.eq(inuop.inst[7:12]),
             uop.lrs1.eq(inuop.inst[15:20]),
             uop.lrs2.eq(inuop.inst[20:25]),
-            uop.lrs3.eq(inuop.inst[27:32]),
             uop.ldst_valid.eq((uop.dst_rtype != RegisterType.X) & ~(
                 (uop.dst_rtype == RegisterType.FIX) & (uop.ldst == 0))),
         ]
+
+        with m.Switch(inuop.inst[0:7]):
+            with m.Case(0b0000111):  # vl*
+                m.d.comb += [
+                    uop.fu_type.eq(VFUType.MEM),
+                    uop.dst_rtype.eq(RegisterType.VEC),
+                    uop.is_ld.eq(1),
+                ]
 
         return m
 
@@ -128,6 +139,9 @@ class VOpExpander(HasVectorParams, Elaboratable):
                     self.expd_uop.eq(expd_uop),
                     self.expd_uop.expd_idx.eq(expd_idx),
                     self.expd_uop.expd_end.eq(expd_idx == expd_count),
+                    self.expd_uop.ldst.eq(expd_uop.ldst + expd_idx),
+                    self.expd_uop.lrs1.eq(expd_uop.lrs1 + expd_idx),
+                    self.expd_uop.lrs2.eq(expd_uop.lrs2 + expd_idx),
                 ]
 
                 with m.If(expd_fire):

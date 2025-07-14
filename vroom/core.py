@@ -4,6 +4,8 @@ from vroom.types import HasVectorParams
 from vroom.if_stage import IFStage
 from vroom.id_stage import DecodeStage, VOpExpander
 from vroom.dispatch import Dispatcher
+from vroom.issue import Scoreboard
+from vroom.regfile import RegisterRead
 
 from room.branch import BranchUpdate
 from room.fu import ExecReq, ExecResp
@@ -79,7 +81,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         # Decoding
         #
 
-        dec_stage = m.submodules.dec_stage = DecodeStage(self.params)
+        dec_stage = m.submodules.decode_stage = DecodeStage(self.params)
         m.d.comb += [
             dec_stage.fetch_packet.valid.eq(if_stage.fetch_packet.valid),
             dec_stage.fetch_packet.bits.eq(if_stage.fetch_packet.bits),
@@ -106,5 +108,37 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         ]
 
         m.d.comb += dispatcher.dis_ready.eq(1)
+
+        #
+        # Issue
+        #
+
+        scoreboard = m.submodules.scoreboard = Scoreboard(params=self.params)
+        m.d.comb += [
+            scoreboard.dis_uop.eq(dispatcher.dis_uop),
+            scoreboard.sb_uop.eq(dispatcher.sb_uop),
+        ]
+
+        sb_ready = scoreboard.dis_ready
+
+        #
+        # Register read
+        #
+
+        vregread = m.submodules.vregread = RegisterRead(num_rports=3,
+                                                        rports_array=[3],
+                                                        reg_width=self.vlen,
+                                                        params=self.params)
+
+        m.d.comb += [
+            vregread.dis_valid.eq(dispatcher.dis_valid & sb_ready),
+            vregread.dis_uop.eq(dispatcher.dis_uop),
+        ]
+
+        dis_ready = vregread.dis_ready
+        m.d.comb += [
+            scoreboard.dis_valid.eq(dispatcher.dis_valid & dis_ready),
+            dispatcher.dis_ready.eq(sb_ready & dis_ready),
+        ]
 
         return m
