@@ -5,7 +5,7 @@ from vroom.if_stage import IFStage
 from vroom.id_stage import DecodeStage, VOpExpander
 from vroom.dispatch import Dispatcher
 from vroom.issue import Scoreboard
-from vroom.regfile import RegisterRead
+from vroom.regfile import RegisterRead, RegisterFile
 
 from room.branch import BranchUpdate
 from room.fu import ExecReq, ExecResp
@@ -125,14 +125,22 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         # Register read
         #
 
+        vregfile = m.submodules.vregfile = RegisterFile(rports=3,
+                                                        wports=1,
+                                                        num_regs=32,
+                                                        data_width=self.vlen)
+
         vregread = m.submodules.vregread = RegisterRead(num_rports=3,
-                                                        rports_array=[3],
                                                         reg_width=self.vlen,
                                                         params=self.params)
 
         m.d.comb += [
             vregread.dis_valid.eq(dispatcher.dis_valid & sb_ready),
             vregread.dis_uop.eq(dispatcher.dis_uop),
+            if_stage.get_rs1.valid.eq(vregread.dis_valid),
+            if_stage.get_rs1.bits.eq(dispatcher.dis_uop.ftq_idx),
+            if_stage.get_rs2.valid.eq(vregread.dis_valid),
+            if_stage.get_rs2.bits.eq(dispatcher.dis_uop.ftq_idx),
         ]
 
         dis_ready = vregread.dis_ready
@@ -140,5 +148,10 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             scoreboard.dis_valid.eq(dispatcher.dis_valid & dis_ready),
             dispatcher.dis_ready.eq(sb_ready & dis_ready),
         ]
+
+        for vrr_rp, rp in zip(vregread.read_ports, vregfile.read_ports):
+            m.d.comb += vrr_rp.connect(rp)
+
+        m.d.comb += vregread.exec_req.ready.eq(1)
 
         return m

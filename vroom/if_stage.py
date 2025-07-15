@@ -8,7 +8,9 @@ from room.consts import RegisterType, UOpCode
 from room.types import MicroOp
 from room.fu import ExecReq, ExecResp
 from room.branch import BranchKillableFIFO, BranchUpdate
-from room.utils import Decoupled, is_older, generate_imm
+from room.utils import is_older, generate_imm
+
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class VecConfigUnit(HasVectorParams, Elaboratable):
@@ -106,6 +108,11 @@ class IFStage(HasVectorParams, Elaboratable):
         self.br_update = BranchUpdate(params)
         self.exception = Signal()
 
+        self.get_rs1 = Valid(Signal, range(self.ftq_size))
+        self.get_rs1_data = Signal(self.xlen)
+        self.get_rs2 = Valid(Signal, range(self.ftq_size))
+        self.get_rs2_data = Signal(self.xlen)
+
     def elaborate(self, platform):
         m = Module()
 
@@ -137,6 +144,14 @@ class IFStage(HasVectorParams, Elaboratable):
         ftq = [
             MicroOp(self.params, name=f'ftq{i}') for i in range(self.ftq_size)
         ]
+        ftq_rs1_data = [
+            Signal(self.xlen, name=f'ftq_rs1_data{i}')
+            for i in range(self.ftq_size)
+        ]
+        ftq_rs2_data = [
+            Signal(self.xlen, name=f'ftq_rs2_data{i}')
+            for i in range(self.ftq_size)
+        ]
 
         ftq_pe = PriorityEncoder(self.ftq_size)
         m.submodules += ftq_pe
@@ -150,7 +165,19 @@ class IFStage(HasVectorParams, Elaboratable):
                         m.d.sync += [
                             ftq_valid[i].eq(1),
                             ftq[i].eq(fetch_buffer.r_data.uop),
+                            ftq_rs1_data[i].eq(fetch_buffer.r_data.rs1_data),
+                            ftq_rs2_data[i].eq(fetch_buffer.r_data.rs2_data),
                         ]
+
+        for req, resp, data in [
+            (self.get_rs1, self.get_rs1_data, ftq_rs1_data),
+            (self.get_rs2, self.get_rs2_data, ftq_rs2_data),
+        ]:
+            with m.If(req.valid):
+                with m.Switch(req.bits):
+                    for i in range(self.ftq_size):
+                        with m.Case(i):
+                            m.d.comb += resp.eq(data[i])
 
         next_uop_safe = is_older(fetch_buffer.r_data.uop.rob_idx,
                                  self.rob_pnr_idx, self.rob_head_idx)
@@ -174,15 +201,6 @@ class IFStage(HasVectorParams, Elaboratable):
                     self.fetch_packet.bits.inst.eq(
                         fetch_buffer.r_data.uop.inst),
                     self.fetch_packet.bits.ftq_idx.eq(next_ftq_idx),
-                    self.fetch_packet.bits.scalar_data.eq(
-                        Mux(
-                            fetch_buffer.r_data.uop.lrs1_rtype ==
-                            RegisterType.FLT, fetch_buffer.r_data.rs3_data,
-                            Mux(
-                                fetch_buffer.r_data.uop.uses_ldq
-                                | fetch_buffer.r_data.uop.uses_stq,
-                                fetch_buffer.r_data.rs2_data,
-                                fetch_buffer.r_data.rs1_data))),
                 ]
 
         m.d.comb += vec_config.resp.connect(self.resp)

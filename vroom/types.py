@@ -42,7 +42,6 @@ class VMicroOp(HasVectorParams, Record):
         Record.__init__(self, [
             ('inst', 32),
             ('ftq_idx', range(self.ftq_size)),
-            ('scalar_data', self.xlen),
             ('vlmul_mag', 2),
             ('vlmul_sign', 1),
             ('vsew', 3),
