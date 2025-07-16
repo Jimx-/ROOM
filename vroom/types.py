@@ -68,6 +68,9 @@ class VMicroOp(HasVectorParams, Record):
                         name=name,
                         src_loc_at=1 + src_loc_at)
 
+    def fu_type_has(self, typ):
+        return (self.fu_type & typ) != 0
+
 
 class VType(HasVectorParams, Record):
 

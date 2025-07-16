@@ -6,6 +6,7 @@ from vroom.id_stage import DecodeStage, VOpExpander
 from vroom.dispatch import Dispatcher
 from vroom.issue import Scoreboard
 from vroom.regfile import RegisterRead, RegisterFile
+from vroom.ex_stage import ALUExecUnit
 
 from room.branch import BranchUpdate
 from room.fu import ExecReq, ExecResp
@@ -152,6 +153,24 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         for vrr_rp, rp in zip(vregread.read_ports, vregfile.read_ports):
             m.d.comb += vrr_rp.connect(rp)
 
-        m.d.comb += vregread.exec_req.ready.eq(1)
+        #
+        # Execute
+        #
+
+        exec_rs1_data = Signal(self.xlen)
+        exec_rs2_data = Signal(self.xlen)
+        m.d.sync += [
+            exec_rs1_data.eq(if_stage.get_rs1_data),
+            exec_rs2_data.eq(if_stage.get_rs2_data),
+        ]
+
+        exec_unit = m.submodules.exec_unit = ALUExecUnit(self.params)
+        m.d.comb += [
+            vregread.exec_req.connect(exec_unit.req),
+            exec_unit.req.bits.rs1_data.eq(exec_rs1_data),
+            exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
+        ]
+
+        m.d.comb += exec_unit.lsu_req.ready.eq(1)
 
         return m
