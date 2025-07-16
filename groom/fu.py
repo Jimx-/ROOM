@@ -133,7 +133,7 @@ class PipelinedFunctionalUnit(FunctionalUnit):
         if self.num_stages > 0:
             self.valids = Signal(self.num_stages)
             self.wids = [
-                MicroOp(self.params, name=f's{i}_wid')
+                Signal(range(self.n_warps), name=f's{i}_wid')
                 for i in range(self.num_stages)
             ]
             self.uops = [
