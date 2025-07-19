@@ -3,6 +3,7 @@ from amaranth.lib.coding import PriorityEncoder
 from amaranth.utils import log2_int
 
 from vroom.types import HasVectorParams, VMicroOp, VType
+from vroom.fu import ExecResp as VExecResp
 
 from room.consts import RegisterType, UOpCode
 from room.types import MicroOp
@@ -10,7 +11,7 @@ from room.fu import ExecReq, ExecResp
 from room.branch import BranchKillableFIFO, BranchUpdate
 from room.utils import is_older, generate_imm
 
-from roomsoc.interconnect.stream import Valid, Decoupled
+from roomsoc.interconnect.stream import Valid, Decoupled, SkidBuffer
 
 
 class VecConfigUnit(HasVectorParams, Elaboratable):
@@ -79,11 +80,14 @@ class VecConfigUnit(HasVectorParams, Elaboratable):
                         & (self.req.bits.uop.lrs1 == 0))):
                 m.d.sync += self.vl.eq(vl_new)
 
+        out_buf = m.submodules.out_buf = SkidBuffer(ExecResp, self.xlen,
+                                                    self.params)
         m.d.comb += [
-            self.resp.bits.uop.eq(self.req.bits.uop),
-            self.resp.bits.data.eq(vl_new),
-            self.resp.valid.eq(self.req.valid),
-            self.req.ready.eq(self.resp.ready),
+            out_buf.enq.bits.uop.eq(self.req.bits.uop),
+            out_buf.enq.bits.data.eq(vl_new),
+            out_buf.enq.valid.eq(self.req.valid),
+            self.req.ready.eq(out_buf.enq.ready),
+            out_buf.deq.connect(self.resp),
         ]
 
         return m
@@ -113,6 +117,8 @@ class IFStage(HasVectorParams, Elaboratable):
         self.get_rs2 = Valid(Signal, range(self.ftq_size))
         self.get_rs2_data = Signal(self.xlen)
 
+        self.wb_req = Valid(VExecResp, params)
+
     def elaborate(self, platform):
         m = Module()
 
@@ -141,6 +147,10 @@ class IFStage(HasVectorParams, Elaboratable):
         ]
 
         ftq_valid = Signal(self.ftq_size)
+        ftq_wb = [
+            Valid(Signal, self.xlen, name=f'ftq_wb{i}')
+            for i in range(self.ftq_size)
+        ]
         ftq = [
             MicroOp(self.params, name=f'ftq{i}') for i in range(self.ftq_size)
         ]
@@ -203,6 +213,48 @@ class IFStage(HasVectorParams, Elaboratable):
                     self.fetch_packet.bits.ftq_idx.eq(next_ftq_idx),
                 ]
 
-        m.d.comb += vec_config.resp.connect(self.resp)
+        with m.If(vec_config.resp.valid):
+            m.d.comb += vec_config.resp.connect(self.resp)
+        with m.Else():
+            wb_grant = Signal(range(self.ftq_size))
+            with m.If(self.wb_req.valid):
+                m.d.comb += [
+                    self.resp.valid.eq(1),
+                    self.resp.bits.data.eq(self.wb_req.bits.rd_data),
+                    wb_grant.eq(self.wb_req.bits.uop.ftq_idx),
+                ]
+                with m.Switch(self.wb_req.bits.uop.ftq_idx):
+                    for i in range(self.ftq_size):
+                        with m.Case(i):
+                            m.d.comb += self.resp.bits.uop.eq(ftq[i])
+                            m.d.sync += [
+                                ftq_wb[i].valid.eq(1),
+                                ftq_wb[i].bits.eq(self.wb_req.bits.rd_data),
+                            ]
+
+            with m.Else():
+                wb_pe = PriorityEncoder(self.ftq_size)
+                m.submodules += wb_pe
+                m.d.comb += [
+                    wb_pe.i.eq(Cat(wb.valid for wb in ftq_wb)),
+                    wb_grant.eq(wb_pe.o),
+                    self.resp.valid.eq(~wb_pe.n),
+                ]
+                with m.Switch(wb_pe.o):
+                    for i in range(self.ftq_size):
+                        with m.Case(i):
+                            m.d.comb += [
+                                self.resp.bits.uop.eq(ftq[i]),
+                                self.resp.bits.data.eq(ftq_wb[i].bits),
+                            ]
+
+            with m.If(self.resp.fire):
+                with m.Switch(wb_grant):
+                    for i in range(self.ftq_size):
+                        with m.Case(i):
+                            m.d.sync += [
+                                ftq_valid[i].eq(0),
+                                ftq_wb[i].valid.eq(0),
+                            ]
 
         return m

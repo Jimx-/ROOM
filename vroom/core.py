@@ -7,11 +7,15 @@ from vroom.dispatch import Dispatcher
 from vroom.issue import Scoreboard
 from vroom.regfile import RegisterRead, RegisterFile
 from vroom.ex_stage import ALUExecUnit
+from vroom.lsu import LoadStoreUnit
+from vroom.fu import ExecReq as VExecReq, ExecResp as VExecResp
 
+from room.consts import RegisterType
 from room.branch import BranchUpdate
 from room.fu import ExecReq, ExecResp
 from room.csr import CSR, AutoCSR, CSRAccess
-from room.utils import Decoupled
+from room.mmu import CoreMemRequest, CoreMemResponse
+from room.utils import Decoupled, Valid, Arbiter
 
 
 def vtype_layout(xlen):
@@ -35,6 +39,10 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
 
         self.req = Decoupled(ExecReq, self.xlen, params)
         self.resp = Decoupled(ExecResp, self.xlen, params)
+
+        self.mem_req = Decoupled(CoreMemRequest, params)
+        self.mem_nack = Signal()
+        self.mem_resp = Valid(CoreMemResponse, params)
 
         self.rob_head_idx = Signal(range(self.core_width * self.num_rob_rows))
         self.rob_pnr_idx = Signal(range(self.core_width * self.num_rob_rows))
@@ -88,6 +96,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             dec_stage.fetch_packet.bits.eq(if_stage.fetch_packet.bits),
             if_stage.fetch_packet.ready.eq(dec_stage.fetch_packet.ready),
             dec_stage.vtype.eq(if_stage.vtype),
+            dec_stage.vl.eq(if_stage.vl),
         ]
 
         expander = m.submodules.expander = VOpExpander(self.params)
@@ -159,10 +168,11 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
 
         exec_rs1_data = Signal(self.xlen)
         exec_rs2_data = Signal(self.xlen)
-        m.d.sync += [
-            exec_rs1_data.eq(if_stage.get_rs1_data),
-            exec_rs2_data.eq(if_stage.get_rs2_data),
-        ]
+        with m.If(vregread.dis_valid & vregread.dis_ready):
+            m.d.sync += [
+                exec_rs1_data.eq(if_stage.get_rs1_data),
+                exec_rs2_data.eq(if_stage.get_rs2_data),
+            ]
 
         exec_unit = m.submodules.exec_unit = ALUExecUnit(self.params)
         m.d.comb += [
@@ -171,6 +181,45 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
         ]
 
-        m.d.comb += exec_unit.lsu_req.ready.eq(1)
+        #
+        # Load/store unit
+        #
+
+        lsu = m.submodules.lsu = LoadStoreUnit(self.params)
+        m.d.comb += [
+            exec_unit.lsu_req.connect(lsu.exec_req),
+            lsu.mem_req.connect(self.mem_req),
+            lsu.mem_nack.eq(self.mem_nack),
+            lsu.mem_resp.eq(self.mem_resp),
+        ]
+
+        #
+        # Writeback
+        #
+
+        wb_arb = m.submodules.wb_arb = Arbiter(2, VExecResp, self.params)
+        wb_req = Valid(VExecResp, self.params)
+        m.d.comb += [
+            lsu.exec_resp.connect(wb_arb.inp[1]),
+            wb_req.eq(wb_arb.out),
+            wb_arb.out.ready.eq(1),
+            if_stage.wb_req.valid.eq(wb_req.valid),
+            if_stage.wb_req.bits.eq(wb_req.bits),
+        ]
+
+        m.d.comb += [
+            scoreboard.wakeup.valid.eq(
+                wb_req.valid
+                & (wb_req.bits.uop.dst_rtype == RegisterType.VEC)),
+            scoreboard.wakeup.bits.ldst.eq(wb_req.bits.uop.ldst),
+        ]
+
+        for wp in vregfile.write_ports:
+            m.d.comb += [
+                wp.valid.eq(wb_req.valid
+                            & (wb_req.bits.uop.dst_rtype == RegisterType.VEC)),
+                wp.bits.addr.eq(wb_req.bits.uop.ldst),
+                wp.bits.data.eq(wb_req.bits.vd_data),
+            ]
 
         return m

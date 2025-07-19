@@ -19,7 +19,7 @@ from room.csr import CSRFile
 from room.exc import ExceptionUnit, CoreInterrupts, Cause
 from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
-from room.mmu import PageTableWalker
+from room.mmu import PageTableWalker, CoreMemRequest
 from room.utils import Arbiter
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -1176,18 +1176,20 @@ class Core(HasCoreParams, Elaboratable):
         ]
 
         if self.use_vector:
-            vec_eu = [eu for eu in exec_units if eu.has_vec][0]
+            vec_exec_unit = [eu for eu in exec_units if eu.has_vec][0]
             m.d.comb += [
-                vec_eu.rob_head_idx.eq(rob.head_idx),
-                vec_eu.rob_pnr_idx.eq(rob.pnr_idx),
-                vec_eu.exception.eq(exc_unit.exception),
+                vec_exec_unit.rob_head_idx.eq(rob.head_idx),
+                vec_exec_unit.rob_pnr_idx.eq(rob.pnr_idx),
+                vec_exec_unit.exception.eq(exc_unit.exception),
             ]
 
-            csr.add_csrs(vec_eu.iter_csrs())
+            csr.add_csrs(vec_exec_unit.iter_csrs())
 
         #
         # Virtual memory
         #
+
+        core_mem_users = []
 
         if self.use_vm:
             ptw_users = [(if_stage.ptw_req, if_stage.ptw_resp),
@@ -1204,18 +1206,40 @@ class Core(HasCoreParams, Elaboratable):
             ptw = m.submodules.ptw = PageTableWalker(self.params)
             csr.add_csrs(ptw.iter_csrs())
             m.d.comb += [
-                ptw.mem_req.connect(lsu.core_req),
-                ptw.mem_nack.eq(lsu.core_nack),
-                ptw.mem_resp.eq(lsu.core_resp),
                 if_stage.ptbr.eq(ptw.satp.r),
                 lsu.ptbr.eq(ptw.satp.r),
                 ptw_arbiter.out.connect(ptw.req),
             ]
+            core_mem_users.append((ptw.mem_req, ptw.mem_nack, ptw.mem_resp))
 
             with m.Switch(ptw_resp_dst):
                 for i, (_, resp) in enumerate(ptw_users):
                     with m.Case(i):
                         m.d.comb += resp.eq(ptw.resp)
+
+        if self.use_vector:
+            core_mem_users.append(
+                (vec_exec_unit.vec_mem_req, vec_exec_unit.vec_mem_nack,
+                 vec_exec_unit.vec_mem_resp))
+
+        if len(core_mem_users) > 0:
+            core_mem_arbiter = m.submodules.core_mem_arbiter = Arbiter(
+                len(core_mem_users), CoreMemRequest, self.params)
+            for (req, _, _), inp in zip(core_mem_users, core_mem_arbiter.inp):
+                m.d.comb += req.connect(inp)
+            m.d.comb += core_mem_arbiter.out.connect(lsu.core_req)
+
+            core_mem_grant = Signal(range(len(core_mem_users)))
+            with m.If(core_mem_arbiter.out.fire):
+                m.d.sync += core_mem_grant.eq(core_mem_arbiter.chosen)
+
+            with m.Switch(core_mem_grant):
+                for i, (_, nack, resp) in enumerate(core_mem_users):
+                    with m.Case(i):
+                        m.d.comb += [
+                            nack.eq(lsu.core_nack),
+                            resp.eq(lsu.core_resp),
+                        ]
 
         #
         # I-D bus

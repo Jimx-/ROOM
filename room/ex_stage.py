@@ -6,6 +6,7 @@ from room.branch import GetPCResp, BranchResolution, BranchUpdate, BranchKillabl
 from room.types import HasCoreParams, MicroOp
 from room.utils import Arbiter, generate_imm
 from room.csr import AutoCSR
+from room.mmu import CoreMemRequest, CoreMemResponse
 
 from vroom.core import VectorUnit
 
@@ -120,6 +121,10 @@ class ExecUnit(HasCoreParams, Elaboratable):
             self.rob_pnr_idx = Signal(
                 range(self.core_width * self.num_rob_rows))
             self.exception = Signal()
+
+            self.vec_mem_req = Decoupled(CoreMemRequest, params)
+            self.vec_mem_nack = Signal()
+            self.vec_mem_resp = Valid(CoreMemResponse, params)
 
         if sim_debug:
             self.exec_debug = Valid(ExecDebug, params, name='ex_debug')
@@ -318,6 +323,9 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                                  &
                                  (self.req.bits.uop.fu_type_has(FUType.VEC))),
                 vec.resp.ready.eq(1),
+                vec.mem_req.connect(self.vec_mem_req),
+                vec.mem_nack.eq(self.vec_mem_nack),
+                vec.mem_resp.eq(self.vec_mem_resp),
                 vec.rob_head_idx.eq(self.rob_head_idx),
                 vec.rob_pnr_idx.eq(self.rob_pnr_idx),
                 vec.br_update.eq(self.br_update),

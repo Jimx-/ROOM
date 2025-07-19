@@ -18,6 +18,10 @@ class HasVectorParams(HasCoreParams):
         self.issue_queue_depth = vector_params['issue_queue_depth']
 
     @property
+    def vlen_bytes(self):
+        return self.vlen // 8
+
+    @property
     def max_vlmax(self):
         return self.vlen
 
@@ -32,6 +36,10 @@ class HasVectorParams(HasCoreParams):
     @property
     def max_vsew(self):
         return log2_int(self.elen // 8)
+
+    @property
+    def max_elem_count(self):
+        return self.xlen // 8
 
 
 class VMicroOp(HasVectorParams, Record):
@@ -49,6 +57,7 @@ class VMicroOp(HasVectorParams, Record):
             ('vma', 1),
             ('vill', 1),
             ('vm', 1),
+            ('vl', self.vl_bits),
             ('fu_type', VFUType),
             ('funct6', 6),
             ('funct3', 3),
@@ -64,12 +73,23 @@ class VMicroOp(HasVectorParams, Record):
             ('expd_end', 1),
             ('is_ld', 1),
             ('is_st', 1),
+            ('mem_size', 2),
+            ('unit_stride', 1),
+            ('mask', 1),
+            ('strided', 1),
+            ('indexed', 1),
+            ('widen', 1),
+            ('widen2', 1),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
 
     def fu_type_has(self, typ):
         return (self.fu_type & typ) != 0
+
+    def dest_eew(self):
+        return Mux((self.widen | self.widen2) & ~self.fu_type_has(VFUType.DIV),
+                   self.vsew + 1, self.vsew)
 
 
 class VType(HasVectorParams, Record):

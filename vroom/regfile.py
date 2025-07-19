@@ -9,6 +9,41 @@ from room.regfile import RFReadPort
 from roomsoc.interconnect.stream import Decoupled, SkidBuffer
 
 
+class RegReadDecoder(HasVectorParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.dis_uop = VMicroOp(params)
+        self.dis_valid = Signal()
+
+        self.rrd_uop = VMicroOp(params)
+        self.rrd_valid = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += [
+            self.rrd_valid.eq(self.dis_valid),
+            self.rrd_uop.eq(self.dis_uop),
+        ]
+
+        inuop = self.dis_uop
+        uop = self.rrd_uop
+
+        with m.If(inuop.is_ld | inuop.is_st):
+            mop = inuop.funct6[:2]
+            lumop = inuop.lrs2
+            m.d.comb += [
+                uop.unit_stride.eq(mop == 0),
+                uop.mask.eq((mop == 0) & (lumop == 0b01011)),
+                uop.strided.eq(mop == 2),
+                uop.indexed.eq(mop[0]),
+            ]
+
+        return m
+
+
 class RegisterRead(HasVectorParams, Elaboratable):
 
     def __init__(self, num_rports, reg_width, params):
@@ -30,12 +65,16 @@ class RegisterRead(HasVectorParams, Elaboratable):
 
     def elaborate(self, platform):
         m = Module()
+
         rrd_uop = VMicroOp(self.params)
         rrd_valid = Signal()
 
+        dec = m.submodules.decoder = RegReadDecoder(self.params)
         m.d.comb += [
-            rrd_uop.eq(self.dis_uop),
-            rrd_valid.eq(self.dis_valid),
+            dec.dis_uop.eq(self.dis_uop),
+            dec.dis_valid.eq(self.dis_valid),
+            rrd_uop.eq(dec.rrd_uop),
+            rrd_valid.eq(dec.rrd_valid),
         ]
 
         rrd_rs1_data = Signal(self.data_width)

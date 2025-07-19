@@ -13,6 +13,7 @@ class DecodeUnit(HasVectorParams, Elaboratable):
         super().__init__(params)
 
         self.vtype = VType(params)
+        self.vl = Signal(self.vl_bits)
 
         self.in_uop = VMicroOp(params)
         self.out_uop = VMicroOp(params)
@@ -32,11 +33,13 @@ class DecodeUnit(HasVectorParams, Elaboratable):
             uop.vma.eq(self.vtype.vma),
             uop.vill.eq(self.vtype.vill),
             uop.vm.eq(inuop.inst[25]),
+            uop.vl.eq(self.vl),
             uop.funct6.eq(inuop.inst[26:32]),
             uop.funct3.eq(inuop.inst[12:15]),
             uop.ldst.eq(inuop.inst[7:12]),
             uop.lrs1.eq(inuop.inst[15:20]),
             uop.lrs2.eq(inuop.inst[20:25]),
+            uop.lrs3_rtype.eq(RegisterType.VEC),
             uop.ldst_valid.eq((uop.dst_rtype != RegisterType.X) & ~(
                 (uop.dst_rtype == RegisterType.FIX) & (uop.ldst == 0))),
         ]
@@ -47,6 +50,7 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                     uop.fu_type.eq(VFUType.MEM),
                     uop.dst_rtype.eq(RegisterType.VEC),
                     uop.is_ld.eq(1),
+                    uop.mem_size.eq(inuop.inst[12:14]),
                 ]
 
         return m
@@ -58,6 +62,7 @@ class DecodeStage(HasVectorParams, Elaboratable):
         super().__init__(params)
 
         self.vtype = VType(params)
+        self.vl = Signal(self.vl_bits)
 
         self.fetch_packet = Decoupled(VMicroOp, params)
 
@@ -72,6 +77,7 @@ class DecodeStage(HasVectorParams, Elaboratable):
         m.d.comb += [
             dec_unit.in_uop.eq(self.fetch_packet.bits),
             dec_unit.vtype.eq(self.vtype),
+            dec_unit.vl.eq(self.vl),
         ]
 
         m.d.comb += [

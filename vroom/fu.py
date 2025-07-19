@@ -51,14 +51,15 @@ class ExecResp(HasVectorParams, ValueCastable):
 
         self.base_addr = Signal(self.xlen, name=f'{name}__base_addr')
         self.stride = Signal(self.xlen, name=f'{name}__stride')
+        self.old_vd = Signal(self.vlen, name=f'{name}__old_vd')
 
         self.vd_data = Signal(self.vlen, name=f'{name}__vd_data')
         self.rd_data = Signal(self.xlen, name=f'{name}__rd_data')
 
     @ValueCastable.lowermethod
     def as_value(self):
-        return Cat(self.uop, self.base_addr, self.stride, self.vd_data,
-                   self.rd_data)
+        return Cat(self.uop, self.base_addr, self.stride, self.old_vd,
+                   self.vd_data, self.rd_data)
 
     def shape(self):
         return self.as_value().shape()
@@ -134,6 +135,7 @@ class AddrGenUnit(PipelinedFunctionalUnit):
         m.d.comb += [
             self.resp.bits.base_addr.eq(self.req.bits.rs1_data),
             self.resp.bits.stride.eq(self.req.bits.rs2_data),
+            self.resp.bits.old_vd.eq(self.req.bits.vs3_data),
         ]
 
         return m
