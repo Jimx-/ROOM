@@ -44,14 +44,47 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                 (uop.dst_rtype == RegisterType.FIX) & (uop.ldst == 0))),
         ]
 
+        UOPC = lambda x: uop.opcode.eq(x)
+
         with m.Switch(inuop.inst[0:7]):
             with m.Case(0b0000111):  # vl*
                 m.d.comb += [
+                    UOPC(VOpCode.VLE),
                     uop.fu_type.eq(VFUType.MEM),
                     uop.dst_rtype.eq(RegisterType.VEC),
                     uop.is_ld.eq(1),
                     uop.mem_size.eq(inuop.inst[12:14]),
                 ]
+
+            with m.Case(0b1010111):
+                with m.Switch(uop.funct3):
+                    with m.Case(0b000):  # OPIVV
+                        m.d.comb += [
+                            uop.fu_type.eq(VFUType.ALU),
+                            uop.dst_rtype.eq(RegisterType.VEC),
+                            uop.lrs1_rtype.eq(RegisterType.VEC),
+                            uop.lrs2_rtype.eq(RegisterType.VEC),
+                        ]
+
+                        with m.Switch(uop.funct6):
+                            with m.Case(0b000000):
+                                m.d.comb += UOPC(VOpCode.VADD)
+                            with m.Case(0b000010):
+                                m.d.comb += UOPC(VOpCode.VSUB)
+                            with m.Case(0b000100):
+                                m.d.comb += UOPC(VOpCode.VMINU)
+                            with m.Case(0b000101):
+                                m.d.comb += UOPC(VOpCode.VMIN)
+                            with m.Case(0b000110):
+                                m.d.comb += UOPC(VOpCode.VMAXU)
+                            with m.Case(0b000111):
+                                m.d.comb += UOPC(VOpCode.VMAX)
+                            with m.Case(0b001001):
+                                m.d.comb += UOPC(VOpCode.VAND)
+                            with m.Case(0b001010):
+                                m.d.comb += UOPC(VOpCode.VOR)
+                            with m.Case(0b001011):
+                                m.d.comb += UOPC(VOpCode.VXOR)
 
         return m
 

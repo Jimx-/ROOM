@@ -34,8 +34,6 @@ class ALU(Elaboratable):
 
         adder_out = Signal(self.width)
         in2_inv = Mux(is_sub == 1, ~self.in2, self.in2)
-        inv = Signal(self.width)
-        m.d.comb += inv.eq(in2_inv)
         m.d.comb += adder_out.eq(self.in1 + in2_inv + is_sub)
 
         #

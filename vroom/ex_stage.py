@@ -2,9 +2,11 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams
-from vroom.fu import ExecReq, ExecResp, AddrGenUnit
+from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit
 
 from room.utils import Decoupled, Valid
+
+from roomsoc.interconnect.stream import Queue
 
 
 class ExecUnit(HasVectorParams, Elaboratable):
@@ -59,6 +61,16 @@ class ALUExecUnit(ExecUnit):
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
+        iresp_units = []
+
+        alu = m.submodules.alu = VALUUnit(self.params, num_stages=1)
+        iresp_units.append(alu)
+        m.d.comb += [
+            self.req.connect(alu.req),
+            alu.req.valid.eq(self.req.valid
+                             & (self.req.bits.uop.fu_type == VFUType.ALU)),
+        ]
+
         agu = m.submodules.agu = AddrGenUnit(self.params)
 
         m.d.comb += [
@@ -68,6 +80,20 @@ class ALUExecUnit(ExecUnit):
             self.lsu_req.valid.eq(agu.resp.valid),
             self.lsu_req.bits.eq(agu.resp.bits),
         ]
+
+        for iu in reversed(iresp_units):
+            if isinstance(iu, Queue):
+                with m.If(iu.deq.valid):
+                    m.d.comb += [
+                        self.iresp.valid.eq(1),
+                        self.iresp.bits.eq(iu.deq.bits),
+                    ]
+            else:
+                with m.If(iu.resp.valid):
+                    m.d.comb += [
+                        self.iresp.valid.eq(1),
+                        self.iresp.bits.eq(iu.resp.bits),
+                    ]
 
         m.d.comb += self.req.ready.eq(1)
         with m.If(self.req.bits.uop.fu_type_has(VFUType.MEM)):

@@ -1117,6 +1117,69 @@ class DecodeUnit(HasCoreParams, Elaboratable):
             if self.use_vector:
                 with m.Case(0b1010111):
                     with m.Switch(inuop.inst[12:15]):
+                        with m.Case(0b000):  # OPIVV
+                            m.d.comb += [
+                                uop.iq_type.eq(IssueQueueType.VEC),
+                                uop.fu_type.eq(FUType.VEC),
+                                uop.dst_rtype.eq(RegisterType.VEC),
+                                uop.lrs1_rtype.eq(RegisterType.VEC),
+                                uop.lrs2_rtype.eq(RegisterType.VEC),
+                            ]
+
+                        with m.Case(0b001):  # OPFVV
+                            m.d.comb += [
+                                uop.iq_type.eq(IssueQueueType.VEC),
+                                uop.fu_type.eq(FUType.VEC),
+                                uop.lrs1_rtype.eq(RegisterType.VEC),
+                                uop.lrs2_rtype.eq(RegisterType.VEC),
+                            ]
+
+                        with m.Case(0b010):  # OPMVV
+                            m.d.comb += [
+                                uop.iq_type.eq(IssueQueueType.VEC),
+                                uop.fu_type.eq(FUType.VEC),
+                                uop.lrs1_rtype.eq(RegisterType.VEC),
+                                uop.lrs2_rtype.eq(RegisterType.VEC),
+                            ]
+
+                        with m.Case(0b011):  # OPIVI
+                            m.d.comb += [
+                                uop.iq_type.eq(IssueQueueType.VEC),
+                                uop.fu_type.eq(FUType.VEC),
+                                uop.dst_rtype.eq(RegisterType.VEC),
+                                uop.lrs2_rtype.eq(RegisterType.VEC),
+                                IMM_SEL_V,
+                            ]
+
+                        with m.Case(0b100):  # OPIVX
+                            m.d.comb += [
+                                uop.iq_type.eq(IssueQueueType.VEC),
+                                uop.fu_type.eq(FUType.VEC),
+                                uop.dst_rtype.eq(RegisterType.VEC),
+                                uop.lrs1_rtype.eq(RegisterType.FIX),
+                                uop.lrs2_rtype.eq(RegisterType.VEC),
+                                IMM_SEL_V,
+                            ]
+
+                        with m.Case(0b101):  # OPFVF
+                            m.d.comb += [
+                                uop.iq_type.eq(IssueQueueType.VEC),
+                                uop.fu_type.eq(FUType.VEC),
+                                uop.dst_rtype.eq(RegisterType.VEC),
+                                uop.lrs1_rtype.eq(RegisterType.FLT),
+                                uop.lrs2_rtype.eq(RegisterType.VEC),
+                                IMM_SEL_V,
+                            ]
+
+                        with m.Case(0b110):  # OPMVX
+                            m.d.comb += [
+                                uop.iq_type.eq(IssueQueueType.VEC),
+                                uop.fu_type.eq(FUType.VEC),
+                                uop.lrs1_rtype.eq(RegisterType.FIX),
+                                uop.lrs2_rtype.eq(RegisterType.VEC),
+                                IMM_SEL_V,
+                            ]
+
                         with m.Case(0b111):  # vset{i}vl{i}
                             m.d.comb += [
                                 uop.iq_type.eq(IssueQueueType.VEC),

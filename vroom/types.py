@@ -41,6 +41,14 @@ class HasVectorParams(HasCoreParams):
     def max_elem_count(self):
         return self.xlen // 8
 
+    @property
+    def lane_width(self):
+        return self.elen
+
+    @property
+    def n_lanes(self):
+        return self.vlen // self.lane_width
+
 
 class VMicroOp(HasVectorParams, Record):
 
@@ -61,6 +69,9 @@ class VMicroOp(HasVectorParams, Record):
             ('fu_type', VFUType),
             ('funct6', 6),
             ('funct3', 3),
+            ('opcode', VOpCode),
+            ('opa_sel', VOpA),
+            ('alu_fn', VALUOperator),
             ('ldst', 5),
             ('lrs1', 5),
             ('lrs2', 5),

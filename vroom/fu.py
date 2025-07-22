@@ -2,9 +2,12 @@ from amaranth import *
 from amaranth import tracer
 from amaranth.hdl.ast import ValueCastable
 
+from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
+from vroom.alu import VALU
+from vroom.utils import TailGen
 
-from room.utils import Decoupled
+from room.utils import Decoupled, sign_extend
 
 
 class ExecReq(HasVectorParams, ValueCastable):
@@ -20,6 +23,7 @@ class ExecReq(HasVectorParams, ValueCastable):
         self.vs1_data = Signal(self.vlen, name=f'{name}__vs1_data')
         self.vs2_data = Signal(self.vlen, name=f'{name}__vs2_data')
         self.vs3_data = Signal(self.vlen, name=f'{name}__vs3_data')
+        self.mask = Signal(self.vlen, name=f'{name}__mask')
 
         self.rs1_data = Signal(self.xlen, name=f'{name}__rs1_data')
         self.rs2_data = Signal(self.xlen, name=f'{name}__rs2_data')
@@ -27,7 +31,7 @@ class ExecReq(HasVectorParams, ValueCastable):
     @ValueCastable.lowermethod
     def as_value(self):
         return Cat(self.uop, self.vs1_data, self.vs2_data, self.vs3_data,
-                   self.rs1_data, self.rs2_data)
+                   self.mask, self.rs1_data, self.rs2_data)
 
     def shape(self):
         return self.as_value().shape()
@@ -71,22 +75,71 @@ class ExecResp(HasVectorParams, ValueCastable):
         return Value.cast(self).eq(Value.cast(rhs))
 
 
-class FunctionalUnit(HasVectorParams, Elaboratable):
+class ExecLaneReq(HasVectorParams, ValueCastable):
 
-    def __init__(self, params):
+    def __init__(self, data_width, params, name=None, src_loc_at=0):
         super().__init__(params)
 
-        self.req = Decoupled(ExecReq, params)
-        self.resp = Decoupled(ExecResp, params)
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.data_width = data_width
+
+        self.uop = VMicroOp(params, name=f'{name}__uop')
+
+        self.opa_data = Signal(data_width, name=f'{name}__opa_data')
+        self.opb_data = Signal(data_width, name=f'{name}__opb_data')
+        self.old_vd = Signal(data_width, name=f'{name}__old_vd')
+
+        self.tail = Signal(data_width // 8, name=f'{name}__tail')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.uop, self.opa_data, self.opb_data, self.old_vd,
+                   self.tail)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
-class PipelinedFunctionalUnit(FunctionalUnit):
+class ExecLaneResp(HasVectorParams, ValueCastable):
 
-    def __init__(self, num_stages, params):
-        self.params = params
+    def __init__(self, data_width, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.data_width = data_width
+
+        self.uop = VMicroOp(params, name=f'{name}__uop')
+
+        self.vd_data = Signal(self.data_width, name=f'{name}__vd_data')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.uop, self.vd_data)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
+
+
+class PipelinedFunctionalUnitBase(Elaboratable):
+
+    def __init__(self, num_stages):
         self.num_stages = num_stages
-
-        super().__init__(params)
 
     def elaborate(self, platform):
         m = Module()
@@ -119,6 +172,196 @@ class PipelinedFunctionalUnit(FunctionalUnit):
             m.d.comb += [
                 self.resp.valid.eq(self.req.valid),
                 self.resp.bits.uop.eq(self.req.bits.uop),
+            ]
+
+        return m
+
+
+class LaneFunctionalUnit(HasVectorParams, Elaboratable):
+
+    def __init__(self, data_width, params):
+        super().__init__(params)
+
+        self.req = Decoupled(ExecLaneReq, data_width, params)
+        self.resp = Decoupled(ExecLaneResp, data_width, params)
+
+
+class PipelinedLaneFunctionalUnit(LaneFunctionalUnit,
+                                  PipelinedFunctionalUnitBase):
+
+    def __init__(self, data_width, num_stages, params):
+        LaneFunctionalUnit.__init__(self, data_width, params)
+        PipelinedFunctionalUnitBase.__init__(self, num_stages)
+
+
+class FunctionalUnit(HasVectorParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.req = Decoupled(ExecReq, params)
+        self.resp = Decoupled(ExecResp, params)
+
+
+class PipelinedFunctionalUnit(FunctionalUnit, PipelinedFunctionalUnitBase):
+
+    def __init__(self, num_stages, params):
+        FunctionalUnit.__init__(self, params)
+        PipelinedFunctionalUnitBase.__init__(self, num_stages)
+
+
+class PerLaneFunctionalUnit(FunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        uop = self.req.bits.uop
+
+        self.lane_reqs = [
+            Decoupled(ExecLaneReq,
+                      self.lane_width,
+                      self.params,
+                      name=f'lane_req{i}') for i in range(self.n_lanes)
+        ]
+        self.lane_resps = [
+            Decoupled(ExecLaneResp,
+                      self.lane_width,
+                      self.params,
+                      name=f'lane_resp{i}') for i in range(self.n_lanes)
+        ]
+
+        imm = sign_extend(uop.lrs1, self.lane_width)
+
+        for w, lane_req in enumerate(self.lane_reqs):
+            opa_data = Signal(self.lane_width, name=f'opa_data{w}')
+            opb_data = Signal(self.lane_width, name=f'opb_data{w}')
+            old_vd = Signal(self.lane_width, name=f'old_vd{w}')
+
+            with m.Switch(uop.opa_sel):
+                with m.Case(VOpA.VS1):
+                    m.d.comb += opa_data.eq(
+                        self.req.bits.vs1_data[w * self.lane_width:(w + 1) *
+                                               self.lane_width])
+                with m.Case(VOpA.IMM):
+                    m.d.comb += opa_data.eq(imm)
+                with m.Case(VOpA.SCALAR):
+                    m.d.comb += opa_data.eq(self.req.bits.rs1_data)
+            m.d.comb += [
+                opb_data.eq(
+                    self.req.bits.vs2_data[w * self.lane_width:(w + 1) *
+                                           self.lane_width]),
+                old_vd.eq(self.req.bits.vs3_data[w * self.lane_width:(w + 1) *
+                                                 self.lane_width]),
+            ]
+
+            m.d.comb += [
+                lane_req.valid.eq(self.req.valid),
+                lane_req.bits.uop.eq(self.req.bits.uop),
+                lane_req.bits.opa_data.eq(opa_data),
+                lane_req.bits.opb_data.eq(opb_data),
+                lane_req.bits.old_vd.eq(old_vd),
+            ]
+        m.d.comb += self.req.ready.eq(self.lane_reqs[0].ready)
+
+        tail_gen = m.submodules.tail_gen = TailGen(self.params)
+        m.d.comb += [
+            tail_gen.vl.eq(self.req.bits.uop.vl),
+            tail_gen.uop_idx.eq(self.req.bits.uop.expd_idx),
+            tail_gen.eew.eq(self.req.bits.uop.dest_eew()),
+        ]
+        for w, lane_req in enumerate(self.lane_reqs):
+            with m.Switch(self.req.bits.uop.dest_eew()):
+                for i in range(4):
+                    with m.Case(i):
+                        tail_width = self.lane_width // (8 << i)
+                        m.d.comb += lane_req.bits.tail.eq(
+                            tail_gen.tail[w * tail_width:(w + 1) * tail_width])
+
+        m.d.comb += [
+            self.resp.valid.eq(self.lane_resps[0].valid),
+            self.resp.bits.uop.eq(self.lane_resps[0].bits.uop),
+        ]
+        for w, lane_resp in enumerate(self.lane_resps):
+            m.d.comb += self.resp.bits.vd_data[w * self.lane_width:(w + 1) *
+                                               self.lane_width].eq(
+                                                   lane_resp.bits.vd_data)
+
+        return m
+
+
+class VALULane(PipelinedLaneFunctionalUnit):
+
+    def __init__(self, data_width, params, num_stages=1):
+        super().__init__(data_width, num_stages, params)
+
+        self.data_width = data_width
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        uop = self.req.bits.uop
+
+        alu = m.submodules.alu = VALU(self.data_width)
+        m.d.comb += [
+            alu.fn.eq(uop.alu_fn),
+            alu.sew.eq(uop.vsew),
+            alu.eew_vd.eq(uop.dest_eew()),
+            alu.in1.eq(self.req.bits.opa_data),
+            alu.in2.eq(self.req.bits.opb_data),
+            alu.in3.eq(self.req.bits.old_vd),
+        ]
+
+        tail_mask = Signal(self.data_width)
+        with m.Switch(uop.dest_eew()):
+            for i in range(4):
+                with m.Case(i):
+                    m.d.comb += tail_mask.eq(
+                        Cat(x.replicate(1 << i) for x in self.req.bits.tail))
+
+        mask_keep = Signal(self.data_width)
+        mask_off_data = Signal(self.data_width)
+        for i in range(self.data_width // 8):
+            with m.If(tail_mask[i]):
+                m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(
+                    Mux(uop.vta, Const(~0, 8),
+                        self.req.bits.old_vd[i * 8:(i + 1) * 8]))
+            with m.Else():
+                m.d.comb += mask_keep[i * 8:(i + 1) * 8].eq(~0)
+
+        s1_alu_out = Signal.like(alu.out)
+        s1_mask_keep = Signal.like(mask_keep)
+        s1_mask_off_data = Signal.like(mask_off_data)
+        m.d.sync += [
+            s1_alu_out.eq(alu.out),
+            s1_mask_keep.eq(mask_keep),
+            s1_mask_off_data.eq(mask_off_data),
+        ]
+
+        m.d.comb += self.resp.bits.vd_data.eq((s1_alu_out & s1_mask_keep)
+                                              | s1_mask_off_data)
+
+        return m
+
+
+class VALUUnit(PerLaneFunctionalUnit):
+
+    def __init__(self, params, num_stages=1):
+        super().__init__(params)
+
+        self.num_stages = num_stages
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        for w in range(self.n_lanes):
+            lane = VALULane(self.lane_width, self.params, self.num_stages)
+            setattr(m.submodules, f'lane{w}', lane)
+            m.d.comb += [
+                self.lane_reqs[w].connect(lane.req),
+                lane.resp.connect(self.lane_resps[w]),
             ]
 
         return m

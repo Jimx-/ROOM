@@ -139,6 +139,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
                                                         wports=1,
                                                         num_regs=32,
                                                         data_width=self.vlen)
+        vregfile_v0 = Signal(self.vlen)
 
         vregread = m.submodules.vregread = RegisterRead(num_rports=3,
                                                         reg_width=self.vlen,
@@ -179,6 +180,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             vregread.exec_req.connect(exec_unit.req),
             exec_unit.req.bits.rs1_data.eq(exec_rs1_data),
             exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
+            exec_unit.req.bits.mask.eq(vregfile_v0),
         ]
 
         #
@@ -200,6 +202,8 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         wb_arb = m.submodules.wb_arb = Arbiter(2, VExecResp, self.params)
         wb_req = Valid(VExecResp, self.params)
         m.d.comb += [
+            wb_arb.inp[0].bits.eq(exec_unit.iresp.bits),
+            wb_arb.inp[0].valid.eq(exec_unit.iresp.valid),
             lsu.exec_resp.connect(wb_arb.inp[1]),
             wb_req.eq(wb_arb.out),
             wb_arb.out.ready.eq(1),
@@ -221,5 +225,8 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
                 wp.bits.addr.eq(wb_req.bits.uop.ldst),
                 wp.bits.data.eq(wb_req.bits.vd_data),
             ]
+
+            with m.If(wp.valid & (wp.bits.addr == 0)):
+                m.d.sync += vregfile_v0.eq(wp.bits.data)
 
         return m
