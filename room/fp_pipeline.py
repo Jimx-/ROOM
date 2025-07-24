@@ -5,7 +5,7 @@ from room.types import HasCoreParams, MicroOp
 from room.fu import ExecResp
 from room.regfile import RegisterFile, RegisterRead, WritebackDebug
 from room.branch import BranchUpdate
-from room.issue import IssueUnit
+from room.issue import IssueUnitUnordered
 from room.ex_stage import ExecUnits
 from room.utils import Arbiter
 
@@ -64,7 +64,7 @@ class FPPipeline(HasCoreParams, Elaboratable):
         # Dispatch
         #
 
-        issue_unit = m.submodules.issue_unit = IssueUnit(
+        issue_unit = m.submodules.issue_unit = IssueUnitUnordered(
             self.iq_params['issue_width'], self.iq_params['num_entries'],
             self.iq_params['dispatch_width'], self.num_wakeup_ports,
             IssueQueueType.FP, self.params)

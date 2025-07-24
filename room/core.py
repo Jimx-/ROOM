@@ -9,7 +9,7 @@ from room.if_stage import IFStage, IFDebug
 from room.id_stage import DecodeStage, IDDebug
 from room.rename import RenameStage
 from room.dispatch import Dispatcher
-from room.issue import IssueUnit
+from room.issue import IssueUnitUnordered, IssueUnitOrdered
 from room.rob import ReorderBuffer, FlushType
 from room.regfile import RegisterFile, RegisterRead, WritebackDebug
 from room.ex_stage import ExecUnits, ExecDebug
@@ -378,9 +378,13 @@ class Core(HasCoreParams, Elaboratable):
         for typ, qp in self.issue_params.items():
             if typ != IssueQueueType.FP and (self.use_vector
                                              or typ != IssueQueueType.VEC):
-                iq = IssueUnit(qp['issue_width'], qp['num_entries'],
-                               qp['dispatch_width'], num_int_iss_wakeup_ports,
-                               typ, self.params)
+                issue_unit_cls = IssueUnitUnordered
+                if typ == IssueQueueType.VEC:
+                    issue_unit_cls = IssueUnitOrdered
+
+                iq = issue_unit_cls(qp['issue_width'], qp['num_entries'],
+                                    qp['dispatch_width'],
+                                    num_int_iss_wakeup_ports, typ, self.params)
                 setattr(m.submodules, f'issue_unit_{str(typ).split(".")[-1]}',
                         iq)
                 issue_units[typ] = iq

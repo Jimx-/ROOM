@@ -5,6 +5,7 @@ from enum import IntEnum
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.branch import BranchUpdate
+from room.utils import PopCount
 
 from roomsoc.interconnect.stream import Valid
 
@@ -33,11 +34,14 @@ class IssueSlot(HasCoreParams, Elaboratable):
         super().__init__(params)
 
         self.valid = Signal()
+        self.will_be_valid = Signal()
 
         self.in_uop = MicroOp(self.params)
         self.in_valid = Signal()
 
         self.out_uop = MicroOp(self.params)
+
+        self.move_uop = MicroOp(self.params)
 
         self.req = Signal()
         self.gnt = Signal()
@@ -49,6 +53,7 @@ class IssueSlot(HasCoreParams, Elaboratable):
 
         self.br_update = BranchUpdate(params)
         self.kill = Signal()
+        self.clear = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -65,6 +70,8 @@ class IssueSlot(HasCoreParams, Elaboratable):
             m.d.sync += state.eq(IssueSlot.State.INVALID)
         with m.Elif(self.in_valid):
             m.d.sync += state.eq(self.in_uop.issue_uops)
+        with m.Elif(self.clear):
+            m.d.sync += state.eq(IssueSlot.State.INVALID)
         with m.Else():
             m.d.sync += state.eq(next_state)
 
@@ -92,6 +99,14 @@ class IssueSlot(HasCoreParams, Elaboratable):
             with m.If(wu.valid & (wu.bits.pdst == next_uop.prs3)):
                 m.d.sync += p3.eq(1)
 
+        m.d.comb += [
+            self.move_uop.eq(slot_uop),
+            self.move_uop.issue_uops.eq(next_state),
+            self.move_uop.prs1_busy.eq(~p1),
+            self.move_uop.prs2_busy.eq(~p2),
+            self.move_uop.prs3_busy.eq(~p3),
+        ]
+
         with m.If(self.kill):
             m.d.comb += next_state.eq(IssueSlot.State.INVALID)
         with m.Elif(self.gnt & ((state == IssueSlot.State.VALID_1) | (
@@ -104,26 +119,33 @@ class IssueSlot(HasCoreParams, Elaboratable):
                     slot_uop.opcode.eq(UOpCode.STD),
                     slot_uop.lrs1_rtype.eq(RegisterType.X),
                 ]
-            with m.Else():
-                m.d.sync += [
-                    slot_uop.lrs2_rtype.eq(RegisterType.X),
+                m.d.comb += [
+                    self.move_uop.opcode.eq(UOpCode.STD),
+                    self.move_uop.lrs1_rtype.eq(RegisterType.X),
                 ]
+            with m.Else():
+                m.d.sync += slot_uop.lrs2_rtype.eq(RegisterType.X)
+                m.d.comb += self.move_uop.lrs2_rtype.eq(RegisterType.X)
 
         with m.If(self.br_update.uop_killed(slot_uop)):
             m.d.comb += next_state.eq(IssueSlot.State.INVALID)
 
+        next_br_mask = self.br_update.get_new_br_mask(slot_uop.br_mask)
         with m.If(~self.in_valid):
-            m.d.sync += slot_uop.br_mask.eq(
-                self.br_update.get_new_br_mask(slot_uop.br_mask))
+            m.d.sync += slot_uop.br_mask.eq(next_br_mask)
+        m.d.comb += self.move_uop.br_mask.eq(next_br_mask)
 
         with m.If(state == IssueSlot.State.VALID_1):
             m.d.comb += self.req.eq(p1 & p2 & p3 & ~self.kill)
         with m.Elif(state == IssueSlot.State.VALID_2):
             m.d.comb += self.req.eq((p1 | p2) & ~self.kill)
 
+        may_vacate = self.gnt & ((state == IssueSlot.State.VALID_1) | (
+            (state == IssueSlot.State.VALID_2) & p1 & p2))
         m.d.comb += [
             self.out_uop.eq(slot_uop),
             self.out_uop.issue_uops.eq(next_state),
+            self.will_be_valid.eq(self.valid & ~may_vacate),
         ]
 
         with m.If(state == IssueSlot.State.VALID_2):
@@ -140,7 +162,7 @@ class IssueSlot(HasCoreParams, Elaboratable):
         return m
 
 
-class IssueUnit(HasCoreParams, Elaboratable):
+class IssueUnitBase(HasCoreParams, Elaboratable):
 
     def __init__(self, issue_width, num_issue_slots, dispatch_width,
                  num_wakeup_ports, iq_type, params):
@@ -179,14 +201,14 @@ class IssueUnit(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        slots = []
+        self.slots = []
         #
         # Issue slots
         #
         for i in range(self.num_issue_slots):
             slot = IssueSlot(self.num_wakeup_ports, self.params)
             setattr(m.submodules, f'issue_slot{i}', slot)
-            slots.append(slot)
+            self.slots.append(slot)
 
             m.d.comb += [
                 slot.kill.eq(self.flush_pipeline),
@@ -196,40 +218,9 @@ class IssueUnit(HasCoreParams, Elaboratable):
             for swu, wu in zip(slot.wakeup_ports, self.wakeup_ports):
                 m.d.comb += swu.eq(wu)
 
-        entry_wen_array = [
-            Signal(self.dispatch_width, name=f'__entry_wen{i}')
-            for i in range(self.num_issue_slots)
-        ]
-
-        allocated = Signal(self.dispatch_width)
-        for slot, entry_wen in zip(slots, entry_wen_array):
-            next_allocated = Signal(self.dispatch_width)
-            can_allocate = ~slot.valid
-
-            for w in range(self.dispatch_width):
-                m.d.comb += [
-                    entry_wen[w].eq(can_allocate & ~allocated[w]),
-                    next_allocated[w].eq(can_allocate | allocated[w]),
-                ]
-
-                can_allocate &= allocated[w]
-
-            allocated = next_allocated
-
-        entry_wen = [
-            Signal(self.dispatch_width, name=f'entry_wen{i}')
-            for i in range(self.num_issue_slots)
-        ]
-        for wen_oh, tmp in zip(entry_wen, entry_wen_array):
-            for w in range(self.dispatch_width):
-                m.d.comb += wen_oh[w].eq(tmp[w] & self.dis_valids[w]
-                                         & ~self.dis_uops[w].exception
-                                         & ~self.dis_uops[w].is_fence
-                                         & ~self.dis_uops[w].is_fencei)
-
-        dis_uops_mux = Array(
+        self.dis_uops_mux = Array(
             MicroOp(self.params) for _ in range(self.dispatch_width))
-        for mux_uop, uop in zip(dis_uops_mux, self.dis_uops):
+        for mux_uop, uop in zip(self.dis_uops_mux, self.dis_uops):
             m.d.comb += [
                 mux_uop.eq(uop),
                 mux_uop.issue_uops.eq(1),
@@ -258,20 +249,64 @@ class IssueUnit(HasCoreParams, Elaboratable):
                         mux_uop.prs1_busy.eq(0),
                     ]
 
-        for slot, wen_oh in zip(slots, entry_wen):
+        return m
+
+
+class IssueUnitUnordered(IssueUnitBase):
+
+    def __init__(self, issue_width, num_issue_slots, dispatch_width,
+                 num_wakeup_ports, iq_type, params):
+        super().__init__(issue_width, num_issue_slots, dispatch_width,
+                         num_wakeup_ports, iq_type, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        entry_wen_array = [
+            Signal(self.dispatch_width, name=f'__entry_wen{i}')
+            for i in range(self.num_issue_slots)
+        ]
+
+        allocated = Signal(self.dispatch_width)
+        for slot, entry_wen in zip(self.slots, entry_wen_array):
+            next_allocated = Signal(self.dispatch_width)
+            can_allocate = ~slot.valid
+
+            for w in range(self.dispatch_width):
+                m.d.comb += [
+                    entry_wen[w].eq(can_allocate & ~allocated[w]),
+                    next_allocated[w].eq(can_allocate | allocated[w]),
+                ]
+
+                can_allocate &= allocated[w]
+
+            allocated = next_allocated
+
+        entry_wen = [
+            Signal(self.dispatch_width, name=f'entry_wen{i}')
+            for i in range(self.num_issue_slots)
+        ]
+        for wen_oh, tmp in zip(entry_wen, entry_wen_array):
+            for w in range(self.dispatch_width):
+                m.d.comb += wen_oh[w].eq(tmp[w] & self.dis_valids[w]
+                                         & ~self.dis_uops[w].exception
+                                         & ~self.dis_uops[w].is_fence
+                                         & ~self.dis_uops[w].is_fencei)
+
+        for slot, wen_oh in zip(self.slots, entry_wen):
             enc = Encoder(self.dispatch_width)
             m.submodules += enc
 
             m.d.comb += [
                 enc.i.eq(wen_oh),
-                slot.in_uop.eq(dis_uops_mux[enc.o]),
+                slot.in_uop.eq(self.dis_uops_mux[enc.o]),
                 slot.in_valid.eq(~enc.n),
             ]
 
         m.d.comb += self.ready.eq(allocated)
 
         req_valids = Signal(self.num_issue_slots)
-        for v, slot in zip(req_valids, slots):
+        for v, slot in zip(req_valids, self.slots):
             m.d.comb += v.eq(slot.req)
 
         for iss, iss_valid, fu_types in zip(self.iss_uops, self.iss_valids,
@@ -280,7 +315,8 @@ class IssueUnit(HasCoreParams, Elaboratable):
             port_issued = Signal()
             next_req_valids = Signal(self.num_issue_slots)
 
-            for slot, v, next_v in zip(slots, req_valids, next_req_valids):
+            for slot, v, next_v in zip(self.slots, req_valids,
+                                       next_req_valids):
                 can_allocate = (slot.out_uop.fu_type & fu_types) != 0
                 next_port_issued = Signal()
 
@@ -298,5 +334,92 @@ class IssueUnit(HasCoreParams, Elaboratable):
                 port_issued = next_port_issued
 
             req_valids = next_req_valids
+
+        return m
+
+
+class IssueUnitOrdered(IssueUnitBase):
+
+    def __init__(self, issue_width, num_issue_slots, dispatch_width,
+                 num_wakeup_ports, iq_type, params):
+        super().__init__(issue_width, num_issue_slots, dispatch_width,
+                         num_wakeup_ports, iq_type, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        max_shift = self.dispatch_width
+        vacants = Cat(*[~s.valid for s in self.slots], ~self.dis_valids)
+        shamts = [
+            Signal(max_shift, name=f'shamt{i}')
+            for i in range(self.num_issue_slots + self.dispatch_width)
+        ]
+        m.d.comb += shamts[0].eq(0)
+        for w in range(1, len(shamts)):
+            next = Signal(max_shift)
+            m.d.comb += next.eq(shamts[w - 1])
+
+            with m.If((shamts[w - 1] == 0) & vacants[w - 1]):
+                m.d.comb += next.eq(1)
+            with m.Elif(~shamts[w - 1][-1] & vacants[w - 1]):
+                m.d.comb += next.eq(shamts[w - 1] << 1)
+
+            m.d.comb += shamts[w].eq(next)
+
+        will_be_valid = [s.will_be_valid for s in self.slots
+                         ] + [(dv & ~d.exception & ~d.is_fence & ~d.is_fencei)
+                              for dv, d in zip(self.dis_valids, self.dis_uops)]
+
+        uops = [s.move_uop for s in self.slots] + list(self.dis_uops_mux)
+        for i, slot in enumerate(self.slots):
+            m.d.comb += slot.in_uop.eq(uops[i + 1])
+
+            for j in range(1, max_shift + 1):
+                with m.If(shamts[i + j][j - 1]):
+                    m.d.comb += [
+                        slot.in_valid.eq(will_be_valid[i + j]),
+                        slot.in_uop.eq(uops[i + j]),
+                    ]
+
+            m.d.comb += slot.clear.eq(shamts[i].any())
+
+        will_be_available = Cat(
+            (~s.will_be_valid | s.clear) & ~s.in_valid for s in self.slots)
+        popcnt_avail = PopCount(self.num_issue_slots)
+        m.submodules += popcnt_avail
+        m.d.comb += popcnt_avail.inp.eq(will_be_available)
+        for w in range(self.dispatch_width):
+            m.d.sync += self.ready[w].eq(popcnt_avail.out > w)
+
+        req_valids = Signal(self.num_issue_slots)
+        m.d.comb += req_valids.eq(Cat(s.valid for s in self.slots))
+
+        port_issued = Const(0, self.issue_width)
+        for slot in self.slots:
+            next_port_issued = Signal(self.issue_width)
+            uop_issued = Const(0, 1)
+
+            for iss, iss_valid, fu_types, issued, next_issued in zip(
+                    self.iss_uops, self.iss_valids, self.fu_types, port_issued,
+                    next_port_issued):
+                can_allocate = (slot.out_uop.fu_type & fu_types).any()
+
+                with m.If(slot.valid & ~uop_issued & can_allocate & ~issued):
+                    m.d.comb += [
+                        slot.gnt.eq(slot.req),
+                        iss_valid.eq(slot.req),
+                        iss.eq(slot.out_uop),
+                    ]
+
+                next_uop_issued = Signal()
+                m.d.comb += [
+                    next_issued.eq((slot.valid & ~uop_issued
+                                    & can_allocate) | issued),
+                    next_uop_issued.eq((slot.valid & can_allocate & ~issued)
+                                       | uop_issued),
+                ]
+                uop_issued = next_uop_issued
+
+            port_issued = next_port_issued
 
         return m
