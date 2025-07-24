@@ -23,6 +23,7 @@ class VALU(Elaboratable):
 
         is_sub = VALUOperator.is_sub(self.fn)
         is_rsub = self.fn == VALUOperator.VRSUB
+        signed = self.fn[0]
 
         in1_inv = Mux(is_sub, ~self.in1, self.in1)
         in2_inv = Mux(is_rsub, ~self.in2, self.in2)
@@ -31,7 +32,7 @@ class VALU(Elaboratable):
         in1_and_in2 = in1_inv & self.in2
 
         #
-        # VADD, VSUB
+        # VADD, VSUB, VRSUB
         #
 
         carry_in = Signal(lane_bytes)
@@ -58,6 +59,53 @@ class VALU(Elaboratable):
             m.d.comb += Cat(adder_out[w * 8:(w + 1) * 8], cout[w]).eq(s[1:])
 
         #
+        # VMSEQ, VMSNE, VMSLT, VMSLTU, VMSLE, VMSLEU, VMSGT, VMSGTU
+        #
+
+        lt_vec = Signal(lane_bytes)
+        eq_vec = Signal(lane_bytes)
+        for i in range(lane_bytes):
+            m.d.comb += [
+                lt_vec[i].eq(
+                    Mux(signed,
+                        self.in2[i * 8 + 7] ^ in1_inv[i * 8 + 7] ^ cout[i],
+                        ~cout[i])),
+                eq_vec[i].eq(self.in1[i * 8:(i + 1) *
+                                      8] == self.in2[i * 8:(i + 1) * 8]),
+            ]
+
+        cmp_eq = Signal(lane_bytes)
+        with m.Switch(self.sew):
+            for i in range(4):
+                with m.Case(i):
+                    sew = 1 << i
+                    m.d.comb += cmp_eq.eq(
+                        Cat(eq_vec[w * sew:(w + 1) * sew].all().replicate(sew)
+                            for w in range(0, lane_bytes, sew)))
+
+        #
+        # VMIN, VMAX
+        #
+
+        minmax = Signal(self.width)
+        select_vs = lt_vec ^ (
+            (self.fn == VALUOperator.VMIN) |
+            (self.fn == VALUOperator.VMINU)).replicate(self.width)
+
+        for w in range(lane_bytes):
+            sel = Signal()
+            with m.Switch(self.sew):
+                for i in range(4):
+                    with m.Case(i):
+                        sew = 1 << i
+                        m.d.comb += sel.eq(select_vs[(w // sew) * sew +
+                                                     (sew - 1)])
+
+            m.d.comb += minmax[w * 8:(w + 1) * 8].eq(
+                Mux(sel, self.in1[w * 8:(w + 1) * 8],
+                    self.in2[w * 8:(w + 1) * 8]))
+
+        #
         # AND, OR, XOR
         #
 
@@ -75,6 +123,9 @@ class VALU(Elaboratable):
         with m.Switch(self.fn):
             with m.Case(VALUOperator.VADD, VALUOperator.VSUB):
                 m.d.comb += self.out.eq(adder_out)
+            with m.Case(VALUOperator.VMAXU, VALUOperator.VMAX,
+                        VALUOperator.VMINU, VALUOperator.VMIN):
+                m.d.comb += self.out.eq(minmax)
             with m.Default():
                 m.d.comb += self.out.eq(shift_logic)
 

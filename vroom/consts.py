@@ -161,10 +161,10 @@ class VALUOperator(IntEnum):
     VSBC = 9
     VMSBC = 10
     VSRA = 11
-    VMSLT = 12
-    VMSGE = 13
-    VMSLTU = 14
-    VMSGEU = 15
+    VMSLTU = 12
+    VMSLT = 13
+    VMSGTU = 14
+    VMSGT = 15
 
     VADC = 16
     VMADC = 17
@@ -177,10 +177,10 @@ class VALUOperator(IntEnum):
     VORN = 25
     VXNOR = 26
 
-    VMAX = 28
-    VMIN = 29
-    VMAXU = 30
-    VMINU = 31
+    VMAXU = 28
+    VMAX = 29
+    VMINU = 30
+    VMIN = 31
 
     VWADDU = 32
     VWADD = 33
@@ -191,6 +191,8 @@ class VALUOperator(IntEnum):
     VWSUB = 41
     VWSUBUWV = 42
     VWSUBWV = 43
+    VMSLEU = 44
+    VMSLE = 45
 
     VSADDU = 48
     VSADD = 49
