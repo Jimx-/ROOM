@@ -4,6 +4,14 @@ from amaranth.utils import log2_int
 from vroom.types import HasVectorParams
 
 
+def vlmul_to_lmul(vlmul_sign, vlmul_mag):
+    y0 = ~vlmul_mag.any() | vlmul_sign
+    y1 = ~vlmul_sign & ~vlmul_mag[1] & vlmul_mag[0]
+    y2 = ~vlmul_sign & vlmul_mag[1] & ~vlmul_mag[0]
+    y3 = ~vlmul_sign & vlmul_mag.all()
+    return Cat(y0, y1, y2, y3)
+
+
 class TailGen(HasVectorParams, Elaboratable):
 
     def __init__(self, params):

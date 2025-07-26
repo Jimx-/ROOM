@@ -2,6 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp, VType
+from vroom.utils import vlmul_to_lmul
 
 from room.consts import RegisterType
 from room.utils import Decoupled
@@ -86,6 +87,145 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                             with m.Case(0b001011):
                                 m.d.comb += UOPC(VOpCode.VXOR)
 
+                    with m.Case(0b001):  # OPFVV
+                        pass
+
+                    with m.Case(0b010):  # OPMVV
+                        m.d.comb += [
+                            uop.fu_type.eq(VFUType.ALU),
+                            uop.dst_rtype.eq(RegisterType.VEC),
+                            uop.lrs1_rtype.eq(RegisterType.VEC),
+                            uop.lrs2_rtype.eq(RegisterType.VEC),
+                        ]
+
+                        with m.Switch(uop.funct6):
+                            with m.Case(0b110000):  # vwaddu
+                                m.d.comb += [
+                                    UOPC(VOpCode.VADDU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110001):  # vwadd
+                                m.d.comb += [
+                                    UOPC(VOpCode.VADD),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110010):  # vwsubu
+                                m.d.comb += [
+                                    UOPC(VOpCode.VSUBU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110011):  # vwsub
+                                m.d.comb += [
+                                    UOPC(VOpCode.VSUB),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110100):  # vwaddu.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VADDU),
+                                    uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b110101):  # vwadd.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VADD),
+                                    uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b110110):  # vwsubu.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VSUBU),
+                                    uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b110111):  # vwsub.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VSUB),
+                                    uop.widen2.eq(1),
+                                ]
+
+                    with m.Case(0b011):  # OPIVI
+                        pass
+
+                    with m.Case(0b100):  # OPIVX
+                        m.d.comb += [
+                            uop.fu_type.eq(VFUType.ALU),
+                            uop.dst_rtype.eq(RegisterType.VEC),
+                            uop.lrs1_rtype.eq(RegisterType.FIX),
+                            uop.lrs2_rtype.eq(RegisterType.VEC),
+                        ]
+
+                        with m.Switch(uop.funct6):
+                            with m.Case(0b000000):
+                                m.d.comb += UOPC(VOpCode.VADD)
+                            with m.Case(0b000010):
+                                m.d.comb += UOPC(VOpCode.VSUB)
+                            with m.Case(0b000011):
+                                m.d.comb += UOPC(VOpCode.VRSUB)
+                            with m.Case(0b000100):
+                                m.d.comb += UOPC(VOpCode.VMINU)
+                            with m.Case(0b000101):
+                                m.d.comb += UOPC(VOpCode.VMIN)
+                            with m.Case(0b000110):
+                                m.d.comb += UOPC(VOpCode.VMAXU)
+                            with m.Case(0b000111):
+                                m.d.comb += UOPC(VOpCode.VMAX)
+                            with m.Case(0b001001):
+                                m.d.comb += UOPC(VOpCode.VAND)
+                            with m.Case(0b001010):
+                                m.d.comb += UOPC(VOpCode.VOR)
+                            with m.Case(0b001011):
+                                m.d.comb += UOPC(VOpCode.VXOR)
+
+                    with m.Case(0b101):  # OPFVF
+                        pass
+
+                    with m.Case(0b110):  # OPMVX
+                        m.d.comb += [
+                            uop.fu_type.eq(VFUType.ALU),
+                            uop.dst_rtype.eq(RegisterType.VEC),
+                            uop.lrs1_rtype.eq(RegisterType.FIX),
+                            uop.lrs2_rtype.eq(RegisterType.VEC),
+                        ]
+
+                        with m.Switch(uop.funct6):
+                            with m.Case(0b110000):  # vwaddu
+                                m.d.comb += [
+                                    UOPC(VOpCode.VADDU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110001):  # vwadd
+                                m.d.comb += [
+                                    UOPC(VOpCode.VADD),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110010):  # vwsubu
+                                m.d.comb += [
+                                    UOPC(VOpCode.VSUBU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110011):  # vwsub
+                                m.d.comb += [
+                                    UOPC(VOpCode.VSUB),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110100):  # vwaddu.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VADDU),
+                                    uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b110101):  # vwadd.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VADD),
+                                    uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b110110):  # vwsubu.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VSUBU),
+                                    uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b110111):  # vwsub.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VSUB),
+                                    uop.widen2.eq(1),
+                                ]
+
         return m
 
 
@@ -138,11 +278,33 @@ class VOpExpander(HasVectorParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        expd_uop = VMicroOp(self.params)
+        expd_idx = Signal(3)
         expd_fire = self.expd_valid & self.expd_ready
 
+        expd_count_start = Signal(3)
         expd_count = Signal(3)
-        expd_idx = Signal(3)
-        expd_uop = VMicroOp(self.params)
+        lmul = vlmul_to_lmul(self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag)
+        with m.If(self.expd_uop.widen | self.expd_uop.widen2):
+            m.d.comb += expd_count_start.eq(
+                Mux(self.expd_uop.vlmul_sign, 1, (lmul << 1) - 1))
+        with m.Else():
+            m.d.comb += expd_count_start.eq(lmul - 1)
+
+        lrs1_incr = Signal(3)
+        with m.If(expd_uop.widen | expd_uop.widen2):
+            m.d.comb += lrs1_incr.eq(expd_idx >> 1)
+        with m.Else():
+            m.d.comb += lrs1_incr.eq(expd_idx)
+
+        lrs2_incr = Signal(3)
+        with m.If(expd_uop.widen):
+            m.d.comb += lrs2_incr.eq(expd_idx >> 1)
+        with m.Else():
+            m.d.comb += lrs2_incr.eq(expd_idx)
+
+        ldst_incr = Signal(3)
+        m.d.comb += ldst_incr.eq(expd_idx)
 
         with m.FSM():
             with m.State('PASSTHRU'):
@@ -156,21 +318,14 @@ class VOpExpander(HasVectorParams, Elaboratable):
 
                 m.d.sync += expd_idx.eq(1)
 
-                with m.If(expd_fire):
-                    with m.If(~self.expd_uop.vlmul_sign
-                              & self.expd_uop.vlmul_mag.any()):
-                        m.d.comb += self.expd_uop.expd_end.eq(0)
-                        m.d.sync += expd_uop.eq(self.expd_uop)
+                with m.If(expd_fire & expd_count_start.any()):
+                    m.d.comb += self.expd_uop.expd_end.eq(0)
+                    m.d.sync += [
+                        expd_uop.eq(self.expd_uop),
+                        expd_count.eq(expd_count_start),
+                    ]
 
-                        with m.Switch(self.expd_uop.vlmul_mag):
-                            with m.Case(0b01):
-                                m.d.sync += expd_count.eq(1)
-                            with m.Case(0b10):
-                                m.d.sync += expd_count.eq(3)
-                            with m.Case(0b11):
-                                m.d.sync += expd_count.eq(7)
-
-                        m.next = 'EXPAND'
+                    m.next = 'EXPAND'
 
             with m.State('EXPAND'):
                 m.d.comb += [
@@ -178,9 +333,9 @@ class VOpExpander(HasVectorParams, Elaboratable):
                     self.expd_uop.eq(expd_uop),
                     self.expd_uop.expd_idx.eq(expd_idx),
                     self.expd_uop.expd_end.eq(expd_idx == expd_count),
-                    self.expd_uop.ldst.eq(expd_uop.ldst + expd_idx),
-                    self.expd_uop.lrs1.eq(expd_uop.lrs1 + expd_idx),
-                    self.expd_uop.lrs2.eq(expd_uop.lrs2 + expd_idx),
+                    self.expd_uop.ldst.eq(expd_uop.ldst + ldst_incr),
+                    self.expd_uop.lrs1.eq(expd_uop.lrs1 + lrs1_incr),
+                    self.expd_uop.lrs2.eq(expd_uop.lrs2 + lrs2_incr),
                 ]
 
                 with m.If(expd_fire):

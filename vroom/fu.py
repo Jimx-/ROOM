@@ -219,6 +219,7 @@ class PerLaneFunctionalUnit(FunctionalUnit):
         m = Module()
 
         uop = self.req.bits.uop
+        sew = uop.vsew
 
         self.lane_reqs = [
             Decoupled(ExecLaneReq,
@@ -236,23 +237,52 @@ class PerLaneFunctionalUnit(FunctionalUnit):
         imm = sign_extend(uop.lrs1, self.lane_width)
 
         for w, lane_req in enumerate(self.lane_reqs):
+            vs1_data = Signal(self.lane_width, name=f'vs1_data{w}')
+            with m.If(uop.widen | uop.widen2):
+                m.d.comb += vs1_data.eq(
+                    Cat(self.req.bits.vs1_data[i * 32:(i + 1) * 32]
+                        for i in range(w, self.vlen // 32, self.vlen // 64)))
+            with m.Else():
+                m.d.comb += vs1_data.eq(
+                    self.req.bits.vs1_data[w * self.lane_width:(w + 1) *
+                                           self.lane_width])
+
+            vs2_data = Signal(self.lane_width, name=f'vs2_data{w}')
+            vs2_f2 = Cat(self.req.bits.vs2_data[i * 32:(i + 1) * 32]
+                         for i in range(w, self.vlen // 32, self.vlen // 64))
+            with m.If(uop.widen):
+                m.d.comb += vs2_data.eq(vs2_f2)
+            with m.Else():
+                m.d.comb += vs2_data.eq(
+                    self.req.bits.vs2_data[w * self.lane_width:(w + 1) *
+                                           self.lane_width])
+
             opa_data = Signal(self.lane_width, name=f'opa_data{w}')
             opb_data = Signal(self.lane_width, name=f'opb_data{w}')
             old_vd = Signal(self.lane_width, name=f'old_vd{w}')
 
             with m.Switch(uop.opa_sel):
                 with m.Case(VOpA.VS1):
-                    m.d.comb += opa_data.eq(
-                        self.req.bits.vs1_data[w * self.lane_width:(w + 1) *
-                                               self.lane_width])
+                    m.d.comb += opa_data.eq(vs1_data)
                 with m.Case(VOpA.IMM):
-                    m.d.comb += opa_data.eq(imm)
+                    with m.Switch(sew):
+                        for i in range(4):
+                            with m.Case(i):
+                                n = 1 << (i + 3)
+                                m.d.comb += opa_data.eq(imm[:n].replicate(
+                                    self.lane_width // n))
+
                 with m.Case(VOpA.SCALAR):
-                    m.d.comb += opa_data.eq(self.req.bits.rs1_data)
+                    with m.Switch(sew):
+                        for i in range(4):
+                            with m.Case(i):
+                                n = 1 << (i + 3)
+                                m.d.comb += opa_data.eq(
+                                    self.req.bits.rs1_data[:n].replicate(
+                                        self.lane_width // n))
+
             m.d.comb += [
-                opb_data.eq(
-                    self.req.bits.vs2_data[w * self.lane_width:(w + 1) *
-                                           self.lane_width]),
+                opb_data.eq(vs2_data),
                 old_vd.eq(self.req.bits.vs3_data[w * self.lane_width:(w + 1) *
                                                  self.lane_width]),
             ]
@@ -309,9 +339,12 @@ class VALULane(PipelinedLaneFunctionalUnit):
             alu.fn.eq(uop.alu_fn),
             alu.sew.eq(uop.vsew),
             alu.eew_vd.eq(uop.dest_eew()),
+            alu.uop_idx.eq(uop.expd_idx),
             alu.in1.eq(self.req.bits.opa_data),
             alu.in2.eq(self.req.bits.opb_data),
             alu.in3.eq(self.req.bits.old_vd),
+            alu.widen.eq(uop.widen),
+            alu.widen2.eq(uop.widen2),
         ]
 
         tail_mask = Signal(self.data_width)
