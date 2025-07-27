@@ -356,6 +356,8 @@ class VALULane(PipelinedLaneFunctionalUnit):
             alu.in1.eq(self.req.bits.opa_data),
             alu.in2.eq(self.req.bits.opb_data),
             alu.in3.eq(self.req.bits.old_vd),
+            alu.vmask.eq(uop.mask),
+            alu.vm.eq(uop.vm),
             alu.widen.eq(uop.widen),
             alu.widen2.eq(uop.widen2),
         ]

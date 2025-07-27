@@ -18,6 +18,8 @@ class VALU(Elaboratable):
         self.in1 = Signal(width)
         self.in2 = Signal(width)
         self.in3 = Signal(width)
+        self.vmask = Signal(width // 8)
+        self.vm = Signal()
         self.widen = Signal()
         self.widen2 = Signal()
         self.out = Signal(width)
@@ -29,6 +31,7 @@ class VALU(Elaboratable):
 
         is_sub = VALUOperator.is_sub(self.fn)
         is_rsub = self.fn == VALUOperator.VRSUB
+        sub = is_sub | is_rsub
         signed = self.fn[0]
 
         def get_element(elem, data, uop_idx, elem_width):
@@ -68,6 +71,15 @@ class VALU(Elaboratable):
         in1_adjust = Mux(self.widen | self.widen2, in1_widen, self.in1)
         in2_adjust = Mux(self.widen, in2_widen, self.in2)
 
+        vmask_adjust = Signal(lane_bytes)
+        with m.Switch(self.sew):
+            for w in (1, 2):  # vsew=16/32
+                with m.Case(w):
+                    n = 1 << w
+                    for i in range(lane_bytes // n):
+                        m.d.comb += vmask_adjust[i * n:(i + 1) * n].eq(
+                            self.vmask[i])
+
         in1_inv = Mux(is_sub, ~in1_adjust, in1_adjust)
         in2_inv = Mux(is_rsub, ~in2_adjust, in2_adjust)
 
@@ -78,6 +90,9 @@ class VALU(Elaboratable):
         # VADD, VSUB, VRSUB
         #
 
+        add_with_carry = (self.fn == VALUOperator.VADC) | (
+            self.fn == VALUOperator.VMADC) | (self.fn == VALUOperator.VSBC) | (
+                self.fn == VALUOperator.VMSBC)
         carry_in = Signal(lane_bytes)
         cin = Signal(lane_bytes)
         cout = Signal(lane_bytes)
@@ -85,7 +100,8 @@ class VALU(Elaboratable):
 
         eew = self.sew
         for w in range(lane_bytes):
-            m.d.comb += carry_in[w].eq(is_sub | is_rsub)
+            m.d.comb += carry_in[w].eq(
+                Mux(add_with_carry & ~self.vm, vmask_adjust[w] ^ sub, sub))
 
             if w == 0:
                 m.d.comb += cin[w].eq(carry_in[w])
@@ -203,7 +219,8 @@ class VALU(Elaboratable):
 
         with m.Switch(self.fn):
             with m.Case(VALUOperator.VADD, VALUOperator.VSUB,
-                        VALUOperator.VRSUB):
+                        VALUOperator.VRSUB, VALUOperator.VADC,
+                        VALUOperator.VSBC):
                 m.d.comb += self.out.eq(adder_out)
             with m.Case(VALUOperator.VMAXU, VALUOperator.VMAX,
                         VALUOperator.VMINU, VALUOperator.VMIN):

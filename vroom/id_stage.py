@@ -86,6 +86,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VOR)
                             with m.Case(0b001011):
                                 m.d.comb += UOPC(VOpCode.VXOR)
+                            with m.Case(0b010000):
+                                m.d.comb += UOPC(VOpCode.VADC)
+                            with m.Case(0b010010):
+                                m.d.comb += UOPC(VOpCode.VSBC)
 
                     with m.Case(0b001):  # OPFVV
                         pass
@@ -181,6 +185,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VOR)
                             with m.Case(0b001011):
                                 m.d.comb += UOPC(VOpCode.VXOR)
+                            with m.Case(0b010000):
+                                m.d.comb += UOPC(VOpCode.VADC)
+                            with m.Case(0b010010):
+                                m.d.comb += UOPC(VOpCode.VSBC)
 
                     with m.Case(0b101):  # OPFVF
                         pass
