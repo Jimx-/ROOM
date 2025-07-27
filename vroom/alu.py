@@ -31,15 +31,17 @@ class VALU(Elaboratable):
         is_rsub = self.fn == VALUOperator.VRSUB
         signed = self.fn[0]
 
+        def get_element(elem, data, uop_idx, elem_width):
+            with m.Switch(uop_idx[:log2_int(self.width // elem_width)]):
+                for i in range(self.width // elem_width):
+                    with m.Case(i):
+                        m.d.comb += elem.eq(data[i * elem_width:(i + 1) *
+                                                 elem_width])
+
         in1_w = Signal(32)
         in2_w = Signal(32)
-        with m.Switch(self.uop_idx[:log2_int(self.width // 32)]):
-            for i in range(self.width // 32):
-                with m.Case(i):
-                    m.d.comb += [
-                        in1_w.eq(self.in1[i * 32:(i + 1) * 32]),
-                        in2_w.eq(self.in2[i * 32:(i + 1) * 32]),
-                    ]
+        get_element(in1_w, self.in1, self.uop_idx, 32)
+        get_element(in2_w, self.in2, self.uop_idx, 32)
 
         in1_widen = Signal(self.width)
         in2_widen = Signal(self.width)
@@ -161,6 +163,44 @@ class VALU(Elaboratable):
 
         shift_logic = logic
 
+        #
+        # VZEXT, VSEXT
+        #
+
+        in2_h = Signal(16)
+        in2_b = Signal(16)
+        get_element(in2_h, self.in2, self.uop_idx, 16)
+        get_element(in2_b, self.in2, self.uop_idx, 8)
+
+        def extend_vector(ext_data, data, elem_width, signed):
+            n_elems = len(data) // elem_width
+            ext_width = len(ext_data) // n_elems
+
+            for i in range(n_elems):
+                m.d.comb += ext_data[i * ext_width:(i + 1) * ext_width].eq(
+                    Mux(
+                        signed,
+                        sign_extend(data[i * elem_width:(i + 1) * elem_width],
+                                    ext_width),
+                        data[i * elem_width:(i + 1) * elem_width]))
+
+        ext_out = Signal(self.width)
+        with m.Switch(self.in1[1:3]):
+            with m.Case(0b01):  # vf8
+                extend_vector(ext_out, in2_b, 8, signed)
+
+            with m.Case(0b10):  # vf4
+                with m.Switch(self.sew):
+                    for i in range(2):
+                        with m.Case(i):
+                            extend_vector(ext_out, in2_h, 1 << (3 + i), signed)
+
+            with m.Case(0b11):  # vf2
+                with m.Switch(self.sew):
+                    for i in range(3):
+                        with m.Case(i):
+                            extend_vector(ext_out, in2_w, 1 << (3 + i), signed)
+
         with m.Switch(self.fn):
             with m.Case(VALUOperator.VADD, VALUOperator.VSUB,
                         VALUOperator.VRSUB):
@@ -168,6 +208,8 @@ class VALU(Elaboratable):
             with m.Case(VALUOperator.VMAXU, VALUOperator.VMAX,
                         VALUOperator.VMINU, VALUOperator.VMIN):
                 m.d.comb += self.out.eq(minmax)
+            with m.Case(VALUOperator.VZEXT, VALUOperator.VSEXT):
+                m.d.comb += self.out.eq(ext_out)
             with m.Default():
                 m.d.comb += self.out.eq(shift_logic)
 

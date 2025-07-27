@@ -241,7 +241,7 @@ class PerLaneFunctionalUnit(FunctionalUnit):
             with m.If(uop.widen | uop.widen2):
                 m.d.comb += vs1_data.eq(
                     Cat(self.req.bits.vs1_data[i * 32:(i + 1) * 32]
-                        for i in range(w, self.vlen // 32, self.vlen // 64)))
+                        for i in range(w, self.vlen // 32, self.n_lanes)))
             with m.Else():
                 m.d.comb += vs1_data.eq(
                     self.req.bits.vs1_data[w * self.lane_width:(w + 1) *
@@ -249,9 +249,22 @@ class PerLaneFunctionalUnit(FunctionalUnit):
 
             vs2_data = Signal(self.lane_width, name=f'vs2_data{w}')
             vs2_f2 = Cat(self.req.bits.vs2_data[i * 32:(i + 1) * 32]
-                         for i in range(w, self.vlen // 32, self.vlen // 64))
-            with m.If(uop.widen):
+                         for i in range(w, self.vlen // 32, self.n_lanes))
+            vs2_f4 = Cat(self.req.bits.vs2_data[i * 16:(i + 1) * 16]
+                         for i in range(w, self.vlen // 16, self.n_lanes))
+            vs2_f8 = Cat(self.req.bits.vs2_data[i * 8:(i + 1) * 8]
+                         for i in range(w, self.vlen // 8, self.n_lanes))
+            with m.If(uop.widen | (VALUOperator.is_ext(uop.alu_fn)
+                                   & (uop.lrs1[1:3] == 3))):
                 m.d.comb += vs2_data.eq(vs2_f2)
+            with m.Elif(
+                    VALUOperator.is_ext(uop.alu_fn)
+                    & (uop.lrs1[1:3] == 2)):
+                m.d.comb += vs2_data.eq(vs2_f4)
+            with m.Elif(
+                    VALUOperator.is_ext(uop.alu_fn)
+                    & (uop.lrs1[1:3] == 1)):
+                m.d.comb += vs2_data.eq(vs2_f8)
             with m.Else():
                 m.d.comb += vs2_data.eq(
                     self.req.bits.vs2_data[w * self.lane_width:(w + 1) *

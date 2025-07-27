@@ -99,6 +99,15 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         ]
 
                         with m.Switch(uop.funct6):
+                            with m.Case(0b010010):  # VXUNARY0
+                                m.d.comb += uop.lrs1_rtype.eq(RegisterType.X)
+
+                                with m.Switch(uop.lrs1):
+                                    with m.Case(0b00010, 0b00100, 0b00110):
+                                        m.d.comb += UOPC(VOpCode.VZEXT)
+                                    with m.Case(0b00011, 0b00101, 0b00111):
+                                        m.d.comb += UOPC(VOpCode.VSEXT)
+
                             with m.Case(0b110000):  # vwaddu
                                 m.d.comb += [
                                     UOPC(VOpCode.VADDU),
@@ -291,15 +300,24 @@ class VOpExpander(HasVectorParams, Elaboratable):
         with m.Else():
             m.d.comb += expd_count_start.eq(lmul - 1)
 
+        is_ext = (expd_uop.opcode == VOpCode.VSEXT) | (expd_uop.opcode
+                                                       == VOpCode.VZEXT)
+
         lrs1_incr = Signal(3)
-        with m.If(expd_uop.widen | expd_uop.widen2):
+        with m.If(is_ext):
+            m.d.comb += lrs1_incr.eq(0)
+        with m.Elif(expd_uop.widen | expd_uop.widen2):
             m.d.comb += lrs1_incr.eq(expd_idx >> 1)
         with m.Else():
             m.d.comb += lrs1_incr.eq(expd_idx)
 
         lrs2_incr = Signal(3)
-        with m.If(expd_uop.widen):
+        with m.If(expd_uop.widen | (is_ext & (expd_uop.lrs1[1:3] == 3))):
             m.d.comb += lrs2_incr.eq(expd_idx >> 1)
+        with m.Elif(is_ext & (expd_uop.lrs1[1:3] == 2)):
+            m.d.comb += lrs2_incr.eq(expd_idx >> 2)
+        with m.Elif(is_ext & (expd_uop.lrs1[1:3] == 1)):
+            m.d.comb += lrs2_incr.eq(expd_idx >> 3)
         with m.Else():
             m.d.comb += lrs2_incr.eq(expd_idx)
 
