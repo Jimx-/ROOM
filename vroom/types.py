@@ -91,6 +91,8 @@ class VMicroOp(HasVectorParams, Record):
             ('indexed', 1),
             ('widen', 1),
             ('widen2', 1),
+            ('narrow', 1),
+            ('narrow_to_1', 1),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)

@@ -20,9 +20,12 @@ class VALU(Elaboratable):
         self.in3 = Signal(width)
         self.vmask = Signal(width // 8)
         self.vm = Signal()
+        self.ma = Signal()
         self.widen = Signal()
         self.widen2 = Signal()
+        self.narrow_to_1 = Signal()
         self.out = Signal(width)
+        self.cmp_out = Signal(width // 8)
 
     def elaborate(self, platform):
         m = Module()
@@ -98,7 +101,7 @@ class VALU(Elaboratable):
         cout = Signal(lane_bytes)
         adder_out = Signal(self.width)
 
-        eew = self.sew
+        eew = Mux(self.narrow_to_1, self.sew, self.eew_vd)
         for w in range(lane_bytes):
             m.d.comb += carry_in[w].eq(
                 Mux(add_with_carry & ~self.vm, vmask_adjust[w] ^ sub, sub))
@@ -141,6 +144,19 @@ class VALU(Elaboratable):
                     m.d.comb += cmp_eq.eq(
                         Cat(eq_vec[w * sew:(w + 1) * sew].all().replicate(sew)
                             for w in range(0, lane_bytes, sew)))
+
+        cmp_result = Signal(lane_bytes)
+        with m.Switch(self.fn):
+            with m.Case(VALUOperator.VMSEQ):
+                m.d.comb += cmp_result.eq(cmp_eq)
+            with m.Case(VALUOperator.VMSNE):
+                m.d.comb += cmp_result.eq(~cmp_eq)
+            with m.Case(VALUOperator.VMSLT, VALUOperator.VMSLTU):
+                m.d.comb += cmp_result.eq(lt_vec)
+            with m.Case(VALUOperator.VMSLE, VALUOperator.VMSLEU):
+                m.d.comb += cmp_result.eq(lt_vec | cmp_eq)
+            with m.Case(VALUOperator.VMSGT, VALUOperator.VMSGTU):
+                m.d.comb += cmp_result.eq(~(lt_vec | cmp_eq))
 
         #
         # VMIN, VMAX
@@ -229,5 +245,23 @@ class VALU(Elaboratable):
                 m.d.comb += self.out.eq(ext_out)
             with m.Default():
                 m.d.comb += self.out.eq(shift_logic)
+
+        cmp_out = Mux(add_with_carry, Mux(is_sub, ~cout, cout), cmp_result)
+        cmp_out_adjust = Signal(lane_bytes)
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << w
+                    m.d.comb += cmp_out_adjust.eq(
+                        Cat(cmp_out[i + n - 1]
+                            for i in range(0, lane_bytes, n)))
+
+        for i in range(lane_bytes):
+            with m.If(add_with_carry):
+                m.d.comb += self.cmp_out[i].eq(cmp_out_adjust[i])
+            with m.Elif(~self.vm & ~self.vmask[i]):
+                m.d.comb += self.cmp_out[i].eq(Mux(self.ma, 1, self.in3[i]))
+            with m.Else():
+                m.d.comb += self.cmp_out[i].eq(cmp_out_adjust[i])
 
         return m

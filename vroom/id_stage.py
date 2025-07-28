@@ -88,8 +88,18 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VXOR)
                             with m.Case(0b010000):
                                 m.d.comb += UOPC(VOpCode.VADC)
+                            with m.Case(0b010001):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMADC),
+                                    uop.narrow_to_1.eq(1),
+                                ]
                             with m.Case(0b010010):
                                 m.d.comb += UOPC(VOpCode.VSBC)
+                            with m.Case(0b010011):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSBC),
+                                    uop.narrow_to_1.eq(1),
+                                ]
 
                     with m.Case(0b001):  # OPFVV
                         pass
@@ -187,8 +197,18 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VXOR)
                             with m.Case(0b010000):
                                 m.d.comb += UOPC(VOpCode.VADC)
+                            with m.Case(0b010001):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMADC),
+                                    uop.narrow_to_1.eq(1),
+                                ]
                             with m.Case(0b010010):
                                 m.d.comb += UOPC(VOpCode.VSBC)
+                            with m.Case(0b010011):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSBC),
+                                    uop.narrow_to_1.eq(1),
+                                ]
 
                     with m.Case(0b101):  # OPFVF
                         pass
@@ -330,7 +350,10 @@ class VOpExpander(HasVectorParams, Elaboratable):
             m.d.comb += lrs2_incr.eq(expd_idx)
 
         ldst_incr = Signal(3)
-        m.d.comb += ldst_incr.eq(expd_idx)
+        with m.If(expd_uop.narrow_to_1):
+            m.d.comb += ldst_incr.eq(0)
+        with m.Else():
+            m.d.comb += ldst_incr.eq(expd_idx)
 
         with m.FSM():
             with m.State('PASSTHRU'):
@@ -347,7 +370,7 @@ class VOpExpander(HasVectorParams, Elaboratable):
                 with m.If(expd_fire & expd_count_start.any()):
                     m.d.comb += self.expd_uop.expd_end.eq(0)
                     m.d.sync += [
-                        expd_uop.eq(self.expd_uop),
+                        expd_uop.eq(self.dec_uop),
                         expd_count.eq(expd_count_start),
                     ]
 
@@ -369,5 +392,8 @@ class VOpExpander(HasVectorParams, Elaboratable):
 
                     with m.If(self.expd_uop.expd_end):
                         m.next = 'PASSTHRU'
+
+        with m.If(self.expd_uop.narrow_to_1 & ~self.expd_uop.expd_end):
+            m.d.comb += self.expd_uop.dst_rtype.eq(RegisterType.X)
 
         return m

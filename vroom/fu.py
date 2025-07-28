@@ -327,10 +327,32 @@ class PerLaneFunctionalUnit(FunctionalUnit):
             self.resp.valid.eq(self.lane_resps[0].valid),
             self.resp.bits.uop.eq(self.lane_resps[0].bits.uop),
         ]
+
+        vd_cmp_out = Signal(self.vlen)
+        with m.Switch(self.resp.bits.uop.vsew):
+            for w in range(4):
+                with m.Case(w):
+                    sew = 1 << (w + 3)
+                    for i in range(self.vlen):
+                        if i >= self.vlen // (1 << w):
+                            m.d.comb += vd_cmp_out[i].eq(1)
+                        else:
+                            lane_idx = (i % (self.vlen // sew)) // (
+                                self.lane_width // sew)
+                            lmul_idx = i // (self.vlen // sew)
+                            offset = (i % (self.vlen // sew)
+                                      ) - lane_idx * (self.lane_width // sew)
+                            m.d.comb += vd_cmp_out[i].eq(
+                                self.lane_resps[lane_idx].bits.vd_data[
+                                    lmul_idx * 8 + offset])
+
         for w, lane_resp in enumerate(self.lane_resps):
-            m.d.comb += self.resp.bits.vd_data[w * self.lane_width:(w + 1) *
-                                               self.lane_width].eq(
-                                                   lane_resp.bits.vd_data)
+            m.d.comb += self.resp.bits.vd_data[w * self.lane_width:(
+                w + 1) * self.lane_width].eq(
+                    Mux(
+                        self.resp.bits.uop.narrow_to_1,
+                        vd_cmp_out[w * self.lane_width:(w + 1) *
+                                   self.lane_width], lane_resp.bits.vd_data))
 
         return m
 
@@ -358,8 +380,10 @@ class VALULane(PipelinedLaneFunctionalUnit):
             alu.in3.eq(self.req.bits.old_vd),
             alu.vmask.eq(uop.mask),
             alu.vm.eq(uop.vm),
+            alu.ma.eq(uop.vma),
             alu.widen.eq(uop.widen),
             alu.widen2.eq(uop.widen2),
+            alu.narrow_to_1.eq(uop.narrow_to_1),
         ]
 
         tail_mask = Signal(self.data_width)
@@ -371,13 +395,24 @@ class VALULane(PipelinedLaneFunctionalUnit):
 
         mask_keep = Signal(self.data_width)
         mask_off_data = Signal(self.data_width)
+        mask_keep_cmp = Signal(self.data_width // 8)
+        mask_off_cmp = Signal(self.data_width // 8)
         for i in range(self.data_width // 8):
             with m.If(tail_mask[i]):
-                m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(
-                    Mux(uop.vta, Const(~0, 8),
-                        self.req.bits.old_vd[i * 8:(i + 1) * 8]))
+                m.d.comb += [
+                    mask_off_data[i * 8:(i + 1) * 8].eq(
+                        Mux(uop.vta, Const(~0, 8),
+                            self.req.bits.old_vd[i * 8:(i + 1) * 8])),
+                    mask_off_cmp[i].eq(Mux(uop.vta, 1,
+                                           self.req.bits.old_vd[i])),
+                ]
             with m.Else():
-                m.d.comb += mask_keep[i * 8:(i + 1) * 8].eq(~0)
+                m.d.comb += [
+                    mask_keep[i * 8:(i + 1) * 8].eq(~0),
+                    mask_keep_cmp[i].eq(1),
+                ]
+
+        cmp_out_masked = (alu.cmp_out & mask_keep_cmp) | mask_off_cmp
 
         s1_alu_out = Signal.like(alu.out)
         s1_mask_keep = Signal.like(mask_keep)
@@ -388,8 +423,25 @@ class VALULane(PipelinedLaneFunctionalUnit):
             s1_mask_off_data.eq(mask_off_data),
         ]
 
-        m.d.comb += self.resp.bits.vd_data.eq((s1_alu_out & s1_mask_keep)
-                                              | s1_mask_off_data)
+        s1_cmp_out = [
+            Signal(self.data_width // 8, name=f's1_cmp_out{i}')
+            for i in range(8)
+        ]
+        with m.If(self.req.valid):
+            with m.Switch(uop.expd_idx):
+                for i in range(1, 8):
+                    with m.Case(i):
+                        m.d.sync += s1_cmp_out[i].eq(cmp_out_masked)
+
+                with m.Default():
+                    m.d.sync += [
+                        Cat(s1_cmp_out).eq(~0),
+                        s1_cmp_out[0].eq(cmp_out_masked),
+                    ]
+
+        s1_alu_out_masked = (s1_alu_out & s1_mask_keep) | s1_mask_off_data
+        m.d.comb += self.resp.bits.vd_data.eq(
+            Mux(self.uops[0].narrow_to_1, Cat(s1_cmp_out), s1_alu_out_masked))
 
         return m
 
