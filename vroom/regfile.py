@@ -60,6 +60,14 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
                 (VOpCode.VMADC, VALUOperator.VMADC),
                 (VOpCode.VSBC, VALUOperator.VSBC),
                 (VOpCode.VMSBC, VALUOperator.VMSBC),
+                (VOpCode.VMSEQ, VALUOperator.VMSEQ),
+                (VOpCode.VMSNE, VALUOperator.VMSNE),
+                (VOpCode.VMSLTU, VALUOperator.VMSLTU),
+                (VOpCode.VMSLT, VALUOperator.VMSLT),
+                (VOpCode.VMSLEU, VALUOperator.VMSLEU),
+                (VOpCode.VMSLE, VALUOperator.VMSLE),
+                (VOpCode.VMSGTU, VALUOperator.VMSGTU),
+                (VOpCode.VMSGT, VALUOperator.VMSGT),
             ):
                 with m.Case(opc):
                     m.d.comb += uop.alu_fn.eq(alu_op)

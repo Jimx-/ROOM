@@ -853,6 +853,13 @@ class Core(HasCoreParams, Elaboratable):
                 m.d.comb += iss_fu_typ.eq(
                     Mux(div_issued, eu.fu_types & ~FUType.DIV, eu.fu_types))
 
+            if eu.has_vec:
+                vec_issued = Signal()
+                m.d.sync += vec_issued.eq(iss_valid
+                                          & (iss_uop.fu_type == FUType.VEC))
+                m.d.comb += iss_fu_typ.eq(
+                    Mux(vec_issued, eu.fu_types & ~FUType.VEC, eu.fu_types))
+
         for irr_rp, rp in zip(iregread.read_ports, iregfile.read_ports):
             m.d.comb += irr_rp.connect(rp)
 

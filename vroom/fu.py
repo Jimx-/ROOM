@@ -387,11 +387,16 @@ class VALULane(PipelinedLaneFunctionalUnit):
         ]
 
         tail_mask = Signal(self.data_width)
-        with m.Switch(uop.dest_eew()):
-            for i in range(4):
-                with m.Case(i):
-                    m.d.comb += tail_mask.eq(
-                        Cat(x.replicate(1 << i) for x in self.req.bits.tail))
+        with m.If(uop.narrow_to_1):
+            m.d.comb += tail_mask.eq(self.req.bits.tail)
+        with m.Else():
+            with m.Switch(uop.dest_eew()):
+                for i in range(4):
+                    with m.Case(i):
+                        m.d.comb += tail_mask.eq(
+                            Cat(
+                                x.replicate(1 << i)
+                                for x in self.req.bits.tail))
 
         mask_keep = Signal(self.data_width)
         mask_off_data = Signal(self.data_width)

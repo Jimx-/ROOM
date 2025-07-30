@@ -330,7 +330,7 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                 vec.rob_pnr_idx.eq(self.rob_pnr_idx),
                 vec.br_update.eq(self.br_update),
                 vec.exception.eq(self.exception),
-                vec_busy.eq(~vec.req.ready),
+                vec_busy.eq(~vec.req.ready | vec.req.valid),
             ]
 
             iresp_units.append(vec)

@@ -100,6 +100,36 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMSBC),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b011000):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSEQ),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011001):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSNE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011010):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLTU),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011011):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLT),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011100):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLEU),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011101):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
 
                     with m.Case(0b001):  # OPFVV
                         pass
@@ -207,6 +237,46 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                             with m.Case(0b010011):
                                 m.d.comb += [
                                     UOPC(VOpCode.VMSBC),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011000):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSEQ),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011001):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSNE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011010):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLTU),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011011):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLT),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011100):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLEU),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011101):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011110):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSGTU),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011111):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSGT),
                                     uop.narrow_to_1.eq(1),
                                 ]
 

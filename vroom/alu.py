@@ -142,7 +142,7 @@ class VALU(Elaboratable):
                 with m.Case(i):
                     sew = 1 << i
                     m.d.comb += cmp_eq.eq(
-                        Cat(eq_vec[w * sew:(w + 1) * sew].all().replicate(sew)
+                        Cat(eq_vec[w:w + sew].all().replicate(sew)
                             for w in range(0, lane_bytes, sew)))
 
         cmp_result = Signal(lane_bytes)
