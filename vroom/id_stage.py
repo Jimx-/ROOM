@@ -200,7 +200,56 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 ]
 
                     with m.Case(0b011):  # OPIVI
-                        pass
+                        m.d.comb += [
+                            uop.fu_type.eq(VFUType.ALU),
+                            uop.dst_rtype.eq(RegisterType.VEC),
+                            uop.lrs2_rtype.eq(RegisterType.VEC),
+                        ]
+
+                        with m.Switch(uop.funct6):
+                            with m.Case(0b000000):
+                                m.d.comb += UOPC(VOpCode.VADD)
+                            with m.Case(0b000011):
+                                m.d.comb += UOPC(VOpCode.VRSUB)
+                            with m.Case(0b001001):
+                                m.d.comb += UOPC(VOpCode.VAND)
+                            with m.Case(0b001010):
+                                m.d.comb += UOPC(VOpCode.VOR)
+                            with m.Case(0b001011):
+                                m.d.comb += UOPC(VOpCode.VXOR)
+                            with m.Case(0b010000):
+                                m.d.comb += UOPC(VOpCode.VADC)
+                            with m.Case(0b010001):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMADC),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011000):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSEQ),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011001):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSNE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011100):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLEU),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011101):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMSLE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b100101):
+                                m.d.comb += UOPC(VOpCode.VSLL)
+                            with m.Case(0b101000):
+                                m.d.comb += UOPC(VOpCode.VSRL)
+                            with m.Case(0b101001):
+                                m.d.comb += UOPC(VOpCode.VSRA)
 
                     with m.Case(0b100):  # OPIVX
                         m.d.comb += [
@@ -414,7 +463,7 @@ class VOpExpander(HasVectorParams, Elaboratable):
                                                        == VOpCode.VZEXT)
 
         lrs1_incr = Signal(3)
-        with m.If(is_ext):
+        with m.If(is_ext | (expd_uop.lrs1_rtype != RegisterType.VEC)):
             m.d.comb += lrs1_incr.eq(0)
         with m.Elif(expd_uop.widen | expd_uop.widen2):
             m.d.comb += lrs1_incr.eq(expd_idx >> 1)

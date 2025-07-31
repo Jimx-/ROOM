@@ -381,6 +381,7 @@ class VALULane(PipelinedLaneFunctionalUnit):
             alu.vmask.eq(uop.mask),
             alu.vm.eq(uop.vm),
             alu.ma.eq(uop.vma),
+            alu.vi.eq(uop.opa_sel == VOpA.IMM),
             alu.widen.eq(uop.widen),
             alu.widen2.eq(uop.widen2),
             alu.narrow_to_1.eq(uop.narrow_to_1),

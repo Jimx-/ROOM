@@ -82,6 +82,9 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
                         with m.Case(0b010):  # OPMVV
                             m.d.comb += uop.opa_sel.eq(VOpA.VS1)
 
+                        with m.Case(0b011):  # OPIVI
+                            m.d.comb += uop.opa_sel.eq(VOpA.IMM)
+
                         with m.Case(0b100):  # OPIVX
                             m.d.comb += uop.opa_sel.eq(VOpA.SCALAR)
 

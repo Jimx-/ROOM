@@ -21,6 +21,7 @@ class VALU(Elaboratable):
         self.vmask = Signal(width // 8)
         self.vm = Signal()
         self.ma = Signal()
+        self.vi = Signal()
         self.widen = Signal()
         self.widen2 = Signal()
         self.narrow_to_1 = Signal()
@@ -185,7 +186,11 @@ class VALU(Elaboratable):
                 with m.Case(w):
                     n = 1 << (3 + w)
                     for i in range(0, self.width, n):
-                        shamt = shamts[i:i + (3 + w)]
+                        if w == 3:
+                            shamt = Cat(shamts[i:i + (2 + w)],
+                                        Mux(self.vi, 0, shamts[i + (2 + w)]))
+                        else:
+                            shamt = shamts[i:i + (3 + w)]
                         m.d.comb += shout_r[i:i + n].eq(
                             Cat(shin[i:i + n], is_sub
                                 & shin[i + n - 1]).as_signed() >> shamt)
