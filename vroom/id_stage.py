@@ -130,6 +130,12 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMSLE),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b100101):
+                                m.d.comb += UOPC(VOpCode.VSLL)
+                            with m.Case(0b101000):
+                                m.d.comb += UOPC(VOpCode.VSRL)
+                            with m.Case(0b101001):
+                                m.d.comb += UOPC(VOpCode.VSRA)
 
                     with m.Case(0b001):  # OPFVV
                         pass
@@ -279,6 +285,12 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMSGT),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b100101):
+                                m.d.comb += UOPC(VOpCode.VSLL)
+                            with m.Case(0b101000):
+                                m.d.comb += UOPC(VOpCode.VSRL)
+                            with m.Case(0b101001):
+                                m.d.comb += UOPC(VOpCode.VSRA)
 
                     with m.Case(0b101):  # OPFVF
                         pass

@@ -159,6 +159,43 @@ class VALU(Elaboratable):
                 m.d.comb += cmp_result.eq(~(lt_vec | cmp_eq))
 
         #
+        # VSLL, VSRL, VSRA
+        #
+
+        shift_r = (self.fn == VALUOperator.VSR) | (self.fn
+                                                   == VALUOperator.VSRA)
+        shin_r = self.in2
+        shin_l = self.in2[::-1]
+        shin = Mux(shift_r, shin_r, shin_l)
+
+        in1_rev = Signal(self.width)
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    m.d.comb += in1_rev.eq(
+                        Cat([
+                            self.in1[i:i + n] for i in range(0, self.width, n)
+                        ][::-1]))
+        shamts = Mux(shift_r, self.in1, in1_rev)
+
+        shout_r = Signal(self.width)
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    for i in range(0, self.width, n):
+                        shamt = shamts[i:i + (3 + w)]
+                        m.d.comb += shout_r[i:i + n].eq(
+                            Cat(shin[i:i + n], is_sub
+                                & shin[i + n - 1]).as_signed() >> shamt)
+
+        shout_l = shout_r[::-1]
+        shout = Mux(
+            (self.fn == VALUOperator.VSR) | (self.fn == VALUOperator.VSRA),
+            shout_r, 0) | Mux(self.fn == VALUOperator.VSL, shout_l, 0)
+
+        #
         # VMIN, VMAX
         #
 
@@ -193,7 +230,7 @@ class VALU(Elaboratable):
                 (self.fn == VALUOperator.VORN) |
                 (self.fn == VALUOperator.VANDN), in1_and_in2, 0)
 
-        shift_logic = logic
+        shift_logic = logic | shout
 
         #
         # VZEXT, VSEXT
