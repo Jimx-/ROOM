@@ -136,6 +136,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):
                                 m.d.comb += UOPC(VOpCode.VSRA)
+                            with m.Case(0b101100):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNSRL),
+                                    uop.narrow.eq(1),
+                                ]
+                            with m.Case(0b101101):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNSRA),
+                                    uop.narrow.eq(1),
+                                ]
 
                     with m.Case(0b001):  # OPFVV
                         pass
@@ -250,6 +260,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):
                                 m.d.comb += UOPC(VOpCode.VSRA)
+                            with m.Case(0b101100):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNSRL),
+                                    uop.narrow.eq(1),
+                                ]
+                            with m.Case(0b101101):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNSRA),
+                                    uop.narrow.eq(1),
+                                ]
 
                     with m.Case(0b100):  # OPIVX
                         m.d.comb += [
@@ -340,6 +360,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):
                                 m.d.comb += UOPC(VOpCode.VSRA)
+                            with m.Case(0b101100):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNSRL),
+                                    uop.narrow.eq(1),
+                                ]
+                            with m.Case(0b101101):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNSRA),
+                                    uop.narrow.eq(1),
+                                ]
 
                     with m.Case(0b101):  # OPFVF
                         pass
@@ -453,7 +483,8 @@ class VOpExpander(HasVectorParams, Elaboratable):
         expd_count_start = Signal(3)
         expd_count = Signal(3)
         lmul = vlmul_to_lmul(self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag)
-        with m.If(self.expd_uop.widen | self.expd_uop.widen2):
+        with m.If(self.expd_uop.widen | self.expd_uop.widen2
+                  | self.expd_uop.narrow):
             m.d.comb += expd_count_start.eq(
                 Mux(self.expd_uop.vlmul_sign, 1, (lmul << 1) - 1))
         with m.Else():
@@ -465,7 +496,7 @@ class VOpExpander(HasVectorParams, Elaboratable):
         lrs1_incr = Signal(3)
         with m.If(is_ext | (expd_uop.lrs1_rtype != RegisterType.VEC)):
             m.d.comb += lrs1_incr.eq(0)
-        with m.Elif(expd_uop.widen | expd_uop.widen2):
+        with m.Elif(expd_uop.widen | expd_uop.widen2 | expd_uop.narrow):
             m.d.comb += lrs1_incr.eq(expd_idx >> 1)
         with m.Else():
             m.d.comb += lrs1_incr.eq(expd_idx)
@@ -481,7 +512,9 @@ class VOpExpander(HasVectorParams, Elaboratable):
             m.d.comb += lrs2_incr.eq(expd_idx)
 
         ldst_incr = Signal(3)
-        with m.If(expd_uop.narrow_to_1):
+        with m.If(expd_uop.narrow):
+            m.d.comb += ldst_incr.eq(expd_idx >> 1)
+        with m.Elif(expd_uop.narrow_to_1):
             m.d.comb += ldst_incr.eq(0)
         with m.Else():
             m.d.comb += ldst_incr.eq(expd_idx)
@@ -526,5 +559,8 @@ class VOpExpander(HasVectorParams, Elaboratable):
 
         with m.If(self.expd_uop.narrow_to_1 & ~self.expd_uop.expd_end):
             m.d.comb += self.expd_uop.dst_rtype.eq(RegisterType.X)
+        with m.Elif(self.expd_uop.narrow):
+            with m.If(~(self.expd_uop.expd_idx[0] | self.expd_uop.expd_end)):
+                m.d.comb += self.expd_uop.dst_rtype.eq(RegisterType.X)
 
         return m

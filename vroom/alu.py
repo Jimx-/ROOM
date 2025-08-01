@@ -24,8 +24,10 @@ class VALU(Elaboratable):
         self.vi = Signal()
         self.widen = Signal()
         self.widen2 = Signal()
+        self.narrow = Signal()
         self.narrow_to_1 = Signal()
         self.out = Signal(width)
+        self.narrow_out = Signal(width // 2)
         self.cmp_out = Signal(width // 8)
 
     def elaborate(self, platform):
@@ -170,18 +172,32 @@ class VALU(Elaboratable):
         shin = Mux(shift_r, shin_r, shin_l)
 
         in1_rev = Signal(self.width)
-        with m.Switch(self.sew):
-            for w in range(4):
-                with m.Case(w):
-                    n = 1 << (3 + w)
-                    m.d.comb += in1_rev.eq(
-                        Cat([
-                            self.in1[i:i + n] for i in range(0, self.width, n)
-                        ][::-1]))
-        shamts = Mux(shift_r, self.in1, in1_rev)
+        m.d.comb += in1_rev.eq(self.in1)
+        with m.If(~shift_r):
+            with m.Switch(self.sew):
+                for w in range(4):
+                    with m.Case(w):
+                        n = 1 << (3 + w)
+                        m.d.comb += in1_rev.eq(
+                            Cat([
+                                self.in1[i:i + n]
+                                for i in range(0, self.width, n)
+                            ][::-1]))
+
+        shamts = Signal(self.width)
+        m.d.comb += shamts.eq(in1_rev)
+        with m.If(self.narrow):
+            for w in range(self.width // 16):
+                with m.If(self.uop_idx[0]):
+                    m.d.comb += shamts[w * 16:(w + 1) * 16].eq(
+                        in1_rev[(w + self.width // 16) *
+                                8:(w + self.width // 16 + 1) * 8])
+                with m.Else():
+                    m.d.comb += shamts[w * 16:(w + 1) * 16].eq(
+                        in1_rev[w * 8:(w + 1) * 8])
 
         shout_r = Signal(self.width)
-        with m.Switch(self.sew):
+        with m.Switch(self.sew + self.narrow):
             for w in range(4):
                 with m.Case(w):
                     n = 1 << (3 + w)
@@ -199,6 +215,14 @@ class VALU(Elaboratable):
         shout = Mux(
             (self.fn == VALUOperator.VSR) | (self.fn == VALUOperator.VSRA),
             shout_r, 0) | Mux(self.fn == VALUOperator.VSL, shout_l, 0)
+
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    m.d.comb += self.narrow_out.eq(
+                        Cat(shout[i * 2 * n:(i * 2 + 1) * n]
+                            for i in range(self.width // (2 * n))))
 
         #
         # VMIN, VMAX

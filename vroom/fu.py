@@ -238,7 +238,7 @@ class PerLaneFunctionalUnit(FunctionalUnit):
 
         for w, lane_req in enumerate(self.lane_reqs):
             vs1_data = Signal(self.lane_width, name=f'vs1_data{w}')
-            with m.If(uop.widen | uop.widen2):
+            with m.If(uop.widen | uop.widen2 | uop.narrow):
                 m.d.comb += vs1_data.eq(
                     Cat(self.req.bits.vs1_data[i * 32:(i + 1) * 32]
                         for i in range(w, self.vlen // 32, self.n_lanes)))
@@ -314,14 +314,34 @@ class PerLaneFunctionalUnit(FunctionalUnit):
             tail_gen.vl.eq(self.req.bits.uop.vl),
             tail_gen.uop_idx.eq(self.req.bits.uop.expd_idx),
             tail_gen.eew.eq(self.req.bits.uop.dest_eew()),
+            tail_gen.narrow.eq(self.req.bits.uop.narrow),
         ]
         for w, lane_req in enumerate(self.lane_reqs):
+            lane_tail = Signal(self.lane_width // 8, name=f'lane_tail{w}')
+            lane_tail_narrow = Signal(self.lane_width // 8,
+                                      name=f'lane_tail_narrow{w}')
+
             with m.Switch(self.req.bits.uop.dest_eew()):
                 for i in range(4):
                     with m.Case(i):
                         tail_width = self.lane_width // (8 << i)
-                        m.d.comb += lane_req.bits.tail.eq(
+                        m.d.comb += lane_tail.eq(
                             tail_gen.tail[w * tail_width:(w + 1) * tail_width])
+
+            with m.Switch(self.req.bits.uop.dest_eew()):
+                for i in range(3):
+                    with m.Case(i):
+                        tail_width = self.lane_width // (16 << i)
+                        m.d.comb += lane_tail_narrow.eq(
+                            Cat(
+                                tail_gen.tail[w * tail_width:(w + 1) *
+                                              tail_width],
+                                tail_gen.tail[(w + self.n_lanes) *
+                                              tail_width:(w + self.n_lanes +
+                                                          1) * tail_width]))
+
+            m.d.comb += lane_req.bits.tail.eq(
+                Mux(self.req.bits.uop.narrow, lane_tail_narrow, lane_tail))
 
         m.d.comb += [
             self.resp.valid.eq(self.lane_resps[0].valid),
@@ -347,12 +367,33 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                                     lmul_idx * 8 + offset])
 
         for w, lane_resp in enumerate(self.lane_resps):
+            lane_vd_data = Signal(self.lane_width, name=f'lane_vd_data{w}')
+            with m.If(self.resp.bits.uop.narrow):
+                if w < self.n_lanes // 2:
+                    m.d.comb += lane_vd_data.eq(
+                        Cat(
+                            self.lane_resps[2 *
+                                            w].bits.vd_data[:self.lane_width //
+                                                            2],
+                            self.lane_resps[2 * w +
+                                            1].bits.vd_data[:self.lane_width //
+                                                            2]))
+                else:
+                    m.d.comb += lane_vd_data.eq(
+                        Cat(
+                            self.lane_resps[2 * w - self.n_lanes].bits.
+                            vd_data[self.lane_width // 2:],
+                            self.lane_resps[2 * w + 1 - self.n_lanes].bits.
+                            vd_data[self.lane_width // 2:]))
+            with m.Else():
+                m.d.comb += lane_vd_data.eq(lane_resp.bits.vd_data)
+
             m.d.comb += self.resp.bits.vd_data[w * self.lane_width:(
                 w + 1) * self.lane_width].eq(
                     Mux(
                         self.resp.bits.uop.narrow_to_1,
                         vd_cmp_out[w * self.lane_width:(w + 1) *
-                                   self.lane_width], lane_resp.bits.vd_data))
+                                   self.lane_width], lane_vd_data))
 
         return m
 
@@ -384,6 +425,7 @@ class VALULane(PipelinedLaneFunctionalUnit):
             alu.vi.eq(uop.opa_sel == VOpA.IMM),
             alu.widen.eq(uop.widen),
             alu.widen2.eq(uop.widen2),
+            alu.narrow.eq(uop.narrow),
             alu.narrow_to_1.eq(uop.narrow_to_1),
         ]
 
@@ -433,6 +475,7 @@ class VALULane(PipelinedLaneFunctionalUnit):
             Signal(self.data_width // 8, name=f's1_cmp_out{i}')
             for i in range(8)
         ]
+        s1_narrow_out = Signal(self.data_width)
         with m.If(self.req.valid):
             with m.Switch(uop.expd_idx):
                 for i in range(1, 8):
@@ -445,7 +488,13 @@ class VALULane(PipelinedLaneFunctionalUnit):
                         s1_cmp_out[0].eq(cmp_out_masked),
                     ]
 
-        s1_alu_out_masked = (s1_alu_out & s1_mask_keep) | s1_mask_off_data
+            m.d.sync += s1_narrow_out.eq(
+                Mux(uop.expd_idx[0],
+                    Cat(s1_narrow_out[:self.data_width // 2], alu.narrow_out),
+                    alu.narrow_out))
+
+        s1_alu_out_masked = (Mux(self.uops[0].narrow, s1_narrow_out,
+                                 s1_alu_out) & s1_mask_keep) | s1_mask_off_data
         m.d.comb += self.resp.bits.vd_data.eq(
             Mux(self.uops[0].narrow_to_1, Cat(s1_cmp_out), s1_alu_out_masked))
 

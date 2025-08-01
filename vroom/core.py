@@ -207,7 +207,8 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             lsu.exec_resp.connect(wb_arb.inp[1]),
             wb_req.eq(wb_arb.out),
             wb_arb.out.ready.eq(1),
-            if_stage.wb_req.valid.eq(wb_req.valid),
+            if_stage.wb_req.valid.eq(wb_req.valid
+                                     & wb_req.bits.uop.expd_end),
             if_stage.wb_req.bits.eq(wb_req.bits),
         ]
 
