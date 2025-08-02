@@ -208,6 +208,8 @@ class IFStage(HasVectorParams, Elaboratable):
                     fetch_buffer.r_en.eq(self.fetch_packet.ready
                                          & next_uop_safe
                                          & ~ftq_pe.n),
+                    self.fetch_packet.bits.uop_id.eq(
+                        fetch_buffer.r_data.uop.uop_id),
                     self.fetch_packet.bits.inst.eq(
                         fetch_buffer.r_data.uop.inst),
                     self.fetch_packet.bits.ftq_idx.eq(next_ftq_idx),

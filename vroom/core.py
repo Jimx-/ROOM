@@ -1,12 +1,12 @@
 from amaranth import *
 
-from vroom.types import HasVectorParams
+from vroom.types import HasVectorParams, VMicroOp
 from vroom.if_stage import IFStage
-from vroom.id_stage import DecodeStage, VOpExpander
+from vroom.id_stage import VIDDebug, DecodeStage, VOpExpander
 from vroom.dispatch import Dispatcher
 from vroom.issue import Scoreboard
 from vroom.regfile import RegisterRead, RegisterFile
-from vroom.ex_stage import ALUExecUnit
+from vroom.ex_stage import VExecDebug, ALUExecUnit
 from vroom.lsu import LoadStoreUnit
 from vroom.fu import ExecReq as VExecReq, ExecResp as VExecResp
 
@@ -28,6 +28,37 @@ def vtype_layout(xlen):
         ("_rsvd", xlen - 9, CSRAccess.RO),
         ("vill", 1, CSRAccess.RO),
     ]
+
+
+class VWritebackDebug(HasVectorParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasVectorParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('uop_id', VMicroOp.ID_WIDTH),
+            ('ldst', range(32)),
+            ('data', self.vlen),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
+class VectorDebug(HasVectorParams):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.id_debug = Valid(VIDDebug, params)
+        self.ex_debug = Valid(VExecDebug, params)
+        self.wb_debug = Valid(VWritebackDebug, params)
+
+    def eq(self, rhs):
+        return [
+            self.id_debug.eq(rhs.id_debug),
+            self.ex_debug.eq(rhs.ex_debug),
+            self.wb_debug.eq(rhs.wb_debug),
+        ]
 
 
 class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
@@ -53,6 +84,9 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         self.vl = CSR(0xC20, [('value', self.xlen, CSRAccess.RO)])
         self.vtype = CSR(0xC21, vtype_layout(self.xlen))
         self.vlenb = CSR(0xC22, [('value', self.xlen, CSRAccess.RO)])
+
+        if self.sim_debug:
+            self.vec_debug = VectorDebug(params)
 
     def elaborate(self, platform):
         m = Module()
@@ -90,7 +124,8 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         # Decoding
         #
 
-        dec_stage = m.submodules.decode_stage = DecodeStage(self.params)
+        dec_stage = m.submodules.decode_stage = DecodeStage(
+            self.params, sim_debug=self.sim_debug)
         m.d.comb += [
             dec_stage.fetch_packet.valid.eq(if_stage.fetch_packet.valid),
             dec_stage.fetch_packet.bits.eq(if_stage.fetch_packet.bits),
@@ -98,6 +133,9 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             dec_stage.vtype.eq(if_stage.vtype),
             dec_stage.vl.eq(if_stage.vl),
         ]
+
+        if self.sim_debug:
+            m.d.comb += self.vec_debug.id_debug.eq(dec_stage.id_debug)
 
         expander = m.submodules.expander = VOpExpander(self.params)
         m.d.comb += [
@@ -175,13 +213,17 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
                 exec_rs2_data.eq(if_stage.get_rs2_data),
             ]
 
-        exec_unit = m.submodules.exec_unit = ALUExecUnit(self.params)
+        exec_unit = m.submodules.exec_unit = ALUExecUnit(
+            self.params, sim_debug=self.sim_debug)
         m.d.comb += [
             vregread.exec_req.connect(exec_unit.req),
             exec_unit.req.bits.rs1_data.eq(exec_rs1_data),
             exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
             exec_unit.req.bits.mask.eq(vregfile_v0),
         ]
+
+        if self.sim_debug:
+            m.d.comb += self.vec_debug.ex_debug.eq(exec_unit.exec_debug)
 
         #
         # Load/store unit
@@ -229,5 +271,15 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
 
             with m.If(wp.valid & (wp.bits.addr == 0)):
                 m.d.sync += vregfile_v0.eq(wp.bits.data)
+
+        if self.sim_debug:
+            m.d.comb += [
+                self.vec_debug.wb_debug.valid.eq(
+                    wb_req.valid
+                    & (wb_req.bits.uop.dst_rtype == RegisterType.VEC)),
+                self.vec_debug.wb_debug.bits.uop_id.eq(wb_req.bits.uop.uop_id),
+                self.vec_debug.wb_debug.bits.ldst.eq(wb_req.bits.uop.ldst),
+                self.vec_debug.wb_debug.bits.data.eq(wb_req.bits.vd_data),
+            ]
 
         return m

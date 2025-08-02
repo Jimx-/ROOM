@@ -22,6 +22,8 @@ from room.fp_pipeline import FPPipeline
 from room.mmu import PageTableWalker, CoreMemRequest
 from room.utils import Arbiter
 
+from vroom.core import VectorDebug
+
 from roomsoc.interconnect.stream import Valid, Decoupled
 from roomsoc.interconnect import wishbone, tilelink as tl
 
@@ -68,7 +70,7 @@ class CoreDebug(HasCoreParams):
 
         self.ex_debug = [
             Valid(ExecDebug, params, name=f'ex_debug{i}')
-            for i in range(int_width)
+            for i in range(int_width + self.use_vector)
         ]
 
         self.mem_debug = [
@@ -205,6 +207,9 @@ class Core(HasCoreParams, Elaboratable):
 
         if sim_debug:
             self.core_debug = CoreDebug(params)
+
+            if self.use_vector:
+                self.vec_debug = VectorDebug(params)
 
     @property
     def pma_regions(self):
@@ -916,8 +921,17 @@ class Core(HasCoreParams, Elaboratable):
             ]
 
         if self.sim_debug:
-            for l, r in zip(self.core_debug.ex_debug, exec_units.exec_debug):
+            for l, r in zip(self.core_debug.ex_debug[:self.int_width],
+                            exec_units.exec_debug):
                 m.d.comb += l.eq(r)
+
+            if self.use_vector:
+                vec_exec_unit = [eu for eu in exec_units if eu.has_vec][0]
+                m.d.comb += [
+                    self.core_debug.ex_debug[self.int_width].eq(
+                        vec_exec_unit.exec_debug),
+                    self.vec_debug.eq(vec_exec_unit.vec_debug),
+                ]
 
         #
         # Get PC for jump unit

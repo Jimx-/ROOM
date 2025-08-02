@@ -11,6 +11,12 @@ PREG_COLORS = [
     for r, g, b in distinctipy.get_colors(NUM_PREGS)
 ]
 
+VLEN = 128
+VREG_COLORS = [
+    f'rgb({int(255*r)},{int(255*g)},{int(255*b)})'
+    for r, g, b in distinctipy.get_colors(32)
+]
+
 EXCEPTION_CAUSE = {
     0x0: 'Misaligned fetch',
     0x1: 'Fetch access fault',
@@ -65,6 +71,15 @@ class Instruction:
         self.addr = 0
         self.data = 0
 
+        self.lmul = None
+        self.sew = -1
+        self.vl = -1
+
+        self.vd_data = dict()
+        self.vs1_data = dict()
+        self.vs2_data = dict()
+        self.vmask = 0
+
     def commit(self, table):
         uop_id = f'{self.uop_id:x}'
         pc = f'{self.pc:x}'
@@ -116,6 +131,16 @@ class Instruction:
         if (rs2_n0 := op.args.get('rs2_n0')) is not None:
             rs2_text = Text(self.int_regs[rs2_n0],
                             style=PREG_COLORS[self.prs2])
+
+        vd_text = ''
+        vs1_text = ''
+        vs2_text = ''
+        if (vd := op.args.get('vd')) is not None:
+            vd_text = Text(f'v{vd}', style=VREG_COLORS[vd])
+        if (vs1 := op.args.get('vs1')) is not None:
+            vs1_text = Text(f'v{vs1}', style=VREG_COLORS[vs1])
+        if (vs2 := op.args.get('vs2')) is not None:
+            vs2_text = Text(f'v{vs2}', style=VREG_COLORS[vs2])
 
         op_name = op.name.replace('_', '.')
 
@@ -319,6 +344,62 @@ class Instruction:
             inst_text.append(' ')
             inst_text.append(target)
 
+        elif op.name in {'vsetvli', 'vsetivli', 'vsetvl'}:
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(rd_text)
+            inst_text.append(f'[={self.rd_data:x}]')
+            inst_text.append(', ')
+
+            if 'zimm5' in op.args:
+                rs1_text = Text(self.int_regs[op.zimm5],
+                                style=PREG_COLORS[self.prs1])
+
+            inst_text.append(rs1_text)
+            inst_text.append(f'[={self.rs1_data:x}]')
+            inst_text.append(', ')
+
+            vtype = self.rs2_data
+            if 'zimm10' in op.args:
+                vtype = op.zimm10
+            elif 'zimm11' in op.args:
+                vtype = op.zimm11
+
+            inst_text.append(f'e{1 << (3 + ((vtype >> 3) & 3))}, ')
+            lmul_name = ['1', '2', '4', '8', '', 'f8', 'f4', 'f2']
+            inst_text.append(f'm{lmul_name[vtype & 7]}, ')
+            inst_text.append(f't{"a" if vtype & 64 else "u"}, ')
+            inst_text.append(f'm{"a" if vtype & 128 else "u"}')
+
+        elif op.name.startswith('v'):
+            inst_text.append(op_name.ljust(5))
+            inst_text.append(' ')
+            inst_text.append(vd_text)
+            inst_text.append(
+                f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=op.name.startswith("vm"))}]'
+            )
+            inst_text.append(', ')
+            inst_text.append(vs2_text)
+            inst_text.append(
+                f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0)}]'
+            )
+
+            inst_text.append(', ')
+            if 'simm5' in op.args:
+                inst_text.append(hex(op.simm5))
+            elif 'rs1' in op.args:
+                inst_text.append(rs1_text)
+                inst_text.append(f'[={self.rs1_data:x}]')
+            else:
+                inst_text.append(vs1_text)
+                inst_text.append(f'[={self.format_vs_data(self.vs1_data)}]')
+
+            if 'vm' in op.args and op.vm == 0 or op.name.endswith('m'):
+                inst_text.append(', v0.t')
+                inst_text.append(
+                    f'[={self.format_vs_data({0: self.vmask}, narrow_to_1=True)}]'
+                )
+
         elif 'rd' in op.args and 'rs1' in op.args:
             if op.name == 'addi' and op.imm12 == 0:
                 if op.rd == 0 and op.rs1 == 0:
@@ -428,12 +509,35 @@ class Instruction:
 
             note_text.append('Taken' if taken else 'Not taken')
 
+        if self.vl != -1:
+            note_text.append(f'SEW={self.sew}, LMUL={self.lmul}')
+
         if illegal_insn:
             inst_text = Text(hex(self.inst), style='red')
             note_text = Text('Illegal instruction', style='red')
 
         table.add_row(uop_id, pc, inst_text, note_text)
         return (uop_id, pc, inst_text, note_text)
+
+    def format_vs_data(self, data, widen=False, narrow_to_1=False):
+        sew = self.sew
+        if widen:
+            sew *= 2
+
+        elems = []
+        for r in data.values():
+            if narrow_to_1:
+                elems.append(r & ((1 << self.vl) - 1))
+                break
+
+            for _ in range(VLEN // sew):
+                elems.append(r & ((1 << sew) - 1))
+                r >>= sew
+
+        if narrow_to_1:
+            return '0b' + f'{elems[0]:b}'.zfill(self.vl)
+
+        return f'({", ".join(hex(x) for x in elems[:self.vl])})'
 
 
 class TraceParser:
@@ -576,6 +680,49 @@ class TraceParser:
                 exc = Text(f'Exception ({cause_str})',
                            style='bold italic red underline')
                 table.add_row('', '', exc, '')
+
+            elif cmd == 'VID':
+                id = int(args[0])
+                vlmul = int(args[1])
+                vsew = int(args[2])
+                vl = int(args[3])
+
+                inst = self.insts.get(id)
+                if inst is None:
+                    raise ValueError(f'Micro-op {id} not found')
+
+                inst.lmul = ['1', '2', '4', '8', '-', '1/8', '1/4',
+                             '1/2'][vlmul]
+                inst.sew = [8, 16, 32, 64, -1, -1, -1, -1][vsew]
+                inst.vl = vl
+
+            elif cmd == 'VEX':
+                id = int(args[0])
+                opcode = int(args[1])
+                lrs1 = int(args[2])
+                vs1_data = int(args[3], base=16)
+                lrs2 = int(args[4])
+                vs2_data = int(args[5], base=16)
+                vmask = int(args[6], base=16)
+
+                inst = self.insts.get(id)
+                if inst is None:
+                    raise ValueError(f'Micro-op {id} not found')
+
+                inst.vs1_data[lrs1] = vs1_data
+                inst.vs2_data[lrs2] = vs2_data
+                inst.vmask = vmask
+
+            elif cmd == 'VWB':
+                id = int(args[0])
+                ldst = int(args[1])
+                vd_data = int(args[2], base=16)
+
+                inst = self.insts.get(id)
+                if inst is None:
+                    raise ValueError(f'Micro-op {id} not found')
+
+                inst.vd_data[ldst] = vd_data
 
             elif cmd == 'X':
                 self.insts.clear()

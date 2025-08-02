@@ -5,7 +5,22 @@ from vroom.types import HasVectorParams, VMicroOp, VType
 from vroom.utils import vlmul_to_lmul
 
 from room.consts import RegisterType
-from room.utils import Decoupled
+from room.utils import Decoupled, Valid
+
+
+class VIDDebug(HasVectorParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasVectorParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('uop_id', VMicroOp.ID_WIDTH),
+            ('vlmul', 3),
+            ('vsew', 3),
+            ('vl', self.vl_bits),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
 
 
 class DecodeUnit(HasVectorParams, Elaboratable):
@@ -429,8 +444,9 @@ class DecodeUnit(HasVectorParams, Elaboratable):
 
 class DecodeStage(HasVectorParams, Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sim_debug=False):
         super().__init__(params)
+        self.sim_debug = sim_debug
 
         self.vtype = VType(params)
         self.vl = Signal(self.vl_bits)
@@ -440,6 +456,9 @@ class DecodeStage(HasVectorParams, Elaboratable):
         self.valid = Signal()
         self.uop = VMicroOp(params)
         self.ready = Signal()
+
+        if sim_debug:
+            self.id_debug = Valid(VIDDebug, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -456,6 +475,16 @@ class DecodeStage(HasVectorParams, Elaboratable):
             self.uop.eq(dec_unit.out_uop),
             self.fetch_packet.ready.eq(self.ready)
         ]
+
+        if self.sim_debug:
+            m.d.comb += [
+                self.id_debug.valid.eq(self.valid & self.ready),
+                self.id_debug.bits.uop_id.eq(self.uop.uop_id),
+                self.id_debug.bits.vlmul.eq(
+                    Cat(self.vtype.vlmul_mag, self.vtype.vlmul_sign)),
+                self.id_debug.bits.vsew.eq(Cat(self.vtype.vsew)),
+                self.id_debug.bits.vl.eq(Cat(self.vl)),
+            ]
 
         return m
 

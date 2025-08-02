@@ -4,7 +4,7 @@ from amaranth.utils import log2_int
 from vroom.consts import *
 
 from room.consts import RegisterType
-from room.types import HasCoreParams
+from room.types import HasCoreParams, MicroOp
 
 
 class HasVectorParams(HasCoreParams):
@@ -52,10 +52,13 @@ class HasVectorParams(HasCoreParams):
 
 class VMicroOp(HasVectorParams, Record):
 
+    ID_WIDTH = MicroOp.ID_WIDTH
+
     def __init__(self, params, name=None, src_loc_at=0):
         HasVectorParams.__init__(self, params)
 
         Record.__init__(self, [
+            ('uop_id', VMicroOp.ID_WIDTH),
             ('inst', 32),
             ('ftq_idx', range(self.ftq_size)),
             ('vlmul_mag', 2),

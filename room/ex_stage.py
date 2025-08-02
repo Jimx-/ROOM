@@ -8,7 +8,7 @@ from room.utils import Arbiter, generate_imm
 from room.csr import AutoCSR
 from room.mmu import CoreMemRequest, CoreMemResponse
 
-from vroom.core import VectorUnit
+from vroom.core import VectorUnit, VectorDebug
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -179,7 +179,10 @@ class ALUExecUnit(ExecUnit, AutoCSR):
         self.name = name
 
         if has_vec:
-            self._vec_unit = VectorUnit(self.params, sim_debug=self.sim_debug)
+            self._vec_unit = VectorUnit(params, sim_debug=self.sim_debug)
+
+            if sim_debug:
+                self.vec_debug = VectorDebug(params)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -334,6 +337,9 @@ class ALUExecUnit(ExecUnit, AutoCSR):
             ]
 
             iresp_units.append(vec)
+
+            if self.sim_debug:
+                m.d.comb += self.vec_debug.eq(vec.vec_debug)
 
         if self.irf_write:
             for iu in reversed(iresp_units):
