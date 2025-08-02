@@ -222,7 +222,8 @@ class IFStage(HasVectorParams, Elaboratable):
             with m.If(self.wb_req.valid):
                 m.d.comb += [
                     self.resp.valid.eq(1),
-                    self.resp.bits.data.eq(self.wb_req.bits.rd_data),
+                    self.resp.bits.data.eq(
+                        self.wb_req.bits.vd_data[:self.xlen]),
                     wb_grant.eq(self.wb_req.bits.uop.ftq_idx),
                 ]
                 with m.Switch(self.wb_req.bits.uop.ftq_idx):
@@ -231,7 +232,8 @@ class IFStage(HasVectorParams, Elaboratable):
                             m.d.comb += self.resp.bits.uop.eq(ftq[i])
                             m.d.sync += [
                                 ftq_wb[i].valid.eq(1),
-                                ftq_wb[i].bits.eq(self.wb_req.bits.rd_data),
+                                ftq_wb[i].bits.eq(
+                                    self.wb_req.bits.vd_data[:self.xlen]),
                             ]
 
             with m.Else():

@@ -309,6 +309,15 @@ class VALU(Elaboratable):
                 m.d.comb += self.out.eq(minmax)
             with m.Case(VALUOperator.VZEXT, VALUOperator.VSEXT):
                 m.d.comb += self.out.eq(ext_out)
+            with m.Case(VALUOperator.VMVSX):
+                m.d.comb += self.out.eq(self.in1)
+            with m.Case(VALUOperator.VMVXS):
+                with m.Switch(self.sew):
+                    for w in range(4):
+                        with m.Case(w):
+                            m.d.comb += self.out.eq(
+                                sign_extend(self.in2[:1 << (3 + w)],
+                                            self.width))
             with m.Default():
                 m.d.comb += self.out.eq(shift_logic)
 

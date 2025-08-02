@@ -374,23 +374,32 @@ class Instruction:
         elif op.name.startswith('v'):
             inst_text.append(op_name.ljust(5))
             inst_text.append(' ')
-            inst_text.append(vd_text)
-            inst_text.append(
-                f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=op.name.startswith("vm"))}]'
-            )
-            inst_text.append(', ')
-            inst_text.append(vs2_text)
-            inst_text.append(
-                f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0)}]'
-            )
 
-            inst_text.append(', ')
+            if 'rd' in op.args:
+                inst_text.append(rd_text)
+                inst_text.append(f'[={self.rd_data:x}]')
+            else:
+                inst_text.append(vd_text)
+                inst_text.append(
+                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=op.name.startswith("vm") and not op.name.startswith("vmv"))}]'
+                )
+
+            if 'vs2' in op.args:
+                inst_text.append(', ')
+                inst_text.append(vs2_text)
+                inst_text.append(
+                    f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0)}]'
+                )
+
             if 'simm5' in op.args:
+                inst_text.append(', ')
                 inst_text.append(hex(op.simm5))
             elif 'rs1' in op.args:
+                inst_text.append(', ')
                 inst_text.append(rs1_text)
                 inst_text.append(f'[={self.rs1_data:x}]')
-            else:
+            elif 'vs1' in op.args:
+                inst_text.append(', ')
                 inst_text.append(vs1_text)
                 inst_text.append(f'[={self.format_vs_data(self.vs1_data)}]')
 

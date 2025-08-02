@@ -174,6 +174,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         ]
 
                         with m.Switch(uop.funct6):
+                            with m.Case(0b010000):  # VWXUNARY0
+                                m.d.comb += [
+                                    uop.dst_rtype.eq(RegisterType.FIX),
+                                    uop.lrs1_rtype.eq(RegisterType.X),
+                                ]
+
+                                with m.Switch(uop.lrs1):
+                                    with m.Case(0b00000):
+                                        m.d.comb += UOPC(VOpCode.VMVXS)
+
                             with m.Case(0b010010):  # VXUNARY0
                                 m.d.comb += uop.lrs1_rtype.eq(RegisterType.X)
 
@@ -398,6 +408,12 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         ]
 
                         with m.Switch(uop.funct6):
+                            with m.Case(0b010000):  # VRXUNARY0
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMVSX),
+                                    uop.lrs2_rtype.eq(RegisterType.X),
+                                    uop.vl.eq(1),
+                                ]
                             with m.Case(0b110000):  # vwaddu
                                 m.d.comb += [
                                     UOPC(VOpCode.VADDU),
@@ -512,8 +528,11 @@ class VOpExpander(HasVectorParams, Elaboratable):
         expd_count_start = Signal(3)
         expd_count = Signal(3)
         lmul = vlmul_to_lmul(self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag)
-        with m.If(self.expd_uop.widen | self.expd_uop.widen2
-                  | self.expd_uop.narrow):
+        with m.If((self.expd_uop.opcode == VOpCode.VMVSX)
+                  | (self.expd_uop.opcode == VOpCode.VMVXS)):
+            m.d.comb += expd_count_start.eq(0)
+        with m.Elif(self.expd_uop.widen | self.expd_uop.widen2
+                    | self.expd_uop.narrow):
             m.d.comb += expd_count_start.eq(
                 Mux(self.expd_uop.vlmul_sign, 1, (lmul << 1) - 1))
         with m.Else():

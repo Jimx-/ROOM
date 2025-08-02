@@ -1142,6 +1142,11 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 uop.lrs2_rtype.eq(RegisterType.VEC),
                             ]
 
+                            with m.Switch(inuop.inst[26:32]):
+                                with m.Case(0b010000):  # VWXUNARY0
+                                    m.d.comb += uop.dst_rtype.eq(
+                                        RegisterType.FIX)
+
                         with m.Case(0b011):  # OPIVI
                             m.d.comb += [
                                 uop.iq_type.eq(IssueQueueType.VEC),
@@ -1158,7 +1163,6 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 uop.dst_rtype.eq(RegisterType.VEC),
                                 uop.lrs1_rtype.eq(RegisterType.FIX),
                                 uop.lrs2_rtype.eq(RegisterType.VEC),
-                                IMM_SEL_V,
                             ]
 
                         with m.Case(0b101):  # OPFVF
@@ -1177,7 +1181,6 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 uop.fu_type.eq(FUType.VEC),
                                 uop.lrs1_rtype.eq(RegisterType.FIX),
                                 uop.lrs2_rtype.eq(RegisterType.VEC),
-                                IMM_SEL_V,
                             ]
 
                         with m.Case(0b111):  # vset{i}vl{i}

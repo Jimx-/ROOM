@@ -7,6 +7,7 @@ from vroom.types import HasVectorParams, VMicroOp
 from vroom.alu import VALU
 from vroom.utils import TailGen
 
+from room.consts import RegisterType
 from room.utils import Decoupled, sign_extend
 
 
@@ -58,12 +59,11 @@ class ExecResp(HasVectorParams, ValueCastable):
         self.old_vd = Signal(self.vlen, name=f'{name}__old_vd')
 
         self.vd_data = Signal(self.vlen, name=f'{name}__vd_data')
-        self.rd_data = Signal(self.xlen, name=f'{name}__rd_data')
 
     @ValueCastable.lowermethod
     def as_value(self):
         return Cat(self.uop, self.base_addr, self.stride, self.old_vd,
-                   self.vd_data, self.rd_data)
+                   self.vd_data)
 
     def shape(self):
         return self.as_value().shape()
@@ -496,7 +496,10 @@ class VALULane(PipelinedLaneFunctionalUnit):
         s1_alu_out_masked = (Mux(self.uops[0].narrow, s1_narrow_out,
                                  s1_alu_out) & s1_mask_keep) | s1_mask_off_data
         m.d.comb += self.resp.bits.vd_data.eq(
-            Mux(self.uops[0].narrow_to_1, Cat(s1_cmp_out), s1_alu_out_masked))
+            Mux(
+                self.uops[0].dst_rtype != RegisterType.VEC, s1_alu_out,
+                Mux(self.uops[0].narrow_to_1, Cat(s1_cmp_out),
+                    s1_alu_out_masked)))
 
         return m
 
