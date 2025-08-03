@@ -299,6 +299,25 @@ class VALU(Elaboratable):
                         with m.Case(i):
                             extend_vector(ext_out, in2_w, 1 << (3 + i), signed)
 
+        #
+        # VMERGE/VMV
+        #
+
+        merge_mask = Signal(self.width)
+        with m.Switch(self.sew):
+            for i in range(4):
+                with m.Case(i):
+                    m.d.comb += merge_mask.eq(
+                        Cat(x.replicate(1 << i) for x in self.vmask))
+
+        merge_result = Signal(self.width)
+        for w in range(self.width // 8):
+            m.d.comb += merge_result[w * 8:(w + 1) * 8].eq(
+                Mux(merge_mask[w], self.in1[w * 8:(w + 1) * 8],
+                    self.in2[w * 8:(w + 1) * 8]))
+
+        merge_out = Mux(self.vm, self.in1, merge_result)
+
         with m.Switch(self.fn):
             with m.Case(VALUOperator.VADD, VALUOperator.VSUB,
                         VALUOperator.VRSUB, VALUOperator.VADC,
@@ -318,6 +337,8 @@ class VALU(Elaboratable):
                             m.d.comb += self.out.eq(
                                 sign_extend(self.in2[:1 << (3 + w)],
                                             self.width))
+            with m.Case(VALUOperator.VMERGE):
+                m.d.comb += self.out.eq(merge_out)
             with m.Default():
                 m.d.comb += self.out.eq(shift_logic)
 

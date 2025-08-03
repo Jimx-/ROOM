@@ -174,6 +174,7 @@ class VALUOperator(IntEnum):
     VMVXS = 20
     VMVSX = 21
     VMVNRV = 22
+    VMERGE = 23
 
     VANDN = 24
     VORN = 25
@@ -220,6 +221,15 @@ class VALUOperator(IntEnum):
     @staticmethod
     def is_ext(x):
         return (x == VALUOperator.VZEXT) | (x == VALUOperator.VSEXT)
+
+    @staticmethod
+    def is_add_with_carry(x):
+        return (x == VALUOperator.VADC) | (x == VALUOperator.VSBC) | (
+            x == VALUOperator.VMADC) | (x == VALUOperator.VMSBC)
+
+    @staticmethod
+    def is_vmerge(x):
+        return (x == VALUOperator.VMERGE)
 
 
 class VFUType(IntEnum):

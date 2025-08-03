@@ -4,6 +4,7 @@ from rich.text import Text
 import distinctipy
 import tinyrv
 import ctypes
+import re
 
 NUM_PREGS = 96
 PREG_COLORS = [
@@ -381,7 +382,7 @@ class Instruction:
             else:
                 inst_text.append(vd_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=op.name.startswith("vm") and not op.name.startswith("vmv"))}]'
+                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=re.match("vm[^ev]", op.name))}]'
                 )
 
             if 'vs2' in op.args:
@@ -546,7 +547,7 @@ class Instruction:
         if narrow_to_1:
             return '0b' + f'{elems[0]:b}'.zfill(self.vl)
 
-        return f'({", ".join(hex(x) for x in elems[:self.vl])})'
+        return f'({", ".join(f"{x:x}" for x in elems[:self.vl])})'
 
 
 class TraceParser:

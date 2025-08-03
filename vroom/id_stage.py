@@ -115,6 +115,8 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMSBC),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b010111):
+                                m.d.comb += UOPC(VOpCode.VMERGE)
                             with m.Case(0b011000):
                                 m.d.comb += [
                                     UOPC(VOpCode.VMSEQ),
@@ -259,6 +261,8 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMADC),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b010111):
+                                m.d.comb += UOPC(VOpCode.VMERGE)
                             with m.Case(0b011000):
                                 m.d.comb += [
                                     UOPC(VOpCode.VMSEQ),
@@ -339,6 +343,8 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMSBC),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b010111):
+                                m.d.comb += UOPC(VOpCode.VMERGE)
                             with m.Case(0b011000):
                                 m.d.comb += [
                                     UOPC(VOpCode.VMSEQ),
@@ -497,9 +503,9 @@ class DecodeStage(HasVectorParams, Elaboratable):
                 self.id_debug.valid.eq(self.valid & self.ready),
                 self.id_debug.bits.uop_id.eq(self.uop.uop_id),
                 self.id_debug.bits.vlmul.eq(
-                    Cat(self.vtype.vlmul_mag, self.vtype.vlmul_sign)),
-                self.id_debug.bits.vsew.eq(Cat(self.vtype.vsew)),
-                self.id_debug.bits.vl.eq(Cat(self.vl)),
+                    Cat(self.uop.vlmul_mag, self.uop.vlmul_sign)),
+                self.id_debug.bits.vsew.eq(Cat(self.uop.vsew)),
+                self.id_debug.bits.vl.eq(Cat(self.uop.vl)),
             ]
 
         return m

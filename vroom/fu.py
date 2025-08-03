@@ -92,11 +92,12 @@ class ExecLaneReq(HasVectorParams, ValueCastable):
         self.old_vd = Signal(data_width, name=f'{name}__old_vd')
 
         self.tail = Signal(data_width // 8, name=f'{name}__tail')
+        self.mask = Signal(data_width // 8, name=f'{name}__mask')
 
     @ValueCastable.lowermethod
     def as_value(self):
         return Cat(self.uop, self.opa_data, self.opb_data, self.old_vd,
-                   self.tail)
+                   self.tail, self.mask)
 
     def shape(self):
         return self.as_value().shape()
@@ -234,6 +235,10 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                       name=f'lane_resp{i}') for i in range(self.n_lanes)
         ]
 
+        #
+        # Input data arrangement
+        #
+
         imm = sign_extend(uop.lrs1, self.lane_width)
 
         for w, lane_req in enumerate(self.lane_reqs):
@@ -309,6 +314,10 @@ class PerLaneFunctionalUnit(FunctionalUnit):
             ]
         m.d.comb += self.req.ready.eq(self.lane_reqs[0].ready)
 
+        #
+        # Tail distribution
+        #
+
         tail_gen = m.submodules.tail_gen = TailGen(self.params)
         m.d.comb += [
             tail_gen.vl.eq(self.req.bits.uop.vl),
@@ -342,6 +351,47 @@ class PerLaneFunctionalUnit(FunctionalUnit):
 
             m.d.comb += lane_req.bits.tail.eq(
                 Mux(self.req.bits.uop.narrow, lane_tail_narrow, lane_tail))
+
+        #
+        # Mask distribution
+        #
+
+        mask = Signal(self.vlen_bytes)
+        with m.Switch(self.req.bits.uop.expd_idx >> self.req.bits.uop.narrow):
+            for i in range(8):
+                with m.Case(i):
+                    with m.Switch(self.req.bits.uop.dest_eew()):
+                        for w in range(4):
+                            with m.Case(w):
+                                n = 1 << w
+                                m.d.comb += mask.eq(
+                                    self.req.bits.mask[i * n:(i + 1) * n])
+
+        for w, lane_req in enumerate(self.lane_reqs):
+            lane_mask = Signal(self.lane_width // 8, name=f'lane_mask{w}')
+            lane_mask_narrow = Signal(self.lane_width // 8,
+                                      name=f'lane_mask_narrow{w}')
+
+            with m.Switch(self.req.bits.uop.dest_eew()):
+                for i in range(4):
+                    with m.Case(i):
+                        mask_width = self.lane_width // (8 << i)
+                        m.d.comb += lane_mask.eq(mask[w * mask_width:(w + 1) *
+                                                      mask_width])
+
+            with m.Switch(self.req.bits.uop.dest_eew()):
+                for i in range(3):
+                    with m.Case(i):
+                        mask_width = self.lane_width // (16 << i)
+                        m.d.comb += lane_mask_narrow.eq(
+                            Cat(
+                                mask[w * mask_width:(w + 1) * mask_width],
+                                mask[(w + self.n_lanes) *
+                                     mask_width:(w + self.n_lanes + 1) *
+                                     mask_width]))
+
+            m.d.comb += lane_req.bits.mask.eq(
+                Mux(self.req.bits.uop.narrow, lane_mask_narrow, lane_mask))
 
         m.d.comb += [
             self.resp.valid.eq(self.lane_resps[0].valid),
@@ -419,7 +469,7 @@ class VALULane(PipelinedLaneFunctionalUnit):
             alu.in1.eq(self.req.bits.opa_data),
             alu.in2.eq(self.req.bits.opb_data),
             alu.in3.eq(self.req.bits.old_vd),
-            alu.vmask.eq(uop.mask),
+            alu.vmask.eq(self.req.bits.mask),
             alu.vm.eq(uop.vm),
             alu.ma.eq(uop.vma),
             alu.vi.eq(uop.opa_sel == VOpA.IMM),
@@ -429,17 +479,20 @@ class VALULane(PipelinedLaneFunctionalUnit):
             alu.narrow_to_1.eq(uop.narrow_to_1),
         ]
 
+        def get_byte_mask(mask_out, mask):
+            with m.If(uop.narrow_to_1):
+                m.d.comb += mask_out.eq(mask)
+            with m.Else():
+                with m.Switch(uop.dest_eew()):
+                    for i in range(4):
+                        with m.Case(i):
+                            m.d.comb += mask_out.eq(
+                                Cat(x.replicate(1 << i) for x in mask))
+
         tail_mask = Signal(self.data_width)
-        with m.If(uop.narrow_to_1):
-            m.d.comb += tail_mask.eq(self.req.bits.tail)
-        with m.Else():
-            with m.Switch(uop.dest_eew()):
-                for i in range(4):
-                    with m.Case(i):
-                        m.d.comb += tail_mask.eq(
-                            Cat(
-                                x.replicate(1 << i)
-                                for x in self.req.bits.tail))
+        byte_mask = Signal(self.data_width)
+        get_byte_mask(tail_mask, self.req.bits.tail)
+        get_byte_mask(byte_mask, self.req.bits.mask)
 
         mask_keep = Signal(self.data_width)
         mask_off_data = Signal(self.data_width)
@@ -447,13 +500,39 @@ class VALULane(PipelinedLaneFunctionalUnit):
         mask_off_cmp = Signal(self.data_width // 8)
         for i in range(self.data_width // 8):
             with m.If(tail_mask[i]):
+                with m.If(uop.vta | uop.narrow_to_1):
+                    m.d.comb += [
+                        mask_off_data[i * 8:(i + 1) * 8].eq(~0),
+                        mask_off_cmp[i].eq(1),
+                    ]
+                with m.Else():
+                    m.d.comb += [
+                        mask_off_data[i * 8:(i + 1) * 8].eq(
+                            self.req.bits.old_vd[i * 8:(i + 1) * 8]),
+                        mask_off_cmp[i].eq(self.req.bits.old_vd[i]),
+                    ]
+
+            with m.Elif(
+                    VALUOperator.is_add_with_carry(uop.alu_fn)
+                    | VALUOperator.is_vmerge(uop.alu_fn)):
                 m.d.comb += [
-                    mask_off_data[i * 8:(i + 1) * 8].eq(
-                        Mux(uop.vta, Const(~0, 8),
-                            self.req.bits.old_vd[i * 8:(i + 1) * 8])),
-                    mask_off_cmp[i].eq(Mux(uop.vta, 1,
-                                           self.req.bits.old_vd[i])),
+                    mask_keep[i * 8:(i + 1) * 8].eq(~0),
+                    mask_keep_cmp[i].eq(1),
                 ]
+
+            with m.Elif(~uop.vm & ~byte_mask[i]):
+                with m.If(uop.vma):
+                    m.d.comb += [
+                        mask_off_data[i * 8:(i + 1) * 8].eq(~0),
+                        mask_off_cmp[i].eq(1),
+                    ]
+                with m.Else():
+                    m.d.comb += [
+                        mask_off_data[i * 8:(i + 1) * 8].eq(
+                            self.req.bits.old_vd[i * 8:(i + 1) * 8]),
+                        mask_off_cmp[i].eq(self.req.bits.old_vd[i]),
+                    ]
+
             with m.Else():
                 m.d.comb += [
                     mask_keep[i * 8:(i + 1) * 8].eq(~0),
