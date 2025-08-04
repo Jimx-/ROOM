@@ -4,7 +4,7 @@ from amaranth.hdl.ast import ValueCastable
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.alu import VALU
+from vroom.alu import VALU, VMultiplier
 from vroom.utils import TailGen
 
 from room.consts import RegisterType
@@ -595,6 +595,109 @@ class VALUUnit(PerLaneFunctionalUnit):
 
         for w in range(self.n_lanes):
             lane = VALULane(self.lane_width, self.params, self.num_stages)
+            setattr(m.submodules, f'lane{w}', lane)
+            m.d.comb += [
+                self.lane_reqs[w].connect(lane.req),
+                lane.resp.connect(self.lane_resps[w]),
+            ]
+
+        return m
+
+
+class VMultiplierLane(PipelinedLaneFunctionalUnit):
+
+    def __init__(self, data_width, params, num_stages):
+        super().__init__(data_width, num_stages, params)
+
+        self.data_width = data_width
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        uop = self.req.bits.uop
+
+        mul = m.submodules.mul = VMultiplier(self.data_width, self.num_stages)
+        m.d.comb += [
+            mul.valid.eq(self.req.valid),
+            mul.fn.eq(uop.alu_fn),
+            mul.sew.eq(uop.vsew),
+            mul.uop_idx.eq(uop.expd_idx),
+            mul.in1.eq(self.req.bits.opa_data),
+            mul.in2.eq(self.req.bits.opb_data),
+            mul.in3.eq(self.req.bits.old_vd),
+            mul.widen.eq(uop.widen),
+        ]
+
+        s1_old_vd = Signal.like(self.req.bits.old_vd)
+        s1_tail = Signal.like(self.req.bits.tail)
+        s1_mask = Signal.like(self.req.bits.mask)
+        with m.If(self.req.valid):
+            m.d.sync += [
+                s1_old_vd.eq(self.req.bits.old_vd),
+                s1_tail.eq(self.req.bits.tail),
+                s1_mask.eq(self.req.bits.mask),
+            ]
+
+        s2_old_vd = Signal.like(s1_old_vd)
+        s2_tail = Signal.like(s1_tail)
+        s2_mask = Signal.like(s1_mask)
+        with m.If(self.valids[0]):
+            m.d.sync += [
+                s2_old_vd.eq(s1_old_vd),
+                s2_tail.eq(s1_tail),
+                s2_mask.eq(s1_mask),
+            ]
+
+        def get_byte_mask(mask_out, mask):
+            with m.Switch(self.uops[1].dest_eew()):
+                for i in range(4):
+                    with m.Case(i):
+                        m.d.comb += mask_out.eq(
+                            Cat(x.replicate(1 << i) for x in mask))
+
+        tail_mask = Signal(self.data_width)
+        byte_mask = Signal(self.data_width)
+        get_byte_mask(tail_mask, s2_tail)
+        get_byte_mask(byte_mask, s2_mask)
+
+        mask_keep = Signal(self.data_width)
+        mask_off_data = Signal(self.data_width)
+        for i in range(self.data_width // 8):
+            with m.If(tail_mask[i]):
+                with m.If(self.uops[1].vta):
+                    m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(~0)
+                with m.Else():
+                    m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(
+                        self.req.bits.old_vd[i * 8:(i + 1) * 8])
+
+            with m.Elif(~self.uops[1].vm & ~byte_mask[i]):
+                with m.If(self.uops[1].vma):
+                    m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(~0)
+                with m.Else():
+                    m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(
+                        self.req.bits.old_vd[i * 8:(i + 1) * 8])
+
+            with m.Else():
+                m.d.comb += mask_keep[i * 8:(i + 1) * 8].eq(~0)
+
+        m.d.comb += self.resp.bits.vd_data.eq((mul.resp_data & mask_keep)
+                                              | mask_off_data)
+
+        return m
+
+
+class VMultiplierUnit(PerLaneFunctionalUnit):
+
+    def __init__(self, latency, params):
+        super().__init__(params)
+
+        self.latency = latency
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        for w in range(self.n_lanes):
+            lane = VMultiplierLane(self.lane_width, self.params, self.latency)
             setattr(m.submodules, f'lane{w}', lane)
             m.d.comb += [
                 self.lane_reqs[w].connect(lane.req),

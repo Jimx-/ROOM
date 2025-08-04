@@ -2,7 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit
+from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit
 
 from room.utils import Decoupled, Valid
 
@@ -108,6 +108,25 @@ class ALUExecUnit(ExecUnit):
                              & (self.req.bits.uop.fu_type == VFUType.ALU)),
         ]
 
+        imul = m.submodules.imul = VMultiplierUnit(3, self.params)
+        imul_queue = m.submodules.imul_queue = Queue(6, ExecResp, self.params)
+        imul_busy = Signal()
+
+        imul_resp_busy = 0
+        for iu in iresp_units:
+            imul_resp_busy |= iu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(imul.req),
+            imul.req.valid.eq(self.req.valid
+                              & (self.req.bits.uop.fu_type == VFUType.MUL)
+                              & ~imul_busy),
+            imul.resp.connect(imul_queue.enq),
+            imul_queue.deq.ready.eq(~imul_resp_busy),
+            imul_busy.eq(imul_queue.count.any()),
+        ]
+        iresp_units.append(imul_queue)
+
         agu = m.submodules.agu = AddrGenUnit(self.params)
 
         m.d.comb += [
@@ -133,7 +152,9 @@ class ALUExecUnit(ExecUnit):
                     ]
 
         m.d.comb += self.req.ready.eq(1)
-        with m.If(self.req.bits.uop.fu_type_has(VFUType.MEM)):
+        with m.If(self.req.bits.uop.fu_type == VFUType.MUL):
+            m.d.comb += self.req.ready.eq(~imul_busy)
+        with m.Elif(self.req.bits.uop.fu_type_has(VFUType.MEM)):
             m.d.comb += self.req.ready.eq(self.lsu_req.ready)
 
         return m

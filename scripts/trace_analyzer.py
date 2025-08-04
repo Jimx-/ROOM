@@ -382,7 +382,7 @@ class Instruction:
             else:
                 inst_text.append(vd_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=re.match("vm[^ev]", op.name))}]'
+                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=re.match("vm[^evu]", op.name))}]'
                 )
 
             if 'vs2' in op.args:

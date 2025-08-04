@@ -3,7 +3,7 @@ from amaranth.utils import log2_int
 
 from vroom.consts import *
 
-from room.utils import sign_extend
+from room.utils import Pipe, sign_extend
 
 
 class VALU(Elaboratable):
@@ -26,6 +26,7 @@ class VALU(Elaboratable):
         self.widen2 = Signal()
         self.narrow = Signal()
         self.narrow_to_1 = Signal()
+
         self.out = Signal(width)
         self.narrow_out = Signal(width // 2)
         self.cmp_out = Signal(width // 8)
@@ -359,5 +360,275 @@ class VALU(Elaboratable):
                 m.d.comb += self.cmp_out[i].eq(Mux(self.ma, 1, self.in3[i]))
             with m.Else():
                 m.d.comb += self.cmp_out[i].eq(cmp_out_adjust[i])
+
+        return m
+
+
+class VMultiplier(Elaboratable):
+
+    CSA_BREAK = 3
+
+    class BoothEncoder(Elaboratable):
+
+        def __init__(self):
+            self.d = Signal(3)
+
+            self.pos = Signal()
+            self.neg = Signal()
+            self.one = Signal()
+            self.double = Signal()
+
+        def elaborate(self, platform):
+            m = Module()
+
+            m.d.comb += [
+                self.pos.eq(~self.d[2] & self.d[:2].any()),
+                self.neg.eq(self.d[2] & ~self.d[:2].all()),
+                self.one.eq(self.d[1] ^ self.d[0]),
+                self.double.eq((self.d[2] ^ self.d[1])
+                               & ~(self.d[1] ^ self.d[0])),
+            ]
+
+            return m
+
+    def __init__(self, width, latency):
+        self.width = width
+        self.latency = latency
+
+        self.valid = Signal()
+        self.fn = Signal(VALUOperator)
+        self.sew = Signal(2)
+        self.uop_idx = Signal(3)
+        self.in1 = Signal(width)
+        self.in2 = Signal(width)
+        self.in3 = Signal(width)
+        self.widen = Signal()
+
+        self.resp_data = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        lane_bytes = self.width // 8
+
+        h = (self.fn == VALUOperator.VMULH) | (
+            self.fn == VALUOperator.VMULHU) | (self.fn == VALUOperator.VMULHSU)
+        lhs_signed = (self.fn == VALUOperator.VMULH) | (
+            self.fn == VALUOperator.VMULHSU)
+        rhs_signed = (self.fn == VALUOperator.VMULH)
+
+        #
+        # Booth encoding
+        #
+
+        in1_booth = [
+            VMultiplier.BoothEncoder() for _ in range(self.width // 2)
+        ]
+        for w, b in enumerate(in1_booth):
+            setattr(m.submodules, f'booth{w}', b)
+
+            if w == 0:
+                m.d.comb += b.d.eq(Cat(Const(0, 1), self.in1[:2]))
+            else:
+                b1 = self.in1[2 * w - 1:2 * w + 2]
+                b2 = Cat(Const(0, 1), self.in1[2 * w:2 * w + 2])
+
+                if w % 4 != 0:
+                    m.d.comb += b.d.eq(b1)
+                elif w == 16:
+                    m.d.comb += b.d.eq(Mux(self.sew == 3, b1, b2))
+                elif w % 8 == 0:
+                    m.d.comb += b.d.eq(
+                        Mux((self.sew == 3) | (self.sew == 2), b1, b2))
+                else:
+                    m.d.comb += b.d.eq(Mux(self.sew != 0, b1, b2))
+
+        in2_blocks = []
+        for i in range(4):
+            in2_blocks.append([])
+            sew = 1 << (3 + i)
+            for bidx in range(self.width // sew):
+                in2_block = self.in2[bidx * sew:(bidx + 1) * sew]
+                in2_elem = Signal(2 * sew, name=f'in2_elem{bidx}_e{sew}')
+                m.d.comb += in2_elem.eq(
+                    Mux(lhs_signed, sign_extend(in2_block, 2 * sew),
+                        in2_block))
+                in2_blocks[-1].append(in2_elem)
+
+        part_prod = [
+            Signal(self.width * 2, name=f'part_prod{i}')
+            for i in range(self.width // 2 + 2)
+        ]
+        for i, (booth, prod) in enumerate(zip(in1_booth, part_prod)):
+            with m.Switch(self.sew):
+                for w, blocks in enumerate(in2_blocks):
+                    with m.Case(w):
+                        sew = 1 << (3 + w)
+                        bidx = 2 * i // sew
+                        in2_elem = blocks[bidx]
+                        booth_double = Signal(2 * sew)
+                        m.d.comb += booth_double.eq(
+                            Mux(booth.one, in2_elem,
+                                Mux(booth.double, in2_elem << 1, 0)))
+
+                        booth_result = Mux(booth.pos, booth_double,
+                                           Mux(booth.neg, ~booth_double, 0))
+                        shamt = 2 * i - sew * bidx
+                        shifted = Signal(2 * sew)
+                        m.d.comb += shifted.eq(booth_result << shamt)
+
+                        if sew == 64 or bidx == 0:
+                            m.d.comb += prod.eq(shifted)
+                        else:
+                            m.d.comb += prod.eq(
+                                Cat(Const(0, bidx * sew * 2), shifted))
+
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    sew = 1 << (w + 3)
+
+                    comps = []
+                    for i in range(self.width // sew):
+                        hi = Mux(self.in1[(i + 1) * sew - 1] & ~rhs_signed,
+                                 self.in2[i * sew:(i + 1) * sew], 0)
+                        lo = Cat(
+                            Cat(b.neg, Const(0, 1))
+                            for b in in1_booth[i * sew // 2:(i + 1) * sew //
+                                               2])
+                        comps.append(Cat(lo, hi))
+
+                    m.d.comb += part_prod[self.width // 2].eq(Cat(comps))
+
+        #
+        # 3-to-2 CSA
+        #
+
+        n = len(part_prod)
+        addends_seq = []
+        while n >= 3:
+            addends_seq.append(n)
+            n = n // 3 * 2 + n % 3
+
+        def get_cout_mask(mask, sew):
+            with m.Switch(sew):
+                for w in range(4):
+                    with m.Case(w):
+                        n = 1 << (3 + w)
+                        m.d.comb += mask.eq(
+                            Cat(
+                                Const(i % (2 * n) != 2 * n - 1, 1)
+                                for i in range(self.width * 2)))
+
+        def compress_3_to_2(addens, cout_mask):
+            groups = [addens[i:i + 3] for i in range(0, len(addens), 3)]
+            rem = []
+            if len(groups[-1]) < 3:
+                groups, rem = groups[:-1], groups[-1]
+
+            cout = [Signal(self.width * 2) for _ in range(len(groups))]
+            sum = [Signal(self.width * 2) for _ in range(len(groups))]
+
+            for group, co, s in zip(groups, cout, sum):
+                a, b, c = group
+                m.d.comb += [
+                    co.eq(((a & b) | (b & c) | (a & c)) & cout_mask),
+                    s.eq(a ^ b ^ c),
+                ]
+
+            cin = [Signal(self.width * 2) for _ in range(len(groups))]
+            for ci, co in zip(cin, cout):
+                m.d.comb += ci.eq(co << 1)
+
+            return sum + cin + rem
+
+        cout_mask = Signal(self.width * 2)
+        get_cout_mask(cout_mask, self.sew)
+
+        addens = part_prod
+        for n_addens in addends_seq[:-VMultiplier.CSA_BREAK]:
+            assert len(addens) == n_addens
+            addens = compress_3_to_2(addens, cout_mask)
+
+        s1_valid = Signal()
+        s1_sew = Signal.like(self.sew)
+        s1_widen = Signal()
+        s1_h = Signal()
+        s1_addens = [
+            Signal(2 * self.width, name=f's1_addens{i}')
+            for i in range(len(addens))
+        ]
+        m.d.sync += s1_valid.eq(self.valid)
+        with m.If(self.valid):
+            m.d.sync += [
+                s1_sew.eq(self.sew),
+                s1_widen.eq(self.widen),
+                s1_h.eq(h),
+            ]
+            m.d.sync += [a.eq(b) for a, b in zip(s1_addens, addens)]
+
+        s1_cout_mask = Signal(self.width * 2)
+        get_cout_mask(s1_cout_mask, s1_sew)
+
+        addens = s1_addens
+        for n_addens in addends_seq[-VMultiplier.CSA_BREAK:]:
+            assert len(addens) == n_addens
+            addens = compress_3_to_2(addens, s1_cout_mask)
+
+        assert len(addens) == 2
+
+        cin = Signal(lane_bytes)
+        cout = Signal(lane_bytes)
+        adder_out = Signal(self.width * 2)
+        for w in range(lane_bytes):
+            if w == 0:
+                m.d.comb += cin[w].eq(0)
+            elif w % 4 == 0:
+                m.d.comb += cin[w].eq((s1_sew == 3) & cout[w - 1])
+            elif w % 2 == 0:
+                m.d.comb += cin[w].eq(((s1_sew == 3) | (s1_sew == 2))
+                                      & cout[w - 1])
+            else:
+                m.d.comb += cin[w].eq(s1_sew.any() & cout[w - 1])
+
+            s = Cat(cin[w], addens[0][w * 16:(w + 1) * 16], Const(0, 1)) + Cat(
+                cin[w], addens[1][w * 16:(w + 1) * 16], Const(0, 1))
+            m.d.comb += Cat(adder_out[w * 16:(w + 1) * 16], cout[w]).eq(s[1:])
+
+        wal_out = Signal(self.width * 2)
+        m.d.sync += wal_out.eq(adder_out)
+
+        s2_valid = Signal()
+        s2_sew = Signal.like(s1_sew)
+        s2_widen = Signal()
+        s2_h = Signal()
+        m.d.sync += s2_valid.eq(s1_valid)
+        with m.If(s1_valid):
+            m.d.sync += [
+                s2_sew.eq(s1_sew),
+                s2_widen.eq(s1_widen),
+                s2_h.eq(s1_h),
+            ]
+
+        mul_out = Signal(self.width)
+        with m.Switch(s2_sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    for i in range(self.width // n):
+                        m.d.comb += mul_out[i * n:(i + 1) * n].eq(
+                            Mux(s2_h, wal_out[(2 * i + 1) * n:(2 * i + 2) * n],
+                                wal_out[(2 * i) * n:(2 * i + 1) * n]))
+
+        out = Signal(self.width)
+        m.d.comb += out.eq(mul_out)
+
+        out_pipe = m.submodules.out_pipe = Pipe(width=self.width,
+                                                depth=self.latency - 2)
+        m.d.comb += [
+            out_pipe.in_valid.eq(s2_valid),
+            out_pipe.in_data.eq(out),
+            self.resp_data.eq(out_pipe.out.bits),
+        ]
 
         return m

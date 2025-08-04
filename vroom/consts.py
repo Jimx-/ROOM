@@ -210,6 +210,16 @@ class VALUOperator(IntEnum):
     VASUBU = 58
     VASUB = 59
 
+    VMUL = VADD
+    VMULH = VSL
+    VMULHSU = VMSEQ
+    VMULHU = VMSNE
+
+    VDIV = VXOR
+    VDIVU = VSR
+    VREM = VOR
+    VREMU = VAND
+
     @staticmethod
     def is_sub(x):
         return x[3]
