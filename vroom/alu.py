@@ -3,7 +3,11 @@ from amaranth.utils import log2_int
 
 from vroom.consts import *
 
+from room.consts import ALUOperator
+from room.alu import IntDiv
 from room.utils import Pipe, sign_extend
+
+from roomsoc.interconnect.stream import Decoupled
 
 
 class VALU(Elaboratable):
@@ -630,5 +634,84 @@ class VMultiplier(Elaboratable):
             out_pipe.in_data.eq(out),
             self.resp_data.eq(out_pipe.out.bits),
         ]
+
+        return m
+
+
+class VIntDiv(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.valid = Signal()
+        self.ready = Signal()
+        self.fn = Signal(VALUOperator)
+        self.sew = Signal(2)
+        self.in1 = Signal(width)
+        self.in2 = Signal(width)
+
+        self.resp = Decoupled(Signal, width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        dividers = []
+        for w in range(4):
+            sew = 1 << (3 + w)
+            ms = []
+
+            for i in range(self.width // sew):
+                div = IntDiv(sew)
+                setattr(m.submodules, f'div{i}_e{sew}', div)
+
+                with m.Switch(self.fn):
+                    for valu_fn, alu_fn in (
+                        (VALUOperator.VDIVU, ALUOperator.DIVU),
+                        (VALUOperator.VDIV, ALUOperator.DIV),
+                        (VALUOperator.VREMU, ALUOperator.REMU),
+                        (VALUOperator.VREM, ALUOperator.REM),
+                    ):
+                        with m.Case(valu_fn):
+                            m.d.comb += div.req.bits.fn.eq(alu_fn)
+
+                m.d.comb += [
+                    div.req.bits.in1.eq(self.in2[i * sew:(i + 1) * sew]),
+                    div.req.bits.in2.eq(self.in1[i * sew:(i + 1) * sew]),
+                ]
+
+                ms.append(div)
+
+            for i, div in enumerate(ms):
+                m.d.comb += div.req.valid.eq((self.sew == w) & Cat(
+                    self.valid & d.req.ready
+                    for j, d in enumerate(ms) if i != j).all())
+
+            dividers.append(ms)
+
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    m.d.comb += self.ready.eq(
+                        Cat(d.req.ready for d in dividers[w]).all())
+
+        resp_sew = Signal.like(self.sew)
+        with m.If(self.valid & self.ready):
+            m.d.sync += resp_sew.eq(self.sew)
+
+        with m.Switch(resp_sew):
+            for w in range(4):
+                with m.Case(w):
+                    m.d.comb += [
+                        self.resp.valid.eq(
+                            Cat(d.resp.valid for d in dividers[w]).all()),
+                        self.resp.bits.eq(Cat(d.resp.bits
+                                              for d in dividers[w])),
+                    ]
+
+                    for i, div in enumerate(dividers[w]):
+                        m.d.comb += div.resp.ready.eq(
+                            Cat(self.resp.ready & d.resp.valid
+                                for j, d in enumerate(dividers[w])
+                                if i != j).all())
 
         return m

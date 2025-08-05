@@ -4,11 +4,18 @@ from amaranth.hdl.ast import ValueCastable
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.alu import VALU, VMultiplier
+from vroom.alu import VALU, VMultiplier, VIntDiv
 from vroom.utils import TailGen
 
 from room.consts import RegisterType
 from room.utils import Decoupled, sign_extend
+
+
+def get_byte_mask(m, mask_out, mask, dest_eew):
+    with m.Switch(dest_eew):
+        for i in range(4):
+            with m.Case(i):
+                m.d.comb += mask_out.eq(Cat(x.replicate(1 << i) for x in mask))
 
 
 class ExecReq(HasVectorParams, ValueCastable):
@@ -178,6 +185,21 @@ class PipelinedFunctionalUnitBase(Elaboratable):
         return m
 
 
+class IterativeFunctionalUnitBase(Elaboratable):
+
+    def elaborate(self, platform):
+        m = Module()
+
+        uop = VMicroOp(self.params)
+
+        with m.If(self.req.fire):
+            m.d.sync += uop.eq(self.req.bits.uop)
+
+        m.d.comb += self.resp.bits.uop.eq(uop)
+
+        return m
+
+
 class LaneFunctionalUnit(HasVectorParams, Elaboratable):
 
     def __init__(self, data_width, params):
@@ -193,6 +215,13 @@ class PipelinedLaneFunctionalUnit(LaneFunctionalUnit,
     def __init__(self, data_width, num_stages, params):
         LaneFunctionalUnit.__init__(self, data_width, params)
         PipelinedFunctionalUnitBase.__init__(self, num_stages)
+
+
+class IterativeLaneFunctionalUnit(LaneFunctionalUnit,
+                                  IterativeFunctionalUnitBase):
+
+    def __init__(self, data_width, params):
+        LaneFunctionalUnit.__init__(self, data_width, params)
 
 
 class FunctionalUnit(HasVectorParams, Elaboratable):
@@ -306,13 +335,17 @@ class PerLaneFunctionalUnit(FunctionalUnit):
             ]
 
             m.d.comb += [
-                lane_req.valid.eq(self.req.valid),
+                lane_req.valid.eq(
+                    Cat(self.req.valid & req.ready
+                        for i, req in enumerate(self.lane_reqs)
+                        if i != w).all()),
                 lane_req.bits.uop.eq(self.req.bits.uop),
                 lane_req.bits.opa_data.eq(opa_data),
                 lane_req.bits.opb_data.eq(opb_data),
                 lane_req.bits.old_vd.eq(old_vd),
             ]
-        m.d.comb += self.req.ready.eq(self.lane_reqs[0].ready)
+        m.d.comb += self.req.ready.eq(
+            Cat(req.ready for req in self.lane_reqs).all())
 
         #
         # Tail distribution
@@ -394,9 +427,15 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                 Mux(self.req.bits.uop.narrow, lane_mask_narrow, lane_mask))
 
         m.d.comb += [
-            self.resp.valid.eq(self.lane_resps[0].valid),
+            self.resp.valid.eq(
+                Cat(resp.valid for resp in self.lane_resps).all()),
             self.resp.bits.uop.eq(self.lane_resps[0].bits.uop),
         ]
+
+        for w, lane_resp in enumerate(self.lane_resps):
+            m.d.comb += lane_resp.ready.eq(
+                Cat(resp.valid & self.resp.ready
+                    for i, resp in enumerate(self.lane_resps) if i != w))
 
         vd_cmp_out = Signal(self.vlen)
         with m.Switch(self.resp.bits.uop.vsew):
@@ -448,6 +487,70 @@ class PerLaneFunctionalUnit(FunctionalUnit):
         return m
 
 
+class MaskDataGen(HasVectorParams, Elaboratable):
+
+    def __init__(self, data_width, params):
+        super().__init__(params)
+        self.data_width = data_width
+
+        self.mask = Signal(data_width // 8)
+        self.tail = Signal(data_width // 8)
+        self.old_vd = Signal(data_width)
+        self.uop = VMicroOp(params)
+
+        self.mask_keep = Signal(data_width)
+        self.mask_off = Signal(data_width)
+
+        self.mask_keep_cmp = Signal(data_width // 8)
+        self.mask_off_cmp = Signal(data_width // 8)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        for i in range(self.data_width // 8):
+            with m.If(self.tail[i]):
+                with m.If(self.uop.vta | self.uop.narrow_to_1):
+                    m.d.comb += [
+                        self.mask_off[i * 8:(i + 1) * 8].eq(~0),
+                        self.mask_off_cmp[i].eq(1),
+                    ]
+                with m.Else():
+                    m.d.comb += [
+                        self.mask_off[i * 8:(i + 1) * 8].eq(
+                            self.old_vd[i * 8:(i + 1) * 8]),
+                        self.mask_off_cmp[i].eq(self.old_vd[i]),
+                    ]
+
+            with m.Elif(
+                    VALUOperator.is_add_with_carry(self.uop.alu_fn)
+                    | VALUOperator.is_vmerge(self.uop.alu_fn)):
+                m.d.comb += [
+                    self.mask_keep[i * 8:(i + 1) * 8].eq(~0),
+                    self.mask_keep_cmp[i].eq(1),
+                ]
+
+            with m.Elif(~self.uop.vm & ~self.mask[i]):
+                with m.If(self.uop.vma):
+                    m.d.comb += [
+                        self.mask_off[i * 8:(i + 1) * 8].eq(~0),
+                        self.mask_off_cmp[i].eq(1),
+                    ]
+                with m.Else():
+                    m.d.comb += [
+                        self.mask_off[i * 8:(i + 1) * 8].eq(
+                            self.old_vd[i * 8:(i + 1) * 8]),
+                        self.mask_off_cmp[i].eq(self.old_vd[i]),
+                    ]
+
+            with m.Else():
+                m.d.comb += [
+                    self.mask_keep[i * 8:(i + 1) * 8].eq(~0),
+                    self.mask_keep_cmp[i].eq(1),
+                ]
+
+        return m
+
+
 class VALULane(PipelinedLaneFunctionalUnit):
 
     def __init__(self, data_width, params, num_stages=1):
@@ -479,75 +582,35 @@ class VALULane(PipelinedLaneFunctionalUnit):
             alu.narrow_to_1.eq(uop.narrow_to_1),
         ]
 
-        def get_byte_mask(mask_out, mask):
-            with m.If(uop.narrow_to_1):
-                m.d.comb += mask_out.eq(mask)
-            with m.Else():
-                with m.Switch(uop.dest_eew()):
-                    for i in range(4):
-                        with m.Case(i):
-                            m.d.comb += mask_out.eq(
-                                Cat(x.replicate(1 << i) for x in mask))
-
         tail_mask = Signal(self.data_width)
         byte_mask = Signal(self.data_width)
-        get_byte_mask(tail_mask, self.req.bits.tail)
-        get_byte_mask(byte_mask, self.req.bits.mask)
+        get_byte_mask(m, tail_mask, self.req.bits.tail, uop.dest_eew())
+        get_byte_mask(m, byte_mask, self.req.bits.mask, uop.dest_eew())
+        with m.If(uop.narrow_to_1):
+            m.d.comb += [
+                tail_mask.eq(self.req.bits.tail),
+                byte_mask.eq(self.req.bits.mask),
+            ]
 
-        mask_keep = Signal(self.data_width)
-        mask_off_data = Signal(self.data_width)
-        mask_keep_cmp = Signal(self.data_width // 8)
-        mask_off_cmp = Signal(self.data_width // 8)
-        for i in range(self.data_width // 8):
-            with m.If(tail_mask[i]):
-                with m.If(uop.vta | uop.narrow_to_1):
-                    m.d.comb += [
-                        mask_off_data[i * 8:(i + 1) * 8].eq(~0),
-                        mask_off_cmp[i].eq(1),
-                    ]
-                with m.Else():
-                    m.d.comb += [
-                        mask_off_data[i * 8:(i + 1) * 8].eq(
-                            self.req.bits.old_vd[i * 8:(i + 1) * 8]),
-                        mask_off_cmp[i].eq(self.req.bits.old_vd[i]),
-                    ]
+        mask_gen = m.submodules.mask_gen = MaskDataGen(self.data_width,
+                                                       self.params)
+        m.d.comb += [
+            mask_gen.mask.eq(byte_mask),
+            mask_gen.tail.eq(tail_mask),
+            mask_gen.old_vd.eq(self.req.bits.old_vd),
+            mask_gen.uop.eq(uop),
+        ]
 
-            with m.Elif(
-                    VALUOperator.is_add_with_carry(uop.alu_fn)
-                    | VALUOperator.is_vmerge(uop.alu_fn)):
-                m.d.comb += [
-                    mask_keep[i * 8:(i + 1) * 8].eq(~0),
-                    mask_keep_cmp[i].eq(1),
-                ]
-
-            with m.Elif(~uop.vm & ~byte_mask[i]):
-                with m.If(uop.vma):
-                    m.d.comb += [
-                        mask_off_data[i * 8:(i + 1) * 8].eq(~0),
-                        mask_off_cmp[i].eq(1),
-                    ]
-                with m.Else():
-                    m.d.comb += [
-                        mask_off_data[i * 8:(i + 1) * 8].eq(
-                            self.req.bits.old_vd[i * 8:(i + 1) * 8]),
-                        mask_off_cmp[i].eq(self.req.bits.old_vd[i]),
-                    ]
-
-            with m.Else():
-                m.d.comb += [
-                    mask_keep[i * 8:(i + 1) * 8].eq(~0),
-                    mask_keep_cmp[i].eq(1),
-                ]
-
-        cmp_out_masked = (alu.cmp_out & mask_keep_cmp) | mask_off_cmp
+        cmp_out_masked = (alu.cmp_out
+                          & mask_gen.mask_keep_cmp) | mask_gen.mask_off_cmp
 
         s1_alu_out = Signal.like(alu.out)
-        s1_mask_keep = Signal.like(mask_keep)
-        s1_mask_off_data = Signal.like(mask_off_data)
+        s1_mask_keep = Signal.like(mask_gen.mask_keep)
+        s1_mask_off_data = Signal.like(mask_gen.mask_off)
         m.d.sync += [
             s1_alu_out.eq(alu.out),
-            s1_mask_keep.eq(mask_keep),
-            s1_mask_off_data.eq(mask_off_data),
+            s1_mask_keep.eq(mask_gen.mask_keep),
+            s1_mask_off_data.eq(mask_gen.mask_off),
         ]
 
         s1_cmp_out = [
@@ -648,40 +711,23 @@ class VMultiplierLane(PipelinedLaneFunctionalUnit):
                 s2_mask.eq(s1_mask),
             ]
 
-        def get_byte_mask(mask_out, mask):
-            with m.Switch(self.uops[1].dest_eew()):
-                for i in range(4):
-                    with m.Case(i):
-                        m.d.comb += mask_out.eq(
-                            Cat(x.replicate(1 << i) for x in mask))
-
         tail_mask = Signal(self.data_width)
         byte_mask = Signal(self.data_width)
-        get_byte_mask(tail_mask, s2_tail)
-        get_byte_mask(byte_mask, s2_mask)
+        get_byte_mask(m, tail_mask, s2_tail, self.uops[1].dest_eew())
+        get_byte_mask(m, byte_mask, s2_mask, self.uops[1].dest_eew())
 
-        mask_keep = Signal(self.data_width)
-        mask_off_data = Signal(self.data_width)
-        for i in range(self.data_width // 8):
-            with m.If(tail_mask[i]):
-                with m.If(self.uops[1].vta):
-                    m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(~0)
-                with m.Else():
-                    m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(
-                        self.req.bits.old_vd[i * 8:(i + 1) * 8])
+        mask_gen = m.submodules.mask_gen = MaskDataGen(self.data_width,
+                                                       self.params)
+        m.d.comb += [
+            mask_gen.mask.eq(byte_mask),
+            mask_gen.tail.eq(tail_mask),
+            mask_gen.old_vd.eq(s2_old_vd),
+            mask_gen.uop.eq(self.uops[1]),
+        ]
 
-            with m.Elif(~self.uops[1].vm & ~byte_mask[i]):
-                with m.If(self.uops[1].vma):
-                    m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(~0)
-                with m.Else():
-                    m.d.comb += mask_off_data[i * 8:(i + 1) * 8].eq(
-                        self.req.bits.old_vd[i * 8:(i + 1) * 8])
-
-            with m.Else():
-                m.d.comb += mask_keep[i * 8:(i + 1) * 8].eq(~0)
-
-        m.d.comb += self.resp.bits.vd_data.eq((mul.resp_data & mask_keep)
-                                              | mask_off_data)
+        m.d.comb += self.resp.bits.vd_data.eq((mul.resp_data
+                                               & mask_gen.mask_keep)
+                                              | mask_gen.mask_off)
 
         return m
 
@@ -698,6 +744,80 @@ class VMultiplierUnit(PerLaneFunctionalUnit):
 
         for w in range(self.n_lanes):
             lane = VMultiplierLane(self.lane_width, self.params, self.latency)
+            setattr(m.submodules, f'lane{w}', lane)
+            m.d.comb += [
+                self.lane_reqs[w].connect(lane.req),
+                lane.resp.connect(self.lane_resps[w]),
+            ]
+
+        return m
+
+
+class VDivLane(IterativeLaneFunctionalUnit):
+
+    def __init__(self, data_width, params):
+        super().__init__(data_width, params)
+
+        self.data_width = data_width
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        uop = self.req.bits.uop
+
+        div = m.submodules.div = VIntDiv(self.data_width)
+        m.d.comb += [
+            div.valid.eq(self.req.valid),
+            self.req.ready.eq(div.ready),
+            div.fn.eq(uop.alu_fn),
+            div.sew.eq(uop.vsew),
+            div.in1.eq(self.req.bits.opa_data),
+            div.in2.eq(self.req.bits.opb_data),
+            self.resp.valid.eq(div.resp.valid),
+            div.resp.ready.eq(self.resp.ready),
+        ]
+
+        old_vd = Signal.like(self.req.bits.old_vd)
+        tail = Signal.like(self.req.bits.tail)
+        mask = Signal.like(self.req.bits.mask)
+        with m.If(self.req.fire):
+            m.d.sync += [
+                old_vd.eq(self.req.bits.old_vd),
+                tail.eq(self.req.bits.tail),
+                mask.eq(self.req.bits.mask),
+            ]
+
+        tail_mask = Signal(self.data_width)
+        byte_mask = Signal(self.data_width)
+        get_byte_mask(m, tail_mask, tail, self.resp.bits.uop.dest_eew())
+        get_byte_mask(m, byte_mask, mask, self.resp.bits.uop.dest_eew())
+
+        mask_gen = m.submodules.mask_gen = MaskDataGen(self.data_width,
+                                                       self.params)
+        m.d.comb += [
+            mask_gen.mask.eq(byte_mask),
+            mask_gen.tail.eq(tail_mask),
+            mask_gen.old_vd.eq(old_vd),
+            mask_gen.uop.eq(self.resp.bits.uop),
+        ]
+
+        m.d.comb += self.resp.bits.vd_data.eq((div.resp.bits
+                                               & mask_gen.mask_keep)
+                                              | mask_gen.mask_off)
+
+        return m
+
+
+class VDivUnit(PerLaneFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        for w in range(self.n_lanes):
+            lane = VDivLane(self.lane_width, self.params)
             setattr(m.submodules, f'lane{w}', lane)
             m.d.comb += [
                 self.lane_reqs[w].connect(lane.req),

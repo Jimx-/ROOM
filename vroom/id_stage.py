@@ -195,6 +195,26 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     with m.Case(0b00011, 0b00101, 0b00111):
                                         m.d.comb += UOPC(VOpCode.VSEXT)
 
+                            with m.Case(0b100000):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.DIV),
+                                    UOPC(VOpCode.VDIVU),
+                                ]
+                            with m.Case(0b100001):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.DIV),
+                                    UOPC(VOpCode.VDIV),
+                                ]
+                            with m.Case(0b100010):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.DIV),
+                                    UOPC(VOpCode.VREMU),
+                                ]
+                            with m.Case(0b100011):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.DIV),
+                                    UOPC(VOpCode.VREM),
+                                ]
                             with m.Case(0b100100):
                                 m.d.comb += [
                                     uop.fu_type.eq(VFUType.MUL),
@@ -439,6 +459,26 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMVSX),
                                     uop.lrs2_rtype.eq(RegisterType.X),
                                     uop.vl.eq(1),
+                                ]
+                            with m.Case(0b100000):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.DIV),
+                                    UOPC(VOpCode.VDIVU),
+                                ]
+                            with m.Case(0b100001):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.DIV),
+                                    UOPC(VOpCode.VDIV),
+                                ]
+                            with m.Case(0b100010):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.DIV),
+                                    UOPC(VOpCode.VREMU),
+                                ]
+                            with m.Case(0b100011):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.DIV),
+                                    UOPC(VOpCode.VREM),
                                 ]
                             with m.Case(0b100100):
                                 m.d.comb += [

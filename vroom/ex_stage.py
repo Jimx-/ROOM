@@ -2,7 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit
+from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit
 
 from room.utils import Decoupled, Valid
 
@@ -137,6 +137,25 @@ class ALUExecUnit(ExecUnit):
             self.lsu_req.bits.eq(agu.resp.bits),
         ]
 
+        div = m.submodules.div = VDivUnit(self.params)
+        div_busy = Signal()
+
+        div_resp_busy = 0
+        for iu in iresp_units:
+            if isinstance(iu, Queue):
+                div_resp_busy |= iu.deq.valid
+            else:
+                div_resp_busy |= iu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(div.req),
+            div.req.valid.eq(self.req.valid
+                             & (self.req.bits.uop.fu_type == VFUType.DIV)),
+            div.resp.ready.eq(~div_resp_busy),
+            div_busy.eq(~div.req.ready),
+        ]
+        iresp_units.append(div)
+
         for iu in reversed(iresp_units):
             if isinstance(iu, Queue):
                 with m.If(iu.deq.valid):
@@ -154,6 +173,8 @@ class ALUExecUnit(ExecUnit):
         m.d.comb += self.req.ready.eq(1)
         with m.If(self.req.bits.uop.fu_type == VFUType.MUL):
             m.d.comb += self.req.ready.eq(~imul_busy)
+        with m.Elif(self.req.bits.uop.fu_type == VFUType.DIV):
+            m.d.comb += self.req.ready.eq(~div_busy)
         with m.Elif(self.req.bits.uop.fu_type_has(VFUType.MEM)):
             m.d.comb += self.req.ready.eq(self.lsu_req.ready)
 
