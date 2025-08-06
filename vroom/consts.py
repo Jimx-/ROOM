@@ -147,8 +147,20 @@ class VOpCode(IntEnum):
 
 class VOpA(IntEnum):
     VS1 = 0
-    IMM = 1
-    SCALAR = 2
+    VS1_WIDEN = 1
+    IMM = 2
+    SCALAR = 3
+
+
+class VOpB(IntEnum):
+    VS2 = 0
+    VS2_WIDEN = 1
+    OLD_VD = 2
+
+
+class VOpC(IntEnum):
+    OLD_VD = 0
+    VS2 = 1
 
 
 class VALUOperator(IntEnum):
@@ -214,6 +226,13 @@ class VALUOperator(IntEnum):
     VMULH = VSL
     VMULHSU = VMSEQ
     VMULHU = VMSNE
+    VMACCU = VXOR
+    VMACC = VSR
+    VMACCUS = VOR
+    VMACCSU = VAND
+    VMADD = VADC
+    VNMSUB = VSUB
+    VNMSAC = VSBC
 
     VDIV = VXOR
     VDIVU = VSR
@@ -240,6 +259,12 @@ class VALUOperator(IntEnum):
     @staticmethod
     def is_vmerge(x):
         return (x == VALUOperator.VMERGE)
+
+    @staticmethod
+    def is_macc(x):
+        return (x == VALUOperator.VMACC) | (x == VALUOperator.VMACCUS) | (
+            x == VALUOperator.VMACCSU) | (x == VALUOperator.VMADD) | (
+                x == VALUOperator.VNMSUB) | (x == VALUOperator.VNMSAC)
 
 
 class VFUType(IntEnum):

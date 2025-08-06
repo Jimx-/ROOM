@@ -421,6 +421,9 @@ class VMultiplier(Elaboratable):
             self.fn == VALUOperator.VMULHSU)
         rhs_signed = (self.fn == VALUOperator.VMULH)
 
+        is_sub = (self.fn == VALUOperator.VNMSAC) | (self.fn
+                                                     == VALUOperator.VNMSUB)
+
         #
         # Booth encoding
         #
@@ -486,7 +489,6 @@ class VMultiplier(Elaboratable):
                         else:
                             m.d.comb += prod.eq(
                                 Cat(Const(0, bidx * sew * 2), shifted))
-
         with m.Switch(self.sew):
             for w in range(4):
                 with m.Case(w):
@@ -500,9 +502,23 @@ class VMultiplier(Elaboratable):
                             Cat(b.neg, Const(0, 1))
                             for b in in1_booth[i * sew // 2:(i + 1) * sew //
                                                2])
-                        comps.append(Cat(lo, hi))
+                        comps.append(Cat((lo[:2] + is_sub)[:2], lo[2:], hi))
 
                     m.d.comb += part_prod[self.width // 2].eq(Cat(comps))
+
+        in3_adjust = Signal(self.width * 2)
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    sew = 1 << (w + 3)
+                    for i in range(self.width // sew):
+                        m.d.comb += in3_adjust[i * 2 * sew:(i + 1) * 2 *
+                                               sew].eq(
+                                                   self.in3[i * sew:(i + 1) *
+                                                            sew])
+
+        with m.If(VALUOperator.is_macc(self.fn)):
+            m.d.comb += part_prod[-1].eq(Mux(is_sub, ~in3_adjust, in3_adjust))
 
         #
         # 3-to-2 CSA
@@ -558,6 +574,7 @@ class VMultiplier(Elaboratable):
         s1_sew = Signal.like(self.sew)
         s1_widen = Signal()
         s1_h = Signal()
+        s1_is_sub = Signal()
         s1_addens = [
             Signal(2 * self.width, name=f's1_addens{i}')
             for i in range(len(addens))
@@ -568,6 +585,7 @@ class VMultiplier(Elaboratable):
                 s1_sew.eq(self.sew),
                 s1_widen.eq(self.widen),
                 s1_h.eq(h),
+                s1_is_sub.eq(is_sub),
             ]
             m.d.sync += [a.eq(b) for a, b in zip(s1_addens, addens)]
 
@@ -606,12 +624,14 @@ class VMultiplier(Elaboratable):
         s2_sew = Signal.like(s1_sew)
         s2_widen = Signal()
         s2_h = Signal()
+        s2_is_sub = Signal()
         m.d.sync += s2_valid.eq(s1_valid)
         with m.If(s1_valid):
             m.d.sync += [
                 s2_sew.eq(s1_sew),
                 s2_widen.eq(s1_widen),
                 s2_h.eq(s1_h),
+                s2_is_sub.eq(s1_is_sub),
             ]
 
         mul_out = Signal(self.width)
@@ -624,8 +644,31 @@ class VMultiplier(Elaboratable):
                             Mux(s2_h, wal_out[(2 * i + 1) * n:(2 * i + 2) * n],
                                 wal_out[(2 * i) * n:(2 * i + 1) * n]))
 
+        rnd_data = Mux(s2_is_sub, ~mul_out, 0)
+        rnd_inc = Mux(s2_is_sub, Const(~0, lane_bytes), 0)
+        rnd_cin = Signal(lane_bytes)
+        rnd_cout = Signal(lane_bytes)
+        rnd_adder_out = Signal(self.width)
+        for w in range(lane_bytes):
+            if w == 0:
+                m.d.comb += rnd_cin[w].eq(rnd_inc[w])
+            elif w % 4 == 0:
+                m.d.comb += rnd_cin[w].eq(
+                    Mux((s2_sew == 3), rnd_cout[w - 1], rnd_inc[w]))
+            elif w % 2 == 0:
+                m.d.comb += rnd_cin[w].eq(
+                    Mux((s2_sew == 3) | (s2_sew == 2), rnd_cout[w - 1],
+                        rnd_inc[w]))
+            else:
+                m.d.comb += rnd_cin[w].eq(
+                    Mux(~s2_sew.any(), rnd_inc[w], rnd_cout[w - 1]))
+
+            s = rnd_data[w * 8:(w + 1) * 8] + rnd_cin[w]
+            m.d.comb += Cat(rnd_adder_out[w * 8:(w + 1) * 8],
+                            rnd_cout[w]).eq(s)
+
         out = Signal(self.width)
-        m.d.comb += out.eq(mul_out)
+        m.d.comb += out.eq(Mux(s2_is_sub, rnd_adder_out, mul_out))
 
         out_pipe = m.submodules.out_pipe = Pipe(width=self.width,
                                                 depth=self.latency - 2)

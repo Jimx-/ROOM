@@ -328,11 +328,23 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                                     self.req.bits.rs1_data[:n].replicate(
                                         self.lane_width // n))
 
-            m.d.comb += [
-                opb_data.eq(vs2_data),
-                old_vd.eq(self.req.bits.vs3_data[w * self.lane_width:(w + 1) *
-                                                 self.lane_width]),
-            ]
+            with m.Switch(uop.opb_sel):
+                with m.Case(VOpB.VS2):
+                    m.d.comb += opb_data.eq(vs2_data)
+
+                with m.Case(VOpB.OLD_VD):
+                    m.d.comb += opb_data.eq(
+                        self.req.bits.vs3_data[w * self.lane_width:(w + 1) *
+                                               self.lane_width])
+
+            with m.Switch(uop.opc_sel):
+                with m.Case(VOpC.OLD_VD):
+                    m.d.comb += old_vd.eq(
+                        self.req.bits.vs3_data[w * self.lane_width:(w + 1) *
+                                               self.lane_width])
+
+                with m.Case(VOpC.VS2):
+                    m.d.comb += old_vd.eq(vs2_data)
 
             m.d.comb += [
                 lane_req.valid.eq(

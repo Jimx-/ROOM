@@ -376,13 +376,20 @@ class Instruction:
             inst_text.append(op_name.ljust(5))
             inst_text.append(' ')
 
+            mask_inst = {
+                'vmadc', 'vmsbc', 'vmseq', 'vmsne', 'vmslt', 'vmsltu', 'vmsle',
+                'vmsleu', 'vmsgt', 'vmsgtu'
+            }
+
             if 'rd' in op.args:
                 inst_text.append(rd_text)
                 inst_text.append(f'[={self.rd_data:x}]')
             else:
+                vd_narrow_to_1 = op.name.split('_')[0] in mask_inst
+
                 inst_text.append(vd_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=re.match("vm[^evu]", op.name))}]'
+                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=vd_narrow_to_1)}]'
                 )
 
             if 'vs2' in op.args:

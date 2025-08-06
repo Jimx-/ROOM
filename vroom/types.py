@@ -74,6 +74,8 @@ class VMicroOp(HasVectorParams, Record):
             ('funct3', 3),
             ('opcode', VOpCode),
             ('opa_sel', VOpA),
+            ('opb_sel', VOpB),
+            ('opc_sel', VOpC),
             ('alu_fn', VALUOperator),
             ('ldst', 5),
             ('lrs1', 5),
