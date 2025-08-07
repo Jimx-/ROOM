@@ -295,6 +295,42 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VSUB),
                                     uop.widen2.eq(1),
                                 ]
+                            with m.Case(0b111000):  # vwmulu
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMULHU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111010):  # vwmulsu
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMULHSU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111011):  # vwmul
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMULH),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111100):  # vwmaccu
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMACCU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111101):  # vwmacc
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMACC),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111111):  # vwmaccsu
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMACCSU),
+                                    uop.widen.eq(1),
+                                ]
 
                     with m.Case(0b011):  # OPIVI
                         m.d.comb += [
@@ -579,6 +615,48 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += [
                                     UOPC(VOpCode.VSUB),
                                     uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b111000):  # vwmulu
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMULHU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111010):  # vwmulsu
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMULHSU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111011):  # vwmul
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMULH),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111100):  # vwmaccu
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMACCU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111101):  # vwmacc
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMACC),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111110):  # vwmaccus
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMACCUS),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111111):  # vwmaccsu
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VMACCSU),
+                                    uop.widen.eq(1),
                                 ]
 
         return m

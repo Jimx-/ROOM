@@ -57,104 +57,107 @@ class VOpCode(IntEnum):
     VNMSAC = 52
     VMADD = 53
     VNMSUB = 54
-    VSMUL = 55
-    VDIVU = 56
-    VDIV = 57
-    VREMU = 58
-    VREM = 59
-    VFADD = 60
-    VFSUB = 61
-    VFRSUB = 62
-    VFMUL = 63
-    VFDIV = 64
-    VFRDIV = 65
-    VFMACC = 66
-    VFNMACC = 67
-    VFMSAC = 68
-    VFNMSAC = 69
-    VFMADD = 70
-    VFNMADD = 71
-    VFMSUB = 72
-    VFNMSUB = 73
-    VFSQRT = 74
-    VFMIN = 75
-    VFMAX = 76
-    VFREC7 = 77
-    VFRSQRT7 = 78
-    VFCLASS = 79
-    VFSGNJ = 80
-    VFSGNJN = 81
-    VFSGNJX = 82
-    VFCVTXUF = 83
-    VFCVTXF = 84
-    VFCVTFXU = 85
-    VFCVTFX = 86
-    VFCVTRTZXUF = 87
-    VFCVTRTZXF = 88
-    VFNCVTRODFF = 89
-    VFCVTFF = 90
-    VFREDUSUM = 91
-    VFREDOSUM = 92
-    VFREDMIN = 93
-    VFREDMAX = 94
-    VFWREDUSUM = 95
-    VFWREDOSUM = 96
-    VMFEQ = 97
-    VMFLE = 98
-    VMFLT = 99
-    VMFNE = 100
-    VMFGT = 101
-    VMFGE = 102
-    VMSEQ = 103
-    VMSNE = 104
-    VMSLTU = 105
-    VMSLT = 106
-    VMSLEU = 107
-    VMSLE = 108
-    VMSGTU = 109
-    VMSGT = 110
-    VMADC = 111
-    VMSBC = 112
-    VMSBF = 113
-    VMSOF = 114
-    VMSIF = 115
-    VIOTA = 116
-    VID = 117
-    VCPOP = 118
-    VFIRST = 119
-    VMANDNOT = 120
-    VMAND = 121
-    VMOR = 122
-    VMXOR = 123
-    VMORNOT = 124
-    VMNAND = 125
-    VMNOR = 126
-    VMXNOR = 127
-    VRGATHER = 128
-    VRGATHEREI16 = 129
-    VCOMPRESS = 130
-    VMVXS = 131
-    VFMVFS = 132
-    VSLIDEUP = 133
-    VSLIDEDOWN = 134
-    VLE = 135
-    VLSE = 136
-    VLXE = 137
-    VSE = 138
-    VSSE = 139
-    VSXE = 140
+    VMACCU = 55
+    VMACCUS = 56
+    VMACCSU = 57
+    VSMUL = 58
+    VDIVU = 59
+    VDIV = 60
+    VREMU = 61
+    VREM = 62
+    VFADD = 63
+    VFSUB = 64
+    VFRSUB = 65
+    VFMUL = 66
+    VFDIV = 67
+    VFRDIV = 68
+    VFMACC = 69
+    VFNMACC = 70
+    VFMSAC = 71
+    VFNMSAC = 72
+    VFMADD = 73
+    VFNMADD = 74
+    VFMSUB = 75
+    VFNMSUB = 76
+    VFSQRT = 77
+    VFMIN = 78
+    VFMAX = 79
+    VFREC7 = 80
+    VFRSQRT7 = 81
+    VFCLASS = 82
+    VFSGNJ = 83
+    VFSGNJN = 84
+    VFSGNJX = 85
+    VFCVTXUF = 86
+    VFCVTXF = 87
+    VFCVTFXU = 88
+    VFCVTFX = 89
+    VFCVTRTZXUF = 90
+    VFCVTRTZXF = 91
+    VFNCVTRODFF = 92
+    VFCVTFF = 93
+    VFREDUSUM = 94
+    VFREDOSUM = 95
+    VFREDMIN = 96
+    VFREDMAX = 97
+    VFWREDUSUM = 98
+    VFWREDOSUM = 99
+    VMFEQ = 100
+    VMFLE = 101
+    VMFLT = 102
+    VMFNE = 103
+    VMFGT = 104
+    VMFGE = 105
+    VMSEQ = 106
+    VMSNE = 107
+    VMSLTU = 108
+    VMSLT = 109
+    VMSLEU = 110
+    VMSLE = 111
+    VMSGTU = 112
+    VMSGT = 113
+    VMADC = 114
+    VMSBC = 115
+    VMSBF = 116
+    VMSOF = 117
+    VMSIF = 118
+    VIOTA = 119
+    VID = 120
+    VCPOP = 121
+    VFIRST = 122
+    VMANDNOT = 123
+    VMAND = 124
+    VMOR = 125
+    VMXOR = 126
+    VMORNOT = 127
+    VMNAND = 128
+    VMNOR = 129
+    VMXNOR = 130
+    VRGATHER = 131
+    VRGATHEREI16 = 132
+    VCOMPRESS = 133
+    VMVXS = 134
+    VFMVFS = 135
+    VSLIDEUP = 136
+    VSLIDEDOWN = 137
+    VLE = 138
+    VLSE = 139
+    VLXE = 140
+    VSE = 141
+    VSSE = 142
+    VSXE = 143
 
 
 class VOpA(IntEnum):
     VS1 = 0
-    VS1_WIDEN = 1
+    VS1_HALF = 1
     IMM = 2
     SCALAR = 3
 
 
 class VOpB(IntEnum):
     VS2 = 0
-    VS2_WIDEN = 1
+    VS2_HALF = 1
     OLD_VD = 2
 
 
@@ -262,9 +265,10 @@ class VALUOperator(IntEnum):
 
     @staticmethod
     def is_macc(x):
-        return (x == VALUOperator.VMACC) | (x == VALUOperator.VMACCUS) | (
-            x == VALUOperator.VMACCSU) | (x == VALUOperator.VMADD) | (
-                x == VALUOperator.VNMSUB) | (x == VALUOperator.VNMSAC)
+        return (x == VALUOperator.VMACCU) | (x == VALUOperator.VMACC) | (
+            x == VALUOperator.VMACCUS) | (x == VALUOperator.VMACCSU) | (
+                x == VALUOperator.VMADD) | (x == VALUOperator.VNMSUB) | (
+                    x == VALUOperator.VNMSAC)
 
 
 class VFUType(IntEnum):

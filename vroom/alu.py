@@ -418,8 +418,12 @@ class VMultiplier(Elaboratable):
         h = (self.fn == VALUOperator.VMULH) | (
             self.fn == VALUOperator.VMULHU) | (self.fn == VALUOperator.VMULHSU)
         lhs_signed = (self.fn == VALUOperator.VMULH) | (
-            self.fn == VALUOperator.VMULHSU)
-        rhs_signed = (self.fn == VALUOperator.VMULH)
+            self.fn == VALUOperator.VMULHSU) | (
+                (self.fn == VALUOperator.VMACC)
+                & self.widen) | (self.fn == VALUOperator.VMACCUS)
+        rhs_signed = (self.fn == VALUOperator.VMULH) | (
+            (self.fn == VALUOperator.VMACC)
+            & self.widen) | (self.fn == VALUOperator.VMACCSU)
 
         is_sub = (self.fn == VALUOperator.VNMSAC) | (self.fn
                                                      == VALUOperator.VNMSUB)
@@ -518,7 +522,11 @@ class VMultiplier(Elaboratable):
                                                             sew])
 
         with m.If(VALUOperator.is_macc(self.fn)):
-            m.d.comb += part_prod[-1].eq(Mux(is_sub, ~in3_adjust, in3_adjust))
+            with m.If(self.widen):
+                m.d.comb += part_prod[-1].eq(Cat(self.in3, self.in3))
+            with m.Else():
+                m.d.comb += part_prod[-1].eq(
+                    Mux(is_sub, ~in3_adjust, in3_adjust))
 
         #
         # 3-to-2 CSA
@@ -572,6 +580,7 @@ class VMultiplier(Elaboratable):
 
         s1_valid = Signal()
         s1_sew = Signal.like(self.sew)
+        s1_uop_idx = Signal.like(self.uop_idx)
         s1_widen = Signal()
         s1_h = Signal()
         s1_is_sub = Signal()
@@ -583,6 +592,7 @@ class VMultiplier(Elaboratable):
         with m.If(self.valid):
             m.d.sync += [
                 s1_sew.eq(self.sew),
+                s1_uop_idx.eq(self.uop_idx),
                 s1_widen.eq(self.widen),
                 s1_h.eq(h),
                 s1_is_sub.eq(is_sub),
@@ -622,6 +632,7 @@ class VMultiplier(Elaboratable):
 
         s2_valid = Signal()
         s2_sew = Signal.like(s1_sew)
+        s2_uop_idx = Signal.like(s1_uop_idx)
         s2_widen = Signal()
         s2_h = Signal()
         s2_is_sub = Signal()
@@ -630,6 +641,7 @@ class VMultiplier(Elaboratable):
             m.d.sync += [
                 s2_sew.eq(s1_sew),
                 s2_widen.eq(s1_widen),
+                s2_uop_idx.eq(s1_uop_idx),
                 s2_h.eq(s1_h),
                 s2_is_sub.eq(s1_is_sub),
             ]
@@ -643,6 +655,10 @@ class VMultiplier(Elaboratable):
                         m.d.comb += mul_out[i * n:(i + 1) * n].eq(
                             Mux(s2_h, wal_out[(2 * i + 1) * n:(2 * i + 2) * n],
                                 wal_out[(2 * i) * n:(2 * i + 1) * n]))
+
+        with m.If(s2_widen):
+            m.d.comb += mul_out.eq(
+                Mux(s2_uop_idx[0], wal_out[self.width:], wal_out[:self.width]))
 
         rnd_data = Mux(s2_is_sub, ~mul_out, 0)
         rnd_inc = Mux(s2_is_sub, Const(~0, lane_bytes), 0)
