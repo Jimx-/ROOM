@@ -72,6 +72,14 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                     uop.mem_size.eq(inuop.inst[12:14]),
                 ]
 
+            with m.Case(0b0100111):  # vs*
+                m.d.comb += [
+                    UOPC(VOpCode.VSE),
+                    uop.fu_type.eq(VFUType.MEM),
+                    uop.is_st.eq(1),
+                    uop.mem_size.eq(inuop.inst[12:14]),
+                ]
+
             with m.Case(0b1010111):
                 with m.Switch(uop.funct3):
                     with m.Case(0b000):  # OPIVV

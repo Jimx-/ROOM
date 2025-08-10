@@ -79,6 +79,7 @@ class Instruction:
         self.vd_data = dict()
         self.vs1_data = dict()
         self.vs2_data = dict()
+        self.vs3_data = dict()
         self.vmask = 0
 
     def commit(self, table):
@@ -136,12 +137,15 @@ class Instruction:
         vd_text = ''
         vs1_text = ''
         vs2_text = ''
+        vs3_text = ''
         if (vd := op.args.get('vd')) is not None:
             vd_text = Text(f'v{vd}', style=VREG_COLORS[vd])
         if (vs1 := op.args.get('vs1')) is not None:
             vs1_text = Text(f'v{vs1}', style=VREG_COLORS[vs1])
         if (vs2 := op.args.get('vs2')) is not None:
             vs2_text = Text(f'v{vs2}', style=VREG_COLORS[vs2])
+        if (vs3 := op.args.get('vs3')) is not None:
+            vs3_text = Text(f'v{vs3}', style=VREG_COLORS[vs3])
 
         op_name = op.name.replace('_', '.')
 
@@ -384,6 +388,9 @@ class Instruction:
             if 'rd' in op.args:
                 inst_text.append(rd_text)
                 inst_text.append(f'[={self.rd_data:x}]')
+            elif 'vs3' in op.args:
+                inst_text.append(vs3_text)
+                inst_text.append(f'[={self.format_vs_data(self.vs3_data)}]')
             else:
                 vd_narrow_to_1 = op.name.split('_')[0] in mask_inst
 
@@ -720,7 +727,9 @@ class TraceParser:
                 vs1_data = int(args[3], base=16)
                 lrs2 = int(args[4])
                 vs2_data = int(args[5], base=16)
-                vmask = int(args[6], base=16)
+                lrs3 = int(args[6])
+                vs3_data = int(args[7], base=16)
+                vmask = int(args[8], base=16)
 
                 inst = self.insts.get(id)
                 if inst is None:
@@ -728,6 +737,7 @@ class TraceParser:
 
                 inst.vs1_data[lrs1] = vs1_data
                 inst.vs2_data[lrs2] = vs2_data
+                inst.vs3_data[lrs3] = vs3_data
                 inst.vmask = vmask
 
             elif cmd == 'VWB':

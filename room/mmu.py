@@ -83,6 +83,8 @@ class CoreMemRequest(HasCoreParams, Record):
             ('size', 2, Direction.FANOUT),
             ('signed', 1, Direction.FANOUT),
             ('phys', 1, Direction.FANOUT),
+            ('data', self.xlen, Direction.FANOUT),
+            ('mask', self.xlen // 8, Direction.FANOUT),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)

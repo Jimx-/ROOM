@@ -310,6 +310,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         core_req_state = Signal(_CoreRequestState,
                                 reset=_CoreRequestState.READY)
         core_req = CoreMemRequest(self.params)
+        core_data_gen = StoreGen(max_size=self.xlen // 8)
+        m.submodules += core_data_gen
+        m.d.comb += [
+            core_data_gen.typ.eq(core_req.size),
+            core_data_gen.data_in.eq(core_req.data),
+        ]
 
         clear_store = Signal()
         live_store_mask = Signal(self.stq_size)
@@ -772,6 +778,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     dmem_req.bits.uop.mem_size.eq(core_req.size),
                     dmem_req.bits.uop.mem_signed.eq(core_req.signed),
                     dmem_req.bits.addr.eq(core_req.addr),
+                    dmem_req.bits.data.eq(core_data_gen.data_out),
                     dmem_req.bits.from_core.eq(1),
                 ]
             with m.Elif(will_fire_core_retry[w]):
@@ -781,6 +788,7 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     dmem_req.bits.uop.mem_size.eq(core_req.size),
                     dmem_req.bits.uop.mem_signed.eq(core_req.signed),
                     dmem_req.bits.addr.eq(core_req.addr),
+                    dmem_req.bits.data.eq(core_data_gen.data_out),
                     dmem_req.bits.from_core.eq(1),
                 ]
 

@@ -80,7 +80,7 @@ class Scoreboard(HasVectorParams, Elaboratable):
                 m.d.sync += rs2_busy.eq(busy_regs_n[i])
 
             with m.If((self.sb_uop.ldst == i)
-                      & (self.sb_uop.lrs2_rtype == rtype)):
+                      & (self.sb_uop.lrs3_rtype == rtype)):
                 m.d.sync += rs3_busy.eq(busy_regs_n[i])
 
         m.d.comb += self.dis_ready.eq(~(rd_busy | rs1_busy | rs2_busy

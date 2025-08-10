@@ -175,6 +175,166 @@ class VLoadPacker(HasVectorParams, Elaboratable):
         return m
 
 
+class VStorePacker(HasVectorParams, Elaboratable):
+
+    class Response(HasVectorParams, Record):
+
+        def __init__(self, params, name=None, src_loc_at=0):
+            HasVectorParams.__init__(self, params)
+
+            Record.__init__(self, [
+                ('data_incr', range(self.vlen // 8), Direction.FANOUT),
+                ('next_vreg', 1, Direction.FANOUT),
+                ('mem_size', 2, Direction.FANOUT),
+                ('last', 1, Direction.FANOUT),
+            ],
+                            name=name,
+                            src_loc_at=1 + src_loc_at)
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.req = Valid(ExecResp, params)
+        self.resp = Decoupled(VStorePacker.Response, params)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        mem_size = Signal.like(self.req.bits.uop.mem_size)
+        cur_offset = Signal(range(self.max_elem_count))
+        cur_max = Signal(range(self.max_elem_count))
+        cur_vmax = Signal(range(self.max_elem_count))
+        cur_idx = Signal(range(self.max_vlmax))
+        cur_vidx = Signal(range(self.vlen_bytes))
+        cur_vl = Signal(self.vl_bits)
+
+        def round_down(rem_rnd, rem):
+            for i in range(len(rem)):
+                with m.If(rem[i]):
+                    m.d.comb += rem_rnd.eq(1 << i)
+
+        rem_line = cur_max - cur_offset
+        rem_vreg = cur_vmax - cur_vidx
+        rem_vl = cur_vl - cur_idx
+
+        rem_line_rnd = Signal.like(rem_line)
+        rem_vreg_rnd = Signal.like(rem_vreg)
+        rem_vl_rnd = Signal.like(rem_vl)
+        round_down(rem_line_rnd, rem_line)
+        round_down(rem_vreg_rnd, rem_vreg)
+        round_down(rem_vl_rnd, rem_vl)
+
+        vreg_count = Mux(rem_line_rnd > rem_vreg_rnd, rem_vreg_rnd,
+                         rem_line_rnd)
+        vl_count = Mux(vreg_count > rem_vl_rnd, rem_vl_rnd, vreg_count)
+
+        m.d.comb += [
+            self.resp.bits.data_incr.eq(vl_count << mem_size),
+            self.resp.bits.next_vreg.eq(vl_count == rem_vreg),
+            self.resp.bits.last.eq(vl_count == rem_vl),
+        ]
+
+        m.d.comb += self.resp.bits.mem_size.eq(mem_size)
+        with m.Switch(vl_count):
+            for i in range(4):
+                with m.Case(1 << i):
+                    m.d.comb += self.resp.bits.mem_size.eq(mem_size + i)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(self.req.valid):
+                    with m.If(self.req.bits.uop.unit_stride
+                              & ~self.req.bits.uop.mask
+                              & self.req.bits.uop.vl.any()):
+
+                        m.d.sync += [
+                            mem_size.eq(self.req.bits.uop.mem_size),
+                            cur_offset.eq(
+                                self.req.bits.base_addr[:log2_int(self.xlen //
+                                                                  8)] >>
+                                self.req.bits.uop.mem_size),
+                            cur_max.eq((self.xlen //
+                                        8) >> self.req.bits.uop.mem_size),
+                            cur_vmax.eq(
+                                self.vlen_bytes >> self.req.bits.uop.mem_size),
+                            cur_idx.eq(0),
+                            cur_vidx.eq(0),
+                            cur_vl.eq(self.req.bits.uop.vl),
+                        ]
+
+                        m.next = 'PACK'
+
+            with m.State('PACK'):
+                m.d.comb += self.resp.valid.eq(1)
+
+                with m.If(self.resp.fire):
+                    m.d.sync += cur_idx.eq(cur_idx + vl_count)
+
+                    with m.If(self.resp.bits.next_vreg):
+                        m.d.sync += cur_vidx.eq(0)
+                    with m.Else():
+                        m.d.sync += cur_vidx.eq(cur_vidx + vl_count)
+
+                    with m.If(cur_offset + vl_count == cur_max):
+                        m.d.sync += cur_offset.eq(0)
+                    with m.Else():
+                        m.d.sync += cur_offset.eq(cur_offset + vl_count)
+
+                    with m.If(self.resp.bits.last):
+                        m.next = 'IDLE'
+
+        return m
+
+
+class StoreDataBuffer(HasVectorParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.write = Valid(Signal, self.vlen)
+        self.read = Decoupled(Signal, self.xlen)
+
+        self.data_incr = Signal(range(self.vlen // 8))
+        self.skip = Signal()
+
+        self.clear = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        buffer = Array(Signal(self.vlen, name=f'buffer{i}') for i in range(8))
+        r_ptr = Signal(range(8))
+        w_ptr = Signal(range(8))
+
+        with m.If(self.write.valid):
+            m.d.sync += [
+                buffer[w_ptr].eq(self.write.bits),
+                w_ptr.eq(w_ptr + 1),
+            ]
+
+        cur_idx = Signal(range(self.vlen // 8))
+        with m.If(self.clear):
+            m.d.sync += cur_idx.eq(0)
+
+        m.d.comb += self.read.valid.eq(1)
+        with m.Switch(cur_idx):
+            for i in range(self.vlen // 8):
+                with m.Case(i):
+                    m.d.comb += self.read.bits.eq(buffer[r_ptr][i * 8:i * 8 +
+                                                                self.xlen])
+
+        with m.If(self.read.fire):
+            with m.If(self.skip):
+                m.d.sync += [
+                    r_ptr.eq(r_ptr + 1),
+                    cur_idx.eq(0),
+                ]
+            with m.Else():
+                m.d.sync += cur_idx.eq(cur_idx + self.data_incr)
+
+        return m
+
+
 class MemTransactionGenerator(HasVectorParams, Elaboratable):
 
     class LoadResponse(HasVectorParams, Record):
@@ -200,8 +360,10 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
         super().__init__(params)
 
         self.req = Decoupled(ExecResp, params)
+        self.done = Signal()
 
         self.ld_resp = Valid(MemTransactionGenerator.LoadResponse, params)
+        self.st_data = Valid(Signal, self.vlen)
 
         self.mem_req = Decoupled(CoreMemRequest, params)
         self.mem_nack = Signal()
@@ -215,6 +377,12 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
         ld_packer = m.submodules.ld_packer = VLoadPacker(self.params)
         m.d.comb += ld_packer.req.bits.eq(self.req.bits)
 
+        st_packer = m.submodules.st_packer = VStorePacker(self.params)
+        m.d.comb += st_packer.req.bits.eq(self.req.bits)
+
+        st_data_buf = m.submodules.st_data_buf = StoreDataBuffer(self.params)
+        m.d.comb += st_data_buf.write.eq(self.st_data)
+
         cur_addr = Signal(self.xlen)
         cur_vdest = Signal(range(32))
         m.d.comb += [
@@ -226,9 +394,14 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
             self.ld_resp.bits.data.eq(self.mem_resp.bits.data),
         ]
 
+        st_mem_size = st_packer.resp.bits.mem_size
+
         with m.FSM():
             with m.State('IDLE'):
-                m.d.comb += self.req.ready.eq(1)
+                m.d.comb += [
+                    self.req.ready.eq(1),
+                    self.done.eq(1),
+                ]
 
                 with m.If(self.req.fire):
                     m.d.sync += [
@@ -240,6 +413,12 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
                     with m.If(self.req.bits.uop.is_ld):
                         m.d.comb += ld_packer.req.valid.eq(1)
                         m.next = 'LOAD_REQ'
+                    with m.Else():
+                        m.d.comb += [
+                            st_packer.req.valid.eq(1),
+                            st_data_buf.clear.eq(1),
+                        ]
+                        m.next = 'STORE_REQ'
 
             with m.State('LOAD_REQ'):
                 m.d.comb += [
@@ -276,6 +455,41 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
                     with m.Else():
                         m.next = 'LOAD_REQ'
 
+            with m.State('STORE_REQ'):
+                m.d.comb += [
+                    self.mem_req.valid.eq(1),
+                    self.mem_req.bits.cmd.eq(MemoryCommand.WRITE),
+                    self.mem_req.bits.addr.eq(cur_addr),
+                    self.mem_req.bits.data.eq(st_data_buf.read.bits),
+                    self.mem_req.bits.size.eq(st_mem_size),
+                ]
+
+                with m.If(self.mem_req.fire):
+                    m.next = 'STORE_RESP'
+
+            with m.State('STORE_RESP'):
+                with m.If(self.mem_nack):
+                    m.next = 'STORE_REQ'
+
+                with m.Elif(self.mem_resp.valid):
+                    m.d.comb += [
+                        st_packer.resp.ready.eq(1),
+                        st_data_buf.read.ready.eq(1),
+                        st_data_buf.skip.eq(st_packer.resp.bits.last
+                                            | st_packer.resp.bits.next_vreg),
+                        st_data_buf.data_incr.eq(
+                            st_packer.resp.bits.data_incr),
+                    ]
+
+                    with m.If(st_packer.resp.valid):
+                        m.d.sync += cur_addr.eq(cur_addr +
+                                                st_packer.resp.bits.data_incr)
+
+                    with m.If(st_packer.resp.bits.last):
+                        m.next = 'IDLE'
+                    with m.Else():
+                        m.next = 'STORE_REQ'
+
         return m
 
 
@@ -297,6 +511,9 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         mem_txn = m.submodules.mem_txn = MemTransactionGenerator(self.params)
         m.d.comb += [
             mem_txn.req.bits.eq(self.exec_req.bits),
+            mem_txn.st_data.valid.eq(self.exec_req.fire
+                                     & self.exec_req.bits.uop.is_st),
+            mem_txn.st_data.bits.eq(self.exec_req.bits.old_vd),
             mem_txn.mem_req.connect(self.mem_req),
             mem_txn.mem_nack.eq(self.mem_nack),
             mem_txn.mem_resp.eq(self.mem_resp),
@@ -357,8 +574,8 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                                               | write_one_mask),
                         ]
 
-        ld_done = Signal()
-        with m.If(ld_done):
+        wb_done = Signal()
+        with m.If(wb_done):
             for i in range(8):
                 m.d.sync += uop_table[i].valid.eq(0)
 
@@ -550,15 +767,19 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                 m.d.comb += ld_resp_q.deq.ready.eq(~ld_resp_done)
 
                 with m.If(ld_resp_done):
-                    m.next = 'LOAD_WB'
+                    m.next = 'WRITEBACK'
 
-            with m.State('LOAD_WB'):
+            with m.State('STORE'):
+                with m.If(mem_txn.done):
+                    m.next = 'WRITEBACK'
+
+            with m.State('WRITEBACK'):
                 with m.Switch(buf_rptr):
                     for i in range(7):
                         with m.Case(i):
-                            m.d.comb += ld_done.eq(~uop_table[i + 1].valid)
+                            m.d.comb += wb_done.eq(~uop_table[i + 1].valid)
                     with m.Case(7):
-                        m.d.comb += ld_done.eq(1)
+                        m.d.comb += wb_done.eq(1)
 
                 with m.Switch(buf_rptr):
                     for i in range(7):
@@ -571,13 +792,10 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
 
                 with m.If(self.exec_resp.fire):
                     m.d.sync += [
-                        buf_rptr.eq(Mux(ld_done, 0, buf_rptr + 1)),
+                        buf_rptr.eq(Mux(wb_done, 0, buf_rptr + 1)),
                         buf_wptr.eq(0),
                     ]
-                    with m.If(ld_done):
+                    with m.If(wb_done):
                         m.next = 'IDLE'
-
-            with m.State('STORE'):
-                pass
 
         return m

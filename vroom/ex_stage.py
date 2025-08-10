@@ -21,6 +21,8 @@ class VExecDebug(HasVectorParams, Record):
             ('vs1_data', self.vlen),
             ('lrs2', range(32)),
             ('vs2_data', self.vlen),
+            ('lrs3', range(32)),
+            ('vs3_data', self.vlen),
             ('mask', self.vlen),
         ],
                         name=name,
@@ -80,6 +82,8 @@ class ExecUnit(HasVectorParams, Elaboratable):
                 self.exec_debug.bits.vs1_data.eq(self.req.bits.vs1_data),
                 self.exec_debug.bits.lrs2.eq(self.req.bits.uop.lrs2),
                 self.exec_debug.bits.vs2_data.eq(self.req.bits.vs2_data),
+                self.exec_debug.bits.lrs3.eq(self.req.bits.uop.ldst),
+                self.exec_debug.bits.vs3_data.eq(self.req.bits.vs3_data),
                 self.exec_debug.bits.mask.eq(self.req.bits.mask),
             ]
 
