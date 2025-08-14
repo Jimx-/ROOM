@@ -1,5 +1,6 @@
 from amaranth import *
 
+from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.if_stage import IFStage
 from vroom.id_stage import VIDDebug, DecodeStage, VOpExpander
@@ -27,6 +28,13 @@ def vtype_layout(xlen):
         ("vma", 1, CSRAccess.RO),
         ("_rsvd", xlen - 9, CSRAccess.RO),
         ("vill", 1, CSRAccess.RO),
+    ]
+
+
+def vxrm_layout(xlen):
+    return [
+        ("vxrm", 2, CSRAccess.RW),
+        ("_rsvd", xlen - 2, CSRAccess.RO),
     ]
 
 
@@ -81,6 +89,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         self.br_update = BranchUpdate(params)
         self.exception = Signal()
 
+        self.vxrm = CSR(0x00A, vxrm_layout(self.xlen))
         self.vl = CSR(0xC20, [('value', self.xlen, CSRAccess.RO)])
         self.vtype = CSR(0xC21, vtype_layout(self.xlen))
         self.vlenb = CSR(0xC22, [('value', self.xlen, CSRAccess.RO)])
@@ -120,6 +129,9 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             self.vlenb.r.eq(self.vlen // 8),
         ]
 
+        with m.If(self.vxrm.we):
+            m.d.sync += self.vxrm.r.eq(self.vxrm.w)
+
         #
         # Decoding
         #
@@ -132,6 +144,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             if_stage.fetch_packet.ready.eq(dec_stage.fetch_packet.ready),
             dec_stage.vtype.eq(if_stage.vtype),
             dec_stage.vl.eq(if_stage.vl),
+            dec_stage.vxrm.eq(self.vxrm.r),
         ]
 
         if self.sim_debug:

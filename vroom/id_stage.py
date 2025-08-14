@@ -30,6 +30,7 @@ class DecodeUnit(HasVectorParams, Elaboratable):
 
         self.vtype = VType(params)
         self.vl = Signal(self.vl_bits)
+        self.vxrm = Signal(VXRoundingMode)
 
         self.in_uop = VMicroOp(params)
         self.out_uop = VMicroOp(params)
@@ -50,6 +51,7 @@ class DecodeUnit(HasVectorParams, Elaboratable):
             uop.vill.eq(self.vtype.vill),
             uop.vm.eq(inuop.inst[25]),
             uop.vl.eq(self.vl),
+            uop.vxrm.eq(self.vxrm),
             uop.funct6.eq(inuop.inst[26:32]),
             uop.funct3.eq(inuop.inst[12:15]),
             uop.ldst.eq(inuop.inst[7:12]),
@@ -157,6 +159,11 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 ]
                             with m.Case(0b100101):
                                 m.d.comb += UOPC(VOpCode.VSLL)
+                            with m.Case(0b100111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VSMUL),
+                                ]
                             with m.Case(0b101000):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):
@@ -491,6 +498,11 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 ]
                             with m.Case(0b100101):
                                 m.d.comb += UOPC(VOpCode.VSLL)
+                            with m.Case(0b100111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MUL),
+                                    UOPC(VOpCode.VSMUL),
+                                ]
                             with m.Case(0b101000):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):
@@ -678,6 +690,7 @@ class DecodeStage(HasVectorParams, Elaboratable):
 
         self.vtype = VType(params)
         self.vl = Signal(self.vl_bits)
+        self.vxrm = Signal(VXRoundingMode)
 
         self.fetch_packet = Decoupled(VMicroOp, params)
 
@@ -696,6 +709,7 @@ class DecodeStage(HasVectorParams, Elaboratable):
             dec_unit.in_uop.eq(self.fetch_packet.bits),
             dec_unit.vtype.eq(self.vtype),
             dec_unit.vl.eq(self.vl),
+            dec_unit.vxrm.eq(self.vxrm),
         ]
 
         m.d.comb += [

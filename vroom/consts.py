@@ -237,6 +237,8 @@ class VALUOperator(IntEnum):
     VNMSUB = VSUB
     VNMSAC = VSBC
 
+    VSMUL = VSADDU
+
     VDIV = VXOR
     VDIVU = VSR
     VREM = VOR
@@ -277,3 +279,10 @@ class VFUType(IntEnum):
     MEM = 2
     MUL = 4
     DIV = 8
+
+
+class VXRoundingMode(IntEnum):
+    RNU = 0
+    RNE = 1
+    RDN = 2
+    ROD = 3

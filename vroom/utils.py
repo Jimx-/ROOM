@@ -1,6 +1,7 @@
 from amaranth import *
 from amaranth.utils import log2_int
 
+from vroom.consts import VXRoundingMode
 from vroom.types import HasVectorParams
 
 
@@ -10,6 +11,13 @@ def vlmul_to_lmul(vlmul_sign, vlmul_mag):
     y2 = ~vlmul_sign & vlmul_mag[1] & ~vlmul_mag[0]
     y3 = ~vlmul_sign & vlmul_mag.all()
     return Cat(y0, y1, y2, y3)
+
+
+def get_round_inc(vxrm, v, d):
+    return Mux(
+        vxrm == VXRoundingMode.RNU, v[d - 1],
+        Mux(vxrm == VXRoundingMode.RNE, v[d - 1] & (v[:d - 1].any() | v[d]),
+            Mux(vxrm == VXRoundingMode.ROD, ~v[d] & v[:d].any(), 0)))
 
 
 class TailGen(HasVectorParams, Elaboratable):

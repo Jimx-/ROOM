@@ -2,6 +2,7 @@ from amaranth import *
 from amaranth.utils import log2_int
 
 from vroom.consts import *
+from vroom.utils import get_round_inc
 
 from room.consts import ALUOperator
 from room.alu import IntDiv
@@ -316,7 +317,7 @@ class VALU(Elaboratable):
                         Cat(x.replicate(1 << i) for x in self.vmask))
 
         merge_result = Signal(self.width)
-        for w in range(self.width // 8):
+        for w in range(lane_bytes):
             m.d.comb += merge_result[w * 8:(w + 1) * 8].eq(
                 Mux(merge_mask[w], self.in1[w * 8:(w + 1) * 8],
                     self.in2[w * 8:(w + 1) * 8]))
@@ -403,12 +404,14 @@ class VMultiplier(Elaboratable):
         self.fn = Signal(VALUOperator)
         self.sew = Signal(2)
         self.uop_idx = Signal(3)
+        self.vxrm = Signal(VXRoundingMode)
         self.in1 = Signal(width)
         self.in2 = Signal(width)
         self.in3 = Signal(width)
         self.widen = Signal()
 
         self.resp_data = Signal(width)
+        self.vxsat = Signal(width // 8)
 
     def elaborate(self, platform):
         m = Module()
@@ -427,6 +430,7 @@ class VMultiplier(Elaboratable):
 
         is_sub = (self.fn == VALUOperator.VNMSAC) | (self.fn
                                                      == VALUOperator.VNMSUB)
+        is_fixp = VALUOperator.is_fixp(self.fn)
 
         #
         # Booth encoding
@@ -584,6 +588,8 @@ class VMultiplier(Elaboratable):
         s1_widen = Signal()
         s1_h = Signal()
         s1_is_sub = Signal()
+        s1_is_fixp = Signal()
+        s1_vxrm = Signal(VXRoundingMode)
         s1_addens = [
             Signal(2 * self.width, name=f's1_addens{i}')
             for i in range(len(addens))
@@ -596,6 +602,8 @@ class VMultiplier(Elaboratable):
                 s1_widen.eq(self.widen),
                 s1_h.eq(h),
                 s1_is_sub.eq(is_sub),
+                s1_is_fixp.eq(is_fixp),
+                s1_vxrm.eq(self.vxrm),
             ]
             m.d.sync += [a.eq(b) for a, b in zip(s1_addens, addens)]
 
@@ -636,6 +644,8 @@ class VMultiplier(Elaboratable):
         s2_widen = Signal()
         s2_h = Signal()
         s2_is_sub = Signal()
+        s2_is_fixp = Signal()
+        s2_vxrm = Signal(VXRoundingMode)
         m.d.sync += s2_valid.eq(s1_valid)
         with m.If(s1_valid):
             m.d.sync += [
@@ -644,6 +654,8 @@ class VMultiplier(Elaboratable):
                 s2_uop_idx.eq(s1_uop_idx),
                 s2_h.eq(s1_h),
                 s2_is_sub.eq(s1_is_sub),
+                s2_is_fixp.eq(s1_is_fixp),
+                s2_vxrm.eq(s1_vxrm),
             ]
 
         mul_out = Signal(self.width)
@@ -660,8 +672,35 @@ class VMultiplier(Elaboratable):
             m.d.comb += mul_out.eq(
                 Mux(s2_uop_idx[0], wal_out[self.width:], wal_out[:self.width]))
 
-        rnd_data = Mux(s2_is_sub, ~mul_out, 0)
-        rnd_inc = Mux(s2_is_sub, Const(~0, lane_bytes), 0)
+        vxsat = Signal(lane_bytes)
+        with m.Switch(s2_sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    for i in range(self.width // n):
+                        m.d.comb += vxsat[i * n // 8:(i + 1) * n // 8].eq(
+                            (wal_out[(i + 1) * n * 2 - 2:(i + 1) * n *
+                                     2] == 1).replicate(n // 8))
+
+        wal_out_rnd = Signal(self.width)
+        wal_rnd_inc = Signal(lane_bytes)
+        with m.Switch(s2_sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    for i in range(self.width // n):
+                        m.d.comb += [
+                            wal_out_rnd[i * n:(i + 1) * n].eq(
+                                wal_out[i * n * 2 + n - 1:(i + 1) * n * 2 -
+                                        1]),
+                            wal_rnd_inc[i * n // 8].eq(
+                                get_round_inc(s2_vxrm,
+                                              wal_out[i * n * 2:i * n * 2 + n],
+                                              n - 1)),
+                        ]
+
+        rnd_data = Mux(s2_is_sub, ~mul_out, wal_out_rnd)
+        rnd_inc = Mux(s2_is_sub, Const(~0, lane_bytes), wal_rnd_inc)
         rnd_cin = Signal(lane_bytes)
         rnd_cout = Signal(lane_bytes)
         rnd_adder_out = Signal(self.width)
@@ -683,15 +722,32 @@ class VMultiplier(Elaboratable):
             m.d.comb += Cat(rnd_adder_out[w * 8:(w + 1) * 8],
                             rnd_cout[w]).eq(s)
 
-        out = Signal(self.width)
-        m.d.comb += out.eq(Mux(s2_is_sub, rnd_adder_out, mul_out))
+        fixp_out = Signal(self.width)
+        m.d.comb += fixp_out.eq(rnd_adder_out)
+        with m.Switch(s2_sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    for i in range(self.width // n):
+                        with m.If(vxsat[i * n // 8]):
+                            m.d.comb += fixp_out[i * n:(i + 1) * n].eq(
+                                Const(~0, n - 1))
 
-        out_pipe = m.submodules.out_pipe = Pipe(width=self.width,
+        out = Signal(self.width)
+        with m.If(s2_is_fixp):
+            m.d.comb += out.eq(fixp_out)
+        with m.Elif(s2_is_sub):
+            m.d.comb += out.eq(rnd_adder_out)
+        with m.Else():
+            m.d.comb += out.eq(mul_out)
+
+        out_pipe_in = Cat(out, vxsat)
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(out_pipe_in),
                                                 depth=self.latency - 2)
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
-            out_pipe.in_data.eq(out),
-            self.resp_data.eq(out_pipe.out.bits),
+            out_pipe.in_data.eq(out_pipe_in),
+            Cat(self.resp_data, self.vxsat).eq(out_pipe.out.bits),
         ]
 
         return m

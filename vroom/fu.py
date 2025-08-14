@@ -716,6 +716,7 @@ class VMultiplierLane(PipelinedLaneFunctionalUnit):
             mul.valid.eq(self.req.valid),
             mul.fn.eq(uop.alu_fn),
             mul.sew.eq(uop.vsew),
+            mul.vxrm.eq(uop.vxrm),
             mul.uop_idx.eq(uop.expd_idx),
             mul.in1.eq(self.req.bits.opa_data),
             mul.in2.eq(self.req.bits.opb_data),

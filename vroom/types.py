@@ -69,6 +69,7 @@ class VMicroOp(HasVectorParams, Record):
             ('vill', 1),
             ('vm', 1),
             ('vl', self.vl_bits),
+            ('vxrm', VXRoundingMode),
             ('fu_type', VFUType),
             ('funct6', 6),
             ('funct3', 3),
