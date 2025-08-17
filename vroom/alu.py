@@ -1,5 +1,7 @@
 from amaranth import *
 from amaranth.utils import log2_int
+import functools
+import operator
 
 from vroom.consts import *
 from vroom.utils import get_round_inc
@@ -369,6 +371,70 @@ class VALU(Elaboratable):
         return m
 
 
+class CSA3to2(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.a = Signal(width)
+        self.b = Signal(width)
+        self.c = Signal(width)
+
+        self.sum = Signal(width)
+        self.cout = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += [
+            self.sum.eq(self.a ^ self.b ^ self.c),
+            self.cout[1:].eq((self.a & self.b) | (self.b & self.c)
+                             | (self.a & self.c)),
+        ]
+
+        return m
+
+
+class CSA4to2(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.a = Signal(width)
+        self.b = Signal(width)
+        self.c = Signal(width)
+        self.d = Signal(width)
+
+        self.sum = Signal(width)
+        self.cout = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        csa1 = CSA3to2(self.width)
+        m.submodules += csa1
+        m.d.comb += [
+            csa1.a.eq(self.a),
+            csa1.b.eq(self.b),
+            csa1.c.eq(self.c),
+        ]
+
+        csa2 = CSA3to2(self.width)
+        m.submodules += csa2
+        m.d.comb += [
+            csa2.a.eq(csa1.sum),
+            csa2.b.eq(csa1.cout),
+            csa2.c.eq(self.d),
+        ]
+
+        m.d.comb += [
+            self.sum.eq(csa2.sum),
+            self.cout.eq(csa2.cout),
+        ]
+
+        return m
+
+
 class VMultiplier(Elaboratable):
 
     CSA_BREAK = 3
@@ -563,16 +629,18 @@ class VMultiplier(Elaboratable):
 
             for group, co, s in zip(groups, cout, sum):
                 a, b, c = group
+                csa = CSA3to2(self.width * 2)
+                m.submodules += csa
+
                 m.d.comb += [
-                    co.eq(((a & b) | (b & c) | (a & c)) & cout_mask),
-                    s.eq(a ^ b ^ c),
+                    csa.a.eq(a),
+                    csa.b.eq(b),
+                    csa.c.eq(c),
+                    co.eq(csa.cout & (cout_mask << 1)),
+                    s.eq(csa.sum),
                 ]
 
-            cin = [Signal(self.width * 2) for _ in range(len(groups))]
-            for ci, co in zip(cin, cout):
-                m.d.comb += ci.eq(co << 1)
-
-            return sum + cin + rem
+            return sum + cout + rem
 
         cout_mask = Signal(self.width * 2)
         get_cout_mask(cout_mask, self.sew)
@@ -828,5 +896,233 @@ class VIntDiv(Elaboratable):
                             Cat(self.resp.ready & d.resp.valid
                                 for j, d in enumerate(dividers[w])
                                 if i != j).all())
+
+        return m
+
+
+class Compare2to1(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.a = Signal(width)
+        self.b = Signal(width)
+        self.max = Signal()
+        self.unsigned = Signal()
+
+        self.out = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        b_inv = ~self.b
+        sum = Cat(Const(1, 1), self.a) + Cat(Const(1, 1), b_inv)
+        cout = sum[self.width + 1]
+        less = Mux(self.unsigned, ~cout, self.a[-1] ^ b_inv[-1] ^ cout)
+        m.d.comb += self.out.eq(Mux(self.max ^ less, self.a, self.b))
+
+        return m
+
+
+class Compare3to1(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.a = Signal(width)
+        self.b = Signal(width)
+        self.c = Signal(width)
+        self.max = Signal()
+        self.unsigned = Signal()
+
+        self.out = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        lhs = [self.a, self.a, self.b]
+        rhs = [self.b, self.c, self.c]
+
+        cout = Signal(3)
+        less = Signal(3)
+        for i, (l, r) in enumerate(zip(lhs, rhs)):
+            r_inv = ~r
+            sum = Cat(Const(1, 1), l) + Cat(Const(1, 1), r_inv)
+            m.d.comb += [
+                cout[i].eq(sum[self.width + 1]),
+                less[i].eq(
+                    Mux(self.unsigned, ~cout[i],
+                        l[self.width - 1] ^ r_inv[self.width - 1] ^ cout[i])),
+            ]
+
+        with m.If((less[0] & less[1] & ~self.max)
+                  | (~less[0] & ~less[1] & self.max)):
+            m.d.comb += self.out.eq(self.a)
+        with m.Elif((~less[0] & less[2] & ~self.max)
+                    | (less[0] & ~less[2] & self.max)):
+            m.d.comb += self.out.eq(self.b)
+        with m.Elif((~less[1] & ~less[2] & ~self.max)
+                    | (less[1] & less[2] & self.max)):
+            m.d.comb += self.out.eq(self.c)
+
+        return m
+
+
+class ReductionSlice(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.valid = Signal()
+        self.sew = Signal(2)
+        self.opcode = Signal(VOpCode)
+        self.in_data = Signal(width * 2)
+
+        self.resp_data = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        is_max = (self.opcode == VOpCode.VREDMAXU) | (self.opcode
+                                                      == VOpCode.VREDMAX)
+        is_unsigned = (self.opcode == VOpCode.VREDMAXU) | (self.opcode
+                                                           == VOpCode.VREDMINU)
+
+        logic_out = [Signal(64, name=f'logic_out{w}') for w in range(4)]
+        in_data_64b = [
+            self.in_data[i * 64:(i + 1) * 64] for i in range(self.width // 64)
+        ]
+        with m.Switch(self.opcode):
+            with m.Case(VOpCode.VREDAND):
+                m.d.comb += logic_out[3].eq(
+                    functools.reduce(operator.and_, in_data_64b))
+            with m.Case(VOpCode.VREDOR):
+                m.d.comb += logic_out[3].eq(
+                    functools.reduce(operator.or_, in_data_64b))
+            with m.Case(VOpCode.VREDXOR):
+                m.d.comb += logic_out[3].eq(
+                    functools.reduce(operator.xor, in_data_64b))
+
+        for w in reversed(range(3)):
+            n = 1 << (w + 3)
+            with m.Switch(self.opcode):
+                with m.Case(VOpCode.VREDAND):
+                    m.d.comb += logic_out[w].eq(logic_out[w + 1][0:n]
+                                                & logic_out[w + 1][n:2 * n])
+                with m.Case(VOpCode.VREDOR):
+                    m.d.comb += logic_out[w].eq(logic_out[w + 1][0:n]
+                                                | logic_out[w + 1][n:2 * n])
+                with m.Case(VOpCode.VREDXOR):
+                    m.d.comb += logic_out[w].eq(logic_out[w + 1][0:n]
+                                                ^ logic_out[w + 1][n:2 * n])
+
+        adder_out = [
+            Signal(self.width, name=f'adder_out{w}') for w in range(4)
+        ]
+        for w in range(4):
+            n = 1 << (3 + w)
+            addens = [
+                self.in_data[i * n:(i + 1) * n]
+                for i in range(len(self.in_data) // n)
+            ]
+
+            while len(addens) > 2:
+                groups = [addens[i:i + 4] for i in range(0, len(addens), 4)]
+                rem = []
+                if len(groups[-1]) < 4:
+                    groups, rem = groups[:-1], groups[-1]
+
+                cout = [Signal(n) for _ in range(len(groups))]
+                sum = [Signal(n) for _ in range(len(groups))]
+                for group, co, s in zip(groups, cout, sum):
+                    a, b, c, d = group
+                    csa = CSA4to2(n)
+                    m.submodules += csa
+
+                    m.d.comb += [
+                        csa.a.eq(a),
+                        csa.b.eq(b),
+                        csa.c.eq(c),
+                        csa.d.eq(d),
+                        co.eq(csa.cout),
+                        s.eq(csa.sum),
+                    ]
+
+                addens = sum + cout + rem
+
+            assert len(addens) == 2
+            m.d.comb += adder_out[w].eq(Cat(addens[0], addens[1]))
+
+        minmax = [Signal(self.width, name=f'minmax{w}') for w in range(4)]
+        for w in range(4):
+            n = 1 << (3 + w)
+            comparands = [
+                self.in_data[i * n:(i + 1) * n]
+                for i in range(len(self.in_data) // n)
+            ]
+
+            while len(comparands) > 1:
+                new_comparands = []
+
+                if len(comparands) == 2:
+                    comp2 = Compare2to1(width=n)
+                    m.submodules += comp2
+                    m.d.comb += [
+                        comp2.a.eq(comparands[0]),
+                        comp2.b.eq(comparands[1]),
+                        comp2.max.eq(is_max),
+                        comp2.unsigned.eq(is_unsigned),
+                    ]
+
+                    new_comparands.append(comp2.out)
+
+                else:
+                    groups = [
+                        comparands[i:i + 3]
+                        for i in range(0, len(comparands), 3)
+                    ]
+                    rem = []
+                    if len(groups[-1]) < 3:
+                        groups, rem = groups[:-1], groups[-1]
+
+                    for a, b, c in groups:
+                        comp3 = Compare3to1(width=n)
+                        m.submodules += comp3
+                        m.d.comb += [
+                            comp3.a.eq(a),
+                            comp3.b.eq(b),
+                            comp3.c.eq(c),
+                            comp3.max.eq(is_max),
+                            comp3.unsigned.eq(is_unsigned),
+                        ]
+                        new_comparands.append(comp3.out)
+
+                    new_comparands.extend(rem)
+
+                comparands = new_comparands
+
+            assert len(comparands) == 1
+            m.d.comb += minmax[w].eq(comparands[0])
+
+        with m.If(self.valid):
+            with m.Switch(self.opcode):
+                with m.Case(VOpCode.VREDAND, VOpCode.VREDOR, VOpCode.VREDXOR):
+                    with m.Switch(self.sew):
+                        for w in range(4):
+                            with m.Case(w):
+                                m.d.sync += self.resp_data.eq(logic_out[w])
+
+                with m.Case(VOpCode.VREDMINU, VOpCode.VREDMIN,
+                            VOpCode.VREDMAXU, VOpCode.VREDMAX):
+                    with m.Switch(self.sew):
+                        for w in range(4):
+                            with m.Case(w):
+                                m.d.sync += self.resp_data.eq(minmax[w])
+
+                with m.Default():
+                    with m.Switch(self.sew):
+                        for w in range(4):
+                            with m.Case(w):
+                                m.d.sync += self.resp_data.eq(adder_out[w])
 
         return m

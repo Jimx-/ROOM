@@ -279,6 +279,7 @@ class VFUType(IntEnum):
     MEM = 2
     MUL = 4
     DIV = 8
+    REDUCE = 16
 
 
 class VXRoundingMode(IntEnum):

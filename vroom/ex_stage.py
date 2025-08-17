@@ -2,7 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit
+from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit
 
 from room.utils import Decoupled, Valid
 
@@ -131,6 +131,30 @@ class ALUExecUnit(ExecUnit):
         ]
         iresp_units.append(imul_queue)
 
+        iredu = m.submodules.iredu = VReductionUnit(self.params)
+        iredu_queue = m.submodules.iredu_queue = Queue(6, ExecResp,
+                                                       self.params)
+        iredu_busy = Signal()
+
+        iredu_resp_busy = 0
+        for iu in iresp_units:
+            if isinstance(iu, Queue):
+                iredu_resp_busy |= iu.deq.valid
+            else:
+                iredu_resp_busy |= iu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(iredu.req),
+            iredu.req.valid.eq(self.req.valid
+                               & (self.req.bits.uop.fu_type == VFUType.REDUCE)
+                               & ~self.req.bits.uop.fp_valid
+                               & ~iredu_busy),
+            iredu.resp.connect(iredu_queue.enq),
+            iredu_queue.deq.ready.eq(~iredu_resp_busy),
+            iredu_busy.eq(iredu_queue.count.any()),
+        ]
+        iresp_units.append(iredu_queue)
+
         agu = m.submodules.agu = AddrGenUnit(self.params)
 
         m.d.comb += [
@@ -177,6 +201,9 @@ class ALUExecUnit(ExecUnit):
         m.d.comb += self.req.ready.eq(1)
         with m.If(self.req.bits.uop.fu_type == VFUType.MUL):
             m.d.comb += self.req.ready.eq(~imul_busy)
+        with m.Elif((self.req.bits.uop.fu_type == VFUType.REDUCE)
+                    & ~self.req.bits.uop.fp_valid):
+            m.d.comb += self.req.ready.eq(~iredu_busy)
         with m.Elif(self.req.bits.uop.fu_type == VFUType.DIV):
             m.d.comb += self.req.ready.eq(~div_busy)
         with m.Elif(self.req.bits.uop.fu_type_has(VFUType.MEM)):

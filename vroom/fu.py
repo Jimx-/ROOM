@@ -1,10 +1,13 @@
 from amaranth import *
 from amaranth import tracer
 from amaranth.hdl.ast import ValueCastable
+from amaranth.utils import log2_int
+import functools
+import operator
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.alu import VALU, VMultiplier, VIntDiv
+from vroom.alu import VALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1
 from vroom.utils import TailGen
 
 from room.consts import RegisterType
@@ -146,8 +149,9 @@ class ExecLaneResp(HasVectorParams, ValueCastable):
 
 class PipelinedFunctionalUnitBase(Elaboratable):
 
-    def __init__(self, num_stages):
+    def __init__(self, num_stages, is_redu=False):
         self.num_stages = num_stages
+        self.is_redu = is_redu
 
     def elaborate(self, platform):
         m = Module()
@@ -866,5 +870,289 @@ class AddrGenUnit(PipelinedFunctionalUnit):
             self.resp.bits.stride.eq(self.req.bits.rs2_data),
             self.resp.bits.old_vd.eq(self.req.bits.vs3_data),
         ]
+
+        return m
+
+
+class VReductionUnit(PipelinedFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(3, params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        vd_reg = Signal(self.vlen)
+
+        s0_vsew = self.req.bits.uop.vsew
+        s0_vm = self.req.bits.uop.vm
+        s0_vmask = self.req.bits.mask
+        s0_vl = self.req.bits.uop.vl
+        s0_opc = self.req.bits.uop.opcode
+        s0_uop_idx = self.req.bits.uop.expd_idx
+
+        s0_vmask_vl = s0_vmask & (Const(~0, self.vlen) >>
+                                  (self.vlen - s0_vl).as_unsigned())
+        s0_vmask_uop = Signal(self.vlen_bytes)
+        with m.Switch(s0_vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    stride = self.vlen // n
+
+                    with m.Switch(s0_uop_idx):
+                        for i in range(8):
+                            with m.Case(i):
+                                m.d.comb += s0_vmask_uop.eq(
+                                    s0_vmask_vl[i * stride:(i + 1) * stride])
+
+        vl_rem = Signal(self.vl_bits)
+        with m.If(s0_vl > (
+            (s0_uop_idx << log2_int(self.vlen_bytes)) >> s0_vsew)):
+            m.d.comb += vl_rem.eq(s0_vl - (
+                (s0_uop_idx << log2_int(self.vlen_bytes)) >> s0_vsew))
+
+        vs2_masked_data = Signal(self.vlen)
+        with m.Switch(s0_vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    for i in range(self.vlen // n):
+                        with m.If((~s0_vm & ~s0_vmask_uop[i]) | (i >= vl_rem)):
+                            with m.Switch(s0_opc):
+                                with m.Case(VOpCode.VREDMAX):
+                                    m.d.comb += vs2_masked_data[i * n:(i + 1) *
+                                                                n].eq(1 << (n -
+                                                                            1))
+                                with m.Case(VOpCode.VREDMIN):
+                                    m.d.comb += vs2_masked_data[i * n:(
+                                        i + 1) * n].eq((1 << (n - 1)) - 1)
+                                with m.Case(VOpCode.VREDMINU, VOpCode.VREDAND):
+                                    m.d.comb += vs2_masked_data[i * n:(i + 1) *
+                                                                n].eq(~0)
+
+                        with m.Else():
+                            m.d.comb += vs2_masked_data[i * n:(i + 1) * n].eq(
+                                self.req.bits.vs2_data[i * n:(i + 1) * n])
+
+        vs1_masked_data = Signal(self.elen)
+        with m.Switch(s0_vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    m.d.comb += vs1_masked_data.eq(
+                        Cat(self.req.bits.vs1_data[:n],
+                            (s0_opc == VOpCode.VREDAND).replicate(self.elen -
+                                                                  n)))
+
+        s1_vs2_data = Signal(self.vlen)
+        s1_vs1_data = Signal(self.elen)
+        s1_old_vd = Signal(self.vlen)
+        with m.If(self.req.fire):
+            m.d.sync += [
+                s1_vs2_data.eq(vs2_masked_data),
+                s1_vs1_data.eq(vs1_masked_data),
+                s1_old_vd.eq(self.req.bits.vs3_data),
+            ]
+
+        slices = []
+        slice_width = 128
+        n_slices = self.vlen // slice_width
+        slice_vd = Signal(self.vlen)
+        for i in range(n_slices):
+            slice = ReductionSlice(slice_width)
+            setattr(m.submodules, f'slice{i}', slice)
+            m.d.comb += [
+                slice.valid.eq(self.valids[0]),
+                slice.opcode.eq(self.uops[0].opcode),
+                slice.sew.eq(self.uops[0].vsew),
+                slice.in_data.eq(s1_vs2_data[i * slice_width:(i + 1) *
+                                             slice_width]),
+                slice_vd[i * slice_width:(i + 1) * slice_width].eq(
+                    slice.resp_data),
+            ]
+
+            slices.append(slice)
+
+        s2_vs1_data = Signal(self.elen)
+        s2_old_vd = Signal(self.vlen)
+        with m.If(self.valids[0]):
+            m.d.sync += [
+                s2_vs1_data.eq(s1_vs1_data),
+                s2_old_vd.eq(s1_old_vd),
+            ]
+
+        s2_vd_masked_data = Signal(self.elen)
+        with m.Switch(self.uops[1].vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    m.d.comb += s2_vd_masked_data.eq(
+                        Cat(vd_reg[:n], (self.uops[1].opcode == VOpCode.VREDAND
+                                         ).replicate(self.elen - n)))
+
+        s2_vs1_vd = Signal(self.elen)
+        with m.If(self.uops[1].expd_idx.any()):
+            m.d.comb += s2_vs1_vd.eq(s2_vd_masked_data)
+        with m.Else():
+            m.d.comb += s2_vs1_vd.eq(s2_vs1_data)
+
+        #
+        # VREDAND, VREDOR, VREDXOR
+        #
+
+        logic_out = Signal(self.vlen)
+        logic_operands = [
+            slice_vd[i * 64:(i + 1) * 64] for i in range(len(slice_vd) // 64)
+        ]
+        logic_operands.append(s2_vs1_vd)
+        with m.Switch(self.uops[1].opcode):
+            with m.Case(VOpCode.VREDAND):
+                m.d.comb += logic_out.eq(
+                    functools.reduce(operator.and_, logic_operands))
+            with m.Case(VOpCode.VREDOR):
+                m.d.comb += logic_out.eq(
+                    functools.reduce(operator.or_, logic_operands))
+            with m.Case(VOpCode.VREDXOR):
+                m.d.comb += logic_out.eq(
+                    functools.reduce(operator.xor, logic_operands))
+
+        #
+        # VREDSUM
+        #
+
+        adder_out = [Signal(self.vlen, name=f'adder_out{w}') for w in range(4)]
+        for w in range(4):
+            n = 1 << (3 + w)
+            addens = []
+            for i in range(n_slices):
+                addens.append(slice_vd[i * slice_width:i * slice_width + n])
+                addens.append(slice_vd[i * slice_width + n:i * slice_width +
+                                       2 * n])
+            addens.append(s2_vs1_vd)
+
+            while len(addens) > 2:
+                groups = [addens[i:i + 3] for i in range(0, len(addens), 3)]
+                rem = []
+                if len(groups[-1]) < 3:
+                    groups, rem = groups[:-1], groups[-1]
+
+                cout = [Signal(n) for _ in range(len(groups))]
+                sum = [Signal(n) for _ in range(len(groups))]
+                for group, co, s in zip(groups, cout, sum):
+                    a, b, c = group
+                    csa = CSA3to2(n)
+                    m.submodules += csa
+
+                    m.d.comb += [
+                        csa.a.eq(a),
+                        csa.b.eq(b),
+                        csa.c.eq(c),
+                        co.eq(csa.cout),
+                        s.eq(csa.sum),
+                    ]
+
+                addens = sum + cout + rem
+
+            assert len(addens) == 2
+            m.d.comb += adder_out[w].eq(addens[0] + addens[1])
+
+        #
+        # VREDMINU, VREDMIN, VREDMAXU, VREDMAX
+        #
+
+        s2_is_max = (self.uops[1].opcode == VOpCode.VREDMAXU) | (
+            self.uops[1].opcode == VOpCode.VREDMAX)
+        s2_unsigned = (self.uops[1].opcode == VOpCode.VREDMAXU) | (
+            self.uops[1].opcode == VOpCode.VREDMINU)
+        minmax = [Signal(self.vlen, name=f'minmax{w}') for w in range(4)]
+        for w in range(4):
+            n = 1 << (3 + w)
+            comparands = []
+            for i in range(n_slices):
+                comparands.append(slice_vd[i * slice_width:i * slice_width +
+                                           n])
+            comparands.append(s2_vs1_vd[:n])
+
+            while len(comparands) > 1:
+                new_comparands = []
+
+                if len(comparands) == 2:
+                    comp2 = Compare2to1(width=n)
+                    m.submodules += comp2
+                    m.d.comb += [
+                        comp2.a.eq(comparands[0]),
+                        comp2.b.eq(comparands[1]),
+                        comp2.max.eq(s2_is_max),
+                        comp2.unsigned.eq(s2_unsigned),
+                    ]
+
+                    new_comparands.append(comp2.out)
+
+                else:
+                    groups = [
+                        comparands[i:i + 3]
+                        for i in range(0, len(comparands), 3)
+                    ]
+                    rem = []
+                    if len(groups[-1]) < 3:
+                        groups, rem = groups[:-1], groups[-1]
+
+                    for a, b, c in groups:
+                        comp3 = Compare3to1(width=n)
+                        m.submodules += comp3
+                        m.d.comb += [
+                            comp3.a.eq(a),
+                            comp3.b.eq(b),
+                            comp3.c.eq(c),
+                            comp3.max.eq(s2_is_max),
+                            comp3.unsigned.eq(s2_unsigned),
+                        ]
+                        new_comparands.append(comp3.out)
+
+                    new_comparands.extend(rem)
+
+                comparands = new_comparands
+
+            assert len(comparands) == 1
+            m.d.comb += minmax[w].eq(comparands[0])
+
+        s3_old_vd = Signal(self.vlen)
+        with m.If(self.valids[1]):
+            m.d.sync += s3_old_vd.eq(s2_old_vd)
+
+        with m.If(self.valids[1]):
+            with m.Switch(self.uops[1].opcode):
+                with m.Case(VOpCode.VREDAND, VOpCode.VREDOR, VOpCode.VREDXOR):
+                    m.d.sync += vd_reg.eq(logic_out)
+
+                with m.Case(VOpCode.VREDMINU, VOpCode.VREDMIN,
+                            VOpCode.VREDMAXU, VOpCode.VREDMAX):
+                    with m.Switch(self.uops[1].vsew):
+                        for w in range(4):
+                            with m.Case(w):
+                                m.d.sync += vd_reg.eq(minmax[w])
+
+                with m.Default():
+                    with m.Switch(self.uops[1].vsew):
+                        for w in range(4):
+                            with m.Case(w):
+                                m.d.sync += vd_reg.eq(adder_out[w])
+
+        vd_mask = Signal(self.vlen)
+        vd_masked_data = Signal(self.vlen)
+        with m.Switch(self.uops[2].vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    m.d.comb += vd_mask.eq((1 << n) - 1)
+
+        with m.If(self.uops[2].vta):
+            m.d.comb += vd_masked_data.eq(vd_reg | ~vd_mask)
+        with m.Else():
+            m.d.comb += vd_masked_data.eq((vd_reg & vd_mask)
+                                          | (s3_old_vd & ~vd_mask))
+
+        m.d.comb += self.resp.bits.vd_data.eq(vd_masked_data)
 
         return m

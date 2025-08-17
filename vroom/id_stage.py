@@ -191,6 +191,46 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         ]
 
                         with m.Switch(uop.funct6):
+                            with m.Case(0b000000):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VREDSUM),
+                                ]
+                            with m.Case(0b000001):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VREDAND),
+                                ]
+                            with m.Case(0b000010):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VREDOR),
+                                ]
+                            with m.Case(0b000011):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VREDXOR),
+                                ]
+                            with m.Case(0b000100):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VREDMINU),
+                                ]
+                            with m.Case(0b000101):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VREDMIN),
+                                ]
+                            with m.Case(0b000110):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VREDMAXU),
+                                ]
+                            with m.Case(0b000111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VREDMAX),
+                                ]
                             with m.Case(0b010000):  # VWXUNARY0
                                 m.d.comb += [
                                     uop.dst_rtype.eq(RegisterType.FIX),
@@ -757,7 +797,9 @@ class VOpExpander(HasVectorParams, Elaboratable):
         with m.If((self.expd_uop.opcode == VOpCode.VMVSX)
                   | (self.expd_uop.opcode == VOpCode.VMVXS)):
             m.d.comb += expd_count_start.eq(0)
-        with m.Elif(self.expd_uop.widen | self.expd_uop.widen2
+        with m.Elif((self.expd_uop.widen
+                     & ~self.expd_uop.fu_type_has(VFUType.REDUCE))
+                    | self.expd_uop.widen2
                     | self.expd_uop.narrow):
             m.d.comb += expd_count_start.eq(
                 Mux(self.expd_uop.vlmul_sign, 1, (lmul << 1) - 1))
@@ -766,17 +808,21 @@ class VOpExpander(HasVectorParams, Elaboratable):
 
         is_ext = (expd_uop.opcode == VOpCode.VSEXT) | (expd_uop.opcode
                                                        == VOpCode.VZEXT)
+        is_redu = expd_uop.fu_type_has(VFUType.REDUCE)
 
         lrs1_incr = Signal(3)
-        with m.If(is_ext | (expd_uop.lrs1_rtype != RegisterType.VEC)):
+        with m.If(is_ext | is_redu
+                  | (expd_uop.lrs1_rtype != RegisterType.VEC)):
             m.d.comb += lrs1_incr.eq(0)
-        with m.Elif(expd_uop.widen | expd_uop.widen2 | expd_uop.narrow):
+        with m.Elif((expd_uop.widen & ~is_redu) | expd_uop.widen2
+                    | expd_uop.narrow):
             m.d.comb += lrs1_incr.eq(expd_idx >> 1)
         with m.Else():
             m.d.comb += lrs1_incr.eq(expd_idx)
 
         lrs2_incr = Signal(3)
-        with m.If(expd_uop.widen | (is_ext & (expd_uop.lrs1[1:3] == 3))):
+        with m.If((expd_uop.widen & ~is_redu)
+                  | (is_ext & (expd_uop.lrs1[1:3] == 3))):
             m.d.comb += lrs2_incr.eq(expd_idx >> 1)
         with m.Elif(is_ext & (expd_uop.lrs1[1:3] == 2)):
             m.d.comb += lrs2_incr.eq(expd_idx >> 2)
@@ -788,7 +834,7 @@ class VOpExpander(HasVectorParams, Elaboratable):
         ldst_incr = Signal(3)
         with m.If(expd_uop.narrow):
             m.d.comb += ldst_incr.eq(expd_idx >> 1)
-        with m.Elif(expd_uop.narrow_to_1):
+        with m.Elif(is_redu | expd_uop.narrow_to_1):
             m.d.comb += ldst_incr.eq(0)
         with m.Else():
             m.d.comb += ldst_incr.eq(expd_idx)
@@ -831,10 +877,18 @@ class VOpExpander(HasVectorParams, Elaboratable):
                     with m.If(self.expd_uop.expd_end):
                         m.next = 'PASSTHRU'
 
-        with m.If(self.expd_uop.narrow_to_1 & ~self.expd_uop.expd_end):
-            m.d.comb += self.expd_uop.dst_rtype.eq(RegisterType.X)
+        with m.If((self.expd_uop.narrow_to_1
+                   | self.expd_uop.fu_type_has(VFUType.REDUCE))
+                  & ~self.expd_uop.expd_end):
+            m.d.comb += [
+                self.expd_uop.ldst_valid.eq(0),
+                self.expd_uop.dst_rtype.eq(RegisterType.X),
+            ]
         with m.Elif(self.expd_uop.narrow):
             with m.If(~(self.expd_uop.expd_idx[0] | self.expd_uop.expd_end)):
-                m.d.comb += self.expd_uop.dst_rtype.eq(RegisterType.X)
+                m.d.comb += [
+                    self.expd_uop.ldst_valid.eq(0),
+                    self.expd_uop.dst_rtype.eq(RegisterType.X),
+                ]
 
         return m
