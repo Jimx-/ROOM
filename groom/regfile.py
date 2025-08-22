@@ -67,7 +67,7 @@ class RegisterFile(Elaboratable):
                 mem2_wport.en.eq(wport.valid),
             ]
 
-            if n_rports == n_wports * 3:
+            if n_rports == n_wports * 3 or n_rports == n_wports * 4:
                 mem3 = Memory(width=self.data_width, depth=self.num_regs)
                 mem3_rport = mem3.read_port(domain='comb')
                 setattr(m.submodules, f'mem_read_port{rp_base + 2}',
@@ -82,6 +82,22 @@ class RegisterFile(Elaboratable):
                     mem3_wport.data.eq(wport.bits.data),
                     mem3_wport.en.eq(wport.valid),
                 ]
+
+                if n_rports == n_wports * 4:
+                    mem4 = Memory(width=self.data_width, depth=self.num_regs)
+                    mem4_rport = mem4.read_port(domain='comb')
+                    setattr(m.submodules, f'mem_read_port{rp_base + 3}',
+                            mem4_rport)
+                    mem4_wport = mem4.write_port()
+                    setattr(m.submodules, f'mem4_write_port{i}', mem4_wport)
+
+                    m.d.comb += [
+                        mem4_rport.addr.eq(self.read_ports[rp_base + 3].addr),
+                        self.read_ports[rp_base + 3].data.eq(mem4_rport.data),
+                        mem4_wport.addr.eq(wport.bits.addr),
+                        mem4_wport.data.eq(wport.bits.data),
+                        mem4_wport.en.eq(wport.valid),
+                    ]
 
         return m
 
