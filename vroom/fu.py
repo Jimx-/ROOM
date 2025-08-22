@@ -244,6 +244,13 @@ class PipelinedFunctionalUnit(FunctionalUnit, PipelinedFunctionalUnitBase):
         PipelinedFunctionalUnitBase.__init__(self, num_stages)
 
 
+class IterativeFunctionalUnit(FunctionalUnit, IterativeFunctionalUnitBase):
+
+    def __init__(self, params):
+        FunctionalUnit.__init__(self, params)
+        IterativeFunctionalUnitBase.__init__(self)
+
+
 class PerLaneFunctionalUnit(FunctionalUnit):
 
     def __init__(self, params):

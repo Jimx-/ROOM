@@ -186,7 +186,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         # Register read
         #
 
-        vregfile = m.submodules.vregfile = RegisterFile(rports=3,
+        vregfile = m.submodules.vregfile = RegisterFile(rports=4,
                                                         wports=1,
                                                         num_regs=32,
                                                         data_width=self.vlen)
@@ -211,7 +211,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             dispatcher.dis_ready.eq(sb_ready & dis_ready),
         ]
 
-        for vrr_rp, rp in zip(vregread.read_ports, vregfile.read_ports):
+        for vrr_rp, rp in zip(vregread.read_ports, vregfile.read_ports[:-1]):
             m.d.comb += vrr_rp.connect(rp)
 
         #
@@ -233,7 +233,10 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             exec_unit.req.bits.rs1_data.eq(exec_rs1_data),
             exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
             exec_unit.req.bits.mask.eq(vregfile_v0),
+            vregfile.read_ports[-1].addr.eq(exec_unit.perm_rd_port.addr),
         ]
+        m.d.sync += exec_unit.perm_rd_port.data.eq(
+            vregfile.read_ports[-1].data)
 
         if self.sim_debug:
             m.d.comb += self.vec_debug.ex_debug.eq(exec_unit.exec_debug)
@@ -272,6 +275,9 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
                 wb_req.valid
                 & (wb_req.bits.uop.dst_rtype == RegisterType.VEC)),
             scoreboard.wakeup.bits.ldst.eq(wb_req.bits.uop.ldst),
+            scoreboard.wakeup.bits.is_perm.eq(
+                (wb_req.bits.uop.fu_type == VFUType.PERM)
+                & wb_req.bits.uop.expd_end),
         ]
 
         for wp in vregfile.write_ports:

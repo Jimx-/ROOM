@@ -1,5 +1,6 @@
 from amaranth import *
 
+from vroom.consts import VFUType
 from vroom.types import HasVectorParams, VMicroOp
 
 from room.consts import RegisterType
@@ -12,6 +13,7 @@ class IssueQueueWakeup(Record):
     def __init__(self, name=None, src_loc_at=0):
         super().__init__([
             ('ldst', range(32)),
+            ('is_perm', 1),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -54,6 +56,19 @@ class Scoreboard(HasVectorParams, Elaboratable):
 
         m.d.sync += busy_regs.eq(busy_regs_n)
 
+        perm_busy = Signal()
+        perm_busy_n = Signal()
+        m.d.comb += perm_busy_n.eq(perm_busy)
+
+        with m.If(self.dis_valid & self.dis_ready
+                  & (self.dis_uop.fu_type == VFUType.PERM)
+                  & self.dis_uop.expd_end):
+            m.d.comb += perm_busy_n.eq(1)
+        with m.Elif(self.wakeup.valid & self.wakeup.bits.is_perm):
+            m.d.comb += perm_busy_n.eq(0)
+
+        m.d.sync += perm_busy.eq(perm_busy_n)
+
         rd_busy = Signal()
         rs1_busy = Signal()
         rs2_busy = Signal()
@@ -69,7 +84,7 @@ class Scoreboard(HasVectorParams, Elaboratable):
         for i in range(32):
             with m.If((self.sb_uop.ldst == i) & self.sb_uop.ldst_valid
                       & (self.sb_uop.dst_rtype == rtype)):
-                m.d.sync += rd_busy.eq(busy_regs_n[i])
+                m.d.sync += rd_busy.eq(busy_regs_n[i] | perm_busy_n)
 
             with m.If((self.sb_uop.lrs1 == i)
                       & (self.sb_uop.lrs1_rtype == rtype)):

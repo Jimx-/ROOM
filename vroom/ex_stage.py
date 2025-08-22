@@ -3,8 +3,10 @@ from amaranth import *
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit
+from vroom.perm import VPermutationUnit
 
 from room.utils import Decoupled, Valid
+from room.regfile import RFReadPort
 
 from roomsoc.interconnect.stream import Queue
 
@@ -39,6 +41,7 @@ class ExecUnit(HasVectorParams, Elaboratable):
                  mem_frf_write=False,
                  has_alu=False,
                  has_mem=False,
+                 has_perm=False,
                  sim_debug=False):
         super().__init__(params)
 
@@ -66,6 +69,9 @@ class ExecUnit(HasVectorParams, Elaboratable):
 
         if has_mem:
             self.lsu_req = Decoupled(ExecResp, params)
+
+        if has_perm:
+            self.perm_rd_port = RFReadPort(addr_width=5, data_width=self.vlen)
 
         if sim_debug:
             self.exec_debug = Valid(VExecDebug, params, name='ex_debug')
@@ -97,6 +103,7 @@ class ALUExecUnit(ExecUnit):
                          irf_write=True,
                          has_alu=True,
                          has_mem=True,
+                         has_perm=True,
                          sim_debug=sim_debug)
 
     def elaborate(self, platform):
@@ -184,6 +191,26 @@ class ALUExecUnit(ExecUnit):
         ]
         iresp_units.append(div)
 
+        perm = m.submodules.perm = VPermutationUnit(self.params)
+        perm_busy = Signal()
+
+        perm_resp_busy = 0
+        for iu in iresp_units:
+            if isinstance(iu, Queue):
+                perm_resp_busy |= iu.deq.valid
+            else:
+                perm_resp_busy |= iu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(perm.req),
+            perm.req.valid.eq(self.req.valid
+                              & (self.req.bits.uop.fu_type == VFUType.PERM)),
+            perm.rd_port.connect(self.perm_rd_port),
+            perm.resp.ready.eq(~perm_resp_busy),
+            perm_busy.eq(~perm.req.ready),
+        ]
+        iresp_units.append(perm)
+
         for iu in reversed(iresp_units):
             if isinstance(iu, Queue):
                 with m.If(iu.deq.valid):
@@ -206,6 +233,8 @@ class ALUExecUnit(ExecUnit):
             m.d.comb += self.req.ready.eq(~iredu_busy)
         with m.Elif(self.req.bits.uop.fu_type == VFUType.DIV):
             m.d.comb += self.req.ready.eq(~div_busy)
+        with m.Elif(self.req.bits.uop.fu_type == VFUType.PERM):
+            m.d.comb += self.req.ready.eq(~perm_busy)
         with m.Elif(self.req.bits.uop.fu_type_has(VFUType.MEM)):
             m.d.comb += self.req.ready.eq(self.lsu_req.ready)
 

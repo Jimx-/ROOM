@@ -140,12 +140,14 @@ class VOpCode(IntEnum):
     VFMVFS = 135
     VSLIDEUP = 136
     VSLIDEDOWN = 137
-    VLE = 138
-    VLSE = 139
-    VLXE = 140
-    VSE = 141
-    VSSE = 142
-    VSXE = 143
+    VSLIDE1UP = 138
+    VSLIDE1DOWN = 139
+    VLE = 140
+    VLSE = 141
+    VLXE = 142
+    VSE = 143
+    VSSE = 144
+    VSXE = 145
 
 
 class VOpA(IntEnum):
@@ -280,6 +282,7 @@ class VFUType(IntEnum):
     MUL = 4
     DIV = 8
     REDUCE = 16
+    PERM = 32
 
 
 class VXRoundingMode(IntEnum):

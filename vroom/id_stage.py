@@ -405,6 +405,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VOR)
                             with m.Case(0b001011):
                                 m.d.comb += UOPC(VOpCode.VXOR)
+                            with m.Case(0b001110):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VSLIDEUP),
+                                ]
+                            with m.Case(0b001111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VSLIDEDOWN),
+                                ]
                             with m.Case(0b010000):
                                 m.d.comb += UOPC(VOpCode.VADC)
                             with m.Case(0b010001):
@@ -480,6 +490,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VOR)
                             with m.Case(0b001011):
                                 m.d.comb += UOPC(VOpCode.VXOR)
+                            with m.Case(0b001110):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VSLIDEUP),
+                                ]
+                            with m.Case(0b001111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VSLIDEDOWN),
+                                ]
                             with m.Case(0b010000):
                                 m.d.comb += UOPC(VOpCode.VADC)
                             with m.Case(0b010001):
@@ -570,6 +590,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         ]
 
                         with m.Switch(uop.funct6):
+                            with m.Case(0b001110):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VSLIDE1UP),
+                                ]
+                            with m.Case(0b001111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VSLIDE1DOWN),
+                                ]
                             with m.Case(0b010000):  # VRXUNARY0
                                 m.d.comb += [
                                     UOPC(VOpCode.VMVSX),
