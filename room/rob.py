@@ -508,7 +508,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 with m.If(rob_tail_valids[w]):
                     m.d.comb += tail_valid_mask.eq((1 << (w + 1)) - 1)
             for w in reversed(range(self.core_width)):
-                with m.If(rob_pnr_unsafe[w] | ~rob_tail_valids[w]):
+                with m.If(rob_pnr_unsafe[w] | ~tail_valid_mask[w]):
                     m.d.sync += rob_pnr_lsb.eq(w)
         with m.Elif(full | pnr_maybe_at_tail):
             m.d.sync += rob_pnr_lsb.eq(0)
