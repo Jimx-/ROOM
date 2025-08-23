@@ -7,6 +7,7 @@ from vroom.fu import IterativeFunctionalUnit
 
 from room.consts import RegisterType
 from room.regfile import RFReadPort
+from room.utils import PopCount
 
 from roomsoc.interconnect.stream import Queue, Valid
 
@@ -304,6 +305,114 @@ class VGatherUnit(HasVectorParams, Elaboratable):
         return m
 
 
+class VCompressUnit(HasVectorParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.vm = Signal()
+        self.vta = Signal()
+        self.vsew = Signal(3)
+        self.vlmul_sign = Signal()
+        self.vlmul_mag = Signal()
+        self.vl = Signal(self.vl_bits)
+        self.uop_idx = Signal(range(8))
+        self.vs_idx = Signal(range(8))
+        self.vs2_data = Signal(self.vlen)
+        self.old_vd = Signal(self.vlen)
+        self.vmask = Signal(self.vlen)
+        self.vd_reg = Signal(self.vlen)
+        self.update_vs_idx = Signal()
+        self.rd_old_vd = Signal()
+        self.clear = Signal()
+
+        self.resp_data = Signal(self.vlen)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        vs2_data_d1 = Signal.like(self.vs2_data)
+        old_vd_d1 = Signal.like(self.old_vd)
+        rd_old_vd_d1 = Signal()
+        m.d.sync += [
+            vs2_data_d1.eq(self.vs2_data),
+            old_vd_d1.eq(self.old_vd),
+            rd_old_vd_d1.eq(self.rd_old_vd),
+        ]
+
+        old_vd_bytes = Array(old_vd_d1[i * 8:(i + 1) * 8]
+                             for i in range(self.vlen_bytes))
+        vs2_bytes = Array(vs2_data_d1[i * 8:(i + 1) * 8]
+                          for i in range(self.vlen_bytes))
+
+        vmask_uop = Signal(self.vlen_bytes)
+        with m.Switch(self.vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    stride = self.vlen // n
+
+                    with m.Switch(self.vs_idx):
+                        for i in range(8):
+                            with m.Case(i):
+                                m.d.comb += vmask_uop.eq(
+                                    self.vmask[i * stride:(i + 1) * stride])
+
+        byte_mask = Signal(self.vlen_bytes)
+        byte_mask_d1 = Signal.like(byte_mask)
+        m.d.sync += byte_mask_d1.eq(byte_mask)
+        with m.Switch(self.vsew):
+            for i in range(4):
+                with m.Case(i):
+                    m.d.comb += byte_mask.eq(
+                        Cat(x.replicate(1 << i) for x in vmask_uop))
+
+        mask_one_count = PopCount(self.vlen_bytes)
+        m.submodules += mask_one_count
+        m.d.comb += mask_one_count.inp.eq(byte_mask)
+
+        ones_sum = Signal(range(self.vlen + 1))
+        with m.If(rd_old_vd_d1 | self.clear):
+            m.d.sync += ones_sum.eq(0)
+        with m.If(self.update_vs_idx):
+            m.d.sync += ones_sum.eq(ones_sum + mask_one_count.out)
+
+        acc_ones_count = [
+            Signal(range(self.vlen + 1), name=f'acc_ones_count{i}')
+            for i in range(self.vlen_bytes)
+        ]
+        acc_ones_count_d1 = [
+            Signal(range(self.vlen + 1), name=f'acc_ones_count{i}_d1')
+            for i in range(self.vlen_bytes)
+        ]
+        m.d.comb += acc_ones_count[0].eq(ones_sum + byte_mask[0])
+        for i in range(1, self.vlen_bytes):
+            m.d.comb += acc_ones_count[i].eq(acc_ones_count[i - 1] +
+                                             byte_mask[i])
+        m.d.sync += Cat(acc_ones_count_d1).eq(Cat(acc_ones_count))
+
+        base_idx = Signal(range(self.vlen))
+        m.d.sync += base_idx.eq(self.uop_idx << log2_int(self.vlen_bytes))
+
+        vd_bytes = Array(
+            Signal(8, name=f'vd_byte{i}') for i in range(self.vlen_bytes))
+        m.d.comb += Cat(vd_bytes).eq(self.vd_reg)
+        for i in range(self.vlen_bytes):
+            with m.If(rd_old_vd_d1):
+                with m.If(i >= ones_sum[:log2_int(self.vlen_bytes)]):
+                    m.d.comb += vd_bytes[i].eq(
+                        Mux(self.vta, 0xff, old_vd_bytes[i]))
+            with m.Else():
+                write_idx = acc_ones_count_d1[i] - base_idx - 1
+                with m.If(byte_mask_d1[i] & (acc_ones_count_d1[i] > base_idx)
+                          & (write_idx < self.vlen_bytes)):
+                    m.d.comb += vd_bytes[write_idx].eq(vs2_bytes[i])
+
+        m.d.comb += self.resp_data.eq(Cat(vd_bytes))
+
+        return m
+
+
 class PermutationCore(HasVectorParams, Elaboratable):
 
     def __init__(self, params):
@@ -339,7 +448,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
         is_vrgatherei16 = uop.opcode == VOpCode.VRGATHEREI16
         is_vrgatherei16_sew8 = is_vrgatherei16 & (uop.vsew == 0)
         is_vrgather = (uop.opcode == VOpCode.VRGATHER) | is_vrgatherei16
-        is_vcompress = Const(0, 1)
+        is_vcompress = uop.opcode == VOpCode.VCOMPRESS
 
         rs1_data = Signal(self.xlen)
         rd_vlmul = Signal(range(8))
@@ -354,10 +463,17 @@ class PermutationCore(HasVectorParams, Elaboratable):
                 m.d.sync += rd_vlmul.eq((1 << self.uop.bits.vlmul_mag) - 1)
 
         vs_idx = Signal(range(8))
-        vs_idx_d1 = Signal(range(8))
+        vs_idx_d3 = Signal(range(8))
         update_vs_idx = Signal()
+        update_vs_idx_d1 = Signal()
+        update_vs_idx_d2 = Signal()
+        update_vs_idx_d3 = Signal()
         vd_idx = Signal(range(8))
-        m.d.sync += vs_idx_d1.eq(vs_idx)
+        m.d.sync += [
+            update_vs_idx_d1.eq(update_vs_idx),
+            update_vs_idx_d2.eq(update_vs_idx_d1),
+            update_vs_idx_d3.eq(update_vs_idx_d2),
+        ]
 
         vs_rd_en = Signal()
         mask_rd_en = Signal()
@@ -376,7 +492,9 @@ class PermutationCore(HasVectorParams, Elaboratable):
         with m.Else():
             m.d.sync += mask_rd_en.eq(0)
 
-        with m.If(~is_vcompress & mask_rd_en):
+        with m.If(is_vcompress & mask.valid):
+            m.d.sync += vs_rd_en.eq(1)
+        with m.Elif(~is_vcompress & mask_rd_en):
             m.d.sync += vs_rd_en.eq(1)
         with m.Elif(update_vs_idx & (vs_idx == rd_vlmul_gather16_sew8)):
             m.d.sync += vs_rd_en.eq(0)
@@ -390,18 +508,29 @@ class PermutationCore(HasVectorParams, Elaboratable):
         wb_valid_d1 = Signal()
         wb_valid_d2 = Signal()
         wb_valid_d3 = Signal()
+        wb_valid_d4 = Signal()
         m.d.sync += [
             wb_valid_d1.eq(wb_valid),
             wb_valid_d2.eq(wb_valid_d1),
             wb_valid_d3.eq(wb_valid_d2),
+            wb_valid_d4.eq(wb_valid_d3),
         ]
 
         wb_vd_idx = Signal(range(8))
-        with m.If(wb_valid_d2):
+        with m.If(wb_valid):
             with m.If(wb_vd_idx == rd_vlmul):
                 m.d.sync += wb_vd_idx.eq(0)
             with m.Else():
                 m.d.sync += wb_vd_idx.eq(wb_vd_idx + 1)
+
+        wb_vd_idx_d3 = Signal(range(8))
+        with m.If(wb_valid_d2):
+            with m.If(wb_vd_idx_d3 == rd_vlmul):
+                m.d.sync += wb_vd_idx_d3.eq(0)
+            with m.Else():
+                m.d.sync += wb_vd_idx_d3.eq(wb_vd_idx_d3 + 1)
+
+        update_vd_idx = wb_valid_d3
 
         #
         # VSLIDEUP/VSLIDEDOWN
@@ -522,7 +651,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
             slide_unit.vlmul_sign.eq(uop.vlmul_sign),
             slide_unit.vlmul_mag.eq(uop.vlmul_mag),
             slide_unit.vl.eq(uop.vl),
-            slide_unit.uop_idx.eq(wb_vd_idx),
+            slide_unit.uop_idx.eq(wb_vd_idx_d3),
             slide_unit.rs1_data.eq(rs1_data),
             slide_unit.vs2_lo.bits.eq(vslide_vs2_lo),
             slide_unit.vs2_hi.bits.eq(vslide_vs2_hi),
@@ -580,7 +709,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
             gather_unit.vl.eq(uop.vl),
             gather_unit.vxi.eq(uop.opa_sel != VOpA.VS1),
             gather_unit.first.eq(vrgather_rd_cnt_d1 == 2),
-            gather_unit.uop_idx.eq(vs_idx_d1),
+            gather_unit.uop_idx.eq(vs_idx_d3),
             gather_unit.vs2_idx.eq(vrgather_rd_cnt_d1 - 2),
             gather_unit.rs1_data.eq(rs1_data),
             gather_unit.vs1_data.eq(vs_data),
@@ -590,9 +719,123 @@ class PermutationCore(HasVectorParams, Elaboratable):
             gather_unit.vd_reg.eq(vd_reg),
         ]
 
+        #
+        # VCOMPRESS
+        #
+
+        vmask_vl = Signal(self.vlen)
+        m.d.sync += vmask_vl.eq(mask.bits & ((1 << uop.vl) - 1))
+
+        vmask_uop = Signal(self.vlen_bytes)
+        with m.Switch(uop.vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    stride = self.vlen // n
+
+                    with m.Switch(vs_idx):
+                        for i in range(8):
+                            with m.Case(i):
+                                m.d.comb += vmask_uop.eq(
+                                    vmask_vl[i * stride:(i + 1) * stride])
+
+        byte_mask = Signal(self.vlen_bytes)
+        with m.Switch(uop.vsew):
+            for i in range(4):
+                with m.Case(i):
+                    m.d.comb += byte_mask.eq(
+                        Cat(x.replicate(1 << i) for x in vmask_uop))
+
+        mask_one_count = PopCount(self.vlen_bytes)
+        m.submodules += mask_one_count
+        m.d.comb += mask_one_count.inp.eq(byte_mask)
+
+        rd_ones_sum = Signal(range(self.vlen + 1))
+        vcompress_update_vs_idx = Signal()
+        vcompress_wb_valid = Signal()
+
+        vcompress_rd_wb = is_vcompress & (
+            (rd_ones_sum + mask_one_count.out)
+            >= (wb_vd_idx + 1) << log2_int(self.vlen_bytes))
+        vcompress_rd_hold = is_vcompress & (
+            (rd_ones_sum + mask_one_count.out)
+            > (wb_vd_idx + 1) << log2_int(self.vlen_bytes))
+
+        vcompress_rd_done = wb_valid & (wb_vd_idx == rd_vlmul)
+        vcompress_rd_old_vd = Signal()
+        vcompress_rd_old_vd_d1 = Signal()
+        vcompress_rd_old_vd_d2 = Signal()
+        with m.If(vcompress_rd_done | vcompress_rd_old_vd):
+            m.d.sync += rd_ones_sum.eq(0)
+        with m.Elif(vcompress_update_vs_idx):
+            m.d.sync += rd_ones_sum.eq(rd_ones_sum + mask_one_count.out)
+        m.d.sync += [
+            vcompress_rd_old_vd_d1.eq(vcompress_rd_old_vd),
+            vcompress_rd_old_vd_d2.eq(vcompress_rd_old_vd_d1),
+        ]
+
+        with m.If(vcompress_rd_done):
+            m.d.sync += vcompress_rd_old_vd.eq(0)
+        with m.Elif(is_vcompress & (update_vs_idx & (vs_idx == rd_vlmul))):
+            m.d.sync += vcompress_rd_old_vd.eq(1)
+
+        vcompress_old_vd_idx = Signal(range(32))
+        m.d.sync += vcompress_old_vd_idx.eq(
+            rd_ones_sum[log2_int(self.vlen_bytes):])
+        with m.If(vcompress_rd_old_vd):
+            with m.If(vcompress_old_vd_idx == rd_vlmul):
+                m.d.sync += vcompress_old_vd_idx.eq(0)
+            with m.Else():
+                m.d.sync += vcompress_old_vd_idx.eq(vcompress_old_vd_idx + 1)
+
+        vcompress_lrs_idx = Signal(range(32))
+        with m.If(mask_rd_en):
+            m.d.comb += vcompress_lrs_idx.eq(self.lrs1_idx[0])
+        with m.Elif(is_vcompress & vs_rd_en):
+            m.d.comb += vcompress_lrs_idx.eq(self.lrs2_idx[vs_idx])
+        with m.Else():
+            m.d.comb += vcompress_lrs_idx.eq(
+                self.old_vd_idx[vcompress_old_vd_idx])
+
         m.d.comb += [
-            update_vs_idx.eq(vslide_update_vs_idx | vrgather_update_vs_idx),
-            wb_valid.eq(vslide_wb_valid | vrgather_wb_valid),
+            vcompress_update_vs_idx.eq(is_vcompress & vs_rd_en
+                                       & ~vcompress_rd_hold),
+            vcompress_wb_valid.eq(vcompress_rd_wb | vcompress_rd_old_vd),
+        ]
+
+        vcompress_done = Signal()
+        with m.If(update_vd_idx & (vd_idx == rd_vlmul)):
+            m.d.sync += vcompress_done.eq(1)
+        with m.Else():
+            m.d.sync += vcompress_done.eq(0)
+
+        # Compress unit
+        compress_unit = m.submodules.vcompress = VCompressUnit(self.params)
+        m.d.comb += [
+            compress_unit.vm.eq(uop.vm),
+            compress_unit.vta.eq(uop.vta),
+            compress_unit.vsew.eq(uop.vsew),
+            compress_unit.vlmul_sign.eq(uop.vlmul_sign),
+            compress_unit.vlmul_mag.eq(uop.vlmul_mag),
+            compress_unit.vl.eq(uop.vl),
+            compress_unit.vs_idx.eq(vs_idx_d3),
+            compress_unit.uop_idx.eq(wb_vd_idx_d3),
+            compress_unit.vmask.eq(vmask_vl),
+            compress_unit.vd_reg.eq(vd_reg),
+            compress_unit.update_vs_idx.eq(update_vs_idx_d2),
+            compress_unit.rd_old_vd.eq(vcompress_rd_old_vd_d2),
+            compress_unit.clear.eq(vcompress_done),
+        ]
+        m.d.sync += [
+            compress_unit.vs2_data.eq(self.rd_port.data),
+            compress_unit.old_vd.eq(self.rd_port.data),
+        ]
+
+        m.d.comb += [
+            update_vs_idx.eq(vslide_update_vs_idx | vrgather_update_vs_idx
+                             | vcompress_update_vs_idx),
+            wb_valid.eq(vslide_wb_valid | vrgather_wb_valid
+                        | vcompress_wb_valid),
         ]
         with m.If(self.uop.valid):
             m.d.sync += vs_idx.eq(0)
@@ -602,7 +845,14 @@ class PermutationCore(HasVectorParams, Elaboratable):
             with m.Else():
                 m.d.sync += vs_idx.eq(vs_idx + 1)
 
-        update_vd_idx = wb_valid_d3
+        with m.If(self.uop.valid):
+            m.d.sync += vs_idx_d3.eq(0)
+        with m.Elif(update_vs_idx_d2):
+            with m.If(vs_idx_d3 == rd_vlmul_gather16_sew8):
+                m.d.sync += vs_idx_d3.eq(0)
+            with m.Else():
+                m.d.sync += vs_idx_d3.eq(vs_idx_d3 + 1)
+
         with m.If(self.uop.valid):
             m.d.sync += vd_idx.eq(0)
         with m.Elif(update_vd_idx):
@@ -627,6 +877,8 @@ class PermutationCore(HasVectorParams, Elaboratable):
             m.d.comb += self.rd_port.addr.eq(vslide_lrs_idx)
         with m.Elif(is_vrgather):
             m.d.comb += self.rd_port.addr.eq(vrgather_lrs_idx)
+        with m.Elif(is_vcompress):
+            m.d.comb += self.rd_port.addr.eq(vcompress_lrs_idx)
 
         with m.If(mask_rdata_valid):
             m.d.sync += [
@@ -654,6 +906,8 @@ class PermutationCore(HasVectorParams, Elaboratable):
             m.d.sync += vd_reg.eq(slide_unit.resp_data)
         with m.Elif(is_vrgather & vrgather_update_vs2):
             m.d.sync += vd_reg.eq(gather_unit.resp_data)
+        with m.Elif(is_vcompress & (update_vs_idx_d3 | wb_valid_d3)):
+            m.d.sync += vd_reg.eq(compress_unit.resp_data)
 
         vl_remain_bytes_d1 = vl_remain_d1 << uop.vsew
         tail_bytes = Mux(vl_remain_bytes_d1 >= self.vlen_bytes, 0,
@@ -676,12 +930,14 @@ class PermutationCore(HasVectorParams, Elaboratable):
 
         m.d.comb += [
             self.wb_req.bits.eq(vd_masked_data),
-            self.wb_req.valid.eq(Mux(is_vcompress, 0, wb_valid_d3)),
+            self.wb_req.valid.eq(Mux(is_vcompress, wb_valid_d4, wb_valid_d3)),
         ]
 
         with m.If(self.uop.valid):
             m.d.sync += self.busy.eq(1)
         with m.Elif(~is_vcompress & (vd_idx == rd_vlmul) & update_vd_idx):
+            m.d.sync += self.busy.eq(0)
+        with m.Elif(is_vcompress & vcompress_done):
             m.d.sync += self.busy.eq(0)
 
         return m

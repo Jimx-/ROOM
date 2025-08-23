@@ -260,6 +260,11 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     with m.Case(0b00011, 0b00101, 0b00111):
                                         m.d.comb += UOPC(VOpCode.VSEXT)
 
+                            with m.Case(0b010111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VCOMPRESS),
+                                ]
                             with m.Case(0b100000):
                                 m.d.comb += [
                                     uop.fu_type.eq(VFUType.DIV),
