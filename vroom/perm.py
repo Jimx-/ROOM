@@ -5,6 +5,7 @@ from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.fu import IterativeFunctionalUnit
 
+from room.consts import RegisterType
 from room.regfile import RFReadPort
 
 from roomsoc.interconnect.stream import Queue, Valid
@@ -165,6 +166,144 @@ class VSlideUnit(HasVectorParams, Elaboratable):
         return m
 
 
+class VGatherUnit(HasVectorParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.opcode = Signal(VOpCode)
+        self.vm = Signal()
+        self.vma = Signal()
+        self.vsew = Signal(3)
+        self.vlmul_sign = Signal()
+        self.vlmul_mag = Signal()
+        self.vl = Signal(self.vl_bits)
+        self.vxi = Signal()
+        self.first = Signal()
+        self.uop_idx = Signal(range(8))
+        self.vs2_idx = Signal(range(8))
+        self.rs1_data = Signal(self.xlen)
+        self.vs1_data = Signal(self.vlen)
+        self.vs2_data = Signal(self.vlen)
+        self.old_vd = Signal(self.vlen)
+        self.vmask = Signal(self.vlen)
+        self.vd_reg = Signal(self.vlen)
+
+        self.resp_data = Signal(self.vlen)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        is_gather16 = self.opcode == VOpCode.VRGATHEREI16
+        is_gather16_sew8 = (self.opcode
+                            == VOpCode.VRGATHEREI16) & ~self.vsew.any()
+
+        vmask_vl = self.vmask & ((1 << self.vl) - 1)
+        vmask_uop = Signal(self.vlen_bytes)
+        with m.Switch(self.vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    stride = self.vlen // n
+
+                    with m.Switch(
+                            Mux(is_gather16_sew8, self.uop_idx[1:3],
+                                self.uop_idx)):
+                        for i in range(8):
+                            with m.Case(i):
+                                m.d.comb += vmask_uop.eq(
+                                    vmask_vl[i * stride:(i + 1) * stride])
+
+        byte_mask = Signal(self.vlen_bytes)
+        with m.Switch(self.vsew):
+            for i in range(4):
+                with m.Case(i):
+                    m.d.comb += byte_mask.eq(
+                        Cat(x.replicate(1 << i) for x in vmask_uop))
+
+        vlmax_bytes = Signal(range(self.vlen_bytes + 1))
+        m.d.comb += vlmax_bytes.eq(self.vlen_bytes)
+        with m.If(self.vlmul_sign):
+            with m.Switch(self.vlmul_mag):
+                for i in range(1, 4):
+                    m.d.comb += vlmax_bytes.eq(self.vlen_bytes >> (4 - i))
+
+        vs2_min = self.vs2_idx << log2_int(self.vlen_bytes)
+        vs2_max = Mux(self.vlmul_sign, vlmax_bytes,
+                      (self.vs2_idx + 1) << log2_int(self.vlen_bytes))
+
+        old_vd_bytes = Array(self.old_vd[i * 8:(i + 1) * 8]
+                             for i in range(self.vlen_bytes))
+        vs2_bytes = Array(self.vs2_data[i * 8:(i + 1) * 8]
+                          for i in range(self.vlen_bytes))
+        vd_reg_bytes = Array(self.vd_reg[i * 8:(i + 1) * 8]
+                             for i in range(self.vlen_bytes))
+
+        byte_sel = [
+            Signal(range(self.xlen * self.elen // 8), name=f'byte_sel{i}')
+            for i in range(self.vlen_bytes)
+        ]
+
+        with m.Switch(self.vsew):
+            for w in range(4):
+                with m.Case(w):
+                    nb = 1 << w
+
+                    for i in range(self.vlen_bytes // nb):
+                        sel_base = Signal(self.xlen)
+
+                        with m.If(self.vxi):
+                            m.d.comb += sel_base.eq(self.rs1_data)
+                        if w == 0:
+                            with m.Elif(is_gather16):
+                                m.d.comb += sel_base.eq(
+                                    self.vs1_data.replicate(2)[i * nb *
+                                                               16:(i + 1) *
+                                                               nb * 16])
+                        elif w > 1:
+                            with m.Elif(is_gather16):
+                                with m.Switch(self.uop_idx[:w - 1]):
+                                    for j in range(1 << (w - 1)):
+                                        with m.Case(j):
+                                            word_idx = i + j * (
+                                                self.vlen_bytes // nb)
+                                            m.d.comb += sel_base.eq(
+                                                self.vs1_data[word_idx *
+                                                              16:(word_idx +
+                                                                  1) * 16])
+                        with m.Else():
+                            m.d.comb += sel_base.eq(
+                                self.vs1_data[i * nb * 8:(i + 1) * nb * 8])
+
+                        for j in range(nb):
+                            bidx = i * nb + j
+                            m.d.comb += byte_sel[bidx].eq((sel_base << w) + j)
+
+        vd_bytes = [
+            Signal(8, name=f'vd_byte{i}') for i in range(self.vlen_bytes)
+        ]
+        for i in range(self.vlen_bytes):
+            with m.If(~is_gather16_sew8
+                      | (self.uop_idx[0] if (i >= self.vlen_bytes //
+                                             2) else ~self.uop_idx[0])):
+                m.d.comb += vd_bytes[i].eq(
+                    Mux(self.first, Mux(self.vma, 0xff, old_vd_bytes[i]),
+                        vd_reg_bytes[i]))
+
+                with m.If(byte_mask[i] | self.vm):
+                    with m.If((byte_sel[i] >= vs2_min)
+                              & (byte_sel[i] < vs2_max)):
+                        m.d.comb += vd_bytes[i].eq(vs2_bytes[byte_sel[i] -
+                                                             vs2_min])
+
+            with m.Elif(self.uop_idx[0]):
+                m.d.comb += vd_bytes[i].eq(vd_reg_bytes[i])
+
+        m.d.comb += self.resp_data.eq(Cat(vd_bytes))
+
+        return m
+
+
 class PermutationCore(HasVectorParams, Elaboratable):
 
     def __init__(self, params):
@@ -197,9 +336,15 @@ class PermutationCore(HasVectorParams, Elaboratable):
         is_vslidedown = (uop.opcode == VOpCode.VSLIDEDOWN) | (
             uop.opcode == VOpCode.VSLIDE1DOWN)
         is_vslide = is_vslideup | is_vslidedown
+        is_vrgatherei16 = uop.opcode == VOpCode.VRGATHEREI16
+        is_vrgatherei16_sew8 = is_vrgatherei16 & (uop.vsew == 0)
+        is_vrgather = (uop.opcode == VOpCode.VRGATHER) | is_vrgatherei16
+        is_vcompress = Const(0, 1)
 
         rs1_data = Signal(self.xlen)
         rd_vlmul = Signal(range(8))
+        rd_vlmul_gather16_sew8 = Mux(is_vrgatherei16_sew8 & ~uop.vlmul_sign,
+                                     ((rd_vlmul + 1) << 1) - 1, rd_vlmul)
         with m.If(self.uop.valid):
             m.d.sync += rs1_data.eq(self.rs1_data)
 
@@ -209,8 +354,10 @@ class PermutationCore(HasVectorParams, Elaboratable):
                 m.d.sync += rd_vlmul.eq((1 << self.uop.bits.vlmul_mag) - 1)
 
         vs_idx = Signal(range(8))
+        vs_idx_d1 = Signal(range(8))
         update_vs_idx = Signal()
         vd_idx = Signal(range(8))
+        m.d.sync += vs_idx_d1.eq(vs_idx)
 
         vs_rd_en = Signal()
         mask_rd_en = Signal()
@@ -229,15 +376,16 @@ class PermutationCore(HasVectorParams, Elaboratable):
         with m.Else():
             m.d.sync += mask_rd_en.eq(0)
 
-        with m.If(is_vslide & mask_rd_en):
+        with m.If(~is_vcompress & mask_rd_en):
             m.d.sync += vs_rd_en.eq(1)
-        with m.Elif(update_vs_idx & (vs_idx == rd_vlmul)):
+        with m.Elif(update_vs_idx & (vs_idx == rd_vlmul_gather16_sew8)):
             m.d.sync += vs_rd_en.eq(0)
 
         vl_remain = Signal(self.vl_bits)
         vl_remain_d1 = Signal.like(vl_remain)
         m.d.sync += vl_remain_d1.eq(vl_remain)
 
+        vd_reg = Signal(self.vlen)
         wb_valid = Signal()
         wb_valid_d1 = Signal()
         wb_valid_d2 = Signal()
@@ -386,14 +534,70 @@ class PermutationCore(HasVectorParams, Elaboratable):
             slide_unit.vs2_hi.valid.eq(vslide_hi_valid_d1),
         ]
 
+        #
+        # VRGATHER/VRGATHEREI16
+        #
+
+        vrgather_rd_cnt_max = rd_vlmul + 2
+        vrgather_rd_cnt = Signal(range(4))
+        vrgather_rd_cnt_d1 = Signal.like(vrgather_rd_cnt)
+        vrgather_update_vs_idx = Signal()
+        vrgather_wb_valid = vrgather_update_vs_idx & (
+            ~is_vrgatherei16_sew8 | uop.vlmul_sign | vs_idx[0])
+        m.d.comb += vrgather_update_vs_idx.eq(
+            is_vrgather & (vrgather_rd_cnt == vrgather_rd_cnt_max) & vs_rd_en)
+        m.d.sync += vrgather_rd_cnt_d1.eq(vrgather_rd_cnt)
+        with m.If(is_vrgather & vs_rd_en):
+            with m.If(vrgather_rd_cnt == vrgather_rd_cnt_max):
+                m.d.sync += vrgather_rd_cnt.eq(0)
+            with m.Else():
+                m.d.sync += vrgather_rd_cnt.eq(vrgather_rd_cnt + 1)
+
+        vrgather_lrs_idx = Signal(range(32))
+        with m.If(mask_rd_en):
+            m.d.comb += vrgather_lrs_idx.eq(0)
+        with m.Elif(is_vrgather & vs_rd_en):
+            with m.Switch(vrgather_rd_cnt):
+                with m.Case(0):
+                    m.d.comb += vrgather_lrs_idx.eq(self.old_vd_idx[vs_idx])
+                with m.Case(1):
+                    m.d.comb += vrgather_lrs_idx.eq(self.lrs1_idx[vs_idx])
+                with m.Default():
+                    m.d.comb += vrgather_lrs_idx.eq(
+                        self.lrs2_idx[vrgather_rd_cnt - 2])
+
+        # Gather unit
+        vrgather_update_vs2 = is_vrgather & ~mask_rdata_valid & vs_rdata_valid & (
+            vrgather_rd_cnt_d1 >= 2) & (vrgather_rd_cnt_d1 < 10)
+        gather_unit = m.submodules.vrgather = VGatherUnit(self.params)
         m.d.comb += [
-            update_vs_idx.eq(vslide_update_vs_idx),
-            wb_valid.eq(vslide_wb_valid),
+            gather_unit.opcode.eq(uop.opcode),
+            gather_unit.vm.eq(uop.vm),
+            gather_unit.vma.eq(uop.vma),
+            gather_unit.vsew.eq(uop.vsew),
+            gather_unit.vlmul_sign.eq(uop.vlmul_sign),
+            gather_unit.vlmul_mag.eq(uop.vlmul_mag),
+            gather_unit.vl.eq(uop.vl),
+            gather_unit.vxi.eq(uop.opa_sel != VOpA.VS1),
+            gather_unit.first.eq(vrgather_rd_cnt_d1 == 2),
+            gather_unit.uop_idx.eq(vs_idx_d1),
+            gather_unit.vs2_idx.eq(vrgather_rd_cnt_d1 - 2),
+            gather_unit.rs1_data.eq(rs1_data),
+            gather_unit.vs1_data.eq(vs_data),
+            gather_unit.vs2_data.eq(self.rd_port.data),
+            gather_unit.old_vd.eq(old_vd_data),
+            gather_unit.vmask.eq(mask.bits),
+            gather_unit.vd_reg.eq(vd_reg),
+        ]
+
+        m.d.comb += [
+            update_vs_idx.eq(vslide_update_vs_idx | vrgather_update_vs_idx),
+            wb_valid.eq(vslide_wb_valid | vrgather_wb_valid),
         ]
         with m.If(self.uop.valid):
             m.d.sync += vs_idx.eq(0)
         with m.Elif(update_vs_idx):
-            with m.If(vs_idx == rd_vlmul):
+            with m.If(vs_idx == rd_vlmul_gather16_sew8):
                 m.d.sync += vs_idx.eq(0)
             with m.Else():
                 m.d.sync += vs_idx.eq(vs_idx + 1)
@@ -421,6 +625,8 @@ class PermutationCore(HasVectorParams, Elaboratable):
 
         with m.If(is_vslide):
             m.d.comb += self.rd_port.addr.eq(vslide_lrs_idx)
+        with m.Elif(is_vrgather):
+            m.d.comb += self.rd_port.addr.eq(vrgather_lrs_idx)
 
         with m.If(mask_rdata_valid):
             m.d.sync += [
@@ -433,13 +639,21 @@ class PermutationCore(HasVectorParams, Elaboratable):
         with m.If(is_vslide & ~mask_rdata_valid & vs_rdata_valid
                   & (vslide_rd_cnt_d1 == 0)):
             m.d.sync += old_vd_data.eq(self.rd_port.data)
+        with m.Elif(is_vrgather & ~mask_rdata_valid & vs_rdata_valid
+                    & (vrgather_rd_cnt_d1 == 0)):
+            m.d.sync += old_vd_data.eq(self.rd_port.data)
+
         with m.If(is_vslide & ~mask_rdata_valid & vs_rdata_valid
                   & (vslide_rd_cnt_d1 == 1)):
             m.d.sync += vs_data.eq(self.rd_port.data)
+        with m.Elif(is_vrgather & ~mask_rdata_valid & vs_rdata_valid
+                    & (vrgather_rd_cnt_d1 == 1)):
+            m.d.sync += vs_data.eq(self.rd_port.data)
 
-        vd_reg = Signal(self.vlen)
         with m.If(is_vslide & wb_valid_d2):
             m.d.sync += vd_reg.eq(slide_unit.resp_data)
+        with m.Elif(is_vrgather & vrgather_update_vs2):
+            m.d.sync += vd_reg.eq(gather_unit.resp_data)
 
         vl_remain_bytes_d1 = vl_remain_d1 << uop.vsew
         tail_bytes = Mux(vl_remain_bytes_d1 >= self.vlen_bytes, 0,
@@ -460,13 +674,14 @@ class PermutationCore(HasVectorParams, Elaboratable):
                 m.d.comb += vd_masked_data.eq((vd_reg & vd_mask)
                                               | (old_vd_data & ~vd_mask))
 
-        m.d.comb += self.wb_req.bits.eq(vd_masked_data)
-        with m.If(is_vslide):
-            m.d.comb += self.wb_req.valid.eq(wb_valid_d3)
+        m.d.comb += [
+            self.wb_req.bits.eq(vd_masked_data),
+            self.wb_req.valid.eq(Mux(is_vcompress, 0, wb_valid_d3)),
+        ]
 
         with m.If(self.uop.valid):
             m.d.sync += self.busy.eq(1)
-        with m.Elif(is_vslide & (vd_idx == rd_vlmul) & update_vd_idx):
+        with m.Elif(~is_vcompress & (vd_idx == rd_vlmul) & update_vd_idx):
             m.d.sync += self.busy.eq(0)
 
         return m
@@ -484,7 +699,8 @@ class VPermutationUnit(IterativeFunctionalUnit):
 
         uop_q = m.submodules.uop_q = Queue(8, VMicroOp, self.params)
         m.d.comb += [
-            uop_q.enq.valid.eq(self.req.valid),
+            uop_q.enq.valid.eq(self.req.valid & self.req.bits.uop.rf_wen() & (
+                self.req.bits.uop.dst_rtype == RegisterType.VEC)),
             uop_q.enq.bits.eq(self.req.bits.uop),
         ]
 

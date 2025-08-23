@@ -104,6 +104,9 @@ class VMicroOp(HasVectorParams, Record):
                         name=name,
                         src_loc_at=1 + src_loc_at)
 
+    def rf_wen(self):
+        return self.dst_rtype != RegisterType.X
+
     def fu_type_has(self, typ):
         return (self.fu_type & typ) != 0
 
