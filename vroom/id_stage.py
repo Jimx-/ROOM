@@ -111,6 +111,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VOR)
                             with m.Case(0b001011):
                                 m.d.comb += UOPC(VOpCode.VXOR)
+                            with m.Case(0b001100):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VRGATHER),
+                                ]
+                            with m.Case(0b001110):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VRGATHEREI16),
+                                ]
                             with m.Case(0b010000):
                                 m.d.comb += UOPC(VOpCode.VADC)
                             with m.Case(0b010001):
@@ -405,6 +415,11 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VOR)
                             with m.Case(0b001011):
                                 m.d.comb += UOPC(VOpCode.VXOR)
+                            with m.Case(0b001100):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VRGATHER),
+                                ]
                             with m.Case(0b001110):
                                 m.d.comb += [
                                     uop.fu_type.eq(VFUType.PERM),
@@ -490,6 +505,11 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VOR)
                             with m.Case(0b001011):
                                 m.d.comb += UOPC(VOpCode.VXOR)
+                            with m.Case(0b001100):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VRGATHER),
+                                ]
                             with m.Case(0b001110):
                                 m.d.comb += [
                                     uop.fu_type.eq(VFUType.PERM),
@@ -824,13 +844,20 @@ class VOpExpander(HasVectorParams, Elaboratable):
         expd_count_start = Signal(3)
         expd_count = Signal(3)
         lmul = vlmul_to_lmul(self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag)
-        with m.If((self.expd_uop.opcode == VOpCode.VMVSX)
-                  | (self.expd_uop.opcode == VOpCode.VMVXS)):
+        emul_vd = vlmul_to_lmul(
+            self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag +
+            (self.expd_uop.mem_size - self.expd_uop.vsew))
+        with m.If(self.expd_uop.is_ld | self.expd_uop.is_st):
+            m.d.comb += expd_count_start.eq(emul_vd - 1)
+        with m.Elif((self.expd_uop.opcode == VOpCode.VMVSX)
+                    | (self.expd_uop.opcode == VOpCode.VMVXS)):
             m.d.comb += expd_count_start.eq(0)
         with m.Elif((self.expd_uop.widen
                      & ~self.expd_uop.fu_type_has(VFUType.REDUCE))
                     | self.expd_uop.widen2
-                    | self.expd_uop.narrow):
+                    | self.expd_uop.narrow
+                    | ((self.expd_uop.opcode == VOpCode.VRGATHEREI16)
+                       & (self.expd_uop.vsew == 0))):
             m.d.comb += expd_count_start.eq(
                 Mux(self.expd_uop.vlmul_sign, 1, (lmul << 1) - 1))
         with m.Else():
@@ -839,20 +866,24 @@ class VOpExpander(HasVectorParams, Elaboratable):
         is_ext = (expd_uop.opcode == VOpCode.VSEXT) | (expd_uop.opcode
                                                        == VOpCode.VZEXT)
         is_redu = expd_uop.fu_type_has(VFUType.REDUCE)
+        is_gather16 = expd_uop.opcode == VOpCode.VRGATHEREI16
 
         lrs1_incr = Signal(3)
         with m.If(is_ext | is_redu
                   | (expd_uop.lrs1_rtype != RegisterType.VEC)):
             m.d.comb += lrs1_incr.eq(0)
         with m.Elif((expd_uop.widen & ~is_redu) | expd_uop.widen2
-                    | expd_uop.narrow):
+                    | expd_uop.narrow | (is_gather16 & (expd_uop.vsew == 2))):
             m.d.comb += lrs1_incr.eq(expd_idx >> 1)
+        with m.Elif((is_gather16 & (expd_uop.vsew == 3))):
+            m.d.comb += lrs1_incr.eq(expd_idx >> 2)
         with m.Else():
             m.d.comb += lrs1_incr.eq(expd_idx)
 
         lrs2_incr = Signal(3)
         with m.If((expd_uop.widen & ~is_redu)
-                  | (is_ext & (expd_uop.lrs1[1:3] == 3))):
+                  | (is_ext & (expd_uop.lrs1[1:3] == 3))
+                  | (is_gather16 & (expd_uop.vsew == 0))):
             m.d.comb += lrs2_incr.eq(expd_idx >> 1)
         with m.Elif(is_ext & (expd_uop.lrs1[1:3] == 2)):
             m.d.comb += lrs2_incr.eq(expd_idx >> 2)
@@ -862,7 +893,7 @@ class VOpExpander(HasVectorParams, Elaboratable):
             m.d.comb += lrs2_incr.eq(expd_idx)
 
         ldst_incr = Signal(3)
-        with m.If(expd_uop.narrow):
+        with m.If(expd_uop.narrow | (is_gather16 & (expd_uop.vsew == 0))):
             m.d.comb += ldst_incr.eq(expd_idx >> 1)
         with m.Elif(is_redu | expd_uop.narrow_to_1):
             m.d.comb += ldst_incr.eq(0)
@@ -914,7 +945,9 @@ class VOpExpander(HasVectorParams, Elaboratable):
                 self.expd_uop.ldst_valid.eq(0),
                 self.expd_uop.dst_rtype.eq(RegisterType.X),
             ]
-        with m.Elif(self.expd_uop.narrow):
+        with m.Elif(self.expd_uop.narrow
+                    | ((self.expd_uop.opcode == VOpCode.VRGATHEREI16)
+                       & (self.expd_uop.vsew == 0))):
             with m.If(~(self.expd_uop.expd_idx[0] | self.expd_uop.expd_end)):
                 m.d.comb += [
                     self.expd_uop.ldst_valid.eq(0),

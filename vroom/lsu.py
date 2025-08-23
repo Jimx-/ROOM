@@ -100,8 +100,8 @@ class VLoadPacker(HasVectorParams, Elaboratable):
 
         cur_offset = Signal(range(self.max_elem_count))
         log_stride = Signal(2)
-        cur_max = Signal(range(self.max_elem_count))
-        cur_vmax = Signal(range(self.max_elem_count))
+        cur_max = Signal(range(self.max_elem_count + 1))
+        cur_vmax = Signal(range(self.vlen_bytes + 1))
         cur_idx = Signal(range(self.max_vlmax))
         cur_vidx = Signal(range(self.vlen_bytes))
         cur_vl = Signal(self.vl_bits)
@@ -202,8 +202,8 @@ class VStorePacker(HasVectorParams, Elaboratable):
 
         mem_size = Signal.like(self.req.bits.uop.mem_size)
         cur_offset = Signal(range(self.max_elem_count))
-        cur_max = Signal(range(self.max_elem_count))
-        cur_vmax = Signal(range(self.max_elem_count))
+        cur_max = Signal(range(self.max_elem_count + 1))
+        cur_vmax = Signal(range(self.vlen_bytes + 1))
         cur_idx = Signal(range(self.max_vlmax))
         cur_vidx = Signal(range(self.vlen_bytes))
         cur_vl = Signal(self.vl_bits)
@@ -528,7 +528,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         req_vlmul_mag = req.uop.vlmul_mag
         req_vlmul_sign = req.uop.vlmul_sign
         req_eew = req.uop.funct3[:2]
-        req_dest_eew = req.uop.dest_eew()
+        req_dest_eew = req.uop.mem_size
         req_vstart = 0
         req_vl = req.uop.vl
         req_nf = req.uop.funct6[3:]
