@@ -167,6 +167,14 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMSLE),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b100000):
+                                m.d.comb += UOPC(VOpCode.VSADDU)
+                            with m.Case(0b100001):
+                                m.d.comb += UOPC(VOpCode.VSADD)
+                            with m.Case(0b100010):
+                                m.d.comb += UOPC(VOpCode.VSSUBU)
+                            with m.Case(0b100011):
+                                m.d.comb += UOPC(VOpCode.VSSUB)
                             with m.Case(0b100101):
                                 m.d.comb += UOPC(VOpCode.VSLL)
                             with m.Case(0b100111):
@@ -464,6 +472,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMSLE),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b100000):
+                                m.d.comb += UOPC(VOpCode.VSADDU)
+                            with m.Case(0b100001):
+                                m.d.comb += UOPC(VOpCode.VSADD)
                             with m.Case(0b100101):
                                 m.d.comb += UOPC(VOpCode.VSLL)
                             with m.Case(0b101000):
@@ -581,6 +593,14 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VMSGT),
                                     uop.narrow_to_1.eq(1),
                                 ]
+                            with m.Case(0b100000):
+                                m.d.comb += UOPC(VOpCode.VSADDU)
+                            with m.Case(0b100001):
+                                m.d.comb += UOPC(VOpCode.VSADD)
+                            with m.Case(0b100010):
+                                m.d.comb += UOPC(VOpCode.VSSUBU)
+                            with m.Case(0b100011):
+                                m.d.comb += UOPC(VOpCode.VSSUB)
                             with m.Case(0b100101):
                                 m.d.comb += UOPC(VOpCode.VSLL)
                             with m.Case(0b100111):

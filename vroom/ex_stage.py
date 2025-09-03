@@ -111,7 +111,7 @@ class ALUExecUnit(ExecUnit):
 
         iresp_units = []
 
-        alu = m.submodules.alu = VALUUnit(self.params, num_stages=1)
+        alu = m.submodules.alu = VALUUnit(self.params, num_stages=2)
         iresp_units.append(alu)
         m.d.comb += [
             self.req.connect(alu.req),

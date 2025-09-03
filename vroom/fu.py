@@ -7,7 +7,7 @@ import operator
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.alu import VALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1
+from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1
 from vroom.utils import TailGen
 
 from room.consts import RegisterType
@@ -596,7 +596,7 @@ class MaskDataGen(HasVectorParams, Elaboratable):
 
 class VALULane(PipelinedLaneFunctionalUnit):
 
-    def __init__(self, data_width, params, num_stages=1):
+    def __init__(self, data_width, params, num_stages=2):
         super().__init__(data_width, num_stages, params)
 
         self.data_width = data_width
@@ -605,6 +605,7 @@ class VALULane(PipelinedLaneFunctionalUnit):
         m = super().elaborate(platform)
 
         uop = self.req.bits.uop
+        is_fixp = VALUOperator.is_fixp(uop.alu_fn)
 
         alu = m.submodules.alu = VALU(self.data_width)
         m.d.comb += [
@@ -647,11 +648,14 @@ class VALULane(PipelinedLaneFunctionalUnit):
         cmp_out_masked = (alu.cmp_out
                           & mask_gen.mask_keep_cmp) | mask_gen.mask_off_cmp
 
+        s1_uop = self.uops[0]
         s1_alu_out = Signal.like(alu.out)
+        s1_is_fixp = Signal()
         s1_mask_keep = Signal.like(mask_gen.mask_keep)
         s1_mask_off_data = Signal.like(mask_gen.mask_off)
         m.d.sync += [
             s1_alu_out.eq(alu.out),
+            s1_is_fixp.eq(is_fixp),
             s1_mask_keep.eq(mask_gen.mask_keep),
             s1_mask_off_data.eq(mask_gen.mask_off),
         ]
@@ -678,20 +682,58 @@ class VALULane(PipelinedLaneFunctionalUnit):
                     Cat(s1_narrow_out[:self.data_width // 2], alu.narrow_out),
                     alu.narrow_out))
 
-        s1_alu_out_masked = (Mux(self.uops[0].narrow, s1_narrow_out,
-                                 s1_alu_out) & s1_mask_keep) | s1_mask_off_data
+        s1_alu_out_masked = (Mux(s1_uop.narrow, s1_narrow_out, s1_alu_out)
+                             & s1_mask_keep) | s1_mask_off_data
+        s1_int_out = Mux(
+            s1_uop.dst_rtype != RegisterType.VEC, s1_alu_out,
+            Mux(s1_uop.narrow_to_1, Cat(s1_cmp_out), s1_alu_out_masked))
+
+        s1_adder_out = Signal.like(alu.adder_out)
+        s1_adder_cout = Signal.like(alu.adder_cout)
+        s1_alu_in1h = Signal.like(alu.in1h)
+        s1_alu_in2h = Signal.like(alu.in2h)
+        m.d.sync += [
+            s1_adder_out.eq(alu.adder_out),
+            s1_adder_cout.eq(alu.adder_cout),
+            s1_alu_in1h.eq(alu.in1h),
+            s1_alu_in2h.eq(alu.in2h),
+        ]
+
+        fixp = m.submodules.fixp = VFixPointALU(self.data_width)
+        m.d.comb += [
+            fixp.fn.eq(s1_uop.alu_fn),
+            fixp.sew.eq(s1_uop.vsew),
+            fixp.vxrm.eq(s1_uop.vxrm),
+            fixp.alu_out.eq(s1_adder_out),
+            fixp.alu_cout.eq(s1_adder_cout),
+            fixp.in1h.eq(s1_alu_in1h),
+            fixp.in2h.eq(s1_alu_in2h),
+        ]
+
+        s2_int_out = Signal(self.data_width)
+        s2_fixp_out = Signal(self.data_width)
+        s2_is_fixp = Signal()
+        s2_mask_keep = Signal.like(s1_mask_keep)
+        s2_mask_off_data = Signal.like(s1_mask_off_data)
+        m.d.sync += [
+            s2_int_out.eq(s1_int_out),
+            s2_fixp_out.eq(fixp.out),
+            s2_is_fixp.eq(s1_is_fixp),
+            s2_mask_keep.eq(s1_mask_keep),
+            s2_mask_off_data.eq(s1_mask_off_data),
+        ]
+
+        s2_fixp_out_masked = (s2_fixp_out & s2_mask_keep) | s2_mask_off_data
+
         m.d.comb += self.resp.bits.vd_data.eq(
-            Mux(
-                self.uops[0].dst_rtype != RegisterType.VEC, s1_alu_out,
-                Mux(self.uops[0].narrow_to_1, Cat(s1_cmp_out),
-                    s1_alu_out_masked)))
+            Mux(s2_is_fixp, s2_fixp_out_masked, s2_int_out))
 
         return m
 
 
 class VALUUnit(PerLaneFunctionalUnit):
 
-    def __init__(self, params, num_stages=1):
+    def __init__(self, params, num_stages=2):
         super().__init__(params)
 
         self.num_stages = num_stages

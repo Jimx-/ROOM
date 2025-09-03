@@ -13,6 +13,46 @@ from room.utils import Pipe, sign_extend
 from roomsoc.interconnect.stream import Decoupled
 
 
+class RoundAdder(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.din = Signal(width)
+        self.incr = Signal(width // 8)
+        self.is_nclip = Signal()
+        self.sew = Signal(2)
+
+        self.dout = Signal(width)
+        self.cout = Signal(width // 8)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        sew = Signal(2)
+        m.d.comb += sew.eq(Mux(self.is_nclip, self.sew + 1, self.sew))
+
+        cin = Signal(self.width // 8)
+        for w in range(self.width // 8):
+            if w == 0:
+                m.d.comb += cin[w].eq(self.incr[w])
+            elif w % 4 == 0:
+                m.d.comb += cin[w].eq(
+                    Mux((sew == 3), self.cout[w - 1], self.incr[w]))
+            elif w % 2 == 0:
+                m.d.comb += cin[w].eq(
+                    Mux((sew == 3) | (sew == 2), self.cout[w - 1],
+                        self.incr[w]))
+            else:
+                m.d.comb += cin[w].eq(
+                    Mux(~sew.any(), self.incr[w], self.cout[w - 1]))
+
+            s = self.din[w * 8:(w + 1) * 8] + cin[w]
+            m.d.comb += Cat(self.dout[w * 8:(w + 1) * 8], self.cout[w]).eq(s)
+
+        return m
+
+
 class VALU(Elaboratable):
 
     def __init__(self, width):
@@ -37,6 +77,12 @@ class VALU(Elaboratable):
         self.out = Signal(width)
         self.narrow_out = Signal(width // 2)
         self.cmp_out = Signal(width // 8)
+
+        # To fix-point
+        self.adder_out = Signal(width)
+        self.adder_cout = Signal(width // 8)
+        self.in1h = Signal(width // 8)
+        self.in2h = Signal(width // 8)
 
     def elaborate(self, platform):
         m = Module()
@@ -130,6 +176,16 @@ class VALU(Elaboratable):
             s = Cat(cin[w], in1_inv[w * 8:(w + 1) * 8], Const(0, 1)) + Cat(
                 cin[w], in2_inv[w * 8:(w + 1) * 8], Const(0, 1))
             m.d.comb += Cat(adder_out[w * 8:(w + 1) * 8], cout[w]).eq(s[1:])
+
+        m.d.comb += [
+            self.adder_out.eq(adder_out),
+            self.adder_cout.eq(cout),
+        ]
+        for i in range(lane_bytes):
+            m.d.comb += [
+                self.in1h[i].eq(self.in1[i * 8 + 7]),
+                self.in2h[i].eq(self.in2[i * 8 + 7]),
+            ]
 
         #
         # VMSEQ, VMSNE, VMSLT, VMSLTU, VMSLE, VMSLEU, VMSGT, VMSGTU
@@ -327,7 +383,8 @@ class VALU(Elaboratable):
         merge_out = Mux(self.vm, self.in1, merge_result)
 
         with m.Switch(self.fn):
-            with m.Case(VALUOperator.VADD, VALUOperator.VSUB,
+            with m.Case(VALUOperator.VADDU, VALUOperator.VADD,
+                        VALUOperator.VSUB, VALUOperator.VSUBU,
                         VALUOperator.VRSUB, VALUOperator.VADC,
                         VALUOperator.VSBC):
                 m.d.comb += self.out.eq(adder_out)
@@ -367,6 +424,75 @@ class VALU(Elaboratable):
                 m.d.comb += self.cmp_out[i].eq(Mux(self.ma, 1, self.in3[i]))
             with m.Else():
                 m.d.comb += self.cmp_out[i].eq(cmp_out_adjust[i])
+
+        return m
+
+
+class VFixPointALU(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.fn = Signal(VALUOperator)
+        self.sew = Signal(2)
+        self.vxrm = Signal(VXRoundingMode)
+        self.alu_out = Signal(width)
+        self.alu_cout = Signal(width // 8)
+        self.in1h = Signal(width // 8)
+        self.in2h = Signal(width // 8)
+
+        self.out = Signal(width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        is_sub = VALUOperator.is_sub(self.fn)
+        is_sat_add = (self.fn == VALUOperator.VSADDU) | (
+            self.fn == VALUOperator.VSADD
+        ) | (self.fn == VALUOperator.VSSUBU) | (self.fn == VALUOperator.VSSUB)
+        signed = self.fn[0]
+
+        sat = Signal(self.width // 8)
+        for i in range(self.width // 8):
+            with m.If(signed):
+                m.d.comb += sat[i].eq((is_sub ^ (self.in1h[i] ^ self.in2h[i]))
+                                      & (self.in2h[i]
+                                         ^ self.alu_out[i * 8 + 7]))
+            with m.Else():
+                m.d.comb += sat[i].eq(self.alu_cout[i] ^ is_sub)
+
+        sat_bytes = Signal(self.width // 8)
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << w
+                    for i in range(len(sat_bytes) // n):
+                        m.d.comb += sat_bytes[i * n:(i + 1) * n].eq(
+                            sat[(i + 1) * n - 1].replicate(n))
+
+        sat_result = Signal(self.width)
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << w
+                    for i in range(self.width // 8):
+                        overflow = self.alu_cout[(i // n + 1) * n - 1]
+                        underflow = self.in2h[(i // n + 1) * n - 1]
+                        is_msb = (i & (n - 1)) == (n - 1)
+                        with m.If(sat_bytes[i]):
+                            with m.If(signed):
+                                m.d.comb += sat_result[i * 8:(i + 1) * 8].eq(
+                                    Mux(underflow, Cat(Const(0, 7), is_msb),
+                                        Cat(Const(~0, 7), not is_msb)))
+                            with m.Else():
+                                m.d.comb += sat_result[i * 8:(i + 1) * 8].eq(
+                                    overflow.replicate(8))
+
+                        with m.Else():
+                            m.d.comb += sat_result[i * 8:(i + 1) * 8].eq(
+                                self.alu_out[i * 8:(i + 1) * 8])
+
+        m.d.comb += self.out.eq(Mux(is_sat_add, sat_result, 0))
 
         return m
 
@@ -767,31 +893,16 @@ class VMultiplier(Elaboratable):
                                               n - 1)),
                         ]
 
-        rnd_data = Mux(s2_is_sub, ~mul_out, wal_out_rnd)
-        rnd_inc = Mux(s2_is_sub, Const(~0, lane_bytes), wal_rnd_inc)
-        rnd_cin = Signal(lane_bytes)
-        rnd_cout = Signal(lane_bytes)
-        rnd_adder_out = Signal(self.width)
-        for w in range(lane_bytes):
-            if w == 0:
-                m.d.comb += rnd_cin[w].eq(rnd_inc[w])
-            elif w % 4 == 0:
-                m.d.comb += rnd_cin[w].eq(
-                    Mux((s2_sew == 3), rnd_cout[w - 1], rnd_inc[w]))
-            elif w % 2 == 0:
-                m.d.comb += rnd_cin[w].eq(
-                    Mux((s2_sew == 3) | (s2_sew == 2), rnd_cout[w - 1],
-                        rnd_inc[w]))
-            else:
-                m.d.comb += rnd_cin[w].eq(
-                    Mux(~s2_sew.any(), rnd_inc[w], rnd_cout[w - 1]))
-
-            s = rnd_data[w * 8:(w + 1) * 8] + rnd_cin[w]
-            m.d.comb += Cat(rnd_adder_out[w * 8:(w + 1) * 8],
-                            rnd_cout[w]).eq(s)
+        rnd_adder = m.submodules.rnd_adder = RoundAdder(self.width)
+        m.d.comb += [
+            rnd_adder.din.eq(Mux(s2_is_sub, ~mul_out, wal_out_rnd)),
+            rnd_adder.incr.eq(
+                Mux(s2_is_sub, Const(~0, lane_bytes), wal_rnd_inc)),
+            rnd_adder.sew.eq(s2_sew),
+        ]
 
         fixp_out = Signal(self.width)
-        m.d.comb += fixp_out.eq(rnd_adder_out)
+        m.d.comb += fixp_out.eq(rnd_adder.dout)
         with m.Switch(s2_sew):
             for w in range(4):
                 with m.Case(w):
@@ -805,7 +916,7 @@ class VMultiplier(Elaboratable):
         with m.If(s2_is_fixp):
             m.d.comb += out.eq(fixp_out)
         with m.Elif(s2_is_sub):
-            m.d.comb += out.eq(rnd_adder_out)
+            m.d.comb += out.eq(rnd_adder.dout)
         with m.Else():
             m.d.comb += out.eq(mul_out)
 
