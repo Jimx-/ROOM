@@ -452,6 +452,10 @@ class VFixPointALU(Elaboratable):
         ) | (self.fn == VALUOperator.VSSUBU) | (self.fn == VALUOperator.VSSUB)
         signed = self.fn[0]
 
+        #
+        # VSADD, VSSUB
+        #
+
         sat = Signal(self.width // 8)
         for i in range(self.width // 8):
             with m.If(signed):
@@ -492,7 +496,43 @@ class VFixPointALU(Elaboratable):
                             m.d.comb += sat_result[i * 8:(i + 1) * 8].eq(
                                 self.alu_out[i * 8:(i + 1) * 8])
 
-        m.d.comb += self.out.eq(Mux(is_sat_add, sat_result, 0))
+        #
+        # VAADD, VASUB
+        #
+
+        avg_high_bit = Signal(self.width // 8)
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << w
+                    for i in range(self.width // 8):
+                        if i % n == (n - 1):
+                            m.d.comb += avg_high_bit[i].eq(
+                                self.alu_cout[i] ^ is_sub
+                                ^ (signed & (self.in1h[i] ^ self.in2h[i])))
+                        else:
+                            m.d.comb += avg_high_bit[i].eq(
+                                self.alu_out[(i + 1) * 8])
+
+        avg_pre_round = Signal(self.width)
+        avg_round_inc = Signal(self.width // 8)
+        for i in range(self.width // 8):
+            m.d.comb += [
+                avg_pre_round[i * 8:(i + 1) * 8].eq(
+                    Cat(self.alu_out[i * 8 + 1:(i + 1) * 8], avg_high_bit[i])),
+                avg_round_inc[i].eq(
+                    get_round_inc(self.vxrm, self.alu_out[i * 8:(i + 1) * 8],
+                                  1)),
+            ]
+
+        rnd_adder = m.submodules.rnd_adder = RoundAdder(self.width)
+        m.d.comb += [
+            rnd_adder.din.eq(avg_pre_round),
+            rnd_adder.incr.eq(avg_round_inc),
+            rnd_adder.sew.eq(self.sew),
+        ]
+
+        m.d.comb += self.out.eq(Mux(is_sat_add, sat_result, rnd_adder.dout))
 
         return m
 

@@ -249,6 +249,14 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     uop.fu_type.eq(VFUType.REDUCE),
                                     UOPC(VOpCode.VREDMAX),
                                 ]
+                            with m.Case(0b001000):
+                                m.d.comb += UOPC(VOpCode.VAADDU)
+                            with m.Case(0b001001):
+                                m.d.comb += UOPC(VOpCode.VAADD)
+                            with m.Case(0b001010):
+                                m.d.comb += UOPC(VOpCode.VASUBU)
+                            with m.Case(0b001011):
+                                m.d.comb += UOPC(VOpCode.VASUB)
                             with m.Case(0b010000):  # VWXUNARY0
                                 m.d.comb += [
                                     uop.dst_rtype.eq(RegisterType.FIX),
