@@ -186,6 +186,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):
                                 m.d.comb += UOPC(VOpCode.VSRA)
+                            with m.Case(0b101010):
+                                m.d.comb += UOPC(VOpCode.VSSRL)
+                            with m.Case(0b101011):
+                                m.d.comb += UOPC(VOpCode.VSSRA)
                             with m.Case(0b101100):
                                 m.d.comb += [
                                     UOPC(VOpCode.VNSRL),
@@ -490,6 +494,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):
                                 m.d.comb += UOPC(VOpCode.VSRA)
+                            with m.Case(0b101010):
+                                m.d.comb += UOPC(VOpCode.VSSRL)
+                            with m.Case(0b101011):
+                                m.d.comb += UOPC(VOpCode.VSSRA)
                             with m.Case(0b101100):
                                 m.d.comb += [
                                     UOPC(VOpCode.VNSRL),
@@ -620,6 +628,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):
                                 m.d.comb += UOPC(VOpCode.VSRA)
+                            with m.Case(0b101010):
+                                m.d.comb += UOPC(VOpCode.VSSRL)
+                            with m.Case(0b101011):
+                                m.d.comb += UOPC(VOpCode.VSSRA)
                             with m.Case(0b101100):
                                 m.d.comb += [
                                     UOPC(VOpCode.VNSRL),

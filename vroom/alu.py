@@ -83,6 +83,9 @@ class VALU(Elaboratable):
         self.adder_cout = Signal(width // 8)
         self.in1h = Signal(width // 8)
         self.in2h = Signal(width // 8)
+        self.shift_out = Signal(width)
+        self.round_high = Signal(width // 8)
+        self.round_tail = Signal(width // 8)
 
     def elaborate(self, platform):
         m = Module()
@@ -229,15 +232,14 @@ class VALU(Elaboratable):
         # VSLL, VSRL, VSRA
         #
 
-        shift_r = (self.fn == VALUOperator.VSR) | (self.fn
-                                                   == VALUOperator.VSRA)
+        shift_l = self.fn == VALUOperator.VSL
         shin_r = self.in2
         shin_l = self.in2[::-1]
-        shin = Mux(shift_r, shin_r, shin_l)
+        shin = Mux(shift_l, shin_l, shin_r)
 
         in1_rev = Signal(self.width)
         m.d.comb += in1_rev.eq(self.in1)
-        with m.If(~shift_r):
+        with m.If(shift_l):
             with m.Switch(self.sew):
                 for w in range(4):
                     with m.Case(w):
@@ -261,19 +263,44 @@ class VALU(Elaboratable):
                         in1_rev[w * 8:(w + 1) * 8])
 
         shout_r = Signal(self.width)
+        m.d.comb += self.shift_out.eq(shout_r)
         with m.Switch(self.sew + self.narrow):
             for w in range(4):
                 with m.Case(w):
-                    n = 1 << (3 + w)
-                    for i in range(0, self.width, n):
+                    nb = 1 << w
+                    n = nb << 3
+                    for i in range(self.width // n):
                         if w == 3:
-                            shamt = Cat(shamts[i:i + (2 + w)],
-                                        Mux(self.vi, 0, shamts[i + (2 + w)]))
+                            shamt = Cat(
+                                shamts[i * n:i * n + (2 + w)],
+                                Mux(self.vi, 0, shamts[i * n + (2 + w)]))
                         else:
-                            shamt = shamts[i:i + (3 + w)]
-                        m.d.comb += shout_r[i:i + n].eq(
-                            Cat(shin[i:i + n], is_sub
-                                & shin[i + n - 1]).as_signed() >> shamt)
+                            shamt = shamts[i * n:i * n + (3 + w)]
+                        m.d.comb += shout_r[i * n:(i + 1) * n].eq(
+                            Cat(shin[i * n:(i + 1) * n], is_sub
+                                & shin[(i + 1) * n - 1]).as_signed() >> shamt)
+
+                        with m.Switch(shamt):
+                            with m.Case(0):
+                                pass
+                            with m.Case(1):
+                                m.d.comb += self.round_high[i * nb:(
+                                    i + 1) * nb].eq(shin[i * n].replicate(nb))
+                            for j in range(2, n):
+                                with m.Case(j):
+                                    m.d.comb += [
+                                        self.round_high[i * nb:(i + 1) * nb].
+                                        eq(shin[i * n + j - 1].replicate(nb)),
+                                        self.round_tail[i * nb:(
+                                            i + 1) * nb].eq(
+                                                (shin[i * n:i * n + j -
+                                                      1].any().replicate(nb))),
+                                    ]
+                            with m.Default():
+                                m.d.comb += self.round_tail[i * nb:(
+                                    i + 1) * nb].eq(
+                                        shin[i * n:(i + 1) *
+                                             n].any().replicate(nb))
 
         shout_l = shout_r[::-1]
         shout = Mux(
@@ -440,6 +467,9 @@ class VFixPointALU(Elaboratable):
         self.alu_cout = Signal(width // 8)
         self.in1h = Signal(width // 8)
         self.in2h = Signal(width // 8)
+        self.alu_shift_out = Signal(width)
+        self.round_high = Signal(width // 8)
+        self.round_tail = Signal(width // 8)
 
         self.out = Signal(width)
 
@@ -450,6 +480,9 @@ class VFixPointALU(Elaboratable):
         is_sat_add = (self.fn == VALUOperator.VSADDU) | (
             self.fn == VALUOperator.VSADD
         ) | (self.fn == VALUOperator.VSSUBU) | (self.fn == VALUOperator.VSSUB)
+        is_avg_add = (self.fn == VALUOperator.VAADDU) | (
+            self.fn == VALUOperator.VAADD
+        ) | (self.fn == VALUOperator.VASUBU) | (self.fn == VALUOperator.VASUB)
         signed = self.fn[0]
 
         #
@@ -525,10 +558,23 @@ class VFixPointALU(Elaboratable):
                                   1)),
             ]
 
+        #
+        # VSSRL, VSSRA
+        #
+
+        shift_pre_round = self.alu_shift_out
+        shift_round_inc = Signal(self.width // 8)
+        for i in range(self.width // 8):
+            m.d.comb += shift_round_inc[i].eq(
+                get_round_inc(
+                    self.vxrm,
+                    Cat(self.round_tail[i], self.round_high[i],
+                        self.alu_shift_out[i * 8]), 2))
+
         rnd_adder = m.submodules.rnd_adder = RoundAdder(self.width)
         m.d.comb += [
-            rnd_adder.din.eq(avg_pre_round),
-            rnd_adder.incr.eq(avg_round_inc),
+            rnd_adder.din.eq(Mux(is_avg_add, avg_pre_round, shift_pre_round)),
+            rnd_adder.incr.eq(Mux(is_avg_add, avg_round_inc, shift_round_inc)),
             rnd_adder.sew.eq(self.sew),
         ]
 

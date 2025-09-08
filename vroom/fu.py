@@ -692,11 +692,17 @@ class VALULane(PipelinedLaneFunctionalUnit):
         s1_adder_cout = Signal.like(alu.adder_cout)
         s1_alu_in1h = Signal.like(alu.in1h)
         s1_alu_in2h = Signal.like(alu.in2h)
+        s1_shift_out = Signal.like(alu.shift_out)
+        s1_round_high = Signal.like(alu.round_high)
+        s1_round_tail = Signal.like(alu.round_tail)
         m.d.sync += [
             s1_adder_out.eq(alu.adder_out),
             s1_adder_cout.eq(alu.adder_cout),
             s1_alu_in1h.eq(alu.in1h),
             s1_alu_in2h.eq(alu.in2h),
+            s1_shift_out.eq(alu.shift_out),
+            s1_round_high.eq(alu.round_high),
+            s1_round_tail.eq(alu.round_tail),
         ]
 
         fixp = m.submodules.fixp = VFixPointALU(self.data_width)
@@ -708,6 +714,9 @@ class VALULane(PipelinedLaneFunctionalUnit):
             fixp.alu_cout.eq(s1_adder_cout),
             fixp.in1h.eq(s1_alu_in1h),
             fixp.in2h.eq(s1_alu_in2h),
+            fixp.alu_shift_out.eq(s1_shift_out),
+            fixp.round_high.eq(s1_round_high),
+            fixp.round_tail.eq(s1_round_tail),
         ]
 
         s2_int_out = Signal(self.data_width)
