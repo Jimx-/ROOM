@@ -719,20 +719,29 @@ class VALULane(PipelinedLaneFunctionalUnit):
             fixp.round_tail.eq(s1_round_tail),
         ]
 
+        s2_uop = self.uops[1]
         s2_int_out = Signal(self.data_width)
         s2_fixp_out = Signal(self.data_width)
         s2_is_fixp = Signal()
         s2_mask_keep = Signal.like(s1_mask_keep)
         s2_mask_off_data = Signal.like(s1_mask_off_data)
+        s2_fixp_narrow_out = Signal(self.data_width)
         m.d.sync += [
             s2_int_out.eq(s1_int_out),
             s2_fixp_out.eq(fixp.out),
             s2_is_fixp.eq(s1_is_fixp),
             s2_mask_keep.eq(s1_mask_keep),
             s2_mask_off_data.eq(s1_mask_off_data),
+            s2_fixp_narrow_out.eq(
+                Mux(
+                    s1_uop.expd_idx[0],
+                    Cat(s2_fixp_narrow_out[:self.data_width // 2],
+                        fixp.narrow_out), fixp.narrow_out)),
         ]
 
-        s2_fixp_out_masked = (s2_fixp_out & s2_mask_keep) | s2_mask_off_data
+        s2_fixp_out_masked = (
+            Mux(s2_uop.narrow, s2_fixp_narrow_out, s2_fixp_out)
+            & s2_mask_keep) | s2_mask_off_data
 
         m.d.comb += self.resp.bits.vd_data.eq(
             Mux(s2_is_fixp, s2_fixp_out_masked, s2_int_out))

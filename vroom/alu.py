@@ -472,6 +472,8 @@ class VFixPointALU(Elaboratable):
         self.round_tail = Signal(width // 8)
 
         self.out = Signal(width)
+        self.narrow_out = Signal(width // 2)
+        self.vxsat = Signal(width // 8)
 
     def elaborate(self, platform):
         m = Module()
@@ -484,6 +486,8 @@ class VFixPointALU(Elaboratable):
             self.fn == VALUOperator.VAADD
         ) | (self.fn == VALUOperator.VASUBU) | (self.fn == VALUOperator.VASUB)
         signed = self.fn[0]
+        is_nclip = (self.fn == VALUOperator.VNCLIPU) | (self.fn
+                                                        == VALUOperator.VNCLIP)
 
         #
         # VSADD, VSSUB
@@ -576,9 +580,64 @@ class VFixPointALU(Elaboratable):
             rnd_adder.din.eq(Mux(is_avg_add, avg_pre_round, shift_pre_round)),
             rnd_adder.incr.eq(Mux(is_avg_add, avg_round_inc, shift_round_inc)),
             rnd_adder.sew.eq(self.sew),
+            rnd_adder.is_nclip.eq(is_nclip),
         ]
 
-        m.d.comb += self.out.eq(Mux(is_sat_add, sat_result, rnd_adder.dout))
+        #
+        # VNCLIPU, VNCLIP
+        #
+
+        all_1s_mask = Signal(self.width // 8)
+        all_0s_mask = Signal(self.width // 8)
+        for i in range(self.width // 8):
+            m.d.comb += [
+                all_1s_mask[i].eq(rnd_adder.din[i * 8:(i + 1) * 8].all()),
+                all_0s_mask[i].eq(~rnd_adder.din[i * 8:(i + 1) * 8].any()),
+            ]
+
+        nclip_sat = Signal(self.width // 16)
+        with m.Switch(self.sew):
+            for w in range(3):
+                with m.Case(w):
+                    nb = 1 << w
+                    n = nb << 3
+                    nw = n << 1
+
+                    for i in range(self.width // nw):
+                        data = rnd_adder.dout[i * nw:(i + 1) * nw]
+                        all_1s = all_1s_mask[i * nb + nb // 2:(i + 1) *
+                                             nb].all()
+                        all_0s = all_0s_mask[i * nb + nb // 2:(i + 1) *
+                                             nb].all()
+                        carry = rnd_adder.cout[i * nb + nb // 2 - 1]
+
+                        with m.If(signed):
+                            with m.If(all_0s & ~carry & ~data[n - 1] | all_1s
+                                      & (carry | ~carry & data[n - 1])):
+                                m.d.comb += self.narrow_out[i * n:(i + 1) *
+                                                            n].eq(data[:n])
+                            with m.Else():
+                                m.d.comb += [
+                                    self.narrow_out[i * n:(i + 1) * n].eq(
+                                        Cat(~data[n - 1].replicate(n - 1),
+                                            data[n - 1])),
+                                    nclip_sat[i * nb:(i + 1) * nb].eq(~0),
+                                ]
+                        with m.Else():
+                            with m.If(all_0s & ~carry):
+                                m.d.comb += self.narrow_out[i * n:(i + 1) *
+                                                            n].eq(data[:n])
+                            with m.Else():
+                                m.d.comb += [
+                                    self.narrow_out[i * n:(i + 1) * n].eq(~0),
+                                    nclip_sat[i * nb:(i + 1) * nb].eq(~0),
+                                ]
+
+        m.d.comb += [
+            self.out.eq(Mux(is_sat_add, sat_result, rnd_adder.dout)),
+            self.vxsat.eq(
+                Mux(is_sat_add, sat_bytes, Mux(is_nclip, nclip_sat, 0))),
+        ]
 
         return m
 

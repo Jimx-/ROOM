@@ -200,6 +200,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VNSRA),
                                     uop.narrow.eq(1),
                                 ]
+                            with m.Case(0b101110):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNCLIPU),
+                                    uop.narrow.eq(1),
+                                ]
+                            with m.Case(0b101111):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNCLIP),
+                                    uop.narrow.eq(1),
+                                ]
 
                     with m.Case(0b001):  # OPFVV
                         pass
@@ -508,6 +518,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VNSRA),
                                     uop.narrow.eq(1),
                                 ]
+                            with m.Case(0b101110):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNCLIPU),
+                                    uop.narrow.eq(1),
+                                ]
+                            with m.Case(0b101111):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNCLIP),
+                                    uop.narrow.eq(1),
+                                ]
 
                     with m.Case(0b100):  # OPIVX
                         m.d.comb += [
@@ -640,6 +660,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                             with m.Case(0b101101):
                                 m.d.comb += [
                                     UOPC(VOpCode.VNSRA),
+                                    uop.narrow.eq(1),
+                                ]
+                            with m.Case(0b101110):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNCLIPU),
+                                    uop.narrow.eq(1),
+                                ]
+                            with m.Case(0b101111):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VNCLIP),
                                     uop.narrow.eq(1),
                                 ]
 
