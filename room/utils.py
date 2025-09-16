@@ -30,6 +30,14 @@ def sign_extend(x, length):
     return Cat(x, x[-1].replicate(length - len(x)))
 
 
+def bit_extend(x, length, signed):
+    if len(x) == length:
+        return x
+
+    return Mux(signed, sign_extend(x, length), Cat(x,
+                                                   Const(0, length - len(x))))
+
+
 def generate_imm(ip, sel):
     sign = ip[-1]
     i20_30 = Mux(sel == ImmSel.U, ip[8:19], Repl(sign, 11))

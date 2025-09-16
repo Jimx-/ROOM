@@ -11,7 +11,7 @@ from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, Reducti
 from vroom.utils import TailGen
 
 from room.consts import RegisterType
-from room.utils import Decoupled, Pipe, sign_extend
+from room.utils import Decoupled, Pipe, sign_extend, bit_extend
 
 
 def get_byte_mask(m, mask_out, mask, dest_eew):
@@ -957,6 +957,7 @@ class VReductionUnit(PipelinedFunctionalUnit):
         s0_vl = self.req.bits.uop.vl
         s0_opc = self.req.bits.uop.opcode
         s0_uop_idx = self.req.bits.uop.expd_idx
+        s0_widen = self.req.bits.uop.widen
 
         s0_vmask_vl = s0_vmask & (Const(~0, self.vlen) >>
                                   (self.vlen - s0_vl).as_unsigned())
@@ -1002,6 +1003,20 @@ class VReductionUnit(PipelinedFunctionalUnit):
                             m.d.comb += vs2_masked_data[i * n:(i + 1) * n].eq(
                                 self.req.bits.vs2_data[i * n:(i + 1) * n])
 
+        vs2_masked_data_widen = Signal(self.vlen * 2)
+        m.d.comb += vs2_masked_data_widen.eq(vs2_masked_data)
+        with m.If(s0_widen):
+            with m.Switch(s0_vsew):
+                for w in range(3):
+                    with m.Case(w):
+                        n = 1 << (3 + w)
+                        for i in range(self.vlen // n):
+                            m.d.comb += vs2_masked_data_widen[i * 2 * n:(
+                                i + 1) * 2 * n].eq(
+                                    bit_extend(
+                                        vs2_masked_data[i * n:(i + 1) * n],
+                                        2 * n, s0_opc[0]))
+
         vs1_masked_data = Signal(self.elen)
         with m.Switch(s0_vsew):
             for w in range(4):
@@ -1012,12 +1027,12 @@ class VReductionUnit(PipelinedFunctionalUnit):
                             (s0_opc == VOpCode.VREDAND).replicate(self.elen -
                                                                   n)))
 
-        s1_vs2_data = Signal(self.vlen)
+        s1_vs2_data_widen = Signal.like(vs2_masked_data_widen)
         s1_vs1_data = Signal(self.elen)
         s1_old_vd = Signal(self.vlen)
         with m.If(self.req.fire):
             m.d.sync += [
-                s1_vs2_data.eq(vs2_masked_data),
+                s1_vs2_data_widen.eq(vs2_masked_data_widen),
                 s1_vs1_data.eq(vs1_masked_data),
                 s1_old_vd.eq(self.req.bits.vs3_data),
             ]
@@ -1032,9 +1047,17 @@ class VReductionUnit(PipelinedFunctionalUnit):
             m.d.comb += [
                 slice.valid.eq(self.valids[0]),
                 slice.opcode.eq(self.uops[0].opcode),
+                slice.widen.eq(self.uops[0].widen),
                 slice.sew.eq(self.uops[0].vsew),
-                slice.in_data.eq(s1_vs2_data[i * slice_width:(i + 1) *
-                                             slice_width]),
+                slice.in_data.eq(
+                    Mux(
+                        self.uops[0].widen,
+                        s1_vs2_data_widen[i * 2 * slice_width:(i + 1) * 2 *
+                                          slice_width],
+                        Cat(
+                            s1_vs2_data_widen[i * slice_width:(i + 1) *
+                                              slice_width],
+                            Const(0, slice_width)))),
                 slice_vd[i * slice_width:(i + 1) * slice_width].eq(
                     slice.resp_data),
             ]
@@ -1201,14 +1224,14 @@ class VReductionUnit(PipelinedFunctionalUnit):
                                 m.d.sync += vd_reg.eq(minmax[w])
 
                 with m.Default():
-                    with m.Switch(self.uops[1].vsew):
+                    with m.Switch(self.uops[1].vsew + self.uops[1].widen):
                         for w in range(4):
                             with m.Case(w):
                                 m.d.sync += vd_reg.eq(adder_out[w])
 
         vd_mask = Signal(self.vlen)
         vd_masked_data = Signal(self.vlen)
-        with m.Switch(self.uops[2].vsew):
+        with m.Switch(self.uops[2].vsew + self.uops[2].widen):
             for w in range(4):
                 with m.Case(w):
                     n = 1 << (3 + w)

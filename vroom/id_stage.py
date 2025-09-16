@@ -210,6 +210,18 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VNCLIP),
                                     uop.narrow.eq(1),
                                 ]
+                            with m.Case(0b110000):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VWREDSUMU),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110001):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VWREDSUM),
+                                    uop.widen.eq(1),
+                                ]
 
                     with m.Case(0b001):  # OPFVV
                         pass

@@ -1231,6 +1231,7 @@ class ReductionSlice(Elaboratable):
 
         self.valid = Signal()
         self.sew = Signal(2)
+        self.widen = Signal()
         self.opcode = Signal(VOpCode)
         self.in_data = Signal(width * 2)
 
@@ -1376,7 +1377,7 @@ class ReductionSlice(Elaboratable):
                                 m.d.sync += self.resp_data.eq(minmax[w])
 
                 with m.Default():
-                    with m.Switch(self.sew):
+                    with m.Switch(self.sew + self.widen):
                         for w in range(4):
                             with m.Case(w):
                                 m.d.sync += self.resp_data.eq(adder_out[w])
