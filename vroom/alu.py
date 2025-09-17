@@ -10,7 +10,7 @@ from room.consts import ALUOperator
 from room.alu import IntDiv
 from room.utils import Pipe, sign_extend
 
-from roomsoc.interconnect.stream import Decoupled
+from roomsoc.interconnect.stream import Decoupled, Valid
 
 
 class RoundAdder(Elaboratable):
@@ -1381,5 +1381,55 @@ class ReductionSlice(Elaboratable):
                         for w in range(4):
                             with m.Case(w):
                                 m.d.sync += self.resp_data.eq(adder_out[w])
+
+        return m
+
+
+class VMask(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.valid = Signal()
+        self.sew = Signal(2)
+        self.opcode = Signal(VOpCode)
+        self.in1 = Signal(width)
+        self.in2 = Signal(width)
+
+        self.resp_data = Valid(Signal, width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        vcpop = self.opcode == VOpCode.VCPOP
+
+        in1_inv = Mux((self.opcode == VOpCode.VMANDNOT) |
+                      (self.opcode == VOpCode.VMORNOT), ~self.in1, self.in1)
+        in1_xor_in2 = in1_inv ^ self.in2
+        in1_and_in2 = in1_inv & self.in2
+
+        logic = Mux(
+            (self.opcode == VOpCode.VMXOR) | (self.opcode == VOpCode.VMOR) |
+            (self.opcode == VOpCode.VMORNOT) |
+            (self.opcode == VOpCode.VMXNOR), in1_xor_in2, 0) | Mux(
+                (self.opcode == VOpCode.VMAND) |
+                (self.opcode == VOpCode.VMOR) |
+                (self.opcode == VOpCode.VMORNOT) |
+                (self.opcode == VOpCode.VMANDNOT), in1_and_in2, 0)
+
+        vd_reg = Signal(self.width)
+
+        with m.If(self.valid):
+            m.d.sync += vd_reg.eq(logic)
+
+        out_valid = Signal()
+        m.d.sync += out_valid.eq(0)
+        with m.If(self.valid & ~vcpop):
+            m.d.sync += out_valid.eq(1)
+
+        m.d.comb += [
+            self.resp_data.valid.eq(out_valid),
+            self.resp_data.bits.eq(vd_reg),
+        ]
 
         return m

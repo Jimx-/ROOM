@@ -382,7 +382,8 @@ class Instruction:
 
             mask_inst = {
                 'vmadc', 'vmsbc', 'vmseq', 'vmsne', 'vmslt', 'vmsltu', 'vmsle',
-                'vmsleu', 'vmsgt', 'vmsgtu'
+                'vmsleu', 'vmsgt', 'vmsgtu', 'vmand', 'vmnand', 'vmandn',
+                'vmxor', 'vmor', 'vmnor', 'vmorn', 'vmxnor'
             }
 
             if 'rd' in op.args:

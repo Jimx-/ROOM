@@ -7,7 +7,7 @@ import operator
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1
+from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1, VMask
 from vroom.utils import TailGen
 
 from room.consts import RegisterType
@@ -1244,5 +1244,41 @@ class VReductionUnit(PipelinedFunctionalUnit):
                                           | (s3_old_vd & ~vd_mask))
 
         m.d.comb += self.resp.bits.vd_data.eq(vd_masked_data)
+
+        return m
+
+
+class VMaskUnit(IterativeFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        m.d.comb += self.req.ready.eq(1)
+
+        vmask = m.submodules.vmask = VMask(self.vlen)
+        m.d.comb += [
+            vmask.valid.eq(self.req.valid),
+            vmask.sew.eq(self.req.bits.uop.vsew),
+            vmask.opcode.eq(self.req.bits.uop.opcode),
+            vmask.in1.eq(self.req.bits.vs1_data),
+            vmask.in2.eq(self.req.bits.vs2_data),
+        ]
+
+        vl_mask = Signal(self.vlen)
+        m.d.comb += vl_mask.eq((1 << self.resp.bits.uop.vl) - 1)
+
+        vd_out = Signal(self.vlen)
+        m.d.comb += vd_out.eq(vmask.resp_data.bits)
+        with m.If((self.resp.bits.uop.opcode >= VOpCode.VMANDNOT)
+                  & (self.resp.bits.uop.opcode <= VOpCode.VMXNOR)):
+            m.d.comb += vd_out.eq((vmask.resp_data.bits & vl_mask) | ~vl_mask)
+
+        m.d.comb += [
+            self.resp.valid.eq(vmask.resp_data.valid),
+            self.resp.bits.vd_data.eq(vd_out),
+        ]
 
         return m

@@ -2,7 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit
+from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit, VMaskUnit
 from vroom.perm import VPermutationUnit
 
 from room.utils import Decoupled, Valid
@@ -111,6 +111,10 @@ class ALUExecUnit(ExecUnit):
 
         iresp_units = []
 
+        #
+        # VALU
+        #
+
         alu = m.submodules.alu = VALUUnit(self.params, num_stages=2)
         iresp_units.append(alu)
         m.d.comb += [
@@ -119,13 +123,44 @@ class ALUExecUnit(ExecUnit):
                              & (self.req.bits.uop.fu_type == VFUType.ALU)),
         ]
 
+        #
+        # VMASK
+        #
+
+        vmask = m.submodules.vmask = VMaskUnit(self.params)
+        vmask_queue = m.submodules.vmask_queue = Queue(6, ExecResp,
+                                                       self.params)
+        vmask_busy = Signal()
+
+        vmask_resp_busy = 0
+        for iu in iresp_units:
+            vmask_resp_busy |= iu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(vmask.req),
+            vmask.req.valid.eq(self.req.valid
+                               & (self.req.bits.uop.fu_type == VFUType.MASK)
+                               & ~vmask_busy),
+            vmask.resp.connect(vmask_queue.enq),
+            vmask_queue.deq.ready.eq(~vmask_resp_busy),
+            vmask_busy.eq(vmask_queue.count.any()),
+        ]
+        iresp_units.append(vmask_queue)
+
+        #
+        # VMUL
+        #
+
         imul = m.submodules.imul = VMultiplierUnit(3, self.params)
         imul_queue = m.submodules.imul_queue = Queue(6, ExecResp, self.params)
         imul_busy = Signal()
 
         imul_resp_busy = 0
         for iu in iresp_units:
-            imul_resp_busy |= iu.resp.valid
+            if isinstance(iu, Queue):
+                imul_resp_busy |= iu.deq.valid
+            else:
+                imul_resp_busy |= iu.resp.valid
 
         m.d.comb += [
             self.req.connect(imul.req),
@@ -137,6 +172,10 @@ class ALUExecUnit(ExecUnit):
             imul_busy.eq(imul_queue.count.any()),
         ]
         iresp_units.append(imul_queue)
+
+        #
+        # REDUCE
+        #
 
         iredu = m.submodules.iredu = VReductionUnit(self.params)
         iredu_queue = m.submodules.iredu_queue = Queue(6, ExecResp,
@@ -162,6 +201,10 @@ class ALUExecUnit(ExecUnit):
         ]
         iresp_units.append(iredu_queue)
 
+        #
+        # AGU
+        #
+
         agu = m.submodules.agu = AddrGenUnit(self.params)
 
         m.d.comb += [
@@ -171,6 +214,10 @@ class ALUExecUnit(ExecUnit):
             self.lsu_req.valid.eq(agu.resp.valid),
             self.lsu_req.bits.eq(agu.resp.bits),
         ]
+
+        #
+        # VDIV
+        #
 
         div = m.submodules.div = VDivUnit(self.params)
         div_busy = Signal()
@@ -190,6 +237,10 @@ class ALUExecUnit(ExecUnit):
             div_busy.eq(~div.req.ready),
         ]
         iresp_units.append(div)
+
+        #
+        # PERMUTE
+        #
 
         perm = m.submodules.perm = VPermutationUnit(self.params)
         perm_busy = Signal()
@@ -228,6 +279,8 @@ class ALUExecUnit(ExecUnit):
         m.d.comb += self.req.ready.eq(1)
         with m.If(self.req.bits.uop.fu_type == VFUType.MUL):
             m.d.comb += self.req.ready.eq(~imul_busy)
+        with m.If(self.req.bits.uop.fu_type == VFUType.MASK):
+            m.d.comb += self.req.ready.eq(~vmask_busy)
         with m.Elif((self.req.bits.uop.fu_type == VFUType.REDUCE)
                     & ~self.req.bits.uop.fp_valid):
             m.d.comb += self.req.ready.eq(~iredu_busy)

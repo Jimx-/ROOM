@@ -283,6 +283,7 @@ class VFUType(IntEnum):
     DIV = 8
     REDUCE = 16
     PERM = 32
+    MASK = 64
 
 
 class VXRoundingMode(IntEnum):

@@ -307,6 +307,46 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     uop.fu_type.eq(VFUType.PERM),
                                     UOPC(VOpCode.VCOMPRESS),
                                 ]
+                            with m.Case(0b011000):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    UOPC(VOpCode.VMANDNOT),
+                                ]
+                            with m.Case(0b011001):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    UOPC(VOpCode.VMAND),
+                                ]
+                            with m.Case(0b011010):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    UOPC(VOpCode.VMOR),
+                                ]
+                            with m.Case(0b011011):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    UOPC(VOpCode.VMXOR),
+                                ]
+                            with m.Case(0b011100):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    UOPC(VOpCode.VMORNOT),
+                                ]
+                            with m.Case(0b011101):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    UOPC(VOpCode.VMNAND),
+                                ]
+                            with m.Case(0b011110):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    UOPC(VOpCode.VMNOR),
+                                ]
+                            with m.Case(0b011111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    UOPC(VOpCode.VMXNOR),
+                                ]
                             with m.Case(0b100000):
                                 m.d.comb += [
                                     uop.fu_type.eq(VFUType.DIV),
@@ -934,10 +974,14 @@ class VOpExpander(HasVectorParams, Elaboratable):
         emul_vd = vlmul_to_lmul(
             self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag +
             (self.expd_uop.mem_size - self.expd_uop.vsew))
+        mask_single_vreg = self.expd_uop.fu_type_has(VFUType.MASK) & (
+            self.expd_uop.opcode != VOpCode.VIOTA) & (self.expd_uop.opcode
+                                                      != VOpCode.VID)
         with m.If(self.expd_uop.is_ld | self.expd_uop.is_st):
             m.d.comb += expd_count_start.eq(emul_vd - 1)
         with m.Elif((self.expd_uop.opcode == VOpCode.VMVSX)
-                    | (self.expd_uop.opcode == VOpCode.VMVXS)):
+                    | (self.expd_uop.opcode == VOpCode.VMVXS)
+                    | mask_single_vreg):
             m.d.comb += expd_count_start.eq(0)
         with m.Elif((self.expd_uop.widen
                      & ~self.expd_uop.fu_type_has(VFUType.REDUCE))
