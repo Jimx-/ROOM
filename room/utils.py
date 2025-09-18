@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth.utils import log2_int
 
 from room.consts import *
 
@@ -165,5 +166,42 @@ class PopCount(Elaboratable):
             return count
 
         m.d.comb += self.out.eq(subcount(self.inp))
+
+        return m
+
+
+class FindFirstSet(Elaboratable):
+
+    def __init__(self, n):
+        self.n = n
+
+        self.inp = Signal(n)
+        self.out = Signal(range(n + 1))
+
+    def elaborate(self, platform):
+        m = Module()
+
+        def first(x):
+            w = len(x)
+            log2w = log2_int(w)
+            result = Signal(log2w + 1)
+
+            if w == 1:
+                m.d.comb += result.eq(~x[0])
+            else:
+                lo = first(x[:len(x) // 2])
+                hi = first(x[len(x) // 2:])
+                with m.If(~lo[log2w - 1]):
+                    m.d.comb += result.eq(lo)
+                with m.Else():
+                    if w == 2:
+                        m.d.comb += result.eq(Cat(Const(1, 1), hi[0]))
+                    else:
+                        m.d.comb += result.eq(
+                            Cat(hi[:log2w - 1], Const(1, 1), hi[log2w - 1]))
+
+            return result
+
+        m.d.comb += self.out.eq(first(self.inp))
 
         return m

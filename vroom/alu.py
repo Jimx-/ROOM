@@ -8,7 +8,7 @@ from vroom.utils import get_round_inc
 
 from room.consts import ALUOperator
 from room.alu import IntDiv
-from room.utils import Pipe, sign_extend
+from room.utils import Pipe, sign_extend, FindFirstSet
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
@@ -1392,9 +1392,12 @@ class VMask(Elaboratable):
 
         self.valid = Signal()
         self.sew = Signal(2)
+        self.vm = Signal()
         self.opcode = Signal(VOpCode)
         self.in1 = Signal(width)
         self.in2 = Signal(width)
+        self.tail = Signal(width)
+        self.vmask = Signal(width)
 
         self.resp_data = Valid(Signal, width)
 
@@ -1402,6 +1405,16 @@ class VMask(Elaboratable):
         m = Module()
 
         vcpop = self.opcode == VOpCode.VCPOP
+
+        vs2_masked = Signal(self.width)
+        for i in range(self.width):
+            m.d.comb += vs2_masked[i].eq(self.in2[i]
+                                         & (self.vm | self.vmask[i])
+                                         & ~self.tail[i])
+
+        #
+        # Logical
+        #
 
         in1_inv = Mux((self.opcode == VOpCode.VMANDNOT) |
                       (self.opcode == VOpCode.VMORNOT), ~self.in1, self.in1)
@@ -1417,10 +1430,28 @@ class VMask(Elaboratable):
                 (self.opcode == VOpCode.VMORNOT) |
                 (self.opcode == VOpCode.VMANDNOT), in1_and_in2, 0)
 
+        #
+        # VFIRST
+        #
+
+        vfirst = Signal(self.width)
+        ffs = m.submodules.ffs = FindFirstSet(self.width)
+        m.d.comb += ffs.inp.eq(vs2_masked)
+
+        with m.If(~vs2_masked.any()):
+            m.d.comb += vfirst.eq(~0)
+        with m.Else():
+            m.d.comb += vfirst.eq(ffs.out)
+
         vd_reg = Signal(self.width)
 
         with m.If(self.valid):
-            m.d.sync += vd_reg.eq(logic)
+            with m.Switch(self.opcode):
+                with m.Case(VOpCode.VFIRST):
+                    m.d.sync += vd_reg.eq(vfirst)
+
+                with m.Default():
+                    m.d.sync += vd_reg.eq(logic)
 
         out_valid = Signal()
         m.d.sync += out_valid.eq(0)

@@ -292,6 +292,11 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 with m.Switch(uop.lrs1):
                                     with m.Case(0b00000):
                                         m.d.comb += UOPC(VOpCode.VMVXS)
+                                    with m.Case(0b10001):
+                                        m.d.comb += [
+                                            uop.fu_type.eq(VFUType.MASK),
+                                            UOPC(VOpCode.VFIRST),
+                                        ]
 
                             with m.Case(0b010010):  # VXUNARY0
                                 m.d.comb += uop.lrs1_rtype.eq(RegisterType.X)

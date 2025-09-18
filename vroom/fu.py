@@ -1258,23 +1258,34 @@ class VMaskUnit(IterativeFunctionalUnit):
 
         m.d.comb += self.req.ready.eq(1)
 
+        vl_mask = Signal(self.vlen)
+        vl_mask_reg = Signal.like(vl_mask)
+        tail_mask = Signal(self.vlen)
+        m.d.comb += [
+            vl_mask.eq((1 << self.req.bits.uop.vl) - 1),
+            tail_mask.eq(~vl_mask),
+        ]
+        with m.If(self.req.fire):
+            m.d.sync += vl_mask_reg.eq(vl_mask)
+
         vmask = m.submodules.vmask = VMask(self.vlen)
         m.d.comb += [
             vmask.valid.eq(self.req.valid),
             vmask.sew.eq(self.req.bits.uop.vsew),
+            vmask.vm.eq(self.req.bits.uop.vm),
             vmask.opcode.eq(self.req.bits.uop.opcode),
             vmask.in1.eq(self.req.bits.vs1_data),
             vmask.in2.eq(self.req.bits.vs2_data),
+            vmask.tail.eq(tail_mask),
+            vmask.vmask.eq(self.req.bits.mask),
         ]
-
-        vl_mask = Signal(self.vlen)
-        m.d.comb += vl_mask.eq((1 << self.resp.bits.uop.vl) - 1)
 
         vd_out = Signal(self.vlen)
         m.d.comb += vd_out.eq(vmask.resp_data.bits)
         with m.If((self.resp.bits.uop.opcode >= VOpCode.VMANDNOT)
                   & (self.resp.bits.uop.opcode <= VOpCode.VMXNOR)):
-            m.d.comb += vd_out.eq((vmask.resp_data.bits & vl_mask) | ~vl_mask)
+            m.d.comb += vd_out.eq((vmask.resp_data.bits & vl_mask_reg)
+                                  | ~vl_mask_reg)
 
         m.d.comb += [
             self.resp.valid.eq(vmask.resp_data.valid),
