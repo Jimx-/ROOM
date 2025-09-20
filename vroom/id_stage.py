@@ -307,6 +307,20 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     with m.Case(0b00011, 0b00101, 0b00111):
                                         m.d.comb += UOPC(VOpCode.VSEXT)
 
+                            with m.Case(0b010100):  # VMUNARY0
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.MASK),
+                                    uop.lrs1_rtype.eq(RegisterType.X),
+                                ]
+
+                                with m.Switch(uop.lrs1):
+                                    with m.Case(0b00001):
+                                        m.d.comb += UOPC(VOpCode.VMSBF)
+                                    with m.Case(0b00010):
+                                        m.d.comb += UOPC(VOpCode.VMSOF)
+                                    with m.Case(0b00011):
+                                        m.d.comb += UOPC(VOpCode.VMSIF)
+
                             with m.Case(0b010111):
                                 m.d.comb += [
                                     uop.fu_type.eq(VFUType.PERM),

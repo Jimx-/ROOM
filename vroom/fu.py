@@ -1272,6 +1272,7 @@ class VMaskUnit(IterativeFunctionalUnit):
         m.d.comb += [
             vmask.valid.eq(self.req.valid),
             vmask.sew.eq(self.req.bits.uop.vsew),
+            vmask.uop_idx.eq(self.req.bits.uop.expd_idx),
             vmask.vm.eq(self.req.bits.uop.vm),
             vmask.opcode.eq(self.req.bits.uop.opcode),
             vmask.in1.eq(self.req.bits.vs1_data),

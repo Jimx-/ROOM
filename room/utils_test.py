@@ -1,7 +1,7 @@
 from amaranth.sim import Settle
 import pytest
 
-from room.utils import PopCount, FindFirstSet
+from room.utils import PopCount, FindFirstSet, SetBeforeFirst
 from room.test import run_test
 
 
@@ -37,5 +37,21 @@ def test_ffs(n):
             yield Settle()
             out = yield dut.out
             assert out == ffs(x)
+
+    run_test(dut, proc)
+
+
+@pytest.mark.parametrize("n", [1, 2, 4, 8])
+def test_sbf(n):
+    dut = SetBeforeFirst(n)
+
+    def proc():
+        xs = range(1, 2**n)
+
+        for x in xs:
+            yield dut.inp.eq(x)
+            yield Settle()
+            out = yield dut.out
+            assert out == 2**ffs(x) - 1
 
     run_test(dut, proc)

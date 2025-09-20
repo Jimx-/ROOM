@@ -205,3 +205,35 @@ class FindFirstSet(Elaboratable):
         m.d.comb += self.out.eq(first(self.inp))
 
         return m
+
+
+class SetBeforeFirst(Elaboratable):
+
+    def __init__(self, n):
+        self.n = n
+
+        self.inp = Signal(n)
+        self.out = Signal(n)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        def sbf(x):
+            w = len(x)
+            result = Signal.like(x)
+
+            if w == 1:
+                m.d.comb += result.eq(~x[0])
+            else:
+                lo = sbf(x[:len(x) // 2])
+                hi = sbf(x[len(x) // 2:])
+                with m.If(lo[-1]):
+                    m.d.comb += result.eq(Cat(lo, hi))
+                with m.Else():
+                    m.d.comb += result.eq(lo)
+
+            return result
+
+        m.d.comb += self.out.eq(sbf(self.inp))
+
+        return m

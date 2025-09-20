@@ -8,7 +8,7 @@ from vroom.utils import get_round_inc
 
 from room.consts import ALUOperator
 from room.alu import IntDiv
-from room.utils import Pipe, sign_extend, FindFirstSet
+from room.utils import Pipe, sign_extend, FindFirstSet, SetBeforeFirst
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
@@ -1392,6 +1392,7 @@ class VMask(Elaboratable):
 
         self.valid = Signal()
         self.sew = Signal(2)
+        self.uop_idx = Signal(3)
         self.vm = Signal()
         self.opcode = Signal(VOpCode)
         self.in1 = Signal(width)
@@ -1443,12 +1444,33 @@ class VMask(Elaboratable):
         with m.Else():
             m.d.comb += vfirst.eq(ffs.out)
 
+        #
+        # VMSBF, VMSIF, VMSOF
+        #
+
+        vmsbf = Signal(self.width)
+        vmsif = Signal(self.width)
+        vmsof = Signal(self.width)
+        sbf = m.submodules.sbf = SetBeforeFirst(self.width)
+        m.d.comb += [
+            sbf.inp.eq(vs2_masked),
+            vmsbf.eq(sbf.out),
+            vmsif.eq(Cat(Const(1, 1), vmsbf[:-1])),
+            vmsof.eq(~vmsbf & vmsif),
+        ]
+
         vd_reg = Signal(self.width)
 
         with m.If(self.valid):
             with m.Switch(self.opcode):
                 with m.Case(VOpCode.VFIRST):
                     m.d.sync += vd_reg.eq(vfirst)
+                with m.Case(VOpCode.VMSBF):
+                    m.d.sync += vd_reg.eq(vmsbf)
+                with m.Case(VOpCode.VMSIF):
+                    m.d.sync += vd_reg.eq(vmsif)
+                with m.Case(VOpCode.VMSOF):
+                    m.d.sync += vd_reg.eq(vmsof)
 
                 with m.Default():
                     m.d.sync += vd_reg.eq(logic)
