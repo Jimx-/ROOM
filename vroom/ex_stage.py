@@ -143,7 +143,7 @@ class ALUExecUnit(ExecUnit):
                                & ~vmask_busy),
             vmask.resp.connect(vmask_queue.enq),
             vmask_queue.deq.ready.eq(~vmask_resp_busy),
-            vmask_busy.eq(vmask_queue.count.any()),
+            vmask_busy.eq(~vmask.req.ready | vmask_queue.count.any()),
         ]
         iresp_units.append(vmask_queue)
 

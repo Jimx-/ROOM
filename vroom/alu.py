@@ -8,7 +8,7 @@ from vroom.utils import get_round_inc
 
 from room.consts import ALUOperator
 from room.alu import IntDiv
-from room.utils import Pipe, sign_extend, FindFirstSet, SetBeforeFirst
+from room.utils import Pipe, sign_extend, PopCount, FindFirstSet, SetBeforeFirst
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
@@ -1393,6 +1393,7 @@ class VMask(Elaboratable):
         self.valid = Signal()
         self.sew = Signal(2)
         self.uop_idx = Signal(3)
+        self.cpop_done = Signal()
         self.vm = Signal()
         self.opcode = Signal(VOpCode)
         self.in1 = Signal(width)
@@ -1405,7 +1406,8 @@ class VMask(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        vcpop = self.opcode == VOpCode.VCPOP
+        is_vcpop = self.opcode == VOpCode.VCPOP
+        is_vid = self.opcode == VOpCode.VID
 
         vs2_masked = Signal(self.width)
         for i in range(self.width):
@@ -1459,6 +1461,59 @@ class VMask(Elaboratable):
             vmsof.eq(~vmsbf & vmsif),
         ]
 
+        #
+        # VCPOP, VIOTA, VID
+        #
+
+        vs2_masked_uop = Signal(self.width // 8)
+        vs2_masked_vid = Signal(self.width // 8)
+        m.d.comb += vs2_masked_vid.eq(Mux(is_vid, ~0, vs2_masked_uop))
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    stride = self.width // n
+
+                    with m.Switch(self.uop_idx):
+                        for i in range(8):
+                            with m.Case(i):
+                                m.d.comb += vs2_masked_uop.eq(
+                                    vs2_masked[i * stride:(i + 1) * stride])
+
+        one_count = Signal(self.width + 8)
+        one_count_acc = Signal(self.width + 8)
+        one_sum = Signal(range(self.width + 1))
+        for i in range(self.width // 8):
+            popcount = PopCount(i + 1)
+            m.submodules += popcount
+            m.d.comb += [
+                popcount.inp.eq(vs2_masked_vid[:i + 1]),
+                one_count[(i + 1) * 8:(i + 2) * 8].eq(popcount.out),
+            ]
+
+        for i in range(self.width // 8 + 1):
+            m.d.comb += one_count_acc[i * 8:(i + 1) * 8].eq(
+                Mux(self.uop_idx.any(), one_count[i * 8:(i + 1) * 8] + one_sum,
+                    one_count[i * 8:(i + 1) * 8]))
+
+        cur_count = Signal(range(self.width + 1))
+        with m.Switch(self.sew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    stride = self.width // n
+                    m.d.comb += cur_count.eq(one_count_acc[stride *
+                                                           8:(stride + 1) * 8])
+        m.d.sync += one_sum.eq(cur_count)
+
+        s1_sew = Signal.like(self.sew)
+        s1_opcode = Signal(VOpCode)
+        with m.If(self.valid):
+            m.d.sync += [
+                s1_sew.eq(self.sew),
+                s1_opcode.eq(self.opcode),
+            ]
+
         vd_reg = Signal(self.width)
 
         with m.If(self.valid):
@@ -1471,18 +1526,36 @@ class VMask(Elaboratable):
                     m.d.sync += vd_reg.eq(vmsif)
                 with m.Case(VOpCode.VMSOF):
                     m.d.sync += vd_reg.eq(vmsof)
+                with m.Case(VOpCode.VIOTA, VOpCode.VID):
+                    m.d.sync += vd_reg.eq(one_count_acc[:self.width])
+                with m.Case(VOpCode.VCPOP):
+                    m.d.sync += vd_reg.eq(cur_count)
 
                 with m.Default():
                     m.d.sync += vd_reg.eq(logic)
 
+        vd_out = Signal(self.width)
+        with m.Switch(s1_opcode):
+            with m.Case(VOpCode.VIOTA, VOpCode.VID):
+                with m.Switch(s1_sew):
+                    for w in range(4):
+                        with m.Case(w):
+                            n = 1 << (3 + w)
+                            for i in range(self.width // n):
+                                m.d.comb += vd_out[i * n:i * n + 8].eq(
+                                    vd_reg[i * 8:(i + 1) * 8])
+
+            with m.Default():
+                m.d.comb += vd_out.eq(vd_reg)
+
         out_valid = Signal()
         m.d.sync += out_valid.eq(0)
-        with m.If(self.valid & ~vcpop):
+        with m.If(self.valid & (~is_vcpop | self.cpop_done)):
             m.d.sync += out_valid.eq(1)
 
         m.d.comb += [
             self.resp_data.valid.eq(out_valid),
-            self.resp_data.bits.eq(vd_reg),
+            self.resp_data.bits.eq(vd_out),
         ]
 
         return m

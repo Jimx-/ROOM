@@ -8,7 +8,7 @@ import operator
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1, VMask
-from vroom.utils import TailGen
+from vroom.utils import TailGen, vlmul_to_lmul
 
 from room.consts import RegisterType
 from room.utils import Decoupled, Pipe, sign_extend, bit_extend
@@ -439,7 +439,7 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                     with m.Switch(self.req.bits.uop.dest_eew()):
                         for w in range(4):
                             with m.Case(w):
-                                n = 1 << w
+                                n = self.vlen_bytes // (1 << w)
                                 m.d.comb += mask.eq(
                                     self.req.bits.mask[i * n:(i + 1) * n])
 
@@ -1256,7 +1256,41 @@ class VMaskUnit(IterativeFunctionalUnit):
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
-        m.d.comb += self.req.ready.eq(1)
+        is_vcpop = self.req.bits.uop.opcode == VOpCode.VCPOP
+        cpop_busy = Signal()
+        m.d.comb += self.req.ready.eq(~cpop_busy)
+
+        lmul_reg = Signal(range(8))
+        cpop_uop_idx = Signal(range(8))
+        cpop_done = (self.req.fire & is_vcpop &
+                     (self.req.bits.uop.vlmul_sign
+                      | ~self.req.bits.uop.vlmul_mag.any())) | (
+                          cpop_busy & (cpop_uop_idx == lmul_reg))
+
+        with m.If(self.req.fire & is_vcpop & ~self.req.bits.uop.vlmul_sign
+                  & self.req.bits.uop.vlmul_mag.any()):
+            m.d.sync += [
+                cpop_busy.eq(1),
+                lmul_reg.eq(
+                    vlmul_to_lmul(self.req.bits.uop.vlmul_sign,
+                                  self.req.bits.uop.vlmul_mag) - 1),
+                cpop_uop_idx.eq(1),
+            ]
+        with m.Elif(cpop_done):
+            m.d.sync += cpop_busy.eq(0)
+
+        with m.If(cpop_busy):
+            m.d.sync += cpop_uop_idx.eq(cpop_uop_idx + 1)
+
+        vs2_reg = Signal(self.vlen)
+        old_vd_reg = Signal(self.vlen)
+        mask_reg = Signal(self.vlen)
+        with m.If(self.req.fire):
+            m.d.sync += [
+                vs2_reg.eq(self.req.bits.vs2_data),
+                old_vd_reg.eq(self.req.bits.vs3_data),
+                mask_reg.eq(self.req.bits.mask),
+            ]
 
         vl_mask = Signal(self.vlen)
         vl_mask_reg = Signal.like(vl_mask)
@@ -1268,25 +1302,80 @@ class VMaskUnit(IterativeFunctionalUnit):
         with m.If(self.req.fire):
             m.d.sync += vl_mask_reg.eq(vl_mask)
 
+        vid_mask = Signal(self.vlen_bytes)
+        with m.Switch(self.req.bits.uop.expd_idx):
+            for i in range(8):
+                with m.Case(i):
+                    with m.Switch(self.req.bits.uop.dest_eew()):
+                        for w in range(4):
+                            with m.Case(w):
+                                n = self.vlen_bytes // (1 << w)
+                                m.d.comb += vid_mask.eq(
+                                    self.req.bits.mask[i * n:(i + 1) * n])
+
+        vid_tail = Signal(self.vlen_bytes)
+        tail_gen = m.submodules.tail_gen = TailGen(self.params)
+        m.d.comb += [
+            tail_gen.vl.eq(self.req.bits.uop.vl),
+            tail_gen.uop_idx.eq(self.req.bits.uop.expd_idx),
+            tail_gen.eew.eq(self.req.bits.uop.dest_eew()),
+            tail_gen.narrow.eq(self.req.bits.uop.narrow),
+            vid_tail.eq(tail_gen.tail),
+        ]
+
+        vid_mask_reg = Signal.like(vid_mask)
+        vid_tail_reg = Signal.like(vid_tail)
+        m.d.sync += [
+            vid_mask_reg.eq(vid_mask),
+            vid_tail_reg.eq(vid_tail),
+        ]
+
         vmask = m.submodules.vmask = VMask(self.vlen)
         m.d.comb += [
-            vmask.valid.eq(self.req.valid),
-            vmask.sew.eq(self.req.bits.uop.vsew),
-            vmask.uop_idx.eq(self.req.bits.uop.expd_idx),
-            vmask.vm.eq(self.req.bits.uop.vm),
-            vmask.opcode.eq(self.req.bits.uop.opcode),
+            vmask.valid.eq(self.req.valid | cpop_busy),
+            vmask.sew.eq(
+                Mux(cpop_busy, self.resp.bits.uop.vsew,
+                    self.req.bits.uop.vsew)),
+            vmask.uop_idx.eq(
+                Mux(cpop_busy, cpop_uop_idx, self.req.bits.uop.expd_idx)),
+            vmask.cpop_done.eq(cpop_done),
+            vmask.vm.eq(
+                Mux(cpop_busy, self.resp.bits.uop.vm, self.req.bits.uop.vm)),
+            vmask.opcode.eq(
+                Mux(cpop_busy, self.resp.bits.uop.opcode,
+                    self.req.bits.uop.opcode)),
             vmask.in1.eq(self.req.bits.vs1_data),
-            vmask.in2.eq(self.req.bits.vs2_data),
+            vmask.in2.eq(Mux(cpop_busy, vs2_reg, self.req.bits.vs2_data)),
             vmask.tail.eq(tail_mask),
-            vmask.vmask.eq(self.req.bits.mask),
+            vmask.vmask.eq(Mux(cpop_busy, mask_reg, self.req.bits.mask)),
+        ]
+
+        vid_tail_mask = Signal(self.vlen)
+        vid_byte_mask = Signal(self.vlen)
+        get_byte_mask(m, vid_tail_mask, vid_tail_reg,
+                      self.resp.bits.uop.dest_eew())
+        get_byte_mask(m, vid_byte_mask, vid_mask_reg,
+                      self.resp.bits.uop.dest_eew())
+
+        mask_gen = m.submodules.mask_gen = MaskDataGen(self.vlen, self.params)
+        m.d.comb += [
+            mask_gen.mask.eq(vid_byte_mask),
+            mask_gen.tail.eq(vid_tail_mask),
+            mask_gen.old_vd.eq(old_vd_reg),
+            mask_gen.uop.eq(self.resp.bits.uop),
         ]
 
         vd_out = Signal(self.vlen)
-        m.d.comb += vd_out.eq(vmask.resp_data.bits)
         with m.If((self.resp.bits.uop.opcode >= VOpCode.VMANDNOT)
                   & (self.resp.bits.uop.opcode <= VOpCode.VMXNOR)):
             m.d.comb += vd_out.eq((vmask.resp_data.bits & vl_mask_reg)
                                   | ~vl_mask_reg)
+        with m.Elif((self.resp.bits.uop.opcode == VOpCode.VIOTA)
+                    | (self.resp.bits.uop.opcode == VOpCode.VID)):
+            m.d.comb += vd_out.eq((vmask.resp_data.bits & mask_gen.mask_keep)
+                                  | mask_gen.mask_off)
+        with m.Else():
+            m.d.comb += vd_out.eq(vmask.resp_data.bits)
 
         m.d.comb += [
             self.resp.valid.eq(vmask.resp_data.valid),

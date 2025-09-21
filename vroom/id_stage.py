@@ -292,6 +292,11 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 with m.Switch(uop.lrs1):
                                     with m.Case(0b00000):
                                         m.d.comb += UOPC(VOpCode.VMVXS)
+                                    with m.Case(0b10000):
+                                        m.d.comb += [
+                                            uop.fu_type.eq(VFUType.MASK),
+                                            UOPC(VOpCode.VCPOP),
+                                        ]
                                     with m.Case(0b10001):
                                         m.d.comb += [
                                             uop.fu_type.eq(VFUType.MASK),
@@ -320,6 +325,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                         m.d.comb += UOPC(VOpCode.VMSOF)
                                     with m.Case(0b00011):
                                         m.d.comb += UOPC(VOpCode.VMSIF)
+                                    with m.Case(0b10000):
+                                        m.d.comb += UOPC(VOpCode.VIOTA)
+                                    with m.Case(0b10001):
+                                        m.d.comb += UOPC(VOpCode.VID)
 
                             with m.Case(0b010111):
                                 m.d.comb += [
@@ -1017,6 +1026,8 @@ class VOpExpander(HasVectorParams, Elaboratable):
                                                        == VOpCode.VZEXT)
         is_redu = expd_uop.fu_type_has(VFUType.REDUCE)
         is_gather16 = expd_uop.opcode == VOpCode.VRGATHEREI16
+        is_vmunary0 = (expd_uop.opcode >= VOpCode.VMSBF) & (expd_uop.opcode
+                                                            <= VOpCode.VID)
 
         lrs1_incr = Signal(3)
         with m.If(is_ext | is_redu
@@ -1039,6 +1050,8 @@ class VOpExpander(HasVectorParams, Elaboratable):
             m.d.comb += lrs2_incr.eq(expd_idx >> 2)
         with m.Elif(is_ext & (expd_uop.lrs1[1:3] == 1)):
             m.d.comb += lrs2_incr.eq(expd_idx >> 3)
+        with m.Elif(is_vmunary0):
+            m.d.comb += lrs2_incr.eq(0)
         with m.Else():
             m.d.comb += lrs2_incr.eq(expd_idx)
 
