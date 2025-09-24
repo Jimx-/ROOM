@@ -4,7 +4,7 @@ from rich.text import Text
 import distinctipy
 import tinyrv
 import ctypes
-import re
+import struct
 
 NUM_PREGS = 96
 PREG_COLORS = [
@@ -397,14 +397,14 @@ class Instruction:
 
                 inst_text.append(vd_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=vd_narrow_to_1)}]'
+                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=vd_narrow_to_1, is_fp=op.name.startswith("vf"))}]'
                 )
 
             if 'vs2' in op.args:
                 inst_text.append(', ')
                 inst_text.append(vs2_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0)}]'
+                    f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0, is_fp=op.name.startswith("vf"))}]'
                 )
 
             if 'simm5' in op.args:
@@ -417,7 +417,9 @@ class Instruction:
             elif 'vs1' in op.args:
                 inst_text.append(', ')
                 inst_text.append(vs1_text)
-                inst_text.append(f'[={self.format_vs_data(self.vs1_data)}]')
+                inst_text.append(
+                    f'[={self.format_vs_data(self.vs1_data, is_fp=op.name.startswith("vf"))}]'
+                )
 
             if 'vm' in op.args and op.vm == 0 or op.name.endswith('m'):
                 inst_text.append(', v0.t')
@@ -544,7 +546,11 @@ class Instruction:
         table.add_row(uop_id, pc, inst_text, note_text)
         return (uop_id, pc, inst_text, note_text)
 
-    def format_vs_data(self, data, widen=False, narrow_to_1=False):
+    def format_vs_data(self,
+                       data,
+                       widen=False,
+                       narrow_to_1=False,
+                       is_fp=False):
         sew = self.sew
         if widen:
             sew *= 2
@@ -561,6 +567,15 @@ class Instruction:
 
         if narrow_to_1:
             return '0b' + f'{elems[0]:b}'.zfill(self.vl)
+
+        if is_fp:
+            typ = 'd' if self.sew == 64 else 'f'
+            fp_vals = [
+                str(
+                    struct.unpack(typ, x.to_bytes(self.sew // 8, 'little'))[0])
+                for x in elems[:self.vl]
+            ]
+            return ", ".join(fp_vals)
 
         return f'({", ".join(f"{x:x}" for x in elems[:self.vl])})'
 

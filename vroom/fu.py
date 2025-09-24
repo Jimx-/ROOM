@@ -8,9 +8,11 @@ import operator
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1, VMask
+from vroom.fpu import VFPUFMA
 from vroom.utils import TailGen, vlmul_to_lmul
 
 from room.consts import RegisterType
+from room.fpu import FPUOperator, FPFormat
 from room.utils import Decoupled, Pipe, sign_extend, bit_extend
 
 
@@ -1381,5 +1383,117 @@ class VMaskUnit(IterativeFunctionalUnit):
             self.resp.valid.eq(vmask.resp_data.valid),
             self.resp.bits.vd_data.eq(vd_out),
         ]
+
+        return m
+
+
+class VFPULane(PipelinedLaneFunctionalUnit):
+
+    def __init__(self, data_width, params, num_stages):
+        super().__init__(data_width, num_stages, params)
+
+        self.data_width = data_width
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        uop = self.req.bits.uop
+
+        fma_en = Signal()
+        cast_en = Signal()
+        cmp_en = Signal()
+
+        fma_op = Signal(FPUOperator)
+        fma_op_mod = Signal()
+
+        fmt_in = Signal(FPFormat)
+        fmt_out = Signal(FPFormat)
+        fmt_int = Signal(2)
+
+        swap32 = Signal()
+
+        with m.Switch(self.req.bits.uop.opcode):
+            with m.Case(VOpCode.VFADD):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.ADD),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    swap32.eq(1),
+                ]
+
+        def set_fu_input(inp):
+            m.d.comb += [
+                inp.bits.in1.eq(self.req.bits.opa_data),
+                inp.bits.in2.eq(self.req.bits.opb_data),
+                inp.bits.in3.eq(self.req.bits.old_vd),
+                inp.bits.fn.eq(fma_op),
+                inp.bits.fn_mod.eq(fma_op_mod),
+                inp.bits.src_fmt.eq(fmt_in),
+                inp.bits.dst_fmt.eq(fmt_out),
+                inp.bits.int_fmt.eq(fmt_int),
+            ]
+
+            with m.If(swap32):
+                m.d.comb += [
+                    inp.bits.in3.eq(self.req.bits.opb_data),
+                    inp.bits.in2.eq(self.req.bits.old_vd),
+                ]
+
+        fma = m.submodules.fma = VFPUFMA(self.data_width, self.num_stages)
+        set_fu_input(fma.inp)
+        m.d.comb += fma.inp.valid.eq(self.req.valid & fma_en)
+
+        pipe_in = Cat(self.req.bits.old_vd, self.req.bits.tail,
+                      self.req.bits.mask)
+        out_old_vd = Signal.like(self.req.bits.old_vd)
+        out_tail = Signal.like(self.req.bits.tail)
+        out_mask = Signal.like(self.req.bits.mask)
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(pipe_in),
+                                                depth=self.num_stages)
+        m.d.comb += [
+            out_pipe.in_valid.eq(self.req.valid),
+            out_pipe.in_data.eq(pipe_in),
+            Cat(out_old_vd, out_tail, out_mask).eq(out_pipe.out.bits),
+        ]
+
+        tail_mask = Signal(self.data_width)
+        byte_mask = Signal(self.data_width)
+        get_byte_mask(m, tail_mask, out_tail, self.resp.bits.uop.dest_eew())
+        get_byte_mask(m, byte_mask, out_mask, self.resp.bits.uop.dest_eew())
+
+        mask_gen = m.submodules.mask_gen = MaskDataGen(self.data_width,
+                                                       self.params)
+        m.d.comb += [
+            mask_gen.mask.eq(byte_mask),
+            mask_gen.tail.eq(tail_mask),
+            mask_gen.old_vd.eq(out_old_vd),
+            mask_gen.uop.eq(self.resp.bits.uop),
+        ]
+
+        m.d.comb += self.resp.bits.vd_data.eq((fma.out.bits.data
+                                               & mask_gen.mask_keep)
+                                              | mask_gen.mask_off)
+
+        return m
+
+
+class VFPUUnit(PerLaneFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.num_stages = params['fma_latency']
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        for w in range(self.n_lanes):
+            lane = VFPULane(self.lane_width, self.params, self.num_stages)
+            setattr(m.submodules, f'lane{w}', lane)
+            m.d.comb += [
+                self.lane_reqs[w].connect(lane.req),
+                lane.resp.connect(self.lane_resps[w]),
+            ]
 
         return m

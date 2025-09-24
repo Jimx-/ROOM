@@ -224,7 +224,17 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 ]
 
                     with m.Case(0b001):  # OPFVV
-                        pass
+                        m.d.comb += [
+                            uop.fu_type.eq(VFUType.FPU),
+                            uop.dst_rtype.eq(RegisterType.VEC),
+                            uop.lrs1_rtype.eq(RegisterType.VEC),
+                            uop.lrs2_rtype.eq(RegisterType.VEC),
+                            uop.fp_valid.eq(1),
+                        ]
+
+                        with m.Switch(uop.funct6):
+                            with m.Case(0b000000):
+                                m.d.comb += UOPC(VOpCode.VFADD)
 
                     with m.Case(0b010):  # OPMVV
                         m.d.comb += [

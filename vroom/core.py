@@ -7,7 +7,7 @@ from vroom.id_stage import VIDDebug, DecodeStage, VOpExpander
 from vroom.dispatch import Dispatcher
 from vroom.issue import Scoreboard
 from vroom.regfile import RegisterRead, RegisterFile
-from vroom.ex_stage import VExecDebug, ALUExecUnit
+from vroom.ex_stage import VExecDebug, ALUExecUnit, FPUExecUnit
 from vroom.lsu import LoadStoreUnit
 from vroom.fu import ExecReq as VExecReq, ExecResp as VExecResp
 
@@ -59,6 +59,8 @@ class VectorDebug(HasVectorParams):
 
         self.id_debug = Valid(VIDDebug, params)
         self.ex_debug = Valid(VExecDebug, params)
+        if self.use_fpu:
+            self.fp_ex_debug = Valid(VExecDebug, params)
         self.wb_debug = Valid(VWritebackDebug, params)
 
     def eq(self, rhs):
@@ -66,7 +68,7 @@ class VectorDebug(HasVectorParams):
             self.id_debug.eq(rhs.id_debug),
             self.ex_debug.eq(rhs.ex_debug),
             self.wb_debug.eq(rhs.wb_debug),
-        ]
+        ] + ([self.fp_ex_debug.eq(rhs.fp_ex_debug)] if self.use_fpu else [])
 
 
 class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
@@ -230,6 +232,8 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             self.params, sim_debug=self.sim_debug)
         m.d.comb += [
             vregread.exec_req.connect(exec_unit.req),
+            exec_unit.req.valid.eq(vregread.exec_req.valid
+                                   & ~vregread.exec_req.bits.uop.fp_valid),
             exec_unit.req.bits.rs1_data.eq(exec_rs1_data),
             exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
             exec_unit.req.bits.mask.eq(vregfile_v0),
@@ -238,8 +242,28 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         m.d.sync += exec_unit.perm_rd_port.data.eq(
             vregfile.read_ports[-1].data)
 
+        if self.use_fpu:
+            fp_exec_unit = m.submodules.fp_exec_unit = FPUExecUnit(
+                self.params, sim_debug=self.sim_debug)
+            m.d.comb += [
+                fp_exec_unit.req.valid.eq(
+                    vregread.exec_req.valid
+                    & vregread.exec_req.bits.uop.fp_valid),
+                fp_exec_unit.req.bits.eq(vregread.exec_req.bits),
+                fp_exec_unit.req.bits.rs1_data.eq(exec_rs1_data),
+                fp_exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
+                fp_exec_unit.req.bits.mask.eq(vregfile_v0),
+            ]
+
+            with m.If(vregread.exec_req.bits.uop.fp_valid):
+                m.d.comb += vregread.exec_req.ready.eq(fp_exec_unit.req.ready)
+
         if self.sim_debug:
             m.d.comb += self.vec_debug.ex_debug.eq(exec_unit.exec_debug)
+
+            if self.use_fpu:
+                m.d.comb += self.vec_debug.fp_ex_debug.eq(
+                    fp_exec_unit.exec_debug)
 
         #
         # Load/store unit
@@ -257,18 +281,22 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         # Writeback
         #
 
-        wb_arb = m.submodules.wb_arb = Arbiter(2, VExecResp, self.params)
+        wb_arb = m.submodules.wb_arb = Arbiter(2 + self.use_fpu, VExecResp,
+                                               self.params)
         wb_req = Valid(VExecResp, self.params)
         m.d.comb += [
-            wb_arb.inp[0].bits.eq(exec_unit.iresp.bits),
-            wb_arb.inp[0].valid.eq(exec_unit.iresp.valid),
-            lsu.exec_resp.connect(wb_arb.inp[1]),
+            wb_arb.inp[0].bits.eq(exec_unit.vresp.bits),
+            wb_arb.inp[0].valid.eq(exec_unit.vresp.valid),
+            lsu.exec_resp.connect(wb_arb.inp[1 + self.use_fpu]),
             wb_req.eq(wb_arb.out),
             wb_arb.out.ready.eq(1),
             if_stage.wb_req.valid.eq(wb_req.valid
                                      & wb_req.bits.uop.expd_end),
             if_stage.wb_req.bits.eq(wb_req.bits),
         ]
+
+        if self.use_fpu:
+            m.d.comb += fp_exec_unit.vresp.connect(wb_arb.inp[1])
 
         m.d.comb += [
             scoreboard.wakeup.valid.eq(

@@ -169,6 +169,9 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
                         uop.opa_sel.eq(VOpA.IMM),
                     ]
 
+        with m.If(inuop.fp_valid):
+            m.d.comb += uop.fp_single.eq(inuop.vsew == 2)
+
         return m
 
 

@@ -284,6 +284,10 @@ class VFUType(IntEnum):
     REDUCE = 16
     PERM = 32
     MASK = 64
+    FPU = 128
+    FDIV = 256
+    I2F = 512
+    F2I = 1024
 
 
 class VXRoundingMode(IntEnum):

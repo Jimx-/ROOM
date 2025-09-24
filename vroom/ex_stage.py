@@ -2,7 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit, VMaskUnit
+from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit, VMaskUnit, VFPUUnit
 from vroom.perm import VPermutationUnit
 
 from room.utils import Decoupled, Valid
@@ -35,37 +35,22 @@ class ExecUnit(HasVectorParams, Elaboratable):
 
     def __init__(self,
                  params,
-                 irf_write=False,
-                 frf_write=False,
-                 mem_irf_write=False,
-                 mem_frf_write=False,
+                 vrf_write=False,
                  has_alu=False,
                  has_mem=False,
                  has_perm=False,
                  sim_debug=False):
         super().__init__(params)
 
-        self.irf_write = irf_write
-        self.frf_write = frf_write
-        self.mem_irf_write = mem_irf_write
-        self.mem_frf_write = mem_frf_write
+        self.vrf_write = vrf_write
         self.has_alu = has_alu
         self.has_mem = has_mem
         self.sim_debug = sim_debug
 
         self.req = Decoupled(ExecReq, params)
 
-        if self.irf_write:
-            self.iresp = Valid(ExecResp, params)
-
-        if self.frf_write:
-            self.fresp = Decoupled(ExecResp, params)
-
-        if self.mem_irf_write:
-            self.mem_iresp = Decoupled(ExecResp, params)
-
-        if self.mem_frf_write:
-            self.mem_fresp = Decoupled(ExecResp, params)
+        if self.vrf_write:
+            self.vresp = Decoupled(ExecResp, params)
 
         if has_mem:
             self.lsu_req = Decoupled(ExecResp, params)
@@ -100,7 +85,7 @@ class ALUExecUnit(ExecUnit):
 
     def __init__(self, params, sim_debug=False):
         super().__init__(params,
-                         irf_write=True,
+                         vrf_write=True,
                          has_alu=True,
                          has_mem=True,
                          has_perm=True,
@@ -109,14 +94,14 @@ class ALUExecUnit(ExecUnit):
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
-        iresp_units = []
+        vresp_units = []
 
         #
         # VALU
         #
 
         alu = m.submodules.alu = VALUUnit(self.params, num_stages=2)
-        iresp_units.append(alu)
+        vresp_units.append(alu)
         m.d.comb += [
             self.req.connect(alu.req),
             alu.req.valid.eq(self.req.valid
@@ -133,7 +118,7 @@ class ALUExecUnit(ExecUnit):
         vmask_busy = Signal()
 
         vmask_resp_busy = 0
-        for iu in iresp_units:
+        for iu in vresp_units:
             vmask_resp_busy |= iu.resp.valid
 
         m.d.comb += [
@@ -145,7 +130,7 @@ class ALUExecUnit(ExecUnit):
             vmask_queue.deq.ready.eq(~vmask_resp_busy),
             vmask_busy.eq(~vmask.req.ready | vmask_queue.count.any()),
         ]
-        iresp_units.append(vmask_queue)
+        vresp_units.append(vmask_queue)
 
         #
         # VMUL
@@ -156,7 +141,7 @@ class ALUExecUnit(ExecUnit):
         imul_busy = Signal()
 
         imul_resp_busy = 0
-        for iu in iresp_units:
+        for iu in vresp_units:
             if isinstance(iu, Queue):
                 imul_resp_busy |= iu.deq.valid
             else:
@@ -171,7 +156,7 @@ class ALUExecUnit(ExecUnit):
             imul_queue.deq.ready.eq(~imul_resp_busy),
             imul_busy.eq(imul_queue.count.any()),
         ]
-        iresp_units.append(imul_queue)
+        vresp_units.append(imul_queue)
 
         #
         # REDUCE
@@ -183,7 +168,7 @@ class ALUExecUnit(ExecUnit):
         iredu_busy = Signal()
 
         iredu_resp_busy = 0
-        for iu in iresp_units:
+        for iu in vresp_units:
             if isinstance(iu, Queue):
                 iredu_resp_busy |= iu.deq.valid
             else:
@@ -199,7 +184,7 @@ class ALUExecUnit(ExecUnit):
             iredu_queue.deq.ready.eq(~iredu_resp_busy),
             iredu_busy.eq(iredu_queue.count.any()),
         ]
-        iresp_units.append(iredu_queue)
+        vresp_units.append(iredu_queue)
 
         #
         # AGU
@@ -223,7 +208,7 @@ class ALUExecUnit(ExecUnit):
         div_busy = Signal()
 
         div_resp_busy = 0
-        for iu in iresp_units:
+        for iu in vresp_units:
             if isinstance(iu, Queue):
                 div_resp_busy |= iu.deq.valid
             else:
@@ -236,7 +221,7 @@ class ALUExecUnit(ExecUnit):
             div.resp.ready.eq(~div_resp_busy),
             div_busy.eq(~div.req.ready),
         ]
-        iresp_units.append(div)
+        vresp_units.append(div)
 
         #
         # PERMUTE
@@ -246,7 +231,7 @@ class ALUExecUnit(ExecUnit):
         perm_busy = Signal()
 
         perm_resp_busy = 0
-        for iu in iresp_units:
+        for iu in vresp_units:
             if isinstance(iu, Queue):
                 perm_resp_busy |= iu.deq.valid
             else:
@@ -260,20 +245,20 @@ class ALUExecUnit(ExecUnit):
             perm.resp.ready.eq(~perm_resp_busy),
             perm_busy.eq(~perm.req.ready),
         ]
-        iresp_units.append(perm)
+        vresp_units.append(perm)
 
-        for iu in reversed(iresp_units):
+        for iu in reversed(vresp_units):
             if isinstance(iu, Queue):
                 with m.If(iu.deq.valid):
                     m.d.comb += [
-                        self.iresp.valid.eq(1),
-                        self.iresp.bits.eq(iu.deq.bits),
+                        self.vresp.valid.eq(1),
+                        self.vresp.bits.eq(iu.deq.bits),
                     ]
             else:
                 with m.If(iu.resp.valid):
                     m.d.comb += [
-                        self.iresp.valid.eq(1),
-                        self.iresp.bits.eq(iu.resp.bits),
+                        self.vresp.valid.eq(1),
+                        self.vresp.bits.eq(iu.resp.bits),
                     ]
 
         m.d.comb += self.req.ready.eq(1)
@@ -290,5 +275,57 @@ class ALUExecUnit(ExecUnit):
             m.d.comb += self.req.ready.eq(~perm_busy)
         with m.Elif(self.req.bits.uop.fu_type_has(VFUType.MEM)):
             m.d.comb += self.req.ready.eq(self.lsu_req.ready)
+
+        return m
+
+
+class FPUExecUnit(ExecUnit):
+
+    def __init__(self, params, sim_debug=False):
+        super().__init__(params, vrf_write=True, sim_debug=sim_debug)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        vresp_units = []
+
+        #
+        # FPU
+        #
+
+        fpu = m.submodules.fpu = VFPUUnit(self.params)
+        fpu_queue = m.submodules.fpu_queue = Queue(6, ExecResp, self.params)
+
+        fpu_busy = Signal()
+
+        m.d.comb += [
+            self.req.connect(fpu.req),
+            fpu.req.valid.eq(self.req.valid & self.req.ready
+                             & ((self.req.bits.uop.fu_type == VFUType.FPU)
+                                | (self.req.bits.uop.fu_type == VFUType.F2I))),
+            fpu.resp.connect(fpu_queue.enq),
+            fpu_queue.deq.ready.eq(self.vresp.ready),
+            fpu_busy.eq(fpu_queue.count.any()),
+        ]
+
+        vresp_units.append(fpu_queue)
+
+        for iu in reversed(vresp_units):
+            if isinstance(iu, Queue):
+                with m.If(iu.deq.valid):
+                    m.d.comb += [
+                        self.vresp.valid.eq(1),
+                        self.vresp.bits.eq(iu.deq.bits),
+                    ]
+            else:
+                with m.If(iu.resp.valid):
+                    m.d.comb += [
+                        self.vresp.valid.eq(1),
+                        self.vresp.bits.eq(iu.resp.bits),
+                    ]
+
+        with m.If((self.req.bits.uop.fu_type == VFUType.FPU)
+                  | (self.req.bits.uop.fu_type == VFUType.F2I)):
+            m.d.comb += self.req.ready.eq(~fpu_busy)
 
         return m
