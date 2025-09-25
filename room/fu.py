@@ -641,7 +641,7 @@ class FPUUnit(PipelinedFunctionalUnit):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
-                    fma_op.eq(1),
+                    fma_op_mod.eq(1),
                     fmt_in.eq(
                         Mux(self.req.bits.uop.fp_single, FPFormat.S,
                             FPFormat.D)),
@@ -666,7 +666,7 @@ class FPUUnit(PipelinedFunctionalUnit):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
-                    fma_op.eq(1),
+                    fma_op_mod.eq(1),
                     fmt_in.eq(
                         Mux(self.req.bits.uop.fp_single, FPFormat.S,
                             FPFormat.D)),

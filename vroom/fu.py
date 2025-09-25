@@ -1412,7 +1412,7 @@ class VFPULane(PipelinedLaneFunctionalUnit):
 
         swap32 = Signal()
 
-        with m.Switch(self.req.bits.uop.opcode):
+        with m.Switch(uop.opcode):
             with m.Case(VOpCode.VFADD):
                 m.d.comb += [
                     fma_en.eq(1),
@@ -1422,27 +1422,105 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     swap32.eq(1),
                 ]
 
-        def set_fu_input(inp):
-            m.d.comb += [
-                inp.bits.in1.eq(self.req.bits.opa_data),
-                inp.bits.in2.eq(self.req.bits.opb_data),
-                inp.bits.in3.eq(self.req.bits.old_vd),
-                inp.bits.fn.eq(fma_op),
-                inp.bits.fn_mod.eq(fma_op_mod),
-                inp.bits.src_fmt.eq(fmt_in),
-                inp.bits.dst_fmt.eq(fmt_out),
-                inp.bits.int_fmt.eq(fmt_int),
-            ]
-
-            with m.If(swap32):
+            with m.Case(VOpCode.VFMUL):
                 m.d.comb += [
-                    inp.bits.in3.eq(self.req.bits.opb_data),
-                    inp.bits.in2.eq(self.req.bits.old_vd),
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.MUL),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
-        fma = m.submodules.fma = VFPUFMA(self.data_width, self.num_stages)
+            with m.Case(VOpCode.VFMACC, VOpCode.VFMADD):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FMADD),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    swap32.eq(uop.opcode == VOpCode.VFMADD),
+                ]
+
+            with m.Case(VOpCode.VFMSAC, VOpCode.VFMSUB):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FMADD),
+                    fma_op_mod.eq(1),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    swap32.eq(uop.opcode == VOpCode.VFMSUB),
+                ]
+
+            with m.Case(VOpCode.VFNMSAC, VOpCode.VFNMSUB):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FNMSUB),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    swap32.eq(uop.opcode == VOpCode.VFNMSUB),
+                ]
+
+            with m.Case(VOpCode.VFNMACC, VOpCode.VFNMADD):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.FNMSUB),
+                    fma_op_mod.eq(1),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    swap32.eq(uop.opcode == VOpCode.VFNMADD),
+                ]
+
+        s1_valid = Signal()
+        s1_fma_en = Signal()
+        s1_cast_en = Signal()
+        s1_cmp_en = Signal()
+        s1_fma_op = Signal(FPUOperator)
+        s1_fma_op_mod = Signal()
+        s1_fmt_in = Signal(FPFormat)
+        s1_fmt_out = Signal(FPFormat)
+        s1_fmt_int = Signal(2)
+        s1_swap32 = Signal()
+        m.d.sync += [
+            s1_valid.eq(self.req.valid),
+            s1_fma_en.eq(fma_en),
+            s1_cast_en.eq(cast_en),
+            s1_cmp_en.eq(cmp_en),
+            s1_fma_op.eq(fma_op),
+            s1_fma_op_mod.eq(fma_op_mod),
+            s1_fmt_in.eq(fmt_in),
+            s1_fmt_out.eq(fmt_out),
+            s1_fmt_int.eq(fmt_int),
+            s1_swap32.eq(swap32),
+        ]
+
+        s1_vs1_data = Signal(self.data_width)
+        s1_vs2_data = Signal(self.data_width)
+        s1_vd_data = Signal(self.data_width)
+        m.d.sync += [
+            s1_vs1_data.eq(self.req.bits.opa_data),
+            s1_vs2_data.eq(self.req.bits.opb_data),
+            s1_vd_data.eq(self.req.bits.old_vd),
+        ]
+
+        def set_fu_input(inp):
+            m.d.comb += [
+                inp.bits.in1.eq(s1_vs1_data),
+                inp.bits.in2.eq(s1_vs2_data),
+                inp.bits.in3.eq(s1_vd_data),
+                inp.bits.fn.eq(s1_fma_op),
+                inp.bits.fn_mod.eq(s1_fma_op_mod),
+                inp.bits.src_fmt.eq(s1_fmt_in),
+                inp.bits.dst_fmt.eq(s1_fmt_out),
+                inp.bits.int_fmt.eq(s1_fmt_int),
+            ]
+
+            with m.If(s1_swap32):
+                m.d.comb += [
+                    inp.bits.in3.eq(s1_vs2_data),
+                    inp.bits.in2.eq(s1_vd_data),
+                ]
+
+        fma = m.submodules.fma = VFPUFMA(self.data_width, self.num_stages - 1)
         set_fu_input(fma.inp)
-        m.d.comb += fma.inp.valid.eq(self.req.valid & fma_en)
+        m.d.comb += fma.inp.valid.eq(s1_valid & s1_fma_en)
 
         pipe_in = Cat(self.req.bits.old_vd, self.req.bits.tail,
                       self.req.bits.mask)
@@ -1483,7 +1561,7 @@ class VFPUUnit(PerLaneFunctionalUnit):
     def __init__(self, params):
         super().__init__(params)
 
-        self.num_stages = params['fma_latency']
+        self.num_stages = params['fma_latency'] + 1
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
