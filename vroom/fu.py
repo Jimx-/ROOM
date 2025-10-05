@@ -1410,6 +1410,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         fmt_out = Signal(FPFormat)
         fmt_int = Signal(2)
 
+        neg_vs1 = Signal()
+        neg_vs2 = Signal()
         swap32 = Signal()
 
         with m.Switch(uop.opcode):
@@ -1420,6 +1422,16 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                     fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                     swap32.eq(1),
+                ]
+
+            with m.Case(VOpCode.VFSUB):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.ADD),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    swap32.eq(1),
+                    neg_vs1.eq(1),
                 ]
 
             with m.Case(VOpCode.VFMUL):
@@ -1468,6 +1480,28 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     swap32.eq(uop.opcode == VOpCode.VFNMADD),
                 ]
 
+        vs1_data = Signal(self.data_width)
+        vs2_data = Signal(self.data_width)
+        with m.Switch(uop.vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    for i in range(self.data_width // n):
+                        m.d.comb += [
+                            vs1_data[i * n:(i + 1) * n].eq(
+                                Cat(
+                                    self.req.bits.opa_data[i * n:(i + 1) * n -
+                                                           1],
+                                    self.req.bits.opa_data[(i + 1) * n - 1]
+                                    ^ neg_vs1)),
+                            vs2_data[i * n:(i + 1) * n].eq(
+                                Cat(
+                                    self.req.bits.opb_data[i * n:(i + 1) * n -
+                                                           1],
+                                    self.req.bits.opb_data[(i + 1) * n - 1]
+                                    ^ neg_vs2)),
+                        ]
+
         s1_valid = Signal()
         s1_fma_en = Signal()
         s1_cast_en = Signal()
@@ -1495,8 +1529,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         s1_vs2_data = Signal(self.data_width)
         s1_vd_data = Signal(self.data_width)
         m.d.sync += [
-            s1_vs1_data.eq(self.req.bits.opa_data),
-            s1_vs2_data.eq(self.req.bits.opb_data),
+            s1_vs1_data.eq(vs1_data),
+            s1_vs2_data.eq(vs2_data),
             s1_vd_data.eq(self.req.bits.old_vd),
         ]
 

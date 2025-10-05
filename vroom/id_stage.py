@@ -235,6 +235,8 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         with m.Switch(uop.funct6):
                             with m.Case(0b000000):
                                 m.d.comb += UOPC(VOpCode.VFADD)
+                            with m.Case(0b000010):
+                                m.d.comb += UOPC(VOpCode.VFSUB)
                             with m.Case(0b100100):
                                 m.d.comb += UOPC(VOpCode.VFMUL)
                             with m.Case(0b101000):
