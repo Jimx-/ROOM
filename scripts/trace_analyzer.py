@@ -397,7 +397,7 @@ class Instruction:
 
                 inst_text.append(vd_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw"), narrow_to_1=vd_narrow_to_1, is_fp=op.name.startswith("vf"))}]'
+                    f'[={self.format_vs_data(self.vd_data, widen=op.name.startswith("vw") or op.name.startswith("vfw"), narrow_to_1=vd_narrow_to_1, is_fp=op.name.startswith("vf"))}]'
                 )
 
             if 'vs2' in op.args:
@@ -569,10 +569,9 @@ class Instruction:
             return '0b' + f'{elems[0]:b}'.zfill(self.vl)
 
         if is_fp:
-            typ = 'd' if self.sew == 64 else 'f'
+            typ = 'd' if sew == 64 else 'f'
             fp_vals = [
-                str(
-                    struct.unpack(typ, x.to_bytes(self.sew // 8, 'little'))[0])
+                str(struct.unpack(typ, x.to_bytes(sew // 8, 'little'))[0])
                 for x in elems[:self.vl]
             ]
             return ", ".join(fp_vals)

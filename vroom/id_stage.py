@@ -255,6 +255,51 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFMSAC)
                             with m.Case(0b101111):
                                 m.d.comb += UOPC(VOpCode.VFNMSAC)
+                            with m.Case(0b110000):  # vfwadd
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFADD),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110010):  # vfwsub
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFSUB),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110100):  # vfwadd.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFADD),
+                                    uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b110110):  # vfwsub.w
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFSUB),
+                                    uop.widen2.eq(1),
+                                ]
+                            with m.Case(0b111000):  # vfwmul
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFMUL),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111100):  # vfwmacc
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFMACC),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111101):  # vfwnmacc
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFNMACC),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111110):  # vfwmsac
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFMSAC),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b111111):  # vfwnmsac
+                                m.d.comb += [
+                                    UOPC(VOpCode.VFNMSAC),
+                                    uop.widen.eq(1),
+                                ]
 
                     with m.Case(0b010):  # OPMVV
                         m.d.comb += [

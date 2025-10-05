@@ -12,7 +12,7 @@ from vroom.fpu import VFPUFMA
 from vroom.utils import TailGen, vlmul_to_lmul
 
 from room.consts import RegisterType
-from room.fpu import FPUOperator, FPFormat
+from room.fpu import FPUOperator, FPFormat, FPUCastMulti
 from room.utils import Decoupled, Pipe, sign_extend, bit_extend
 
 
@@ -1405,6 +1405,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
 
         fma_op = Signal(FPUOperator)
         fma_op_mod = Signal()
+        fma_fmt = Mux(uop.fp_single & ~(uop.widen | uop.widen2), FPFormat.S,
+                      FPFormat.D)
 
         fmt_in = Signal(FPFormat)
         fmt_out = Signal(FPFormat)
@@ -1419,8 +1421,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
-                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
-                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_in.eq(fma_fmt),
+                    fmt_out.eq(fma_fmt),
                     swap32.eq(1),
                 ]
 
@@ -1428,8 +1430,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
-                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
-                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_in.eq(fma_fmt),
+                    fmt_out.eq(fma_fmt),
                     swap32.eq(1),
                     neg_vs1.eq(1),
                 ]
@@ -1438,16 +1440,16 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.MUL),
-                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
-                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_in.eq(fma_fmt),
+                    fmt_out.eq(fma_fmt),
                 ]
 
             with m.Case(VOpCode.VFMACC, VOpCode.VFMADD):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
-                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
-                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_in.eq(fma_fmt),
+                    fmt_out.eq(fma_fmt),
                     swap32.eq(uop.opcode == VOpCode.VFMADD),
                 ]
 
@@ -1456,8 +1458,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
                     fma_op_mod.eq(1),
-                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
-                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_in.eq(fma_fmt),
+                    fmt_out.eq(fma_fmt),
                     swap32.eq(uop.opcode == VOpCode.VFMSUB),
                 ]
 
@@ -1465,8 +1467,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
-                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
-                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_in.eq(fma_fmt),
+                    fmt_out.eq(fma_fmt),
                     swap32.eq(uop.opcode == VOpCode.VFNMSUB),
                 ]
 
@@ -1475,32 +1477,70 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
                     fma_op_mod.eq(1),
-                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
-                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_in.eq(fma_fmt),
+                    fmt_out.eq(fma_fmt),
                     swap32.eq(uop.opcode == VOpCode.VFNMADD),
                 ]
 
-        vs1_data = Signal(self.data_width)
-        vs2_data = Signal(self.data_width)
+        vs1_data_inv = Signal(self.data_width)
+        vs2_data_inv = Signal(self.data_width)
         with m.Switch(uop.vsew):
             for w in range(4):
                 with m.Case(w):
                     n = 1 << (3 + w)
                     for i in range(self.data_width // n):
                         m.d.comb += [
-                            vs1_data[i * n:(i + 1) * n].eq(
+                            vs1_data_inv[i * n:(i + 1) * n].eq(
                                 Cat(
                                     self.req.bits.opa_data[i * n:(i + 1) * n -
                                                            1],
                                     self.req.bits.opa_data[(i + 1) * n - 1]
                                     ^ neg_vs1)),
-                            vs2_data[i * n:(i + 1) * n].eq(
+                            vs2_data_inv[i * n:(i + 1) * n].eq(
                                 Cat(
                                     self.req.bits.opb_data[i * n:(i + 1) * n -
                                                            1],
                                     self.req.bits.opb_data[(i + 1) * n - 1]
                                     ^ neg_vs2)),
                         ]
+
+        s1_vs1_data_widen = Signal(self.data_width)
+        s1_vs2_data_widen = Signal(self.data_width)
+        for i in range(self.data_width // 64):
+            fcvt_widen_vs1 = FPUCastMulti(latency=1)
+            fcvt_widen_vs2 = FPUCastMulti(latency=1)
+            m.submodules += fcvt_widen_vs1
+            m.submodules += fcvt_widen_vs2
+
+            with m.Switch(uop.expd_idx[0]):
+                for w in range(2):
+                    with m.Case(w):
+                        m.d.comb += [
+                            fcvt_widen_vs1.inp.valid.eq(uop.widen
+                                                        | uop.widen2),
+                            fcvt_widen_vs1.inp.bits.in1.eq(
+                                vs1_data_inv[w * (self.data_width // 2) +
+                                             i * 32:w *
+                                             (self.data_width // 2) +
+                                             (i + 1) * 32]),
+                            fcvt_widen_vs1.inp.bits.src_fmt.eq(FPFormat.S),
+                            fcvt_widen_vs1.inp.bits.dst_fmt.eq(FPFormat.D),
+                            fcvt_widen_vs2.inp.valid.eq(uop.widen),
+                            fcvt_widen_vs2.inp.bits.in1.eq(
+                                vs2_data_inv[w * (self.data_width // 2) +
+                                             i * 32:w *
+                                             (self.data_width // 2) +
+                                             (i + 1) * 32]),
+                            fcvt_widen_vs2.inp.bits.src_fmt.eq(FPFormat.S),
+                            fcvt_widen_vs2.inp.bits.dst_fmt.eq(FPFormat.D),
+                        ]
+
+            m.d.comb += [
+                s1_vs1_data_widen[i * 64:(i + 1) * 64].eq(
+                    fcvt_widen_vs1.out.bits),
+                s1_vs2_data_widen[i * 64:(i + 1) * 64].eq(
+                    fcvt_widen_vs2.out.bits),
+            ]
 
         s1_valid = Signal()
         s1_fma_en = Signal()
@@ -1512,6 +1552,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         s1_fmt_out = Signal(FPFormat)
         s1_fmt_int = Signal(2)
         s1_swap32 = Signal()
+        s1_widen = Signal()
+        s1_widen2 = Signal()
         m.d.sync += [
             s1_valid.eq(self.req.valid),
             s1_fma_en.eq(fma_en),
@@ -1523,16 +1565,22 @@ class VFPULane(PipelinedLaneFunctionalUnit):
             s1_fmt_out.eq(fmt_out),
             s1_fmt_int.eq(fmt_int),
             s1_swap32.eq(swap32),
+            s1_widen.eq(uop.widen),
+            s1_widen2.eq(uop.widen2),
         ]
 
-        s1_vs1_data = Signal(self.data_width)
-        s1_vs2_data = Signal(self.data_width)
+        s1_vs1_data_inv = Signal(self.data_width)
+        s1_vs2_data_inv = Signal(self.data_width)
         s1_vd_data = Signal(self.data_width)
         m.d.sync += [
-            s1_vs1_data.eq(vs1_data),
-            s1_vs2_data.eq(vs2_data),
+            s1_vs1_data_inv.eq(vs1_data_inv),
+            s1_vs2_data_inv.eq(vs2_data_inv),
             s1_vd_data.eq(self.req.bits.old_vd),
         ]
+
+        s1_vs1_data = Mux(s1_widen | s1_widen2, s1_vs1_data_widen,
+                          s1_vs1_data_inv)
+        s1_vs2_data = Mux(s1_widen, s1_vs2_data_widen, s1_vs2_data_inv)
 
         def set_fu_input(inp):
             m.d.comb += [

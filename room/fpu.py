@@ -805,6 +805,9 @@ class FPUDivSqrtMulti(Elaboratable):
 class FPUCastMulti(Elaboratable):
 
     def __init__(self, latency=3):
+        if latency < 1:
+            raise ValueError('Latency should be at least 1 cycle')
+
         self.width = 64
         self.ftyp = FType.FP64
         self.latency = latency
@@ -828,7 +831,8 @@ class FPUCastMulti(Elaboratable):
         s1_valid = Signal()
         s1_inp = FPUInput(self.width)
 
-        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp.bits))
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp.bits),
+                                                depth=int(self.latency > 2))
         m.d.comb += [
             inp_pipe.in_valid.eq(self.inp.valid),
             inp_pipe.in_data.eq(self.inp.bits),
@@ -945,8 +949,8 @@ class FPUCastMulti(Elaboratable):
                           s2_src_info, s2_dst_exp, s2_inp, s2_src_is_int,
                           s2_dst_is_int, s2_mant_is_zero)
 
-        s2_pipe = m.submodules.s2_pipe = Pipe(
-            width=len(s2_pipe_in), depth=1 if self.latency > 1 else 0)
+        s2_pipe = m.submodules.s2_pipe = Pipe(width=len(s2_pipe_in),
+                                              depth=int(self.latency > 1))
 
         m.d.comb += [
             s2_pipe.in_valid.eq(s1_valid),
@@ -1108,7 +1112,7 @@ class FPUCastMulti(Elaboratable):
         result = Mux(s2_dst_is_int, int_result, fp_result)
 
         out_pipe = m.submodules.out_pipe = Pipe(width=len(result),
-                                                depth=self.latency - 2)
+                                                depth=max(self.latency - 2, 1))
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
             out_pipe.in_data.eq(result),
