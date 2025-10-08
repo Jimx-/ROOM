@@ -1167,12 +1167,11 @@ class DecodeUnit(HasCoreParams, Elaboratable):
 
                         with m.Case(0b101):  # OPFVF
                             m.d.comb += [
-                                uop.iq_type.eq(IssueQueueType.VEC),
-                                uop.fu_type.eq(FUType.VEC),
+                                uop.iq_type.eq(IssueQueueType.FP),
+                                uop.fu_type.eq(FUType.F2IVEC),
                                 uop.dst_rtype.eq(RegisterType.VEC),
                                 uop.lrs1_rtype.eq(RegisterType.FLT),
                                 uop.lrs2_rtype.eq(RegisterType.VEC),
-                                IMM_SEL_V,
                             ]
 
                         with m.Case(0b110):  # OPMVX

@@ -1436,6 +1436,16 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     neg_vs1.eq(1),
                 ]
 
+            with m.Case(VOpCode.VFRSUB):
+                m.d.comb += [
+                    fma_en.eq(1),
+                    fma_op.eq(FPUOperator.ADD),
+                    fma_op_mod.eq(1),
+                    fmt_in.eq(fma_fmt),
+                    fmt_out.eq(fma_fmt),
+                    swap32.eq(1),
+                ]
+
             with m.Case(VOpCode.VFMUL):
                 m.d.comb += [
                     fma_en.eq(1),

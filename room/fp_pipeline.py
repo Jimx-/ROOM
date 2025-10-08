@@ -44,6 +44,9 @@ class FPPipeline(HasCoreParams, Elaboratable):
         self.to_int = Decoupled(ExecResp, self.xlen, params)
         self.to_lsu = Decoupled(ExecResp, self.xlen, params)
 
+        if self.use_vector:
+            self.to_vec = Decoupled(ExecResp, self.xlen, params)
+
         self.br_update = BranchUpdate(params)
 
         self.flush_pipeline = Signal()
@@ -227,16 +230,27 @@ class FPPipeline(HasCoreParams, Elaboratable):
 
         fpiu_unit = [eu for eu in exec_units if eu.has_fpiu][0]
         fpiu_is_stq = fpiu_unit.mem_iresp.bits.uop.opcode == UOpCode.STA
-        m.d.comb += [
-            self.to_int.bits.eq(fpiu_unit.mem_iresp.bits),
-            self.to_int.valid.eq(fpiu_unit.mem_iresp.valid
-                                 & fpiu_unit.mem_iresp.ready & ~fpiu_is_stq),
-            self.to_lsu.bits.eq(fpiu_unit.mem_iresp.bits),
-            self.to_lsu.valid.eq(fpiu_unit.mem_iresp.valid
-                                 & fpiu_unit.mem_iresp.ready & fpiu_is_stq),
-            fpiu_unit.mem_iresp.ready.eq(self.to_int.ready
-                                         & self.to_lsu.ready),
-        ]
+        fpiu_is_vec = fpiu_unit.mem_iresp.bits.uop.fu_type_has(FUType.VEC)
+        with m.If(~fpiu_is_vec):
+            m.d.comb += [
+                self.to_int.bits.eq(fpiu_unit.mem_iresp.bits),
+                self.to_int.valid.eq(fpiu_unit.mem_iresp.valid
+                                     & fpiu_unit.mem_iresp.ready
+                                     & ~fpiu_is_stq),
+                self.to_lsu.bits.eq(fpiu_unit.mem_iresp.bits),
+                self.to_lsu.valid.eq(fpiu_unit.mem_iresp.valid
+                                     & fpiu_unit.mem_iresp.ready
+                                     & fpiu_is_stq),
+                fpiu_unit.mem_iresp.ready.eq(self.to_int.ready
+                                             & self.to_lsu.ready),
+            ]
+        if self.use_vector:
+            with m.Else():
+                m.d.comb += [
+                    self.to_vec.bits.eq(fpiu_unit.mem_iresp.bits),
+                    self.to_vec.valid.eq(fpiu_unit.mem_iresp.valid),
+                    fpiu_unit.mem_iresp.ready.eq(self.to_vec.ready),
+                ]
 
         #
         # Commit

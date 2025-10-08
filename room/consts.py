@@ -308,6 +308,7 @@ class FUType(IntEnum):
     F2IMEM = F2I | MEM
     GPU = 1024
     VEC = 2048
+    F2IVEC = F2I | VEC
 
 
 class PCSel(IntEnum):

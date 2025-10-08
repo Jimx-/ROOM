@@ -126,6 +126,9 @@ class ExecUnit(HasCoreParams, Elaboratable):
             self.vec_mem_nack = Signal()
             self.vec_mem_resp = Valid(CoreMemResponse, params)
 
+            if self.use_fpu:
+                self.fp_req = Decoupled(ExecResp, self.data_width, params)
+
         if sim_debug:
             self.exec_debug = Valid(ExecDebug, params, name='ex_debug')
 
@@ -320,11 +323,25 @@ class ALUExecUnit(ExecUnit, AutoCSR):
         if self.has_vec:
             vec = m.submodules.vec = self._vec_unit
 
+            vec_req_arb = m.submodules.vec_req_arb = Arbiter(
+                1 + self.use_fpu, ExecReq, self.data_width, self.params)
             m.d.comb += [
-                self.req.connect(vec.req),
-                vec.req.valid.eq(self.req.valid
-                                 &
-                                 (self.req.bits.uop.fu_type_has(FUType.VEC))),
+                self.req.connect(vec_req_arb.inp[0]),
+                vec_req_arb.inp[0].valid.eq(
+                    self.req.valid
+                    & (self.req.bits.uop.fu_type_has(FUType.VEC))),
+            ]
+
+            if self.use_fpu:
+                m.d.comb += [
+                    vec_req_arb.inp[1].valid.eq(self.fp_req.valid),
+                    vec_req_arb.inp[1].bits.uop.eq(self.fp_req.bits.uop),
+                    vec_req_arb.inp[1].bits.rs1_data.eq(self.fp_req.bits.data),
+                    self.fp_req.ready.eq(vec_req_arb.inp[1].ready),
+                ]
+
+            m.d.comb += [
+                vec_req_arb.out.connect(vec.req),
                 vec.resp.ready.eq(1),
                 vec.mem_req.connect(self.vec_mem_req),
                 vec.mem_nack.eq(self.vec_mem_nack),
