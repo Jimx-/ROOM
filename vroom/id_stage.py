@@ -237,6 +237,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFADD)
                             with m.Case(0b000010):
                                 m.d.comb += UOPC(VOpCode.VFSUB)
+                            with m.Case(0b000100):
+                                m.d.comb += UOPC(VOpCode.VFMIN)
+                            with m.Case(0b000110):
+                                m.d.comb += UOPC(VOpCode.VFMAX)
                             with m.Case(0b100100):
                                 m.d.comb += UOPC(VOpCode.VFMUL)
                             with m.Case(0b101000):
@@ -842,6 +846,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFADD)
                             with m.Case(0b000010):
                                 m.d.comb += UOPC(VOpCode.VFSUB)
+                            with m.Case(0b000100):
+                                m.d.comb += UOPC(VOpCode.VFMIN)
+                            with m.Case(0b000110):
+                                m.d.comb += UOPC(VOpCode.VFMAX)
                             with m.Case(0b100100):
                                 m.d.comb += UOPC(VOpCode.VFMUL)
                             with m.Case(0b100111):
