@@ -241,6 +241,12 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFMIN)
                             with m.Case(0b000110):
                                 m.d.comb += UOPC(VOpCode.VFMAX)
+                            with m.Case(0b001000):
+                                m.d.comb += UOPC(VOpCode.VFSGNJ)
+                            with m.Case(0b001001):
+                                m.d.comb += UOPC(VOpCode.VFSGNJN)
+                            with m.Case(0b001010):
+                                m.d.comb += UOPC(VOpCode.VFSGNJX)
                             with m.Case(0b100100):
                                 m.d.comb += UOPC(VOpCode.VFMUL)
                             with m.Case(0b101000):
@@ -850,6 +856,12 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFMIN)
                             with m.Case(0b000110):
                                 m.d.comb += UOPC(VOpCode.VFMAX)
+                            with m.Case(0b001000):
+                                m.d.comb += UOPC(VOpCode.VFSGNJ)
+                            with m.Case(0b001001):
+                                m.d.comb += UOPC(VOpCode.VFSGNJN)
+                            with m.Case(0b001010):
+                                m.d.comb += UOPC(VOpCode.VFSGNJX)
                             with m.Case(0b100100):
                                 m.d.comb += UOPC(VOpCode.VFMUL)
                             with m.Case(0b100111):

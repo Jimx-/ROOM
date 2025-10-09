@@ -1494,6 +1494,19 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     swap32.eq(uop.opcode == VOpCode.VFNMADD),
                 ]
 
+            with m.Case(VOpCode.VFSGNJ, VOpCode.VFSGNJN, VOpCode.VFSGNJX):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.SGNJ),
+                    fp_rm.eq(
+                        Mux(
+                            uop.opcode == VOpCode.VFSGNJN, RoundingMode.RTZ,
+                            Mux(uop.opcode == VOpCode.VFSGNJX,
+                                RoundingMode.RDN, RoundingMode.RNE))),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                ]
+
             with m.Case(VOpCode.VFMIN, VOpCode.VFMAX):
                 m.d.comb += [
                     cmp_en.eq(1),
