@@ -1518,6 +1518,33 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
+            with m.Case(VOpCode.VMFEQ, VOpCode.VMFNE):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.CMP),
+                    fma_op_mod.eq(uop.opcode == VOpCode.VMFNE),
+                    fp_rm.eq(RoundingMode.RDN),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                ]
+
+            with m.Case(VOpCode.VMFLT, VOpCode.VMFGE):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.CMP),
+                    fma_op_mod.eq(uop.opcode == VOpCode.VMFLT),
+                    fp_rm.eq(RoundingMode.RNE),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                ]
+
+            with m.Case(VOpCode.VMFLE, VOpCode.VMFGT):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.CMP),
+                    fma_op_mod.eq(uop.opcode == VOpCode.VMFLE),
+                    fp_rm.eq(RoundingMode.RTZ),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                ]
+
         vs1_data_inv = Signal(self.data_width)
         vs2_data_inv = Signal(self.data_width)
         with m.Switch(uop.vsew):
@@ -1675,10 +1702,37 @@ class VFPULane(PipelinedLaneFunctionalUnit):
             mask_gen.uop.eq(self.resp.bits.uop),
         ]
 
-        m.d.comb += self.resp.bits.vd_data.eq((
-            Mux(fcmp.out.valid, fcmp.out.bits.data, fma.out.bits.data)
-            & mask_gen.mask_keep)
-                                              | mask_gen.mask_off)
+        cmp_out_masked = (fcmp.out.bits.data
+                          & mask_gen.mask_keep_cmp) | mask_gen.mask_off_cmp
+
+        cmp_out = [
+            Signal(self.data_width // 8, name=f'cmp_out{i}') for i in range(8)
+        ]
+        cmp_out_next = [
+            Signal(self.data_width // 8, name=f'cmp_out_next{i}')
+            for i in range(8)
+        ]
+        m.d.comb += Cat(cmp_out_next).eq(Cat(cmp_out))
+        with m.If(fcmp.out.valid):
+            with m.Switch(self.resp.bits.uop.expd_idx):
+                for i in range(1, 8):
+                    with m.Case(i):
+                        m.d.comb += cmp_out_next[i].eq(cmp_out_masked)
+
+                with m.Default():
+                    m.d.comb += [
+                        Cat(cmp_out_next).eq(~0),
+                        cmp_out_next[0].eq(cmp_out_masked),
+                    ]
+
+            m.d.sync += Cat(cmp_out).eq(Cat(cmp_out_next))
+
+        m.d.comb += self.resp.bits.vd_data.eq(
+            Mux(
+                self.resp.bits.uop.narrow_to_1, Cat(cmp_out_next),
+                Mux(fcmp.out.valid, fcmp.out.bits.data, fma.out.bits.data)
+                & mask_gen.mask_keep)
+            | mask_gen.mask_off)
 
         return m
 

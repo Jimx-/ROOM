@@ -383,7 +383,8 @@ class Instruction:
             mask_inst = {
                 'vmadc', 'vmsbc', 'vmseq', 'vmsne', 'vmslt', 'vmsltu', 'vmsle',
                 'vmsleu', 'vmsgt', 'vmsgtu', 'vmand', 'vmnand', 'vmandn',
-                'vmxor', 'vmor', 'vmnor', 'vmorn', 'vmxnor'
+                'vmxor', 'vmor', 'vmnor', 'vmorn', 'vmxnor', 'vmfeq', 'vmfne',
+                'vmflt', 'vmfle', 'vmfgt', 'vmfge'
             }
 
             if 'rd' in op.args:
@@ -404,7 +405,7 @@ class Instruction:
                 inst_text.append(', ')
                 inst_text.append(vs2_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0, is_fp=op.name.startswith("vf"))}]'
+                    f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0, is_fp=op.name.startswith("vf") or op.name.startswith("vmf"))}]'
                 )
 
             if 'simm5' in op.args:
@@ -418,7 +419,7 @@ class Instruction:
                 inst_text.append(', ')
                 inst_text.append(vs1_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vs1_data, is_fp=op.name.startswith("vf"))}]'
+                    f'[={self.format_vs_data(self.vs1_data, is_fp=op.name.startswith("vf") or op.name.startswith("vmf"))}]'
                 )
 
             if 'vm' in op.args and op.vm == 0 or op.name.endswith('m'):

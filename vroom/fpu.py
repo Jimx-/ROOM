@@ -1,6 +1,6 @@
 from amaranth import *
 
-from room.fpu import FPFormat, FPUInput, FPUResult, FPUFMA, FPUComp
+from room.fpu import FPFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp
 from room.utils import Pipe
 
 from roomsoc.interconnect.stream import Valid
@@ -152,5 +152,14 @@ class VFPUComp(Elaboratable):
                 m.d.comb += self.out.bits.data.eq(Cat(dcmp_res))
             with m.Case(FPFormat.S):
                 m.d.comb += self.out.bits.data.eq(Cat(scmp_res))
+
+        with m.If(in_pipe_out.fn == FPUOperator.CMP):
+            with m.Switch(in_pipe_out.src_fmt):
+                with m.Case(FPFormat.D):
+                    m.d.comb += self.out.bits.data.eq(
+                        Cat(x[0] for x in dcmp_res))
+                with m.Case(FPFormat.S):
+                    m.d.comb += self.out.bits.data.eq(
+                        Cat(x[0] for x in scmp_res))
 
         return m

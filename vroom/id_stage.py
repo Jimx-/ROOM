@@ -247,6 +247,26 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFSGNJN)
                             with m.Case(0b001010):
                                 m.d.comb += UOPC(VOpCode.VFSGNJX)
+                            with m.Case(0b011000):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFEQ),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011001):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFLE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011011):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFLT),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011100):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFNE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
                             with m.Case(0b100100):
                                 m.d.comb += UOPC(VOpCode.VFMUL)
                             with m.Case(0b101000):
@@ -862,6 +882,36 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFSGNJN)
                             with m.Case(0b001010):
                                 m.d.comb += UOPC(VOpCode.VFSGNJX)
+                            with m.Case(0b011000):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFEQ),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011001):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFLE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011011):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFLT),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011100):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFNE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011101):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFGT),
+                                    uop.narrow_to_1.eq(1),
+                                ]
+                            with m.Case(0b011111):
+                                m.d.comb += [
+                                    UOPC(VOpCode.VMFGE),
+                                    uop.narrow_to_1.eq(1),
+                                ]
                             with m.Case(0b100100):
                                 m.d.comb += UOPC(VOpCode.VFMUL)
                             with m.Case(0b100111):
