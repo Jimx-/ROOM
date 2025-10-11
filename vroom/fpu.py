@@ -1,9 +1,10 @@
 from amaranth import *
 
-from room.fpu import FPFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp
+from room.consts import RoundingMode
+from room.fpu import FPFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp, FPUDivSqrtMulti
 from room.utils import Pipe
 
-from roomsoc.interconnect.stream import Valid
+from roomsoc.interconnect.stream import Valid, Decoupled
 
 
 class VFPUFMA(Elaboratable):
@@ -161,5 +162,84 @@ class VFPUComp(Elaboratable):
                 with m.Case(FPFormat.S):
                     m.d.comb += self.out.bits.data.eq(
                         Cat(x[0] for x in scmp_res))
+
+        return m
+
+
+class VFPUDivSqrt(Elaboratable):
+
+    def __init__(self, width):
+        self.width = width
+
+        self.a = Signal(width)
+        self.b = Signal(width)
+        self.is_sqrt = Signal()
+        self.fmt = Signal(FPFormat)
+        self.rm = Signal(RoundingMode)
+        self.in_valid = Signal()
+        self.in_ready = Signal()
+
+        self.out = Decoupled(Signal, width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        fdiv_busy = Signal()
+        fmt = Signal(FPFormat)
+        m.d.comb += self.in_ready.eq(~fdiv_busy)
+        with m.If(self.in_valid & self.in_ready):
+            m.d.sync += [
+                fdiv_busy.eq(1),
+                fmt.eq(self.fmt),
+            ]
+        with m.Elif(self.out.fire):
+            m.d.sync += fdiv_busy.eq(0)
+
+        resp_valid = Signal(self.width // 32)
+        resp_data_s = Signal(self.width)
+        resp_data_d = Signal(self.width)
+        for i in range(self.width // 32):
+            fdiv = FPUDivSqrtMulti()
+            setattr(m.submodules, f'fdiv{i}', fdiv)
+
+            m.d.comb += [
+                fdiv.is_sqrt.eq(self.is_sqrt),
+                fdiv.fmt.eq(self.fmt),
+                fdiv.rm.eq(self.rm),
+                resp_valid[i].eq(fdiv.out.valid),
+                fdiv.out.ready.eq(~fdiv_busy | self.out.fire),
+            ]
+            if i & 1:
+                m.d.comb += [
+                    fdiv.a.eq(self.a[i * 32:(i + 1) * 32]),
+                    fdiv.b.eq(self.b[i * 32:(i + 1) * 32]),
+                    fdiv.in_valid.eq(self.in_valid & self.in_ready
+                                     & (self.fmt == FPFormat.S)),
+                    resp_data_s[i * 32:(i + 1) * 32].eq(fdiv.out.bits),
+                ]
+            else:
+                m.d.comb += [
+                    fdiv.a.eq(self.a[(i // 2) * 64:(i // 2 + 1) * 64]),
+                    fdiv.b.eq(self.b[(i // 2) * 64:(i // 2 + 1) * 64]),
+                    fdiv.in_valid.eq(self.in_valid & self.in_ready),
+                    resp_data_s[i * 32:(i + 1) * 32].eq(fdiv.out.bits),
+                    resp_data_d[(i // 2) * 64:(i // 2 + 1) * 64].eq(
+                        fdiv.out.bits),
+                ]
+
+        resp_mask = Signal(self.width // 32)
+        with m.Switch(fmt):
+            with m.Case(FPFormat.D):
+                m.d.comb += [
+                    self.out.bits.eq(resp_data_d),
+                    resp_mask.eq(Const(1, 2).replicate(self.width // 64)),
+                ]
+            with m.Case(FPFormat.S):
+                m.d.comb += [
+                    self.out.bits.eq(resp_data_s),
+                    resp_mask.eq(~0),
+                ]
+
+        m.d.comb += self.out.valid.eq((resp_valid & resp_mask) == resp_mask)
 
         return m

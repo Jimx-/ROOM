@@ -2,7 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit, VMaskUnit, VFPUUnit
+from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit, VMaskUnit, VFPUUnit, VFDivUnit
 from vroom.perm import VPermutationUnit
 
 from room.utils import Decoupled, Valid
@@ -310,6 +310,25 @@ class FPUExecUnit(ExecUnit):
 
         vresp_units.append(fpu_queue)
 
+        fdiv = m.submodules.fdiv = VFDivUnit(self.params)
+        fdiv_busy = Signal()
+        fdiv_resp_busy = 0
+        for fu in vresp_units:
+            if isinstance(fu, Queue):
+                fdiv_resp_busy |= fu.deq.valid
+            else:
+                fdiv_resp_busy |= fu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(fdiv.req),
+            fdiv.req.valid.eq(self.req.valid
+                              & self.req.bits.uop.fu_type_has(VFUType.FDIV)),
+            fdiv.resp.ready.eq(~fdiv_resp_busy),
+            fdiv_busy.eq(~fdiv.req.ready),
+        ]
+
+        vresp_units.append(fdiv)
+
         for iu in reversed(vresp_units):
             if isinstance(iu, Queue):
                 with m.If(iu.deq.valid):
@@ -327,5 +346,7 @@ class FPUExecUnit(ExecUnit):
         with m.If((self.req.bits.uop.fu_type == VFUType.FPU)
                   | (self.req.bits.uop.fu_type == VFUType.F2I)):
             m.d.comb += self.req.ready.eq(~fpu_busy)
+        with m.Elif(self.req.bits.uop.fu_type_has(VFUType.FDIV)):
+            m.d.comb += self.req.ready.eq(~fdiv_busy)
 
         return m

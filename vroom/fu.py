@@ -8,7 +8,7 @@ import operator
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1, VMask
-from vroom.fpu import VFPUFMA, VFPUComp
+from vroom.fpu import VFPUFMA, VFPUComp, VFPUDivSqrt
 from vroom.utils import TailGen, vlmul_to_lmul
 
 from room.consts import RegisterType, RoundingMode
@@ -1749,6 +1749,86 @@ class VFPUUnit(PerLaneFunctionalUnit):
 
         for w in range(self.n_lanes):
             lane = VFPULane(self.lane_width, self.params, self.num_stages)
+            setattr(m.submodules, f'lane{w}', lane)
+            m.d.comb += [
+                self.lane_reqs[w].connect(lane.req),
+                lane.resp.connect(self.lane_resps[w]),
+            ]
+
+        return m
+
+
+class VFDivLane(IterativeLaneFunctionalUnit):
+
+    def __init__(self, data_width, params):
+        super().__init__(data_width, params)
+
+        self.data_width = data_width
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        uop = self.req.bits.uop
+
+        fdiv = m.submodules.fdiv = VFPUDivSqrt(self.data_width)
+        m.d.comb += [
+            fdiv.a.eq(self.req.bits.opb_data),
+            fdiv.b.eq(self.req.bits.opa_data),
+            fdiv.is_sqrt.eq(uop.opcode == VOpCode.VFSQRT),
+            fdiv.fmt.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+            fdiv.in_valid.eq(self.req.valid),
+            self.req.ready.eq(fdiv.in_ready),
+            self.resp.valid.eq(fdiv.out.valid),
+            fdiv.out.ready.eq(self.resp.ready),
+        ]
+
+        with m.If(uop.opcode == VOpCode.VFRDIV):
+            m.d.comb += [
+                fdiv.a.eq(self.req.bits.opa_data),
+                fdiv.b.eq(self.req.bits.opb_data),
+            ]
+
+        old_vd = Signal.like(self.req.bits.old_vd)
+        tail = Signal.like(self.req.bits.tail)
+        mask = Signal.like(self.req.bits.mask)
+        with m.If(self.req.fire):
+            m.d.sync += [
+                old_vd.eq(self.req.bits.old_vd),
+                tail.eq(self.req.bits.tail),
+                mask.eq(self.req.bits.mask),
+            ]
+
+        tail_mask = Signal(self.data_width)
+        byte_mask = Signal(self.data_width)
+        get_byte_mask(m, tail_mask, tail, self.resp.bits.uop.dest_eew())
+        get_byte_mask(m, byte_mask, mask, self.resp.bits.uop.dest_eew())
+
+        mask_gen = m.submodules.mask_gen = MaskDataGen(self.data_width,
+                                                       self.params)
+        m.d.comb += [
+            mask_gen.mask.eq(byte_mask),
+            mask_gen.tail.eq(tail_mask),
+            mask_gen.old_vd.eq(old_vd),
+            mask_gen.uop.eq(self.resp.bits.uop),
+        ]
+
+        m.d.comb += self.resp.bits.vd_data.eq((fdiv.out.bits
+                                               & mask_gen.mask_keep)
+                                              | mask_gen.mask_off)
+
+        return m
+
+
+class VFDivUnit(PerLaneFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        for w in range(self.n_lanes):
+            lane = VFDivLane(self.lane_width, self.params)
             setattr(m.submodules, f'lane{w}', lane)
             m.d.comb += [
                 self.lane_reqs[w].connect(lane.req),
