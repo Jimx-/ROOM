@@ -882,6 +882,18 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFSGNJN)
                             with m.Case(0b001010):
                                 m.d.comb += UOPC(VOpCode.VFSGNJX)
+                            with m.Case(0b001110):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VSLIDE1UP),
+                                    uop.fp_valid.eq(0),
+                                ]
+                            with m.Case(0b001111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.PERM),
+                                    UOPC(VOpCode.VSLIDE1DOWN),
+                                    uop.fp_valid.eq(0),
+                                ]
                             with m.Case(0b011000):
                                 m.d.comb += [
                                     UOPC(VOpCode.VMFEQ),
