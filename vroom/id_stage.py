@@ -247,6 +247,97 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFSGNJN)
                             with m.Case(0b001010):
                                 m.d.comb += UOPC(VOpCode.VFSGNJX)
+                            with m.Case(0b010010):  # VFUNARY0
+                                m.d.comb += uop.lrs1_rtype.eq(RegisterType.X)
+
+                                with m.Switch(uop.lrs1):
+                                    with m.Case(0b00000):  # vfcvt.xu.f.v
+                                        m.d.comb += UOPC(VOpCode.VFCVTXUF)
+                                    with m.Case(0b00001):  # vfcvt.x.f.v
+                                        m.d.comb += UOPC(VOpCode.VFCVTXF)
+                                    with m.Case(0b00010):  # vfcvt.f.xu.v
+                                        m.d.comb += UOPC(VOpCode.VFCVTFXU)
+                                    with m.Case(0b00011):  # vfcvt.f.x.v
+                                        m.d.comb += UOPC(VOpCode.VFCVTFX)
+                                    with m.Case(0b00110):  # vfcvt.rtz.xu.f.v
+                                        m.d.comb += UOPC(VOpCode.VFCVTRTZXUF)
+                                    with m.Case(0b00111):  # vfcvt.rtz.x.f.v
+                                        m.d.comb += UOPC(VOpCode.VFCVTRTZXF)
+                                    with m.Case(0b01000):  # vfwcvt.xu.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTXUF),
+                                            uop.widen.eq(1),
+                                        ]
+                                    with m.Case(0b01001):  # vfwcvt.x.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTXF),
+                                            uop.widen.eq(1),
+                                        ]
+                                    with m.Case(0b01010):  # vfwcvt.f.xu.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTFXU),
+                                            uop.widen.eq(1),
+                                        ]
+                                    with m.Case(0b01011):  # vfwcvt.f.x.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTFX),
+                                            uop.widen.eq(1),
+                                        ]
+                                    with m.Case(0b01100):  # vfwcvt.f.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTFF),
+                                            uop.widen.eq(1),
+                                        ]
+                                    with m.Case(0b01110):  # vfwcvt.rtz.xu.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTRTZXUF),
+                                            uop.widen.eq(1),
+                                        ]
+                                    with m.Case(0b01111):  # vfwcvt.rtz.x.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTRTZXF),
+                                            uop.widen.eq(1),
+                                        ]
+                                    with m.Case(0b10000):  # vfncvt.xu.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTXUF),
+                                            uop.narrow.eq(1),
+                                        ]
+                                    with m.Case(0b10001):  # vfncvt.x.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTXF),
+                                            uop.narrow.eq(1),
+                                        ]
+                                    with m.Case(0b10010):  # vfncvt.f.xu.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTFXU),
+                                            uop.narrow.eq(1),
+                                        ]
+                                    with m.Case(0b10011):  # vfncvt.f.x.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTFX),
+                                            uop.narrow.eq(1),
+                                        ]
+                                    with m.Case(0b10100):  # vfncvt.f.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTFF),
+                                            uop.narrow.eq(1),
+                                        ]
+                                    with m.Case(0b10101):  # vfncvt.rod.f.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFNCVTRODFF),
+                                            uop.narrow.eq(1),
+                                        ]
+                                    with m.Case(0b10110):  # vfncvt.rtz.xu.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTRTZXUF),
+                                            uop.narrow.eq(1),
+                                        ]
+                                    with m.Case(0b10111):  # vfncvt.rtz.x.f.v
+                                        m.d.comb += [
+                                            UOPC(VOpCode.VFCVTRTZXF),
+                                            uop.narrow.eq(1),
+                                        ]
                             with m.Case(0b010011):  # VFUNARY1
                                 m.d.comb += uop.lrs1_rtype.eq(RegisterType.X)
 

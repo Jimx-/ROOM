@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import RoundingMode
-from room.fpu import FPFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp, FPUDivSqrtMulti
+from room.fpu import FPFormat, IntFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp, FPUDivSqrtMulti, FPUCastMulti
 from room.utils import Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -241,5 +241,75 @@ class VFPUDivSqrt(Elaboratable):
                 ]
 
         m.d.comb += self.out.valid.eq((resp_valid & resp_mask) == resp_mask)
+
+        return m
+
+
+class VFPUCast(Elaboratable):
+
+    def __init__(self, width, latency=3):
+        self.width = width
+        self.latency = latency
+
+        self.inp = Valid(FPUInput, self.width)
+        self.out = Valid(FPUResult, self.width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_pipe = m.submodules.in_pipe = Pipe(width=len(self.inp.bits),
+                                              depth=self.latency)
+        in_pipe_out = FPUInput(self.width)
+        m.d.comb += [
+            in_pipe.in_valid.eq(self.inp.valid),
+            in_pipe.in_data.eq(self.inp.bits),
+            in_pipe_out.eq(in_pipe.out.bits),
+        ]
+
+        resp_data_s = Signal(self.width)
+        resp_data_d = Signal(self.width)
+        for i in range(self.width // 32):
+            cast = FPUCastMulti(latency=self.latency)
+            setattr(m.submodules, f'cast{i}', cast)
+
+            m.d.comb += [
+                cast.inp.bits.fn.eq(self.inp.bits.fn),
+                cast.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
+                cast.inp.bits.rm.eq(self.inp.bits.rm),
+                cast.inp.bits.src_fmt.eq(self.inp.bits.src_fmt),
+                cast.inp.bits.dst_fmt.eq(self.inp.bits.dst_fmt),
+                cast.inp.bits.int_fmt.eq(self.inp.bits.int_fmt),
+            ]
+            if i & 1:
+                m.d.comb += [
+                    cast.inp.bits.in1.eq(self.inp.bits.in2[i * 32:(i + 1) *
+                                                           32]),
+                    cast.inp.valid.eq(self.inp.valid
+                                      & (self.inp.bits.src_fmt == FPFormat.S)),
+                    resp_data_s[i * 32:(i + 1) * 32].eq(cast.out.bits.data),
+                ]
+            else:
+                m.d.comb += [
+                    cast.inp.bits.in1.eq(
+                        self.inp.bits.in2[(i // 2) * 64:(i // 2 + 1) * 64]),
+                    cast.inp.valid.eq(self.inp.valid),
+                    resp_data_s[i * 32:(i + 1) * 32].eq(cast.out.bits.data),
+                    resp_data_d[(i // 2) * 64:(i // 2 + 1) * 64].eq(
+                        cast.out.bits.data),
+                ]
+
+        m.d.comb += self.out.valid.eq(in_pipe.out.valid)
+        with m.If(in_pipe_out.fn == FPUOperator.F2I):
+            with m.Switch(in_pipe_out.int_fmt):
+                with m.Case(IntFormat.INT64):
+                    m.d.comb += self.out.bits.data.eq(resp_data_d)
+                with m.Case(IntFormat.INT32):
+                    m.d.comb += self.out.bits.data.eq(resp_data_s)
+        with m.Else():
+            with m.Switch(in_pipe_out.dst_fmt):
+                with m.Case(FPFormat.D):
+                    m.d.comb += self.out.bits.data.eq(resp_data_d)
+                with m.Case(FPFormat.S):
+                    m.d.comb += self.out.bits.data.eq(resp_data_s)
 
         return m
