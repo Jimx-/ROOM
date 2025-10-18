@@ -1545,6 +1545,13 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
+            with m.Case(VOpCode.VFCLASS):
+                m.d.comb += [
+                    cmp_en.eq(1),
+                    fma_op.eq(FPUOperator.CLASSIFY),
+                    fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                ]
+
             with m.Case(VOpCode.VFCVTXUF, VOpCode.VFCVTXF, VOpCode.VFCVTRTZXUF,
                         VOpCode.VFCVTRTZXF):
                 m.d.comb += [
