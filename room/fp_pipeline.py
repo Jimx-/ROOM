@@ -45,6 +45,7 @@ class FPPipeline(HasCoreParams, Elaboratable):
         self.to_lsu = Decoupled(ExecResp, self.xlen, params)
 
         if self.use_vector:
+            self.from_vec = Decoupled(ExecResp, self.flen, params)
             self.to_vec = Decoupled(ExecResp, self.xlen, params)
 
         self.br_update = BranchUpdate(params)
@@ -157,13 +158,16 @@ class FPPipeline(HasCoreParams, Elaboratable):
         # Writeback
         #
 
-        mem_wbarb = m.submodules.mem_wbarb = Arbiter(2, ExecResp, self.flen,
+        mem_wbarb = m.submodules.mem_wbarb = Arbiter(2 + self.use_vector,
+                                                     ExecResp, self.flen,
                                                      self.params)
 
         m.d.comb += [
             self.mem_wb_ports[0].connect(mem_wbarb.inp[0]),
             self.from_int.connect(mem_wbarb.inp[1]),
         ]
+        if self.use_vector:
+            m.d.comb += self.from_vec.connect(mem_wbarb.inp[2])
 
         m.d.sync += [
             fregfile.write_ports[0].valid.eq(

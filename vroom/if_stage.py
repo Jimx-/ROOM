@@ -103,6 +103,7 @@ class IFStage(HasVectorParams, Elaboratable):
 
         self.req = Decoupled(ExecReq, self.xlen, params)
         self.resp = Decoupled(ExecResp, self.xlen, params)
+        self.fresp = Decoupled(ExecResp, self.flen, params)
 
         self.fetch_packet = Decoupled(VMicroOp, params)
 
@@ -142,7 +143,9 @@ class IFStage(HasVectorParams, Elaboratable):
         m.d.comb += [
             fetch_buffer.w_data.eq(self.req.bits),
             fetch_buffer.w_br_mask.eq(self.req.bits.uop.br_mask),
-            fetch_buffer.w_en.eq(self.req.valid),
+            fetch_buffer.w_en.eq(
+                self.req.valid
+                & ~self.br_update.uop_killed(self.req.bits.uop)),
             self.req.ready.eq(fetch_buffer.w_rdy),
         ]
 
@@ -218,18 +221,18 @@ class IFStage(HasVectorParams, Elaboratable):
         with m.If(vec_config.resp.valid):
             m.d.comb += vec_config.resp.connect(self.resp)
         with m.Else():
+            resp = Decoupled(ExecResp, self.xlen, self.params)
             wb_grant = Signal(range(self.ftq_size))
             with m.If(self.wb_req.valid):
                 m.d.comb += [
-                    self.resp.valid.eq(1),
-                    self.resp.bits.data.eq(
-                        self.wb_req.bits.vd_data[:self.xlen]),
+                    resp.valid.eq(1),
+                    resp.bits.data.eq(self.wb_req.bits.vd_data[:self.xlen]),
                     wb_grant.eq(self.wb_req.bits.uop.ftq_idx),
                 ]
                 with m.Switch(self.wb_req.bits.uop.ftq_idx):
                     for i in range(self.ftq_size):
                         with m.Case(i):
-                            m.d.comb += self.resp.bits.uop.eq(ftq[i])
+                            m.d.comb += resp.bits.uop.eq(ftq[i])
                             m.d.sync += [
                                 ftq_wb[i].valid.eq(1),
                                 ftq_wb[i].bits.eq(
@@ -242,17 +245,23 @@ class IFStage(HasVectorParams, Elaboratable):
                 m.d.comb += [
                     wb_pe.i.eq(Cat(wb.valid for wb in ftq_wb)),
                     wb_grant.eq(wb_pe.o),
-                    self.resp.valid.eq(~wb_pe.n),
+                    resp.valid.eq(~wb_pe.n),
                 ]
                 with m.Switch(wb_pe.o):
                     for i in range(self.ftq_size):
                         with m.Case(i):
                             m.d.comb += [
-                                self.resp.bits.uop.eq(ftq[i]),
-                                self.resp.bits.data.eq(ftq_wb[i].bits),
+                                resp.bits.uop.eq(ftq[i]),
+                                resp.bits.data.eq(ftq_wb[i].bits),
                             ]
 
-            with m.If(self.resp.fire):
+            with m.If(resp.bits.uop.rf_wen()
+                      & (resp.bits.uop.dst_rtype == RegisterType.FLT)):
+                m.d.comb += resp.connect(self.fresp)
+            with m.Else():
+                m.d.comb += resp.connect(self.resp)
+
+            with m.If(self.resp.fire | self.fresp.fire):
                 with m.Switch(wb_grant):
                     for i in range(self.ftq_size):
                         with m.Case(i):

@@ -80,6 +80,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
 
         self.req = Decoupled(ExecReq, self.xlen, params)
         self.resp = Decoupled(ExecResp, self.xlen, params)
+        self.fresp = Decoupled(ExecResp, self.flen, params)
 
         self.mem_req = Decoupled(CoreMemRequest, params)
         self.mem_nack = Signal()
@@ -110,6 +111,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         m.d.comb += [
             self.req.connect(if_stage.req),
             if_stage.resp.connect(self.resp),
+            if_stage.fresp.connect(self.fresp),
             if_stage.rob_head_idx.eq(self.rob_head_idx),
             if_stage.rob_pnr_idx.eq(self.rob_pnr_idx),
             if_stage.br_update.eq(self.br_update),

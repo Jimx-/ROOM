@@ -343,6 +343,7 @@ class ALUExecUnit(ExecUnit, AutoCSR):
             m.d.comb += [
                 vec_req_arb.out.connect(vec.req),
                 vec.resp.ready.eq(1),
+                vec.fresp.connect(self.mem_fresp),
                 vec.mem_req.connect(self.vec_mem_req),
                 vec.mem_nack.eq(self.vec_mem_nack),
                 vec.mem_resp.eq(self.vec_mem_resp),

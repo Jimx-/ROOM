@@ -1211,7 +1211,10 @@ class Core(HasCoreParams, Elaboratable):
             csr.add_csrs(vec_exec_unit.iter_csrs())
 
             if self.use_fpu:
-                m.d.comb += fp_pipeline.to_vec.connect(vec_exec_unit.fp_req)
+                m.d.comb += [
+                    fp_pipeline.to_vec.connect(vec_exec_unit.fp_req),
+                    vec_exec_unit.mem_fresp.connect(fp_pipeline.from_vec),
+                ]
 
         #
         # Virtual memory

@@ -247,6 +247,20 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VFSGNJN)
                             with m.Case(0b001010):
                                 m.d.comb += UOPC(VOpCode.VFSGNJX)
+                            with m.Case(0b010000):  # VWFUNARY0
+                                m.d.comb += [
+                                    uop.dst_rtype.eq(RegisterType.FLT),
+                                    uop.lrs1_rtype.eq(RegisterType.X),
+                                ]
+
+                                with m.Switch(uop.lrs1):
+                                    with m.Case(0b00000):
+                                        m.d.comb += [
+                                            uop.fu_type.eq(VFUType.ALU),
+                                            UOPC(VOpCode.VMVXS),
+                                            uop.fp_valid.eq(0),
+                                        ]
+
                             with m.Case(0b010010):  # VFUNARY0
                                 m.d.comb += uop.lrs1_rtype.eq(RegisterType.X)
 
@@ -999,6 +1013,20 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += [
                                     uop.fu_type.eq(VFUType.PERM),
                                     UOPC(VOpCode.VSLIDE1DOWN),
+                                    uop.fp_valid.eq(0),
+                                ]
+                            with m.Case(0b010000):  # VRFUNARY0
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.ALU),
+                                    UOPC(VOpCode.VMVSX),
+                                    uop.lrs2_rtype.eq(RegisterType.X),
+                                    uop.vl.eq(1),
+                                    uop.fp_valid.eq(0),
+                                ]
+                            with m.Case(0b010111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.ALU),
+                                    UOPC(VOpCode.VMERGE),
                                     uop.fp_valid.eq(0),
                                 ]
                             with m.Case(0b011000):

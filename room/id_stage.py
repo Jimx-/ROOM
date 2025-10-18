@@ -1134,6 +1134,11 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 uop.lrs2_rtype.eq(RegisterType.VEC),
                             ]
 
+                            with m.Switch(inuop.inst[26:32]):
+                                with m.Case(0b010000):  # VWFUNARY0
+                                    m.d.comb += uop.dst_rtype.eq(
+                                        RegisterType.FLT)
+
                         with m.Case(0b010):  # OPMVV
                             m.d.comb += [
                                 uop.iq_type.eq(IssueQueueType.VEC),
