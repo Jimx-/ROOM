@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.consts import RoundingMode
-from room.fpu import FPFormat, IntFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp, FPUDivSqrtMulti, FPUCastMulti
+from room.fpu import FPFormat, IntFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp, FPUDivSqrtMulti, FPUCastMulti, FPURec
 from room.utils import Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -311,5 +311,68 @@ class VFPUCast(Elaboratable):
                     m.d.comb += self.out.bits.data.eq(resp_data_d)
                 with m.Case(FPFormat.S):
                     m.d.comb += self.out.bits.data.eq(resp_data_s)
+
+        return m
+
+
+class VFPURec(Elaboratable):
+
+    def __init__(self, width, latency=3):
+        self.width = width
+        self.latency = latency
+
+        self.inp = Valid(FPUInput, self.width)
+        self.out = Valid(FPUResult, self.width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_pipe = m.submodules.in_pipe = Pipe(width=len(self.inp.bits),
+                                              depth=self.latency)
+        in_pipe_out = FPUInput(self.width)
+        m.d.comb += [
+            in_pipe.in_valid.eq(self.inp.valid),
+            in_pipe.in_data.eq(self.inp.bits),
+            in_pipe_out.eq(in_pipe.out.bits),
+        ]
+
+        drec_res = []
+        if self.width >= 64:
+            for i in range(self.width // 64):
+                drec = FPURec(64, FPFormat.D, latency=self.latency)
+                setattr(m.submodules, f'drec{i}', drec)
+
+                m.d.comb += [
+                    drec.inp.valid.eq(self.inp.valid),
+                    drec.inp.bits.fn.eq(self.inp.bits.fn),
+                    drec.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
+                    drec.inp.bits.rm.eq(self.inp.bits.rm),
+                    drec.inp.bits.in1.eq(self.inp.bits.in2[i * 64:(i + 1) *
+                                                           64]),
+                ]
+
+                drec_res.append(drec.out.bits.data)
+
+        srec_res = []
+        for i in range(self.width // 32):
+            srec = FPURec(32, FPFormat.S, latency=self.latency)
+            setattr(m.submodules, f'srec{i}', srec)
+
+            m.d.comb += [
+                srec.inp.valid.eq(self.inp.valid),
+                srec.inp.bits.fn.eq(self.inp.bits.fn),
+                srec.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
+                srec.inp.bits.rm.eq(self.inp.bits.rm),
+                srec.inp.bits.in1.eq(self.inp.bits.in2[i * 32:(i + 1) * 32]),
+            ]
+
+            srec_res.append(srec.out.bits.data)
+
+        m.d.comb += self.out.valid.eq(in_pipe.out.valid)
+        with m.Switch(in_pipe_out.dst_fmt):
+            with m.Case(FPFormat.D):
+                m.d.comb += self.out.bits.data.eq(Cat(drec_res))
+            with m.Case(FPFormat.S):
+                m.d.comb += self.out.bits.data.eq(Cat(srec_res))
 
         return m

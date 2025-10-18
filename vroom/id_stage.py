@@ -361,6 +361,10 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                             UOPC(VOpCode.VFSQRT),
                                             uop.fu_type.eq(VFUType.FDIV),
                                         ]
+                                    with m.Case(0b00100):
+                                        m.d.comb += UOPC(VOpCode.VFRSQRT7)
+                                    with m.Case(0b00101):
+                                        m.d.comb += UOPC(VOpCode.VFREC7)
                                     with m.Case(0b10000):
                                         m.d.comb += UOPC(VOpCode.VFCLASS)
                             with m.Case(0b011000):

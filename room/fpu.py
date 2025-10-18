@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth.lib.coding import PriorityEncoder
 from enum import IntEnum
 
 from room.consts import *
@@ -19,6 +20,7 @@ class FPUOperator(IntEnum):
     F2F = 8
     F2I = 9
     I2F = 10
+    REC = 11
 
 
 class FPFormat(IntEnum):
@@ -48,6 +50,21 @@ class FType:
 
     def half_bias(self):
         return (2**(self.exp - 2)) - 1
+
+    def default_nan(self):
+        return Cat(Const(0, self.man - 1),
+                   Const(1, 1).replicate(self.exp + 1), Const(0, 1))
+
+    def inf(self, sign):
+        return Cat(Const(0, self.man), Const(1, 1).replicate(self.exp), sign)
+
+    def zero(self, sign):
+        return Cat(Const(0, self.man + self.exp), sign)
+
+    def greatest_finite(self, sign):
+        return Cat(
+            Const(1, 1).replicate(self.man), Const(0, 1),
+            Const(1, 1).replicate(self.exp - 1), sign)
 
     def record_layout(self):
         return [('man', self.man), ('exp', self.exp), ('sign', 1)]
@@ -1277,6 +1294,477 @@ class FPUComp(Elaboratable):
                                                 depth=self.latency - 1)
         m.d.comb += [
             out_pipe.in_valid.eq(s1_valid),
+            out_pipe.in_data.eq(result),
+            self.out.valid.eq(out_pipe.out.valid),
+            self.out.bits.data.eq(out_pipe.out.bits),
+        ]
+
+        return m
+
+
+class FPURec(Elaboratable):
+    _RSQRT_TABLE = [
+        # exp[0] = 0
+        52,  # man[-6:] = 0
+        51,  # man[-6:] = 1
+        50,  # man[-6:] = 2
+        48,  # man[-6:] = 3
+        47,  # man[-6:] = 4
+        46,  # man[-6:] = 5
+        44,  # man[-6:] = 6
+        43,  # man[-6:] = 7
+        42,  # man[-6:] = 8
+        41,  # man[-6:] = 9
+        40,  # man[-6:] = 10
+        39,  # man[-6:] = 11
+        38,  # man[-6:] = 12
+        36,  # man[-6:] = 13
+        35,  # man[-6:] = 14
+        34,  # man[-6:] = 15
+        33,  # man[-6:] = 16
+        32,  # man[-6:] = 17
+        31,  # man[-6:] = 18
+        30,  # man[-6:] = 19
+        30,  # man[-6:] = 20
+        29,  # man[-6:] = 21
+        28,  # man[-6:] = 22
+        27,  # man[-6:] = 23
+        26,  # man[-6:] = 24
+        25,  # man[-6:] = 25
+        24,  # man[-6:] = 26
+        23,  # man[-6:] = 27
+        23,  # man[-6:] = 28
+        22,  # man[-6:] = 29
+        21,  # man[-6:] = 30
+        20,  # man[-6:] = 31
+        19,  # man[-6:] = 32
+        19,  # man[-6:] = 33
+        18,  # man[-6:] = 34
+        17,  # man[-6:] = 35
+        16,  # man[-6:] = 36
+        16,  # man[-6:] = 37
+        15,  # man[-6:] = 38
+        14,  # man[-6:] = 39
+        14,  # man[-6:] = 40
+        13,  # man[-6:] = 41
+        12,  # man[-6:] = 42
+        12,  # man[-6:] = 43
+        11,  # man[-6:] = 44
+        10,  # man[-6:] = 45
+        10,  # man[-6:] = 46
+        9,  # man[-6:] = 47
+        9,  # man[-6:] = 48
+        8,  # man[-6:] = 49
+        7,  # man[-6:] = 50
+        7,  # man[-6:] = 51
+        6,  # man[-6:] = 52
+        6,  # man[-6:] = 53
+        5,  # man[-6:] = 54
+        4,  # man[-6:] = 55
+        4,  # man[-6:] = 56
+        3,  # man[-6:] = 57
+        3,  # man[-6:] = 58
+        2,  # man[-6:] = 59
+        2,  # man[-6:] = 60
+        1,  # man[-6:] = 61
+        1,  # man[-6:] = 62
+        0,  # man[-6:] = 63
+        # exp[0] = 1
+        127,  # man[-6:] = 0
+        125,  # man[-6:] = 1
+        123,  # man[-6:] = 2
+        121,  # man[-6:] = 3
+        119,  # man[-6:] = 4
+        118,  # man[-6:] = 5
+        116,  # man[-6:] = 6
+        114,  # man[-6:] = 7
+        113,  # man[-6:] = 8
+        111,  # man[-6:] = 9
+        109,  # man[-6:] = 10
+        108,  # man[-6:] = 11
+        106,  # man[-6:] = 12
+        105,  # man[-6:] = 13
+        103,  # man[-6:] = 14
+        102,  # man[-6:] = 15
+        100,  # man[-6:] = 16
+        99,  # man[-6:] = 17
+        97,  # man[-6:] = 18
+        96,  # man[-6:] = 19
+        95,  # man[-6:] = 20
+        93,  # man[-6:] = 21
+        92,  # man[-6:] = 22
+        91,  # man[-6:] = 23
+        90,  # man[-6:] = 24
+        88,  # man[-6:] = 25
+        87,  # man[-6:] = 26
+        86,  # man[-6:] = 27
+        85,  # man[-6:] = 28
+        84,  # man[-6:] = 29
+        83,  # man[-6:] = 30
+        82,  # man[-6:] = 31
+        80,  # man[-6:] = 32
+        79,  # man[-6:] = 33
+        78,  # man[-6:] = 34
+        77,  # man[-6:] = 35
+        76,  # man[-6:] = 36
+        75,  # man[-6:] = 37
+        74,  # man[-6:] = 38
+        73,  # man[-6:] = 39
+        72,  # man[-6:] = 40
+        71,  # man[-6:] = 41
+        70,  # man[-6:] = 42
+        70,  # man[-6:] = 43
+        69,  # man[-6:] = 44
+        68,  # man[-6:] = 45
+        67,  # man[-6:] = 46
+        66,  # man[-6:] = 47
+        65,  # man[-6:] = 48
+        64,  # man[-6:] = 49
+        63,  # man[-6:] = 50
+        63,  # man[-6:] = 51
+        62,  # man[-6:] = 52
+        61,  # man[-6:] = 53
+        60,  # man[-6:] = 54
+        59,  # man[-6:] = 55
+        59,  # man[-6:] = 56
+        58,  # man[-6:] = 57
+        57,  # man[-6:] = 58
+        56,  # man[-6:] = 59
+        56,  # man[-6:] = 60
+        55,  # man[-6:] = 61
+        54,  # man[-6:] = 62
+        53,  # man[-6:] = 63
+    ]
+
+    _REC_TABLE = [
+        127,  # man[-7:] = 0
+        125,  # man[-7:] = 1
+        123,  # man[-7:] = 2
+        121,  # man[-7:] = 3
+        119,  # man[-7:] = 4
+        117,  # man[-7:] = 5
+        116,  # man[-7:] = 6
+        114,  # man[-7:] = 7
+        112,  # man[-7:] = 8
+        110,  # man[-7:] = 9
+        109,  # man[-7:] = 10
+        107,  # man[-7:] = 11
+        105,  # man[-7:] = 12
+        104,  # man[-7:] = 13
+        102,  # man[-7:] = 14
+        100,  # man[-7:] = 15
+        99,  # man[-7:] = 16
+        97,  # man[-7:] = 17
+        96,  # man[-7:] = 18
+        94,  # man[-7:] = 19
+        93,  # man[-7:] = 20
+        91,  # man[-7:] = 21
+        90,  # man[-7:] = 22
+        88,  # man[-7:] = 23
+        87,  # man[-7:] = 24
+        85,  # man[-7:] = 25
+        84,  # man[-7:] = 26
+        83,  # man[-7:] = 27
+        81,  # man[-7:] = 28
+        80,  # man[-7:] = 29
+        79,  # man[-7:] = 30
+        77,  # man[-7:] = 31
+        76,  # man[-7:] = 32
+        75,  # man[-7:] = 33
+        74,  # man[-7:] = 34
+        72,  # man[-7:] = 35
+        71,  # man[-7:] = 36
+        70,  # man[-7:] = 37
+        69,  # man[-7:] = 38
+        68,  # man[-7:] = 39
+        66,  # man[-7:] = 40
+        65,  # man[-7:] = 41
+        64,  # man[-7:] = 42
+        63,  # man[-7:] = 43
+        62,  # man[-7:] = 44
+        61,  # man[-7:] = 45
+        60,  # man[-7:] = 46
+        59,  # man[-7:] = 47
+        58,  # man[-7:] = 48
+        57,  # man[-7:] = 49
+        56,  # man[-7:] = 50
+        55,  # man[-7:] = 51
+        54,  # man[-7:] = 52
+        53,  # man[-7:] = 53
+        52,  # man[-7:] = 54
+        51,  # man[-7:] = 55
+        50,  # man[-7:] = 56
+        49,  # man[-7:] = 57
+        48,  # man[-7:] = 58
+        47,  # man[-7:] = 59
+        46,  # man[-7:] = 60
+        45,  # man[-7:] = 61
+        44,  # man[-7:] = 62
+        43,  # man[-7:] = 63
+        42,  # man[-7:] = 64
+        41,  # man[-7:] = 65
+        40,  # man[-7:] = 66
+        40,  # man[-7:] = 67
+        39,  # man[-7:] = 68
+        38,  # man[-7:] = 69
+        37,  # man[-7:] = 70
+        36,  # man[-7:] = 71
+        35,  # man[-7:] = 72
+        35,  # man[-7:] = 73
+        34,  # man[-7:] = 74
+        33,  # man[-7:] = 75
+        32,  # man[-7:] = 76
+        31,  # man[-7:] = 77
+        31,  # man[-7:] = 78
+        30,  # man[-7:] = 79
+        29,  # man[-7:] = 80
+        28,  # man[-7:] = 81
+        28,  # man[-7:] = 82
+        27,  # man[-7:] = 83
+        26,  # man[-7:] = 84
+        25,  # man[-7:] = 85
+        25,  # man[-7:] = 86
+        24,  # man[-7:] = 87
+        23,  # man[-7:] = 88
+        23,  # man[-7:] = 89
+        22,  # man[-7:] = 90
+        21,  # man[-7:] = 91
+        21,  # man[-7:] = 92
+        20,  # man[-7:] = 93
+        19,  # man[-7:] = 94
+        19,  # man[-7:] = 95
+        18,  # man[-7:] = 96
+        17,  # man[-7:] = 97
+        17,  # man[-7:] = 98
+        16,  # man[-7:] = 99
+        15,  # man[-7:] = 100
+        15,  # man[-7:] = 101
+        14,  # man[-7:] = 102
+        14,  # man[-7:] = 103
+        13,  # man[-7:] = 104
+        12,  # man[-7:] = 105
+        12,  # man[-7:] = 106
+        11,  # man[-7:] = 107
+        11,  # man[-7:] = 108
+        10,  # man[-7:] = 109
+        9,  # man[-7:] = 110
+        9,  # man[-7:] = 111
+        8,  # man[-7:] = 112
+        8,  # man[-7:] = 113
+        7,  # man[-7:] = 114
+        7,  # man[-7:] = 115
+        6,  # man[-7:] = 116
+        5,  # man[-7:] = 117
+        5,  # man[-7:] = 118
+        4,  # man[-7:] = 119
+        4,  # man[-7:] = 120
+        3,  # man[-7:] = 121
+        3,  # man[-7:] = 122
+        2,  # man[-7:] = 123
+        2,  # man[-7:] = 124
+        1,  # man[-7:] = 125
+        1,  # man[-7:] = 126
+        0,  # man[-7:] = 127
+    ]
+
+    def __init__(self, width, format, latency=3):
+        if latency < 1:
+            raise ValueError('Latency should be at least 1 cycle')
+
+        self.width = width
+        self.ftyp = _fmt_ftypes[format]
+        self.latency = latency
+
+        self.inp = Valid(FPUInput, self.width)
+        self.out = Valid(FPUResult, self.width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        #
+        # S1 - Input
+        #
+
+        s1_valid = Signal()
+        s1_inp = FPUInput(self.width)
+
+        inp_pipe = m.submodules.inp_pipe = Pipe(width=len(self.inp.bits),
+                                                depth=int(self.latency > 2))
+        m.d.comb += [
+            inp_pipe.in_valid.eq(self.inp.valid),
+            inp_pipe.in_data.eq(self.inp.bits),
+            s1_valid.eq(inp_pipe.out.valid),
+            s1_inp.eq(inp_pipe.out.bits),
+        ]
+
+        s1_in1 = Record(self.ftyp.record_layout())
+        s1_info1 = Record(self.ftyp.INFO_LAYOUT)
+        m.d.comb += [
+            s1_in1.eq(s1_inp.in1),
+            s1_info1.eq(self.ftyp.classify(s1_in1)),
+        ]
+
+        s1_rm = s1_inp.rm
+        s1_is_rsqrt = s1_inp.fn_mod
+
+        #
+        # Normalization
+        #
+
+        clz_pe = m.submodules.clz_pe = PriorityEncoder(self.ftyp.man)
+        m.d.comb += clz_pe.i.eq(s1_in1.man)
+
+        norm_exponent = Signal(self.ftyp.exp + 1)
+        norm_mantissa = Signal(self.ftyp.man)
+        with m.If(s1_info1.is_subnormal):
+            m.d.comb += [
+                norm_exponent.eq(-clz_pe.o),
+                norm_mantissa.eq(s1_in1.man << (1 + clz_pe.o)),
+            ]
+        with m.Else():
+            m.d.comb += [
+                norm_exponent.eq(s1_in1.exp),
+                norm_mantissa.eq(s1_in1.man),
+            ]
+
+        rsqrt_table = Memory(width=7,
+                             depth=len(FPURec._RSQRT_TABLE),
+                             init=FPURec._RSQRT_TABLE)
+        rsqrt_rd = m.submodules.rsqrt_rd = rsqrt_table.read_port()
+        m.d.comb += rsqrt_rd.addr.eq(Cat(norm_mantissa[-6:], norm_exponent[0]))
+
+        rec_table = Memory(width=7,
+                           depth=len(FPURec._REC_TABLE),
+                           init=FPURec._REC_TABLE)
+        rec_rd = m.submodules.rec_rd = rec_table.read_port()
+        m.d.comb += rec_rd.addr.eq(Cat(norm_mantissa[-7:]))
+
+        #
+        # S2
+        #
+
+        s2_valid = Signal()
+        s2_in1 = Record(self.ftyp.record_layout())
+        s2_rm = Signal(RoundingMode)
+        s2_is_rsqrt = Signal()
+        s2_info1 = Record(self.ftyp.INFO_LAYOUT)
+        s2_norm_exponent = Signal(self.ftyp.exp + 1)
+        s2_norm_mantissa = Signal(self.ftyp.man)
+        m.d.sync += [
+            s2_valid.eq(s1_valid),
+            s2_in1.eq(s1_in1),
+            s2_rm.eq(s1_rm),
+            s2_is_rsqrt.eq(s1_is_rsqrt),
+            s2_info1.eq(s1_info1),
+            s2_norm_exponent.eq(norm_exponent),
+            s2_norm_mantissa.eq(norm_mantissa),
+        ]
+
+        s2_exponent = Signal(self.ftyp.exp)
+        s2_norm_out = Record(self.ftyp.record_layout())
+        with m.If(s2_is_rsqrt):
+            m.d.comb += [
+                s2_exponent.eq((3 * self.ftyp.bias() - 1 -
+                                s2_norm_exponent) >> 1),
+                s2_norm_out.sign.eq(s2_in1.sign),
+                s2_norm_out.exp.eq(s2_exponent),
+                s2_norm_out.man[-7:].eq(rsqrt_rd.data),
+            ]
+
+        with m.Else():
+            m.d.comb += [
+                s2_exponent.eq(2 * self.ftyp.bias() - 1 - s2_norm_exponent),
+                s2_norm_out.sign.eq(s2_in1.sign),
+                s2_norm_out.exp.eq(s2_exponent),
+                s2_norm_out.man[-7:].eq(rec_rd.data),
+            ]
+
+        result = Record(self.ftyp.record_layout())
+        with m.If(s2_is_rsqrt):
+            with m.If(s2_in1.sign & (
+                (~s2_info1.is_nan & ~s2_info1.is_zero) | s2_info1.is_inf)):
+                # -inf <= x < -0.0, canonical NaN, NV
+                m.d.comb += result.eq(self.ftyp.default_nan())
+            with m.Elif(s2_in1.sign & s2_info1.is_zero):
+                # -0.0, -inf, DZ
+                m.d.comb += result.eq(self.ftyp.inf(1))
+            with m.Elif(~s2_in1.sign & s2_info1.is_zero):
+                # +0.0, +inf, DZ
+                m.d.comb += result.eq(self.ftyp.inf(0))
+            with m.Elif(~s2_in1.sign & (
+                (~s2_info1.is_nan & ~s2_info1.is_zero) | s2_info1.is_inf)):
+                # +0.0 < x < +inf, estimate
+                m.d.comb += result.eq(s2_norm_out)
+            with m.Elif(~s2_in1.sign & s2_info1.is_inf):
+                # +inf, +0.0
+                m.d.comb += result.eq(self.ftyp.zero(0))
+            with m.Elif(s2_info1.is_qnan):
+                # qNaN, canonical NaN
+                m.d.comb += result.eq(self.ftyp.default_nan())
+            with m.Elif(s2_info1.is_snan):
+                # sNaN, canonical NaN, NV
+                m.d.comb += result.eq(self.ftyp.default_nan())
+
+        with m.Else():
+            m.d.comb += result.eq(s2_norm_out)
+            with m.If(s2_info1.is_inf):
+                # +-inf, +-0.0
+                m.d.comb += result.eq(self.ftyp.zero(s2_in1.sign))
+            with m.Elif(s2_in1.exp[2:].all() & s2_in1.exp[1] & ~s2_in1.exp[0]):
+                # 2^B <= x < 2^(B+1) (normal), 2^-B > y >= 2^-(B+1) (subnormal, sig=01...)
+                m.d.comb += result.eq(
+                    Cat(s2_norm_out.man >> 2, Const(1, 2), s2_norm_out.exp,
+                        s2_norm_out.sign))
+            with m.Elif(s2_in1.exp[2:].all() & ~s2_in1.exp[1] & s2_in1.exp[0]):
+                # 2^(B-1) <= x < 2^B (normal), 2^-(B-1) > y >= 2^-B (subnormal, sig=1...)
+                m.d.comb += result.eq(
+                    Cat(s2_norm_out.man >> 1, Const(1, 1), s2_norm_out.exp,
+                        s2_norm_out.sign))
+            with m.If(s2_in1.sign & s2_info1.is_subnormal
+                      & ~s2_in1.man[-2:].any()
+                      & ((s2_rm == RoundingMode.RTZ)
+                         | (s2_rm == RoundingMode.RUP))):
+                # -2^-(B+1) < x < -0.0 (subnormal, sig=00...), {RUP, RTZ}, greatest-mag. negative finite value, {NX, OF}
+                m.d.comb += result.eq(self.ftyp.greatest_finite(1))
+            with m.If(s2_in1.sign & s2_info1.is_subnormal
+                      & ~s2_in1.man[-2:].any()
+                      & ((s2_rm == RoundingMode.RDN)
+                         | (s2_rm == RoundingMode.RNE)
+                         | (s2_rm == RoundingMode.RMM))):
+                # -2^-(B+1) < x < -0.0 (subnormal, sig=00...), {RDN, RNE, RMM}, -inf, {NX, OF}
+                m.d.comb += result.eq(self.ftyp.inf(1))
+            with m.If(~s2_in1.sign & s2_info1.is_subnormal
+                      & ~s2_in1.man[-2:].any()
+                      & ((s2_rm == RoundingMode.RTZ)
+                         | (s2_rm == RoundingMode.RUP))):
+                # +0.0 < x < 2^-(B+1) (subnormal, sig=00...), {RUP, RTZ}, greatest finite value, {NX, OF}
+                m.d.comb += result.eq(self.ftyp.greatest_finite(0))
+            with m.If(~s2_in1.sign & s2_info1.is_subnormal
+                      & ~s2_in1.man[-2:].any()
+                      & ((s2_rm == RoundingMode.RDN)
+                         | (s2_rm == RoundingMode.RNE)
+                         | (s2_rm == RoundingMode.RMM))):
+                # +0.0 < x < 2^-(B+1) (subnormal, sig=00...), {RDN, RNE, RMM}, +inf, {NX, OF}
+                m.d.comb += result.eq(self.ftyp.inf(0))
+            with m.If(s2_info1.is_zero):
+                # +-0.0, +-inf, DZ
+                m.d.comb += result.eq(self.ftyp.inf(s2_in1.sign))
+            with m.If(s2_info1.is_qnan):
+                # qNaN, canonical NaN
+                m.d.comb += result.eq(self.ftyp.default_nan())
+            with m.If(s2_info1.is_snan):
+                # sNaN, canonical NaN, NV
+                m.d.comb += result.eq(self.ftyp.default_nan())
+
+        #
+        # S3 - Output
+        #
+
+        out_pipe = m.submodules.out_pipe = Pipe(
+            width=len(result),
+            depth=0 if self.latency == 1 else max(self.latency - 2, 1))
+        m.d.comb += [
+            out_pipe.in_valid.eq(s2_valid),
             out_pipe.in_data.eq(result),
             self.out.valid.eq(out_pipe.out.valid),
             self.out.bits.data.eq(out_pipe.out.bits),

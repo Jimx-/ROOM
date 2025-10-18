@@ -8,7 +8,7 @@ import operator
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1, VMask
-from vroom.fpu import VFPUFMA, VFPUComp, VFPUDivSqrt, VFPUCast
+from vroom.fpu import VFPUFMA, VFPUComp, VFPUDivSqrt, VFPUCast, VFPURec
 from vroom.utils import TailGen, vlmul_to_lmul
 
 from room.consts import RegisterType, RoundingMode
@@ -1402,6 +1402,7 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         fma_en = Signal()
         cast_en = Signal()
         cmp_en = Signal()
+        rec_en = Signal()
 
         fma_op = Signal(FPUOperator)
         fma_op_mod = Signal()
@@ -1599,6 +1600,14 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                                 Mux(uop.fp_single, FPFormat.S, FPFormat.D)))),
                 ]
 
+            with m.Case(VOpCode.VFRSQRT7, VOpCode.VFREC7):
+                m.d.comb += [
+                    rec_en.eq(1),
+                    fma_op.eq(FPUOperator.REC),
+                    fma_op_mod.eq(uop.opcode == VOpCode.VFRSQRT7),
+                    fmt_out.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                ]
+
         vs1_data_inv = Signal(self.data_width)
         vs2_data_inv = Signal(self.data_width)
         with m.Switch(uop.vsew):
@@ -1625,6 +1634,7 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         s1_fma_en = Signal()
         s1_cast_en = Signal()
         s1_cmp_en = Signal()
+        s1_rec_en = Signal()
         s1_fma_op = Signal(FPUOperator)
         s1_fma_op_mod = Signal()
         s1_fmt_in = Signal(FPFormat)
@@ -1639,6 +1649,7 @@ class VFPULane(PipelinedLaneFunctionalUnit):
             s1_fma_en.eq(fma_en),
             s1_cast_en.eq(cast_en),
             s1_cmp_en.eq(cmp_en),
+            s1_rec_en.eq(rec_en),
             s1_fma_op.eq(fma_op),
             s1_fma_op_mod.eq(fma_op_mod),
             s1_fmt_in.eq(fmt_in),
@@ -1737,6 +1748,11 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         set_fu_input(cast.inp)
         m.d.comb += cast.inp.valid.eq(s1_valid & s1_cast_en)
 
+        frec = m.submodules.frec = VFPURec(self.data_width,
+                                           self.num_stages - 1)
+        set_fu_input(frec.inp)
+        m.d.comb += frec.inp.valid.eq(s1_valid & s1_rec_en)
+
         pipe_in = Cat(self.req.bits.old_vd, self.req.bits.tail,
                       self.req.bits.mask)
         out_old_vd = Signal.like(self.req.bits.old_vd)
@@ -1792,8 +1808,12 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         m.d.comb += self.resp.bits.vd_data.eq(
             Mux(
                 self.resp.bits.uop.narrow_to_1, Cat(cmp_out_next),
-                Mux(fcmp.out.valid, fcmp.out.bits.data,
-                    Mux(cast.out.valid, cast.out.bits.data, fma.out.bits.data))
+                Mux(
+                    fcmp.out.valid, fcmp.out.bits.data,
+                    Mux(
+                        cast.out.valid, cast.out.bits.data,
+                        Mux(frec.out.valid, frec.out.bits.data,
+                            fma.out.bits.data)))
                 & mask_gen.mask_keep)
             | mask_gen.mask_off)
 
