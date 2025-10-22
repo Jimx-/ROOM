@@ -376,3 +376,48 @@ class VFPURec(Elaboratable):
                 m.d.comb += self.out.bits.data.eq(Cat(srec_res))
 
         return m
+
+
+class VFPUReduce(Elaboratable):
+
+    def __init__(self, width, latency=3):
+        self.width = width
+        self.latency = latency
+
+        self.inp = Valid(FPUInput, self.width)
+        self.out = Valid(FPUResult, self.width)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_pipe = m.submodules.in_pipe = Pipe(width=len(self.inp.bits),
+                                              depth=self.latency)
+        in_pipe_out = FPUInput(self.width)
+        m.d.comb += [
+            in_pipe.in_valid.eq(self.inp.valid),
+            in_pipe.in_data.eq(self.inp.bits),
+            in_pipe_out.eq(in_pipe.out.bits),
+        ]
+
+        fadd = m.submodules.fadd = VFPUFMA(self.width, latency=self.latency)
+        m.d.comb += [
+            fadd.inp.eq(self.inp),
+            fadd.inp.valid.eq(self.inp.valid
+                              & (self.inp.bits.fn != FPUOperator.MINMAX)),
+            fadd.inp.bits.in3.eq(self.inp.bits.in2),
+        ]
+
+        fcmp = m.submodules.fcmp = VFPUCast(self.width, latency=self.latency)
+        m.d.comb += [
+            fcmp.inp.eq(self.inp),
+            fcmp.inp.valid.eq(self.inp.valid
+                              & (self.inp.bits.fn == FPUOperator.MINMAX)),
+        ]
+
+        m.d.comb += self.out.valid.eq(in_pipe.out.valid)
+        with m.If(in_pipe_out.fn == FPUOperator.MINMAX):
+            m.d.comb += self.out.bits.eq(fcmp.out.bits)
+        with m.Else():
+            m.d.comb += self.out.bits.eq(fadd.out.bits)
+
+        return m

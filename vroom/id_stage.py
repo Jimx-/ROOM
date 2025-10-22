@@ -235,8 +235,18 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         with m.Switch(uop.funct6):
                             with m.Case(0b000000):
                                 m.d.comb += UOPC(VOpCode.VFADD)
+                            with m.Case(0b000001):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VFREDUSUM),
+                                ]
                             with m.Case(0b000010):
                                 m.d.comb += UOPC(VOpCode.VFSUB)
+                            with m.Case(0b000011):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VFREDOSUM),
+                                ]
                             with m.Case(0b000100):
                                 m.d.comb += UOPC(VOpCode.VFMIN)
                             with m.Case(0b000110):

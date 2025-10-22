@@ -8,7 +8,7 @@ import operator
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.alu import VALU, VFixPointALU, VMultiplier, VIntDiv, CSA3to2, ReductionSlice, Compare2to1, Compare3to1, VMask
-from vroom.fpu import VFPUFMA, VFPUComp, VFPUDivSqrt, VFPUCast, VFPURec
+from vroom.fpu import VFPUFMA, VFPUComp, VFPUDivSqrt, VFPUCast, VFPURec, VFPUReduce
 from vroom.utils import TailGen, vlmul_to_lmul
 
 from room.consts import RegisterType, RoundingMode
@@ -1917,5 +1917,214 @@ class VFDivUnit(PerLaneFunctionalUnit):
                 self.lane_reqs[w].connect(lane.req),
                 lane.resp.connect(self.lane_resps[w]),
             ]
+
+        return m
+
+
+class VFReductionUnit(IterativeFunctionalUnit):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.num_red_stages = params['fma_latency']
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        def is_redsum(opcode):
+            return (opcode == VOpCode.VFREDUSUM) | (opcode
+                                                    == VOpCode.VFREDOSUM)
+
+        req_uop = self.req.bits.uop
+        req_vsew = req_uop.vsew
+        req_vm = req_uop.vm
+        req_vmask = self.req.bits.mask
+        req_vl = req_uop.vl
+        req_opc = req_uop.opcode
+        req_uop_idx = req_uop.expd_idx
+
+        uop = self.resp.bits.uop
+
+        vs2_count = Signal(range(self.vlen_bytes))
+        vs2_in_count = Signal(range(self.vlen_bytes))
+        vs2_count_max = Signal(range(self.vlen_bytes))
+        with m.If(self.req.fire):
+            with m.If(is_redsum(req_uop.opcode)):
+                with m.Switch(req_uop.vsew):
+                    for w in range(4):
+                        with m.Case(w):
+                            n = 1 << (w + 3)
+                            m.d.sync += vs2_count_max.eq(self.vlen // n - 1)
+
+        req_fired = Signal()
+        m.d.sync += req_fired.eq(0)
+        with m.If(self.req.fire):
+            m.d.sync += req_fired.eq(1)
+
+        red_in_valid = Signal()
+        red_out_valid = Signal()
+        red_out_data = Signal(self.vlen // 2)
+        red_vd_data = Signal(self.vlen)
+        red_out_reg = Signal(64)
+        resp_en = Signal()
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.comb += self.req.ready.eq(1)
+
+                with m.If(self.req.fire):
+                    m.d.sync += resp_en.eq(req_uop.expd_end)
+                    m.next = 'CALC_VS2'
+
+            with m.State('CALC_VS2'):
+                with m.If(red_out_valid):
+                    m.d.comb += red_in_valid.eq(1)
+
+                    with m.If(vs2_count == vs2_count_max - 1):
+                        m.d.sync += vs2_count.eq(0)
+                    with m.Else():
+                        m.d.sync += vs2_count.eq(vs2_count + 1)
+
+                with m.If(req_fired | red_in_valid):
+                    with m.If(vs2_in_count == vs2_count_max):
+                        m.d.sync += vs2_in_count.eq(0)
+                    with m.Else():
+                        m.d.sync += vs2_in_count.eq(vs2_in_count + 1)
+
+                with m.If((vs2_count == vs2_count_max - 1) & red_out_valid):
+                    m.next = 'CALC_VS1'
+
+            with m.State('CALC_VS1'):
+                with m.If(red_out_valid):
+                    m.d.sync += red_out_reg.eq(red_out_data)
+
+                    with m.If(resp_en):
+                        m.d.sync += self.resp.bits.vd_data.eq(red_vd_data)
+                        m.next = 'RESP'
+                    with m.Else():
+                        m.next = 'IDLE'
+
+            with m.State('RESP'):
+                m.d.comb += self.resp.valid.eq(1)
+                with m.If(self.resp.fire):
+                    m.next = 'IDLE'
+
+        old_vd_data = Signal(self.vlen)
+        with m.If(self.req.fire):
+            m.d.sync += old_vd_data.eq(self.req.bits.vs3_data)
+
+        vd_vsew = Mux(req_uop.widen | req_uop.widen2, req_vsew + 1, req_vsew)
+        vd_vsew_reg = Signal(3)
+        with m.If(self.req.fire):
+            m.d.sync += vd_vsew_reg.eq(vd_vsew)
+        vd_mask_vsew = Signal(self.vlen)
+        with m.Switch(vd_vsew_reg):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    m.d.comb += vd_mask_vsew.eq(~((1 << n) - 1))
+
+        with m.If(uop.vl == 0):
+            m.d.comb += red_vd_data.eq(old_vd_data)
+        with m.Elif(uop.vta):
+            m.d.comb += red_vd_data.eq(vd_mask_vsew
+                                       | (red_out_data & ~vd_mask_vsew))
+        with m.Else():
+            m.d.comb += red_vd_data.eq((old_vd_data & vd_mask_vsew)
+                                       | (red_out_data
+                                          & ~vd_mask_vsew))
+
+        vs1_data = Signal(self.vlen)
+        with m.If(self.req.fire):
+            with m.Switch(req_vsew):
+                for w in range(4):
+                    with m.Case(w):
+                        n = 1 << (3 + w)
+                        m.d.sync += vs1_data.eq(self.req.bits.vs1_data[:n])
+
+        req_vmask_vl = req_vmask & (Const(~0, self.vlen) >>
+                                    (self.vlen - req_vl).as_unsigned())
+        req_vmask_uop = Signal(self.vlen_bytes)
+        with m.Switch(req_vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    stride = self.vlen // n
+
+                    with m.Switch(req_uop_idx):
+                        for i in range(8):
+                            with m.Case(i):
+                                m.d.comb += req_vmask_uop.eq(
+                                    req_vmask_vl[i * stride:(i + 1) * stride])
+
+        vl_rem = Signal(self.vl_bits)
+        with m.If(req_vl > (
+            (req_uop_idx << log2_int(self.vlen_bytes)) >> req_vsew)):
+            m.d.comb += vl_rem.eq(req_vl - (
+                (req_uop_idx << log2_int(self.vlen_bytes)) >> req_vsew))
+
+        vs2_masked_data = Signal(self.vlen)
+        with m.Switch(req_vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (3 + w)
+                    for i in range(self.vlen // n):
+                        with m.If((~req_vm & ~req_vmask_uop[i])
+                                  | (i >= vl_rem)):
+                            with m.If(is_redsum(req_opc)):
+                                m.d.comb += vs2_masked_data[i * n:(i + 1) *
+                                                            n].eq(0)
+
+                        with m.Else():
+                            m.d.comb += vs2_masked_data[i * n:(i + 1) * n].eq(
+                                self.req.bits.vs2_data[i * n:(i + 1) * n])
+
+        vs2_masked_data_reg = Signal.like(vs2_masked_data)
+        with m.If(self.req.fire):
+            m.d.sync += vs2_masked_data_reg.eq(vs2_masked_data)
+
+        red_vs1_data = Signal(self.vlen // 2)
+        red_vs2_data = Signal(self.vlen // 2)
+
+        vs2_shamt = Signal(range(self.vlen))
+        with m.Switch(uop.vsew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 3 + w
+                    m.d.comb += vs2_shamt.eq(vs2_in_count << n)
+        vs2_shifted_data = vs2_masked_data_reg >> vs2_shamt
+
+        with m.If(is_redsum(uop.opcode)):
+            with m.If(req_fired):
+                m.d.comb += red_vs2_data.eq(
+                    Mux(~uop.expd_idx.any(), vs1_data, red_out_reg))
+            with m.Else():
+                m.d.comb += red_vs2_data.eq(red_out_data)
+
+            m.d.comb += red_vs1_data.eq(vs2_shifted_data)
+
+        lane_out_valid = 1
+        for i in range(self.n_lanes // 2):
+            lane = VFPUReduce(self.lane_width, latency=self.num_red_stages)
+            setattr(m.submodules, f'lane{i}', lane)
+            lane_out_valid &= lane.out.valid
+
+            m.d.comb += [
+                lane.inp.valid.eq(req_fired | red_in_valid),
+                lane.inp.bits.in1.eq(red_vs1_data[i * self.lane_width:(i + 1) *
+                                                  self.lane_width]),
+                lane.inp.bits.in2.eq(red_vs2_data[i * self.lane_width:(i + 1) *
+                                                  self.lane_width]),
+                lane.inp.bits.src_fmt.eq(
+                    Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                lane.inp.bits.dst_fmt.eq(
+                    Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                red_out_data[i * self.lane_width:(i + 1) * self.lane_width].eq(
+                    lane.out.bits.data),
+            ]
+
+            with m.If(is_redsum(uop.opcode)):
+                m.d.comb += lane.inp.bits.fn.eq(FPUOperator.ADD)
+
+        m.d.comb += red_out_valid.eq(lane_out_valid)
 
         return m

@@ -2,7 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit, VMaskUnit, VFPUUnit, VFDivUnit
+from vroom.fu import ExecReq, ExecResp, VALUUnit, AddrGenUnit, VMultiplierUnit, VDivUnit, VReductionUnit, VMaskUnit, VFPUUnit, VFDivUnit, VFReductionUnit
 from vroom.perm import VPermutationUnit
 
 from room.utils import Decoupled, Valid
@@ -310,6 +310,10 @@ class FPUExecUnit(ExecUnit):
 
         vresp_units.append(fpu_queue)
 
+        #
+        # FDIV
+        #
+
         fdiv = m.submodules.fdiv = VFDivUnit(self.params)
         fdiv_busy = Signal()
         fdiv_resp_busy = 0
@@ -328,6 +332,30 @@ class FPUExecUnit(ExecUnit):
         ]
 
         vresp_units.append(fdiv)
+
+        #
+        # VFREDUCE
+        #
+
+        fredu = m.submodules.fredu = VFReductionUnit(self.params)
+        fredu_busy = Signal()
+
+        fredu_resp_busy = 0
+        for iu in vresp_units:
+            if isinstance(iu, Queue):
+                fredu_resp_busy |= iu.deq.valid
+            else:
+                fredu_resp_busy |= iu.resp.valid
+
+        m.d.comb += [
+            self.req.connect(fredu.req),
+            fredu.req.valid.eq(self.req.valid
+                               &
+                               (self.req.bits.uop.fu_type == VFUType.REDUCE)),
+            fredu.resp.ready.eq(~fredu_resp_busy),
+            fredu_busy.eq(~fredu.req.ready),
+        ]
+        vresp_units.append(fredu)
 
         for iu in reversed(vresp_units):
             if isinstance(iu, Queue):
@@ -348,5 +376,8 @@ class FPUExecUnit(ExecUnit):
             m.d.comb += self.req.ready.eq(~fpu_busy)
         with m.Elif(self.req.bits.uop.fu_type_has(VFUType.FDIV)):
             m.d.comb += self.req.ready.eq(~fdiv_busy)
+        with m.Elif((self.req.bits.uop.fu_type == VFUType.REDUCE)
+                    & self.req.bits.uop.fp_valid):
+            m.d.comb += self.req.ready.eq(~fredu_busy)
 
         return m
