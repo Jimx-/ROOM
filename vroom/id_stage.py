@@ -249,8 +249,18 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 ]
                             with m.Case(0b000100):
                                 m.d.comb += UOPC(VOpCode.VFMIN)
+                            with m.Case(0b000101):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VFREDMIN),
+                                ]
                             with m.Case(0b000110):
                                 m.d.comb += UOPC(VOpCode.VFMAX)
+                            with m.Case(0b000111):
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VFREDMAX),
+                                ]
                             with m.Case(0b001000):
                                 m.d.comb += UOPC(VOpCode.VFSGNJ)
                             with m.Case(0b001001):

@@ -12,7 +12,7 @@ from vroom.fpu import VFPUFMA, VFPUComp, VFPUDivSqrt, VFPUCast, VFPURec, VFPURed
 from vroom.utils import TailGen, vlmul_to_lmul
 
 from room.consts import RegisterType, RoundingMode
-from room.fpu import FPUOperator, FPFormat, IntFormat, FPUCastMulti
+from room.fpu import FPUOperator, FPFormat, FType, IntFormat, FPUCastMulti
 from room.utils import Decoupled, Pipe, sign_extend, bit_extend
 
 
@@ -1955,6 +1955,8 @@ class VFReductionUnit(IterativeFunctionalUnit):
                         with m.Case(w):
                             n = 1 << (w + 3)
                             m.d.sync += vs2_count_max.eq(self.vlen // n - 1)
+            with m.Else():
+                m.d.sync += vs2_count_max.eq(len(vs2_count_max) - req_vsew)
 
         req_fired = Signal()
         m.d.sync += req_fired.eq(0)
@@ -1966,6 +1968,7 @@ class VFReductionUnit(IterativeFunctionalUnit):
         red_out_data = Signal(self.vlen // 2)
         red_vd_data = Signal(self.vlen)
         red_out_reg = Signal(64)
+        calc_vs2_last = Signal()
         resp_en = Signal()
         with m.FSM():
             with m.State('IDLE'):
@@ -1991,6 +1994,7 @@ class VFReductionUnit(IterativeFunctionalUnit):
                         m.d.sync += vs2_in_count.eq(vs2_in_count + 1)
 
                 with m.If((vs2_count == vs2_count_max - 1) & red_out_valid):
+                    m.d.comb += calc_vs2_last.eq(1)
                     m.next = 'CALC_VS1'
 
             with m.State('CALC_VS1'):
@@ -2067,12 +2071,19 @@ class VFReductionUnit(IterativeFunctionalUnit):
             for w in range(4):
                 with m.Case(w):
                     n = 1 << (3 + w)
+                    ftyp = FType.FP64 if n == 64 else FType.FP32
                     for i in range(self.vlen // n):
                         with m.If((~req_vm & ~req_vmask_uop[i])
                                   | (i >= vl_rem)):
                             with m.If(is_redsum(req_opc)):
                                 m.d.comb += vs2_masked_data[i * n:(i + 1) *
                                                             n].eq(0)
+                            with m.Elif(req_opc == VOpCode.VFREDMIN):
+                                m.d.comb += vs2_masked_data[i * n:(
+                                    i + 1) * n].eq(ftyp.greatest_finite(0))
+                            with m.Elif(req_opc == VOpCode.VFREDMAX):
+                                m.d.comb += vs2_masked_data[i * n:(
+                                    i + 1) * n].eq(ftyp.greatest_finite(1))
 
                         with m.Else():
                             m.d.comb += vs2_masked_data[i * n:(i + 1) * n].eq(
@@ -2101,6 +2112,27 @@ class VFReductionUnit(IterativeFunctionalUnit):
                 m.d.comb += red_vs2_data.eq(red_out_data)
 
             m.d.comb += red_vs1_data.eq(vs2_shifted_data)
+        with m.Else():
+            with m.If(req_fired):
+                m.d.comb += [
+                    red_vs1_data.eq(vs2_masked_data_reg[:self.vlen // 2]),
+                    red_vs2_data.eq(vs2_masked_data_reg[self.vlen // 2:]),
+                ]
+            with m.Elif(calc_vs2_last):
+                m.d.comb += [
+                    red_vs1_data.eq(red_out_data),
+                    red_vs2_data.eq(
+                        Mux(~uop.expd_idx.any(), vs1_data, red_out_reg)),
+                ]
+            with m.Else():
+                with m.Switch(vs2_count):
+                    for i in range(len(vs2_count_max) - 2):
+                        with m.Case(i):
+                            n = 1 << (len(vs2_count_max) - i + 1)
+                            m.d.comb += [
+                                red_vs1_data.eq(red_out_data[:n]),
+                                red_vs2_data.eq(red_out_data[n:2 * n]),
+                            ]
 
         lane_out_valid = 1
         for i in range(self.n_lanes // 2):
@@ -2124,6 +2156,13 @@ class VFReductionUnit(IterativeFunctionalUnit):
 
             with m.If(is_redsum(uop.opcode)):
                 m.d.comb += lane.inp.bits.fn.eq(FPUOperator.ADD)
+            with m.Else():
+                m.d.comb += [
+                    lane.inp.bits.fn.eq(FPUOperator.MINMAX),
+                    lane.inp.bits.rm.eq(
+                        Mux(uop.opcode == VOpCode.VFREDMIN, RoundingMode.RNE,
+                            RoundingMode.RTZ)),
+                ]
 
         m.d.comb += red_out_valid.eq(lane_out_valid)
 

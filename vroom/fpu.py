@@ -407,7 +407,7 @@ class VFPUReduce(Elaboratable):
             fadd.inp.bits.in3.eq(self.inp.bits.in2),
         ]
 
-        fcmp = m.submodules.fcmp = VFPUCast(self.width, latency=self.latency)
+        fcmp = m.submodules.fcmp = VFPUComp(self.width, latency=self.latency)
         m.d.comb += [
             fcmp.inp.eq(self.inp),
             fcmp.inp.valid.eq(self.inp.valid
