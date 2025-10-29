@@ -380,7 +380,7 @@ class VFPURec(Elaboratable):
 
 class VFPUReduce(Elaboratable):
 
-    def __init__(self, width, latency=3):
+    def __init__(self, width, latency=4):
         self.width = width
         self.latency = latency
 
@@ -391,7 +391,7 @@ class VFPUReduce(Elaboratable):
         m = Module()
 
         in_pipe = m.submodules.in_pipe = Pipe(width=len(self.inp.bits),
-                                              depth=self.latency)
+                                              depth=1)
         in_pipe_out = FPUInput(self.width)
         m.d.comb += [
             in_pipe.in_valid.eq(self.inp.valid),
@@ -399,23 +399,48 @@ class VFPUReduce(Elaboratable):
             in_pipe_out.eq(in_pipe.out.bits),
         ]
 
-        fadd = m.submodules.fadd = VFPUFMA(self.width, latency=self.latency)
+        fcvt_widen_in1 = FPUCastMulti(latency=1)
+        m.submodules += fcvt_widen_in1
         m.d.comb += [
-            fadd.inp.eq(self.inp),
-            fadd.inp.valid.eq(self.inp.valid
-                              & (self.inp.bits.fn != FPUOperator.MINMAX)),
-            fadd.inp.bits.in3.eq(self.inp.bits.in2),
+            fcvt_widen_in1.inp.valid.eq(self.inp.valid & (
+                self.inp.bits.src_fmt != self.inp.bits.dst_fmt)),
+            fcvt_widen_in1.inp.bits.in1.eq(self.inp.bits.in1),
+            fcvt_widen_in1.inp.bits.src_fmt.eq(self.inp.bits.src_fmt),
+            fcvt_widen_in1.inp.bits.dst_fmt.eq(self.inp.bits.dst_fmt),
         ]
 
-        fcmp = m.submodules.fcmp = VFPUComp(self.width, latency=self.latency)
+        fadd = m.submodules.fadd = VFPUFMA(self.width,
+                                           latency=self.latency - 1)
         m.d.comb += [
-            fcmp.inp.eq(self.inp),
-            fcmp.inp.valid.eq(self.inp.valid
-                              & (self.inp.bits.fn == FPUOperator.MINMAX)),
+            fadd.inp.valid.eq(in_pipe.out.valid
+                              & (in_pipe_out.fn != FPUOperator.MINMAX)),
+            fadd.inp.bits.eq(in_pipe_out),
+            fadd.inp.bits.in1.eq(
+                Mux(fcvt_widen_in1.out.valid, fcvt_widen_in1.out.bits,
+                    in_pipe_out.in1)),
+            fadd.inp.bits.in3.eq(in_pipe_out.in2),
+            fadd.inp.bits.src_fmt.eq(in_pipe_out.dst_fmt),
         ]
 
-        m.d.comb += self.out.valid.eq(in_pipe.out.valid)
-        with m.If(in_pipe_out.fn == FPUOperator.MINMAX):
+        fcmp = m.submodules.fcmp = VFPUComp(self.width,
+                                            latency=self.latency - 1)
+        m.d.comb += [
+            fcmp.inp.valid.eq(in_pipe.out.valid
+                              & (in_pipe_out.fn == FPUOperator.MINMAX)),
+            fcmp.inp.bits.eq(in_pipe_out),
+        ]
+
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(self.inp.bits),
+                                                depth=self.latency - 1)
+        out_pipe_out = FPUInput(self.width)
+        m.d.comb += [
+            out_pipe.in_valid.eq(in_pipe.out.valid),
+            out_pipe.in_data.eq(in_pipe.out.bits),
+            out_pipe_out.eq(out_pipe.out.bits),
+        ]
+
+        m.d.comb += self.out.valid.eq(out_pipe.out.valid)
+        with m.If(out_pipe_out.fn == FPUOperator.MINMAX):
             m.d.comb += self.out.bits.eq(fcmp.out.bits)
         with m.Else():
             m.d.comb += self.out.bits.eq(fadd.out.bits)

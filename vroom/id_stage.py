@@ -435,9 +435,21 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                     UOPC(VOpCode.VFADD),
                                     uop.widen.eq(1),
                                 ]
+                            with m.Case(0b110001):  # vfwredusum
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VFREDUSUM),
+                                    uop.widen.eq(1),
+                                ]
                             with m.Case(0b110010):  # vfwsub
                                 m.d.comb += [
                                     UOPC(VOpCode.VFSUB),
+                                    uop.widen.eq(1),
+                                ]
+                            with m.Case(0b110011):  # vfwredosum
+                                m.d.comb += [
+                                    uop.fu_type.eq(VFUType.REDUCE),
+                                    UOPC(VOpCode.VFREDOSUM),
                                     uop.widen.eq(1),
                                 ]
                             with m.Case(0b110100):  # vfwadd.w

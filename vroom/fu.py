@@ -1926,7 +1926,7 @@ class VFReductionUnit(IterativeFunctionalUnit):
     def __init__(self, params):
         super().__init__(params)
 
-        self.num_red_stages = params['fma_latency']
+        self.num_red_stages = 1 + params['fma_latency']
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -2039,7 +2039,7 @@ class VFReductionUnit(IterativeFunctionalUnit):
 
         vs1_data = Signal(self.vlen)
         with m.If(self.req.fire):
-            with m.Switch(req_vsew):
+            with m.Switch(vd_vsew):
                 for w in range(4):
                     with m.Case(w):
                         n = 1 << (3 + w)
@@ -2149,7 +2149,7 @@ class VFReductionUnit(IterativeFunctionalUnit):
                 lane.inp.bits.src_fmt.eq(
                     Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 lane.inp.bits.dst_fmt.eq(
-                    Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+                    Mux(uop.fp_single & ~uop.widen, FPFormat.S, FPFormat.D)),
                 red_out_data[i * self.lane_width:(i + 1) * self.lane_width].eq(
                     lane.out.bits.data),
             ]
