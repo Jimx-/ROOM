@@ -61,7 +61,7 @@ class StrideClassifier(HasVectorParams, Elaboratable):
         return m
 
 
-class VLoadPacker(HasVectorParams, Elaboratable):
+class BaseLoadGenerator(HasVectorParams, Elaboratable):
 
     class Response(HasVectorParams, Record):
 
@@ -69,13 +69,14 @@ class VLoadPacker(HasVectorParams, Elaboratable):
             HasVectorParams.__init__(self, params)
 
             Record.__init__(self, [
+                ('addr', self.xlen, Direction.FANOUT),
+                ('vdest', range(32), Direction.FANOUT),
                 ('elem_idx', range(self.max_vlmax), Direction.FANOUT),
                 ('elem_offset', range(self.max_elem_count), Direction.FANOUT),
                 ('elem_count', range(self.max_elem_count + 1),
                  Direction.FANOUT),
-                ('next_vreg', 1, Direction.FANOUT),
-                ('next_vmask', 1, Direction.FANOUT),
-                ('next_line', 1, Direction.FANOUT),
+                ('mask', self.xlen // 8, Direction.FANOUT),
+                ('mask_valid', 1, Direction.FANOUT),
                 ('dir', 1, Direction.FANOUT),
                 ('last', 1, Direction.FANOUT),
             ],
@@ -86,7 +87,10 @@ class VLoadPacker(HasVectorParams, Elaboratable):
         super().__init__(params)
 
         self.req = Valid(ExecResp, params)
-        self.resp = Decoupled(VLoadPacker.Response, params)
+        self.resp = Decoupled(BaseLoadGenerator.Response, params)
+
+
+class PackedLoadGenerator(BaseLoadGenerator):
 
     def elaborate(self, platform):
         m = Module()
@@ -98,6 +102,8 @@ class VLoadPacker(HasVectorParams, Elaboratable):
             stride_cls.stride.eq(self.req.bits.stride),
         ]
 
+        cur_addr = Signal(self.xlen)
+        cur_vdest = Signal(range(32))
         cur_offset = Signal(range(self.max_elem_count))
         log_stride = Signal(2)
         cur_max = Signal(range(self.max_elem_count + 1))
@@ -113,43 +119,43 @@ class VLoadPacker(HasVectorParams, Elaboratable):
         vreg_count = Mux(rem_line > rem_vreg, rem_vreg, rem_line)
         vl_count = Mux(vreg_count > rem_vl, rem_vl, vreg_count)
 
+        next_vreg = vl_count == rem_vreg
+        next_line = vl_count == rem_line
+
         m.d.comb += [
+            self.resp.bits.addr.eq(cur_addr),
+            self.resp.bits.vdest.eq(cur_vdest),
             self.resp.bits.elem_idx.eq(cur_idx),
             self.resp.bits.elem_offset.eq(cur_offset),
             self.resp.bits.elem_count.eq(vl_count),
-            self.resp.bits.next_vreg.eq(vl_count == rem_vreg),
-            self.resp.bits.next_line.eq(vl_count == rem_line),
             self.resp.bits.last.eq(vl_count == rem_vl),
         ]
 
         with m.FSM():
             with m.State('IDLE'):
                 with m.If(self.req.valid):
-                    with m.If((self.req.bits.uop.unit_stride
-                               | (self.req.bits.uop.strided
-                                  & stride_cls.out[1:].any()))
-                              & self.req.bits.uop.vl.any()):
-                        log_stride_n = Mux(self.req.bits.uop.unit_stride, 0,
-                                           stride_cls.log_stride)
+                    log_stride_n = Mux(self.req.bits.uop.unit_stride, 0,
+                                       stride_cls.log_stride)
 
-                        m.d.sync += [
-                            cur_offset.eq(
-                                self.req.bits.base_addr[:log2_int(self.xlen //
-                                                                  8)] >>
-                                self.req.bits.uop.mem_size),
-                            log_stride.eq(log_stride_n),
-                            self.resp.bits.dir.eq(self.req.bits.uop.strided
-                                                  & self.req.bits.stride[-1]),
-                            cur_max.eq((self.xlen // 8) >> (
-                                self.req.bits.uop.mem_size + log_stride_n)),
-                            cur_vmax.eq(
-                                self.vlen_bytes >> self.req.bits.uop.mem_size),
-                            cur_idx.eq(0),
-                            cur_vidx.eq(0),
-                            cur_vl.eq(self.req.bits.uop.vl),
-                        ]
+                    m.d.sync += [
+                        cur_addr.eq(self.req.bits.base_addr),
+                        cur_vdest.eq(self.req.bits.uop.ldst),
+                        cur_offset.eq(
+                            self.req.bits.base_addr[:log2_int(self.xlen // 8)]
+                            >> self.req.bits.uop.mem_size),
+                        log_stride.eq(log_stride_n),
+                        self.resp.bits.dir.eq(self.req.bits.uop.strided
+                                              & self.req.bits.stride[-1]),
+                        cur_max.eq((self.xlen // 8) >> (
+                            self.req.bits.uop.mem_size + log_stride_n)),
+                        cur_vmax.eq(
+                            self.vlen_bytes >> self.req.bits.uop.mem_size),
+                        cur_idx.eq(0),
+                        cur_vidx.eq(0),
+                        cur_vl.eq(self.req.bits.uop.vl),
+                    ]
 
-                        m.next = 'PACK'
+                    m.next = 'PACK'
 
             with m.State('PACK'):
                 m.d.comb += self.resp.valid.eq(1)
@@ -157,20 +163,62 @@ class VLoadPacker(HasVectorParams, Elaboratable):
                 with m.If(self.resp.fire):
                     m.d.sync += cur_idx.eq(cur_idx + self.resp.bits.elem_count)
 
-                    with m.If(self.resp.bits.next_vreg):
-                        m.d.sync += cur_vidx.eq(0)
+                    with m.If(next_vreg):
+                        m.d.sync += [
+                            cur_vdest.eq(cur_vdest + 1),
+                            cur_vidx.eq(0),
+                        ]
                     with m.Else():
                         m.d.sync += cur_vidx.eq(cur_vidx +
                                                 self.resp.bits.elem_count)
 
-                    with m.If(self.resp.bits.next_line):
+                    with m.If(next_line):
                         m.d.sync += cur_offset.eq(0)
+
+                        with m.If(self.resp.bits.dir):
+                            m.d.sync += cur_addr.eq(cur_addr - self.xlen // 8)
+                        with m.Else():
+                            m.d.sync += cur_addr.eq(cur_addr + self.xlen // 8)
                     with m.Else():
                         m.d.sync += cur_offset.eq(cur_offset + (
                             self.resp.bits.elem_count << log_stride))
 
                     with m.If(self.resp.bits.last):
                         m.next = 'IDLE'
+
+        return m
+
+
+class VLoadGenerator(BaseLoadGenerator):
+
+    def elaborate(self, platform):
+        m = Module()
+
+        stride_cls = StrideClassifier(self.params)
+        m.submodules += stride_cls
+        m.d.comb += [
+            stride_cls.mem_size.eq(self.req.bits.uop.mem_size),
+            stride_cls.stride.eq(self.req.bits.stride),
+        ]
+
+        packed_gen = m.submodules.packed_gen = PackedLoadGenerator(self.params)
+        m.d.comb += packed_gen.req.bits.eq(self.req.bits)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                can_pack = self.req.bits.uop.unit_stride | (
+                    self.req.bits.uop.strided & stride_cls.out[1:].any())
+
+                with m.If(self.req.valid & self.req.bits.uop.vl.any()):
+                    with m.If(can_pack):
+                        m.d.comb += packed_gen.req.valid.eq(1)
+                        m.next = 'PACKING'
+
+            with m.State('PACKING'):
+                m.d.comb += packed_gen.resp.connect(self.resp)
+
+                with m.If(self.resp.fire & self.resp.bits.last):
+                    m.next = 'IDLE'
 
         return m
 
@@ -374,8 +422,8 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
 
         req = ExecResp(self.params)
 
-        ld_packer = m.submodules.ld_packer = VLoadPacker(self.params)
-        m.d.comb += ld_packer.req.bits.eq(self.req.bits)
+        ld_gen = m.submodules.ld_gen = VLoadGenerator(self.params)
+        m.d.comb += ld_gen.req.bits.eq(self.req.bits)
 
         st_packer = m.submodules.st_packer = VStorePacker(self.params)
         m.d.comb += st_packer.req.bits.eq(self.req.bits)
@@ -384,15 +432,17 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
         m.d.comb += st_data_buf.write.eq(self.st_data)
 
         cur_addr = Signal(self.xlen)
-        cur_vdest = Signal(range(32))
         m.d.comb += [
-            self.ld_resp.bits.vdest.eq(cur_vdest),
-            self.ld_resp.bits.elem_idx.eq(ld_packer.resp.bits.elem_idx),
-            self.ld_resp.bits.elem_offset.eq(ld_packer.resp.bits.elem_offset),
-            self.ld_resp.bits.elem_count.eq(ld_packer.resp.bits.elem_count),
-            self.ld_resp.bits.last.eq(ld_packer.resp.bits.last),
+            self.ld_resp.bits.vdest.eq(ld_gen.resp.bits.vdest),
+            self.ld_resp.bits.elem_idx.eq(ld_gen.resp.bits.elem_idx),
+            self.ld_resp.bits.elem_offset.eq(ld_gen.resp.bits.elem_offset),
+            self.ld_resp.bits.elem_count.eq(ld_gen.resp.bits.elem_count),
+            self.ld_resp.bits.last.eq(ld_gen.resp.bits.last),
             self.ld_resp.bits.data.eq(self.mem_resp.bits.data),
         ]
+
+        mask_data = Signal(self.vlen)
+        mask_offset = Signal(range(self.vlen))
 
         st_mem_size = st_packer.resp.bits.mem_size
 
@@ -407,11 +457,12 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
                     m.d.sync += [
                         req.eq(self.req.bits),
                         cur_addr.eq(self.req.bits.base_addr),
-                        cur_vdest.eq(self.req.bits.uop.ldst),
+                        mask_data.eq(self.req.bits.mask),
+                        mask_offset.eq(0),
                     ]
 
                     with m.If(self.req.bits.uop.is_ld):
-                        m.d.comb += ld_packer.req.valid.eq(1)
+                        m.d.comb += ld_gen.req.valid.eq(1)
                         m.next = 'LOAD_REQ'
                     with m.Else():
                         m.d.comb += [
@@ -422,9 +473,9 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
 
             with m.State('LOAD_REQ'):
                 m.d.comb += [
-                    self.mem_req.valid.eq(1),
+                    self.mem_req.valid.eq(ld_gen.resp.valid),
                     self.mem_req.bits.cmd.eq(MemoryCommand.READ),
-                    self.mem_req.bits.addr.eq(cur_addr),
+                    self.mem_req.bits.addr.eq(ld_gen.resp.bits.addr),
                     self.mem_req.bits.size.eq(log2_int(self.xlen // 8)),
                 ]
 
@@ -437,20 +488,11 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
 
                 with m.Elif(self.mem_resp.valid):
                     m.d.comb += [
-                        ld_packer.resp.ready.eq(1),
+                        ld_gen.resp.ready.eq(1),
                         self.ld_resp.valid.eq(1),
                     ]
 
-                    with m.If(ld_packer.resp.bits.next_line):
-                        with m.If(ld_packer.resp.bits.dir):
-                            m.d.sync += cur_addr.eq(cur_addr - self.xlen // 8)
-                        with m.Else():
-                            m.d.sync += cur_addr.eq(cur_addr + self.xlen // 8)
-
-                    with m.If(ld_packer.resp.bits.next_vreg):
-                        m.d.sync += cur_vdest.eq(cur_vdest + 1)
-
-                    with m.If(ld_packer.resp.bits.last):
+                    with m.If(ld_gen.resp.bits.last):
                         m.next = 'IDLE'
                     with m.Else():
                         m.next = 'LOAD_REQ'
