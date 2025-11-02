@@ -111,6 +111,9 @@ class PackedLoadGenerator(BaseLoadGenerator):
         cur_idx = Signal(range(self.max_vlmax))
         cur_vidx = Signal(range(self.vlen_bytes))
         cur_vl = Signal(self.vl_bits)
+        is_masked = Signal()
+        cur_mask_data = Signal(self.vlen)
+        cur_mask_offset = Signal(range(self.vlen))
 
         rem_line = cur_max - (cur_offset >> log_stride)
         rem_vreg = cur_vmax - cur_vidx
@@ -128,6 +131,9 @@ class PackedLoadGenerator(BaseLoadGenerator):
             self.resp.bits.elem_idx.eq(cur_idx),
             self.resp.bits.elem_offset.eq(cur_offset),
             self.resp.bits.elem_count.eq(vl_count),
+            self.resp.bits.mask_valid.eq(is_masked),
+            self.resp.bits.mask.eq(cur_mask_data
+                                   & ((1 << self.resp.bits.elem_count) - 1)),
             self.resp.bits.last.eq(vl_count == rem_vl),
         ]
 
@@ -153,6 +159,9 @@ class PackedLoadGenerator(BaseLoadGenerator):
                         cur_idx.eq(0),
                         cur_vidx.eq(0),
                         cur_vl.eq(self.req.bits.uop.vl),
+                        is_masked.eq(~self.req.bits.uop.vm),
+                        cur_mask_data.eq(self.req.bits.mask),
+                        cur_mask_offset.eq(0),
                     ]
 
                     m.next = 'PACK'
@@ -161,7 +170,13 @@ class PackedLoadGenerator(BaseLoadGenerator):
                 m.d.comb += self.resp.valid.eq(1)
 
                 with m.If(self.resp.fire):
-                    m.d.sync += cur_idx.eq(cur_idx + self.resp.bits.elem_count)
+                    m.d.sync += [
+                        cur_idx.eq(cur_idx + self.resp.bits.elem_count),
+                        cur_mask_offset.eq(cur_mask_offset +
+                                           self.resp.bits.elem_count),
+                        cur_mask_data.eq(
+                            cur_mask_data >> self.resp.bits.elem_count),
+                    ]
 
                     with m.If(next_vreg):
                         m.d.sync += [
@@ -437,12 +452,11 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
             self.ld_resp.bits.elem_idx.eq(ld_gen.resp.bits.elem_idx),
             self.ld_resp.bits.elem_offset.eq(ld_gen.resp.bits.elem_offset),
             self.ld_resp.bits.elem_count.eq(ld_gen.resp.bits.elem_count),
+            self.ld_resp.bits.mask_valid.eq(ld_gen.resp.bits.mask_valid),
+            self.ld_resp.bits.mask.eq(ld_gen.resp.bits.mask),
             self.ld_resp.bits.last.eq(ld_gen.resp.bits.last),
             self.ld_resp.bits.data.eq(self.mem_resp.bits.data),
         ]
-
-        mask_data = Signal(self.vlen)
-        mask_offset = Signal(range(self.vlen))
 
         st_mem_size = st_packer.resp.bits.mem_size
 
@@ -457,8 +471,6 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
                     m.d.sync += [
                         req.eq(self.req.bits),
                         cur_addr.eq(self.req.bits.base_addr),
-                        mask_data.eq(self.req.bits.mask),
-                        mask_offset.eq(0),
                     ]
 
                     with m.If(self.req.bits.uop.is_ld):
@@ -603,6 +615,10 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
             with m.If(tail_mask[i]):
                 m.d.comb += write_one_mask[i * 8:(i + 1) * 8].eq(
                     self.exec_req.bits.uop.vta.replicate(8))
+            with m.Else():
+                m.d.comb += write_one_mask[i * 8:(i + 1) * 8].eq(
+                    (self.exec_req.bits.uop.vm
+                     | self.exec_req.bits.uop.vma).replicate(8))
 
         with m.If(self.exec_req.fire):
             m.d.sync += buf_wptr.eq(buf_wptr + 1)
@@ -687,6 +703,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         s1_ld_elem_idx = Signal.like(ld_resp_q.deq.bits.elem_idx)
         s1_ld_elem_off = Signal.like(elem_off)
         s1_ld_elem_count = Signal.like(ld_resp_q.deq.bits.elem_count)
+        s1_ld_byte_mask = Signal(self.xlen // 8)
         s1_ld_last = Signal()
         m.d.sync += s1_ld_data_valid.eq(s0_ld_data_valid)
         with m.If(s0_ld_data_valid):
@@ -754,18 +771,37 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
             for i in range(self.vlen_bytes):
                 with m.Case(i):
                     m.d.comb += elem_count_mask_preshift.eq((1 << i) - 1)
-        elem_count_shamt = Signal(range(self.vlen_bytes))
+                    elem_count_shamt = Signal(range(self.vlen_bytes))
         with m.Switch(req_dest_eew):
             for i in range(4):
                 with m.Case(i):
-                    m.d.comb += elem_count_shamt.eq(ld_elem_idx_low << i)
-        m.d.comb += elem_count_mask.eq(
-            elem_count_mask_preshift << elem_count_shamt)
+                    m.d.comb += [
+                        elem_count_shamt.eq(ld_elem_idx_low << i),
+                        elem_count_mask.eq(
+                            elem_count_mask_preshift << elem_count_shamt),
+                    ]
 
         ld_resp_done = s1_ld_data_valid & s1_ld_last
 
+        # Load mask
+        m.d.sync += s1_ld_byte_mask.eq(~0)
+        with m.If(ld_resp_q.deq.bits.mask_valid):
+            with m.Switch(req_dest_eew):
+                for i in range(4):
+                    with m.Case(i):
+                        n = 1 << i
+                        nb = n << 3
+                        m.d.sync += s1_ld_byte_mask.eq(
+                            Cat(
+                                b.replicate(n)
+                                for b in ld_resp_q.deq.bits.mask[:self.xlen //
+                                                                 nb]))
+
+        s1_ld_mask = Signal.like(elem_count_mask)
+        m.d.comb += s1_ld_mask.eq(s1_ld_byte_mask << elem_count_shamt)
+
         # Write load data buffer
-        ld_write_mask = elem_count_mask
+        ld_write_mask = elem_count_mask & s1_ld_mask
         ld_write_bit_mask = Signal(self.vlen)
         m.d.comb += ld_write_bit_mask.eq(
             Cat(b.replicate(8) for b in ld_write_mask))
