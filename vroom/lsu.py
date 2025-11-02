@@ -51,11 +51,11 @@ class StrideClassifier(HasVectorParams, Elaboratable):
             m.d.comb += self.out[3].eq(1)
 
         m.d.comb += self.log_stride.eq(3)
-        with m.If(self.out[0]):
+        with m.If(self.out[1]):
             m.d.comb += self.log_stride.eq(0)
-        with m.Elif(self.out[1]):
-            m.d.comb += self.log_stride.eq(1)
         with m.Elif(self.out[2]):
+            m.d.comb += self.log_stride.eq(1)
+        with m.Elif(self.out[3]):
             m.d.comb += self.log_stride.eq(2)
 
         return m
