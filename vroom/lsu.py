@@ -14,6 +14,18 @@ from room.utils import Decoupled, Valid
 from roomsoc.interconnect.stream import Queue
 
 
+class IndexData(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        Record.__init__(self, [
+            ('index', 64, Direction.FANOUT),
+            ('mask', 1, Direction.FANOUT),
+            ('last', 1, Direction.FANOUT),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
 class StrideClassifier(HasVectorParams, Elaboratable):
 
     def __init__(self, params):
@@ -83,11 +95,14 @@ class BaseLoadGenerator(HasVectorParams, Elaboratable):
                             name=name,
                             src_loc_at=1 + src_loc_at)
 
-    def __init__(self, params):
+    def __init__(self, params, with_index=False):
         super().__init__(params)
 
         self.req = Valid(ExecResp, params)
         self.resp = Decoupled(BaseLoadGenerator.Response, params)
+
+        if with_index:
+            self.idx_data = Decoupled(IndexData)
 
 
 class PackedLoadGenerator(BaseLoadGenerator):
@@ -204,7 +219,139 @@ class PackedLoadGenerator(BaseLoadGenerator):
         return m
 
 
+class IndexedLoadGenerator(BaseLoadGenerator):
+
+    def __init__(self, params):
+        super().__init__(params, with_index=True)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        cur_uop = VMicroOp(self.params)
+        stride = Signal(self.xlen)
+        dest_eew = Mux(cur_uop.indexed, cur_uop.vsew, cur_uop.mem_size)
+
+        base_addr = Signal(self.xlen)
+        cur_addr = Signal(self.xlen)
+        next_addr = Signal(self.xlen)
+        cur_vdest = Signal(range(32))
+        cur_offset = cur_addr[:log2_int(self.xlen // 8)] >> dest_eew
+        cur_max = Signal(range(self.max_elem_count + 1))
+        cur_vmax = Signal(range(self.vlen_bytes + 1))
+        cur_idx = Signal(range(self.max_vlmax))
+        cur_vidx = Signal(range(self.vlen_bytes))
+        cur_vl = Signal(self.vl_bits)
+        is_masked = Signal()
+        cur_mask_data = Signal(self.vlen)
+        cur_mask_offset = Signal(range(self.vlen))
+
+        rem_seg = 1
+        rem_line = cur_max - cur_offset
+        rem_vreg = cur_vmax - cur_vidx
+        rem_vl = cur_vl - cur_idx
+
+        seg_count = Mux(rem_line > rem_seg, rem_seg, rem_line)
+        vreg_count = Mux(seg_count > rem_vreg, rem_vreg, seg_count)
+        vl_count = Mux(vreg_count > rem_vl, rem_vl, vreg_count)
+
+        next_seg = vl_count == rem_seg
+        next_vreg = vl_count == rem_vreg
+
+        m.d.comb += [
+            self.resp.bits.addr.eq(cur_addr),
+            self.resp.bits.vdest.eq(cur_vdest),
+            self.resp.bits.elem_idx.eq(cur_idx),
+            self.resp.bits.elem_offset.eq(cur_offset),
+            self.resp.bits.elem_count.eq(vl_count),
+            self.resp.bits.mask_valid.eq(is_masked),
+            self.resp.bits.mask.eq(cur_mask_data
+                                   & ((1 << self.resp.bits.elem_count) - 1)),
+            self.resp.bits.last.eq(vl_count == rem_vl),
+        ]
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(self.req.valid):
+                    m.d.sync += [
+                        cur_uop.eq(self.req.bits.uop),
+                        stride.eq(self.req.bits.stride),
+                        base_addr.eq(self.req.bits.base_addr),
+                        cur_addr.eq(self.req.bits.base_addr),
+                        cur_vdest.eq(self.req.bits.uop.ldst),
+                        self.resp.bits.dir.eq(self.req.bits.uop.strided
+                                              & self.req.bits.stride[-1]),
+                        cur_max.eq((self.xlen // 8) >> Mux(
+                            self.req.bits.uop.indexed, self.req.bits.uop.vsew,
+                            self.req.bits.uop.mem_size)),
+                        cur_vmax.eq(
+                            self.vlen_bytes >> self.req.bits.uop.mem_size),
+                        cur_idx.eq(0),
+                        cur_vidx.eq(0),
+                        cur_vl.eq(self.req.bits.uop.vl),
+                        is_masked.eq(~self.req.bits.uop.vm),
+                        cur_mask_data.eq(self.req.bits.mask),
+                        cur_mask_offset.eq(0),
+                    ]
+
+                    with m.If(self.req.bits.uop.indexed):
+                        m.next = 'WAIT_START'
+                    with m.Else():
+                        m.next = 'SCAN'
+
+            with m.State('WAIT_START'):
+                m.d.comb += [
+                    self.idx_data.ready.eq(1),
+                    next_addr.eq(self.req.bits.base_addr +
+                                 self.idx_data.bits.index),
+                ]
+
+                with m.If(self.idx_data.valid):
+                    m.d.sync += cur_addr.eq(next_addr)
+                    m.next = 'SCAN'
+
+            with m.State('SCAN'):
+                m.d.comb += [
+                    self.resp.valid.eq(~cur_uop.indexed
+                                       | self.idx_data.valid
+                                       | self.resp.bits.last),
+                    next_addr.eq(
+                        Mux(cur_uop.indexed,
+                            base_addr + self.idx_data.bits.index,
+                            cur_addr + stride)),
+                ]
+
+                with m.If(self.resp.fire):
+                    m.d.sync += [
+                        cur_idx.eq(cur_idx + self.resp.bits.elem_count),
+                        cur_mask_offset.eq(cur_mask_offset +
+                                           self.resp.bits.elem_count),
+                        cur_mask_data.eq(
+                            cur_mask_data >> self.resp.bits.elem_count),
+                    ]
+
+                    with m.If(next_vreg):
+                        m.d.sync += [
+                            cur_vdest.eq(cur_vdest + 1),
+                            cur_vidx.eq(0),
+                        ]
+                    with m.Else():
+                        m.d.sync += cur_vidx.eq(cur_vidx +
+                                                self.resp.bits.elem_count)
+
+                    with m.If(next_seg):
+                        m.d.comb += self.idx_data.ready.eq(1)
+                        m.d.sync += cur_addr.eq(next_addr)
+
+                    with m.If(self.resp.bits.last):
+                        m.next = 'IDLE'
+
+        return m
+
+
 class VLoadGenerator(BaseLoadGenerator):
+
+    def __init__(self, params):
+        super().__init__(params, with_index=True)
 
     def elaborate(self, platform):
         m = Module()
@@ -219,6 +366,13 @@ class VLoadGenerator(BaseLoadGenerator):
         packed_gen = m.submodules.packed_gen = PackedLoadGenerator(self.params)
         m.d.comb += packed_gen.req.bits.eq(self.req.bits)
 
+        indexed_gen = m.submodules.indexed_gen = IndexedLoadGenerator(
+            self.params)
+        m.d.comb += [
+            indexed_gen.req.bits.eq(self.req.bits),
+            self.idx_data.connect(indexed_gen.idx_data),
+        ]
+
         with m.FSM():
             with m.State('IDLE'):
                 can_pack = self.req.bits.uop.unit_stride | (
@@ -227,14 +381,23 @@ class VLoadGenerator(BaseLoadGenerator):
                 with m.If(self.req.valid & self.req.bits.uop.vl.any()):
                     with m.If(can_pack):
                         m.d.comb += packed_gen.req.valid.eq(1)
-                        m.next = 'PACKING'
+                        m.next = 'PACK'
 
-            with m.State('PACKING'):
+                    with m.Else():
+                        m.d.comb += indexed_gen.req.valid.eq(1)
+                        m.next = 'SCAN'
+
+            with m.State('PACK'):
                 m.d.comb += packed_gen.resp.connect(self.resp)
 
                 with m.If(self.resp.fire & self.resp.bits.last):
                     m.next = 'IDLE'
 
+            with m.State('SCAN'):
+                m.d.comb += indexed_gen.resp.connect(self.resp)
+
+                with m.If(self.resp.fire & self.resp.bits.last):
+                    m.next = 'IDLE'
         return m
 
 
@@ -426,6 +589,7 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
         self.done = Signal()
 
         self.ld_resp = Valid(MemTransactionGenerator.LoadResponse, params)
+        self.idx_data = Decoupled(IndexData)
         self.st_data = Valid(Signal, self.vlen)
 
         self.mem_req = Decoupled(CoreMemRequest, params)
@@ -445,6 +609,9 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
 
         st_data_buf = m.submodules.st_data_buf = StoreDataBuffer(self.params)
         m.d.comb += st_data_buf.write.eq(self.st_data)
+
+        idx_queue = m.submodules.idx_queue = Queue(4, IndexData, flow=True)
+        m.d.comb += self.idx_data.connect(idx_queue.enq)
 
         cur_addr = Signal(self.xlen)
         m.d.comb += [
@@ -489,12 +656,15 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
                     self.mem_req.bits.cmd.eq(MemoryCommand.READ),
                     self.mem_req.bits.addr.eq(ld_gen.resp.bits.addr),
                     self.mem_req.bits.size.eq(log2_int(self.xlen // 8)),
+                    idx_queue.deq.connect(ld_gen.idx_data),
                 ]
 
                 with m.If(self.mem_req.fire):
                     m.next = 'LOAD_RESP'
 
             with m.State('LOAD_RESP'):
+                m.d.comb += idx_queue.deq.connect(ld_gen.idx_data)
+
                 with m.If(self.mem_nack):
                     m.next = 'LOAD_REQ'
 
@@ -813,6 +983,35 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                             (ld_data_shifted & ld_write_bit_mask)
                             | (ld_data_buf[i] & ~ld_write_bit_mask))
 
+        idx_buf = Array(
+            Signal(self.vlen, name=f'idx_buf{i}') for i in range(8))
+        with m.If(self.exec_req.fire):
+            m.d.sync += idx_buf[buf_wptr].eq(self.exec_req.bits.index)
+
+        idx_offset = Signal(self.vl_bits)
+        with m.If(mem_txn.idx_data.fire):
+            m.d.sync += idx_offset.eq(idx_offset + 1)
+            with m.If(idx_offset == req_vl - 1):
+                m.d.sync += mem_txn.idx_data.valid.eq(0)
+
+        m.d.comb += mem_txn.idx_data.bits.last.eq(idx_offset == req_vl - 1)
+        with m.Switch(req_eew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (w + 3)
+
+                    with m.Switch(idx_offset):
+                        for i in range(self.vlen * 8 // n):
+                            with m.Case(i):
+                                m.d.comb += mem_txn.idx_data.bits.index.eq(
+                                    Cat(idx_buf)[i * n:(i + 1) * n])
+
+        with m.Switch(idx_offset):
+            for i in range(self.vlen):
+                with m.Case(i):
+                    m.d.comb += mem_txn.idx_data.bits.mask.eq(req.mask[i]
+                                                              | req.uop.vm)
+
         with m.FSM():
             with m.State('IDLE'):
                 m.d.comb += [
@@ -837,6 +1036,12 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                 with m.If(self.exec_req.fire
                           & self.exec_req.bits.uop.expd_end):
                     with m.If(self.exec_req.bits.uop.is_ld):
+                        with m.If(req.uop.indexed):
+                            m.d.sync += [
+                                mem_txn.idx_data.valid.eq(1),
+                                idx_offset.eq(0),
+                            ]
+
                         m.next = 'LOAD'
                     with m.Else():
                         m.next = 'STORE'

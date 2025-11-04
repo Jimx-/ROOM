@@ -74,6 +74,9 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                     uop.mem_size.eq(inuop.inst[12:14]),
                 ]
 
+                with m.If(inuop.inst[26]):  # vlu/oxei*
+                    m.d.comb += uop.lrs2_rtype.eq(RegisterType.VEC)
+
             with m.Case(0b0100111):  # vs*
                 m.d.comb += [
                     UOPC(VOpCode.VSE),
