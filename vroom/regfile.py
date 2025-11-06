@@ -65,9 +65,10 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
                 lumop = inuop.lrs2
                 m.d.comb += [
                     uop.unit_stride.eq(mop == 0),
-                    uop.mask.eq((mop == 0) & (lumop == 0b01011)),
+                    uop.mask_ls.eq((mop == 0) & (lumop == 0b01011)),
                     uop.strided.eq(mop == 2),
                     uop.indexed.eq(mop[0]),
+                    uop.nf.eq(inuop.funct6[3:6]),
                 ]
 
             with m.Case(VOpCode.VSE):
@@ -75,9 +76,10 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
                 sumop = inuop.lrs2
                 m.d.comb += [
                     uop.unit_stride.eq(mop == 0),
-                    uop.mask.eq((mop == 0) & (sumop == 0b01011)),
+                    uop.mask_ls.eq((mop == 0) & (sumop == 0b01011)),
                     uop.strided.eq(mop == 2),
                     uop.indexed.eq(mop[0]),
+                    uop.nf.eq(inuop.funct6[3:6]),
                 ]
 
             for opc, alu_op in (

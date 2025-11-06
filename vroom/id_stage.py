@@ -1423,8 +1423,15 @@ class VOpExpander(HasVectorParams, Elaboratable):
         mask_single_vreg = self.expd_uop.fu_type_has(VFUType.MASK) & (
             self.expd_uop.opcode != VOpCode.VIOTA) & (self.expd_uop.opcode
                                                       != VOpCode.VID)
+        req_nf = self.expd_uop.inst[29:32]
+        expd_count_seg = Signal(4)
+        with m.Switch(lmul):
+            for i in range(3):
+                with m.Case(2**i):
+                    m.d.comb += expd_count_seg.eq(((req_nf + 1) << i))
         with m.If(self.expd_uop.is_ld | self.expd_uop.is_st):
-            m.d.comb += expd_count_start.eq(emul_vd - 1)
+            m.d.comb += expd_count_start.eq(
+                Mux(req_nf.any(), expd_count_seg - 1, emul_vd - 1))
         with m.Elif((self.expd_uop.opcode == VOpCode.VMVSX)
                     | (self.expd_uop.opcode == VOpCode.VMVXS)
                     | mask_single_vreg):

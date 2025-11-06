@@ -4,8 +4,8 @@ from amaranth.utils import log2_int
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
-from vroom.fu import ExecReq, ExecResp
-from vroom.utils import TailGen
+from vroom.fu import ExecResp
+from vroom.utils import vlmul_to_lmul, TailGen
 
 from room.consts import MemoryCommand
 from room.mmu import CoreMemRequest, CoreMemResponse
@@ -83,6 +83,7 @@ class BaseLoadGenerator(HasVectorParams, Elaboratable):
             Record.__init__(self, [
                 ('addr', self.xlen, Direction.FANOUT),
                 ('vdest', range(32), Direction.FANOUT),
+                ('seg_idx', 3, Direction.FANOUT),
                 ('elem_idx', range(self.max_vlmax), Direction.FANOUT),
                 ('elem_offset', range(self.max_elem_count), Direction.FANOUT),
                 ('elem_count', range(self.max_elem_count + 1),
@@ -235,6 +236,7 @@ class IndexedLoadGenerator(BaseLoadGenerator):
         cur_addr = Signal(self.xlen)
         next_addr = Signal(self.xlen)
         cur_vdest = Signal(range(32))
+        cur_seg_id = Signal(4)
         cur_offset = cur_addr[:log2_int(self.xlen // 8)] >> dest_eew
         cur_max = Signal(range(self.max_elem_count + 1))
         cur_vmax = Signal(range(self.vlen_bytes + 1))
@@ -245,28 +247,33 @@ class IndexedLoadGenerator(BaseLoadGenerator):
         cur_mask_data = Signal(self.vlen)
         cur_mask_offset = Signal(range(self.vlen))
 
-        rem_seg = 1
+        is_seg = cur_uop.nf.any()
+        seg_max = Mux(is_seg, cur_uop.nf + 1, 1)
+
+        rem_seg = seg_max - cur_seg_id
         rem_line = cur_max - cur_offset
         rem_vreg = cur_vmax - cur_vidx
         rem_vl = cur_vl - cur_idx
 
         seg_count = Mux(rem_line > rem_seg, rem_seg, rem_line)
-        vreg_count = Mux(seg_count > rem_vreg, rem_vreg, seg_count)
-        vl_count = Mux(vreg_count > rem_vl, rem_vl, vreg_count)
+        vreg_count = Mux(is_seg, seg_count,
+                         Mux(seg_count > rem_vreg, rem_vreg, seg_count))
+        vl_count = vreg_count
 
         next_seg = vl_count == rem_seg
         next_vreg = vl_count == rem_vreg
 
         m.d.comb += [
-            self.resp.bits.addr.eq(cur_addr),
+            self.resp.bits.addr.eq(cur_addr + (cur_seg_id << dest_eew)),
             self.resp.bits.vdest.eq(cur_vdest),
+            self.resp.bits.seg_idx.eq(cur_seg_id),
             self.resp.bits.elem_idx.eq(cur_idx),
             self.resp.bits.elem_offset.eq(cur_offset),
             self.resp.bits.elem_count.eq(vl_count),
             self.resp.bits.mask_valid.eq(is_masked),
             self.resp.bits.mask.eq(cur_mask_data
                                    & ((1 << self.resp.bits.elem_count) - 1)),
-            self.resp.bits.last.eq(vl_count == rem_vl),
+            self.resp.bits.last.eq((cur_idx == cur_vl - 1) & next_seg),
         ]
 
         with m.FSM():
@@ -280,6 +287,7 @@ class IndexedLoadGenerator(BaseLoadGenerator):
                         cur_vdest.eq(self.req.bits.uop.ldst),
                         self.resp.bits.dir.eq(self.req.bits.uop.strided
                                               & self.req.bits.stride[-1]),
+                        cur_seg_id.eq(0),
                         cur_max.eq((self.xlen // 8) >> Mux(
                             self.req.bits.uop.indexed, self.req.bits.uop.vsew,
                             self.req.bits.uop.mem_size)),
@@ -315,14 +323,15 @@ class IndexedLoadGenerator(BaseLoadGenerator):
                                        | self.idx_data.valid
                                        | self.resp.bits.last),
                     next_addr.eq(
-                        Mux(cur_uop.indexed,
+                        Mux(
+                            cur_uop.indexed,
                             base_addr + self.idx_data.bits.index,
-                            cur_addr + stride)),
+                            Mux(cur_uop.strided, cur_addr + stride,
+                                cur_addr + (seg_max << dest_eew)))),
                 ]
 
                 with m.If(self.resp.fire):
                     m.d.sync += [
-                        cur_idx.eq(cur_idx + self.resp.bits.elem_count),
                         cur_mask_offset.eq(cur_mask_offset +
                                            self.resp.bits.elem_count),
                         cur_mask_data.eq(
@@ -340,7 +349,14 @@ class IndexedLoadGenerator(BaseLoadGenerator):
 
                     with m.If(next_seg):
                         m.d.comb += self.idx_data.ready.eq(1)
-                        m.d.sync += cur_addr.eq(next_addr)
+                        m.d.sync += [
+                            cur_idx.eq(cur_idx + 1),
+                            cur_seg_id.eq(0),
+                            cur_addr.eq(next_addr),
+                        ]
+                    with m.Else():
+                        m.d.sync += cur_seg_id.eq(cur_seg_id +
+                                                  self.resp.bits.elem_count)
 
                     with m.If(self.resp.bits.last):
                         m.next = 'IDLE'
@@ -375,8 +391,10 @@ class VLoadGenerator(BaseLoadGenerator):
 
         with m.FSM():
             with m.State('IDLE'):
-                can_pack = self.req.bits.uop.unit_stride | (
-                    self.req.bits.uop.strided & stride_cls.out[1:].any())
+                is_seg = self.req.bits.uop.nf.any()
+                can_pack = (self.req.bits.uop.unit_stride |
+                            (self.req.bits.uop.strided
+                             & stride_cls.out[1:].any())) & ~is_seg
 
                 with m.If(self.req.valid & self.req.bits.uop.vl.any()):
                     with m.If(can_pack):
@@ -470,7 +488,7 @@ class VStorePacker(HasVectorParams, Elaboratable):
             with m.State('IDLE'):
                 with m.If(self.req.valid):
                     with m.If(self.req.bits.uop.unit_stride
-                              & ~self.req.bits.uop.mask
+                              & ~self.req.bits.uop.mask_ls
                               & self.req.bits.uop.vl.any()):
 
                         m.d.sync += [
@@ -570,6 +588,7 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
 
             Record.__init__(self, [
                 ('vdest', range(32), Direction.FANOUT),
+                ('seg_idx', 3, Direction.FANOUT),
                 ('elem_idx', range(self.max_vlmax), Direction.FANOUT),
                 ('elem_offset', range(self.max_elem_count), Direction.FANOUT),
                 ('elem_count', range(self.max_elem_count + 1),
@@ -616,6 +635,7 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
         cur_addr = Signal(self.xlen)
         m.d.comb += [
             self.ld_resp.bits.vdest.eq(ld_gen.resp.bits.vdest),
+            self.ld_resp.bits.seg_idx.eq(ld_gen.resp.bits.seg_idx),
             self.ld_resp.bits.elem_idx.eq(ld_gen.resp.bits.elem_idx),
             self.ld_resp.bits.elem_offset.eq(ld_gen.resp.bits.elem_offset),
             self.ld_resp.bits.elem_count.eq(ld_gen.resp.bits.elem_count),
@@ -751,11 +771,13 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         req_sew = req.uop.vsew
         req_vlmul_mag = req.uop.vlmul_mag
         req_vlmul_sign = req.uop.vlmul_sign
+        req_emul_vd = vlmul_to_lmul(req_vlmul_sign, req_vlmul_mag)
         req_eew = req.uop.funct3[:2]
-        req_dest_eew = req.uop.mem_size
+        req_dest_eew = Mux(req.uop.indexed, req.uop.vsew, req.uop.mem_size)
         req_vstart = 0
         req_vl = req.uop.vl
         req_nf = req.uop.funct6[3:]
+        req_is_seg = req_nf.any()
 
         uop_table = [
             Valid(VMicroOp, self.params, name=f'uop_table{i}')
@@ -870,6 +892,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
 
         s1_ld_data_valid = Signal()
         s1_ld_data = Signal.like(s0_ld_data)
+        s1_ld_seg_idx = Signal.like(ld_resp_q.deq.bits.seg_idx)
         s1_ld_elem_idx = Signal.like(ld_resp_q.deq.bits.elem_idx)
         s1_ld_elem_off = Signal.like(elem_off)
         s1_ld_elem_count = Signal.like(ld_resp_q.deq.bits.elem_count)
@@ -879,6 +902,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         with m.If(s0_ld_data_valid):
             m.d.sync += [
                 s1_ld_data.eq(ld_data_reversed),
+                s1_ld_seg_idx.eq(ld_resp_q.deq.bits.seg_idx),
                 s1_ld_elem_idx.eq(ld_resp_q.deq.bits.elem_idx),
                 s1_ld_elem_off.eq(elem_off),
                 s1_ld_elem_count.eq(ld_resp_q.deq.bits.elem_count),
@@ -975,7 +999,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         ld_write_bit_mask = Signal(self.vlen)
         m.d.comb += ld_write_bit_mask.eq(
             Cat(b.replicate(8) for b in ld_write_mask))
-        with m.If(s1_ld_data_valid):
+        with m.If(s1_ld_data_valid & ~req_is_seg):
             with m.Switch(ld_elem_idx_high):
                 for i in range(8):
                     with m.Case(i):
@@ -1011,6 +1035,97 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                 with m.Case(i):
                     m.d.comb += mem_txn.idx_data.bits.mask.eq(req.mask[i]
                                                               | req.uop.vm)
+
+        #
+        # Segment write load data buffer
+        #
+
+        seg_data_shift = Signal(512)
+        seg_data_shamt = Signal(range(513))
+        m.d.comb += [
+            seg_data_shamt.eq(s1_ld_seg_idx << (req_dest_eew + 3)),
+            seg_data_shift.eq(s1_ld_data << seg_data_shamt),
+        ]
+
+        def seg_data_select(emul, data, reg_idx, eew_bits, wdata):
+            with m.Switch(emul):
+                for i in range(3):
+                    n = 1 << i
+                    with m.Case(n):
+                        m.d.comb += wdata.eq(
+                            data[(reg_idx >> i) *
+                                 eew_bits:((reg_idx >> i) + 1) * eew_bits])
+
+        seg_wdata = [Signal(64, name=f'seg_wdata{i}') for i in range(8)]
+        seg_wmask = Signal(64)
+        with m.Switch(req_dest_eew):
+            for w in range(3):
+                with m.Case(w):
+                    n = 1 << (w + 3)
+
+                    with m.Switch(s1_ld_elem_idx[:3 - w]):
+                        for off in range(2**(3 - w)):
+                            with m.Case(off):
+                                m.d.comb += seg_wmask[off * n:(off + 1) *
+                                                      n].eq(~0)
+                                for reg_idx in range(8):
+                                    seg_data_select(
+                                        req_emul_vd, seg_data_shift, reg_idx,
+                                        n, seg_wdata[reg_idx][off *
+                                                              n:(off + 1) * n])
+
+            with m.Case(3):
+                m.d.comb += seg_wmask.eq(~0)
+                for reg_idx in range(8):
+                    seg_data_select(req_emul_vd, seg_data_shift, reg_idx, 64,
+                                    seg_wdata[reg_idx])
+
+        emul_seg_mask = Signal(8)
+        nf_seg_mask = Signal(8)
+        with m.Switch(req_emul_vd):
+            with m.Case(1):
+                m.d.comb += [
+                    emul_seg_mask.eq(~0),
+                    nf_seg_mask.eq((1 << s1_ld_elem_count) - 1),
+                ]
+
+            for i in range(1, 3):
+                with m.Case(2**i):  # i == log2(req_emul_vd)
+                    emul_mask = Const(1, 2**i).replicate(2**(3 - i))
+
+                    m.d.comb += nf_seg_mask.eq((1 << (s1_ld_elem_count << i)) -
+                                               1)
+                    with m.Switch(req_dest_eew):
+                        for w in range(4):
+                            with m.Case(w):
+                                n = log2_int(self.vlen) - (w + 3)
+
+                                with m.Switch(s1_ld_elem_idx[n:n + i]):
+                                    for j in range(2**i):
+                                        with m.Case(j):
+                                            m.d.comb += emul_seg_mask.eq(
+                                                emul_mask << j)
+
+        seg_mask_shamt = Signal(range(8))
+        with m.Switch(req_emul_vd):
+            for i in range(3):
+                with m.Case(2**i):
+                    m.d.comb += seg_mask_shamt.eq(s1_ld_seg_idx << i)
+        seg_mask_shift = (emul_seg_mask & nf_seg_mask) << seg_mask_shamt
+
+        with m.If(s1_ld_data_valid & req_is_seg):
+            seg_offset = s1_ld_elem_idx << req_dest_eew
+            with m.Switch(seg_offset[3:log2_int(self.vlen_bytes)]):
+                for i in range(self.vlen_bytes // 8):
+                    with m.Case(i):
+                        for reg_idx in range(8):
+                            with m.If(seg_mask_shift[reg_idx]):
+                                m.d.sync += ld_data_buf[reg_idx][i * 64:(
+                                    i + 1) * 64].eq(
+                                        (seg_wdata[reg_idx] & seg_wmask)
+                                        | (ld_data_buf[reg_idx][i * 64:
+                                                                (i + 1) * 64]
+                                           & ~seg_wmask))
 
         with m.FSM():
             with m.State('IDLE'):
@@ -1065,7 +1180,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                         m.d.comb += wb_done.eq(1)
 
                 with m.Switch(buf_rptr):
-                    for i in range(7):
+                    for i in range(8):
                         with m.Case(i):
                             m.d.comb += [
                                 self.exec_resp.valid.eq(uop_table[i].valid),
