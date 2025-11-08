@@ -66,23 +66,37 @@ class DecodeUnit(HasVectorParams, Elaboratable):
 
         with m.Switch(inuop.inst[0:7]):
             with m.Case(0b0000111):  # vl*
+                mop = inuop.inst[26:28]
+                lumop = inuop.inst[20:25]
                 m.d.comb += [
                     UOPC(VOpCode.VLE),
                     uop.fu_type.eq(VFUType.MEM),
                     uop.dst_rtype.eq(RegisterType.VEC),
                     uop.is_ld.eq(1),
                     uop.mem_size.eq(inuop.inst[12:14]),
+                    uop.unit_stride.eq(mop == 0),
+                    uop.mask_ls.eq((mop == 0) & (lumop == 0b01011)),
+                    uop.strided.eq(mop == 2),
+                    uop.indexed.eq(mop[0]),
+                    uop.nf.eq(inuop.inst[29:32]),
                 ]
 
-                with m.If(inuop.inst[26]):  # vlu/oxei*
+                with m.If(uop.indexed):  # vlu/oxei*
                     m.d.comb += uop.lrs2_rtype.eq(RegisterType.VEC)
 
             with m.Case(0b0100111):  # vs*
+                mop = inuop.inst[26:28]
+                sumop = inuop.inst[20:25]
                 m.d.comb += [
                     UOPC(VOpCode.VSE),
                     uop.fu_type.eq(VFUType.MEM),
                     uop.is_st.eq(1),
                     uop.mem_size.eq(inuop.inst[12:14]),
+                    uop.unit_stride.eq(mop == 0),
+                    uop.mask_ls.eq((mop == 0) & (sumop == 0b01011)),
+                    uop.strided.eq(mop == 2),
+                    uop.indexed.eq(mop[0]),
+                    uop.nf.eq(inuop.inst[29:32]),
                 ]
 
             with m.Case(0b1010111):
