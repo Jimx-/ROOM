@@ -2,7 +2,7 @@ from amaranth import *
 
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp, VType
-from vroom.utils import vlmul_to_lmul
+from vroom.utils import vlmul_to_lmul, EmulDecoder
 
 from room.consts import RegisterType
 from room.utils import Decoupled, Valid
@@ -1428,6 +1428,9 @@ class VOpExpander(HasVectorParams, Elaboratable):
         expd_idx = Signal(3)
         expd_fire = self.expd_valid & self.expd_ready
 
+        emul_dec = m.submodules.emul_dec = EmulDecoder(self.params)
+        m.d.comb += emul_dec.uop.eq(self.dec_uop)
+
         expd_count_start = Signal(3)
         expd_count = Signal(3)
         lmul = vlmul_to_lmul(self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag)
@@ -1437,7 +1440,7 @@ class VOpExpander(HasVectorParams, Elaboratable):
         mask_single_vreg = self.expd_uop.fu_type_has(VFUType.MASK) & (
             self.expd_uop.opcode != VOpCode.VIOTA) & (self.expd_uop.opcode
                                                       != VOpCode.VID)
-        req_nf = self.expd_uop.inst[29:32]
+        req_nf = self.expd_uop.nf
         expd_count_seg = Signal(4)
         with m.Switch(lmul):
             for i in range(3):
