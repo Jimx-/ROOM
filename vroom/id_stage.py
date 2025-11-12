@@ -859,6 +859,22 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                 m.d.comb += UOPC(VOpCode.VSADD)
                             with m.Case(0b100101):
                                 m.d.comb += UOPC(VOpCode.VSLL)
+                            with m.Case(0b100111):  # vmv<nr>r
+                                m.d.comb += UOPC(VOpCode.VMVNRV)
+                                with m.Switch(uop.lrs1[:3]):
+                                    for i in range(4):
+                                        with m.Case((1 << i) - 1):
+                                            with m.Switch(uop.vsew):
+                                                for w in range(4):
+                                                    with m.Case(w):
+                                                        n = self.vlen_bytes >> w
+                                                        m.d.comb += [
+                                                            uop.vl.eq(n << i),
+                                                            uop.vlmul_mag.eq(
+                                                                w),
+                                                            uop.vlmul_sign.eq(
+                                                                0),
+                                                        ]
                             with m.Case(0b101000):
                                 m.d.comb += UOPC(VOpCode.VSRL)
                             with m.Case(0b101001):

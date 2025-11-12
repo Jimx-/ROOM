@@ -429,6 +429,8 @@ class VALU(Elaboratable):
                             m.d.comb += self.out.eq(
                                 sign_extend(self.in2[:1 << (3 + w)],
                                             self.width))
+            with m.Case(VALUOperator.VMVNRV):
+                m.d.comb += self.out.eq(self.in2)
             with m.Case(VALUOperator.VMERGE):
                 m.d.comb += self.out.eq(merge_out)
             with m.Default():

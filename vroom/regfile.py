@@ -92,6 +92,7 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
                 (VOpCode.VNSRA, VALUOperator.VSRA),
                 (VOpCode.VMVSX, VALUOperator.VMVSX),
                 (VOpCode.VMVXS, VALUOperator.VMVXS),
+                (VOpCode.VMVNRV, VALUOperator.VMVNRV),
                 (VOpCode.VMERGE, VALUOperator.VMERGE),
                 (VOpCode.VDIVU, VALUOperator.VDIVU),
                 (VOpCode.VDIV, VALUOperator.VDIV),
