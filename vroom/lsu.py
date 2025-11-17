@@ -271,8 +271,7 @@ class IndexedLoadGenerator(BaseLoadGenerator):
             self.resp.bits.elem_offset.eq(cur_offset),
             self.resp.bits.elem_count.eq(vl_count),
             self.resp.bits.mask_valid.eq(is_masked),
-            self.resp.bits.mask.eq(cur_mask_data
-                                   & ((1 << self.resp.bits.elem_count) - 1)),
+            self.resp.bits.mask.eq(cur_mask_data & 1),
             self.resp.bits.last.eq((cur_idx == cur_vl - 1) & next_seg),
         ]
 
@@ -331,13 +330,6 @@ class IndexedLoadGenerator(BaseLoadGenerator):
                 ]
 
                 with m.If(self.resp.fire):
-                    m.d.sync += [
-                        cur_mask_offset.eq(cur_mask_offset +
-                                           self.resp.bits.elem_count),
-                        cur_mask_data.eq(
-                            cur_mask_data >> self.resp.bits.elem_count),
-                    ]
-
                     with m.If(next_vreg):
                         m.d.sync += [
                             cur_vdest.eq(cur_vdest + 1),
@@ -353,6 +345,8 @@ class IndexedLoadGenerator(BaseLoadGenerator):
                             cur_idx.eq(cur_idx + 1),
                             cur_seg_id.eq(0),
                             cur_addr.eq(next_addr),
+                            cur_mask_offset.eq(cur_mask_offset + 1),
+                            cur_mask_data.eq(cur_mask_data >> 1),
                         ]
                     with m.Else():
                         m.d.sync += cur_seg_id.eq(cur_seg_id +
@@ -1066,8 +1060,9 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                     with m.Switch(s1_ld_elem_idx[:3 - w]):
                         for off in range(2**(3 - w)):
                             with m.Case(off):
-                                m.d.comb += seg_wmask[off * n:(off + 1) *
-                                                      n].eq(~0)
+                                m.d.comb += seg_wmask[off * n:(
+                                    off + 1) * n].eq(
+                                        s1_ld_byte_mask[0].replicate(n))
                                 for reg_idx in range(8):
                                     seg_data_select(
                                         req_emul_vd, seg_data_shift, reg_idx,
@@ -1075,7 +1070,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                                                               n:(off + 1) * n])
 
             with m.Case(3):
-                m.d.comb += seg_wmask.eq(~0)
+                m.d.comb += seg_wmask.eq(s1_ld_byte_mask[0].replicate(64))
                 for reg_idx in range(8):
                     seg_data_select(req_emul_vd, seg_data_shift, reg_idx, 64,
                                     seg_wdata[reg_idx])
