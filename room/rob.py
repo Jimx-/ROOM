@@ -444,6 +444,10 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 rob_head_lsb.eq(0),
             ]
             m.d.comb += do_deq.eq(1)
+        with m.Else():
+            for i in reversed(range(self.core_width)):
+                with m.If(rob_head_valids[i]):
+                    m.d.sync += rob_head_lsb.eq(i)
 
         with m.If(state_is_rollback & ((rob_tail != rob_head) | maybe_full)):
             m.d.sync += [
@@ -510,7 +514,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
             for w in reversed(range(self.core_width)):
                 with m.If(rob_pnr_unsafe[w] | ~tail_valid_mask[w]):
                     m.d.sync += rob_pnr_lsb.eq(w)
-        with m.Elif(full | pnr_maybe_at_tail):
+        with m.Elif(full & pnr_maybe_at_tail):
             m.d.sync += rob_pnr_lsb.eq(0)
 
         m.d.sync += pnr_maybe_at_tail.eq(~do_deq
