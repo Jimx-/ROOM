@@ -76,6 +76,7 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                     uop.mem_size.eq(inuop.inst[12:14]),
                     uop.unit_stride.eq(mop == 0),
                     uop.mask_ls.eq((mop == 0) & (lumop == 0b01011)),
+                    uop.whole_reg.eq((mop == 0) & (lumop == 0b01000)),
                     uop.strided.eq(mop == 2),
                     uop.indexed.eq(mop[0]),
                     uop.nf.eq(inuop.inst[29:32]),
@@ -83,6 +84,16 @@ class DecodeUnit(HasVectorParams, Elaboratable):
 
                 with m.If(uop.indexed):  # vlu/oxei*
                     m.d.comb += uop.lrs2_rtype.eq(RegisterType.VEC)
+
+                with m.If(uop.whole_reg):  # vl<nr>re*
+                    with m.Switch(uop.nf):
+                        for i in range(4):
+                            with m.Case((1 << i) - 1):
+                                with m.Switch(uop.mem_size):
+                                    for w in range(4):
+                                        with m.Case(w):
+                                            n = self.vlen_bytes >> w
+                                            m.d.comb += uop.vl.eq(n << i)
 
             with m.Case(0b0100111):  # vs*
                 mop = inuop.inst[26:28]
@@ -1450,9 +1461,7 @@ class VOpExpander(HasVectorParams, Elaboratable):
         expd_count_start = Signal(3)
         expd_count = Signal(3)
         lmul = vlmul_to_lmul(self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag)
-        emul_vd = vlmul_to_lmul(
-            self.expd_uop.vlmul_sign, self.expd_uop.vlmul_mag +
-            (self.expd_uop.mem_size - self.expd_uop.vsew))
+        emul_vd = emul_dec.emul_vd
         mask_single_vreg = self.expd_uop.fu_type_has(VFUType.MASK) & (
             self.expd_uop.opcode != VOpCode.VIOTA) & (self.expd_uop.opcode
                                                       != VOpCode.VID)
@@ -1464,7 +1473,8 @@ class VOpExpander(HasVectorParams, Elaboratable):
                     m.d.comb += expd_count_seg.eq(((req_nf + 1) << i))
         with m.If(self.expd_uop.is_ld | self.expd_uop.is_st):
             m.d.comb += expd_count_start.eq(
-                Mux(req_nf.any(), expd_count_seg - 1, emul_vd - 1))
+                Mux(~self.expd_uop.whole_reg & req_nf.any(),
+                    expd_count_seg - 1, emul_vd - 1))
         with m.Elif((self.expd_uop.opcode == VOpCode.VMVSX)
                     | (self.expd_uop.opcode == VOpCode.VMVXS)
                     | mask_single_vreg):

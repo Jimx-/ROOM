@@ -52,6 +52,12 @@ class EmulDecoder(HasVectorParams, Elaboratable):
         vemul_ldst = Signal(3)
         m.d.comb += vemul_ldst.eq(vlmul + (veew_ldst - self.uop.vsew))
 
+        vnfield = Signal(3)
+        with m.Switch(self.uop.nf):
+            for i in range(4):
+                with m.Case((1 << i) - 1):
+                    m.d.comb += vnfield.eq(i)
+
         mask_single_vreg = self.uop.fu_type_has(VFUType.MASK) & (
             self.uop.opcode != VOpCode.VIOTA) & (self.uop.opcode
                                                  != VOpCode.VID)
@@ -59,8 +65,10 @@ class EmulDecoder(HasVectorParams, Elaboratable):
         vemul_vd = Signal(3)
         with m.If(self.uop.is_ld | self.uop.is_st):
             m.d.comb += vemul_vd.eq(
-                Mux(self.uop.mask_ls, 0,
-                    Mux(self.uop.indexed, vlmul, vemul_ldst)))
+                Mux(
+                    self.uop.whole_reg, vnfield,
+                    Mux(self.uop.mask_ls, 0,
+                        Mux(self.uop.indexed, vlmul, vemul_ldst))))
         with m.Elif((self.uop.opcode == VOpCode.VMVSX)
                     | (self.uop.opcode == VOpCode.VMVXS)
                     | mask_single_vreg):

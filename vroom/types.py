@@ -93,6 +93,7 @@ class VMicroOp(HasVectorParams, Record):
             ('mem_size', 2),
             ('unit_stride', 1),
             ('mask_ls', 1),
+            ('whole_reg', 1),
             ('strided', 1),
             ('indexed', 1),
             ('nf', 3),

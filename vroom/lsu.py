@@ -248,7 +248,7 @@ class MaskedLoadGenerator(BaseLoadGenerator):
         cur_mask_data = Signal(self.vlen)
         cur_mask_offset = Signal(range(self.vlen))
 
-        is_seg = cur_uop.nf.any()
+        is_seg = ~cur_uop.whole_reg & cur_uop.nf.any()
         seg_max = Mux(is_seg, cur_uop.nf + 1, 1)
 
         rem_seg = seg_max - cur_seg_id
@@ -388,7 +388,7 @@ class IndexedLoadGenerator(BaseLoadGenerator):
         cur_mask_data = Signal(self.vlen)
         cur_mask_offset = Signal(range(self.vlen))
 
-        is_seg = cur_uop.nf.any()
+        is_seg = ~cur_uop.whole_reg & cur_uop.nf.any()
         seg_max = Mux(is_seg, cur_uop.nf + 1, 1)
 
         rem_seg = seg_max - cur_seg_id
@@ -529,7 +529,8 @@ class VLoadGenerator(BaseLoadGenerator):
 
         with m.FSM():
             with m.State('IDLE'):
-                is_seg = self.req.bits.uop.nf.any()
+                is_seg = ~self.req.bits.uop.whole_reg & self.req.bits.uop.nf.any(
+                )
                 can_pack = (self.req.bits.uop.unit_stride |
                             (self.req.bits.uop.strided
                              & stride_cls.out[1:].any())) & ~is_seg
@@ -933,7 +934,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         req_vstart = 0
         req_vl = req.uop.vl
         req_nf = req.uop.funct6[3:]
-        req_is_seg = req_nf.any()
+        req_is_seg = ~req.uop.whole_reg & req_nf.any()
 
         uop_table = [
             Valid(VMicroOp, self.params, name=f'uop_table{i}')
@@ -979,11 +980,6 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                             ld_data_buf[i].eq(self.exec_req.bits.old_vd
                                               | write_one_mask),
                         ]
-
-        wb_done = Signal()
-        with m.If(wb_done):
-            for i in range(8):
-                m.d.sync += uop_table[i].valid.eq(0)
 
         #
         # Load
@@ -1329,6 +1325,8 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                     m.next = 'WRITEBACK'
 
             with m.State('WRITEBACK'):
+                wb_done = Signal()
+
                 with m.Switch(buf_rptr):
                     for i in range(7):
                         with m.Case(i):
@@ -1351,6 +1349,9 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                         buf_wptr.eq(0),
                     ]
                     with m.If(wb_done):
+                        for i in range(8):
+                            m.d.sync += uop_table[i].valid.eq(0)
+
                         m.next = 'IDLE'
 
         return m
