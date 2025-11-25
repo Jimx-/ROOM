@@ -105,10 +105,14 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                     uop.mem_size.eq(inuop.inst[12:14]),
                     uop.unit_stride.eq(mop == 0),
                     uop.mask_ls.eq((mop == 0) & (sumop == 0b01011)),
+                    uop.whole_reg.eq((mop == 0) & (sumop == 0b01000)),
                     uop.strided.eq(mop == 2),
                     uop.indexed.eq(mop[0]),
                     uop.nf.eq(inuop.inst[29:32]),
                 ]
+
+                with m.If(uop.indexed):  # vsu/oxei*
+                    m.d.comb += uop.lrs2_rtype.eq(RegisterType.VEC)
 
             with m.Case(0b1010111):
                 with m.Switch(uop.funct3):
