@@ -223,9 +223,6 @@ class PackedLoadGenerator(BaseLoadGenerator):
 
 class MaskedLoadGenerator(BaseLoadGenerator):
 
-    def __init__(self, params):
-        super().__init__(params)
-
     def elaborate(self, platform):
         m = Module()
 
@@ -694,6 +691,149 @@ class PackedStoreGenerator(BaseStoreGenerator):
         return m
 
 
+class MaskedStoreGenerator(BaseStoreGenerator):
+
+    def elaborate(self, platform):
+        m = Module()
+
+        cur_uop = VMicroOp(self.params)
+        stride = Signal(self.xlen)
+        dest_eew = Mux(cur_uop.indexed, cur_uop.vsew, cur_uop.mem_size)
+
+        base_addr = Signal(self.xlen)
+        cur_addr = Signal(self.xlen)
+        next_addr = Signal(self.xlen)
+        mem_size = Signal.like(self.req.bits.uop.mem_size)
+        cur_seg_id = Signal(4)
+        cur_offset = cur_addr[:log2_int(self.xlen // 8)] >> dest_eew
+        cur_max = Signal(range(self.max_elem_count + 1))
+        cur_vmax = Signal(range(self.vlen_bytes + 1))
+        cur_idx = Signal(range(self.max_vlmax))
+        cur_vidx = Signal(range(self.vlen_bytes))
+        cur_vl = Signal(self.vl_bits)
+        is_masked = Signal()
+        cur_mask_data = Signal(self.vlen)
+        cur_mask_offset = Signal(range(self.vlen))
+
+        is_seg = ~cur_uop.whole_reg & cur_uop.nf.any()
+        seg_max = Mux(is_seg, cur_uop.nf + 1, 1)
+
+        rem_seg = seg_max - cur_seg_id
+        rem_line = cur_max - cur_offset
+        rem_vreg = cur_vmax - cur_vidx
+        rem_vl = cur_vl - cur_idx
+
+        skip_count_mask = Signal(range(self.vlen))
+        for i in reversed(range(self.vlen)):
+            with m.If(cur_mask_data[i]):
+                m.d.comb += skip_count_mask.eq(i)
+        skip_count_vreg = Mux(skip_count_mask > rem_vreg, rem_vreg,
+                              skip_count_mask)
+        skip_count_vl = Mux(skip_count_vreg > rem_vl, rem_vl, skip_count_vreg)
+
+        skip_count = Signal(range(self.vlen))
+        skip_count_oh = Signal(range(len(skip_count_vl)))
+        skipping = skip_count.any()
+        for i in range(len(skip_count_vl)):
+            with m.If(skip_count_vl[i]):
+                m.d.comb += [
+                    skip_count.eq(1 << i),
+                    skip_count_oh.eq(i),
+                ]
+
+        skip_vreg = skip_count == rem_vreg
+
+        seg_count = Mux(rem_line > rem_seg, rem_seg, rem_line)
+        vreg_count = Mux(is_seg, seg_count,
+                         Mux(seg_count > rem_vreg, rem_vreg, seg_count))
+        vl_count = vreg_count
+
+        next_seg = vl_count == rem_seg
+        next_vreg = vl_count == rem_vreg
+
+        m.d.comb += [
+            self.resp.bits.addr.eq(cur_addr + (cur_seg_id << dest_eew)),
+            self.resp.bits.data.eq(self.st_data.bits.data),
+            self.resp.bits.noop.eq(is_masked & skipping),
+            self.resp.bits.last.eq((cur_idx == cur_vl - 1) & next_seg),
+        ]
+
+        m.d.comb += self.resp.bits.mem_size.eq(mem_size)
+        with m.Switch(vl_count):
+            for i in range(4):
+                with m.Case(1 << i):
+                    m.d.comb += self.resp.bits.mem_size.eq(mem_size + i)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(self.req.valid):
+                    m.d.sync += [
+                        cur_uop.eq(self.req.bits.uop),
+                        stride.eq(self.req.bits.stride),
+                        base_addr.eq(self.req.bits.base_addr),
+                        cur_addr.eq(self.req.bits.base_addr),
+                        mem_size.eq(self.req.bits.uop.mem_size),
+                        cur_seg_id.eq(0),
+                        cur_max.eq((self.xlen //
+                                    8) >> self.req.bits.uop.mem_size),
+                        cur_vmax.eq(
+                            self.vlen_bytes >> self.req.bits.uop.mem_size),
+                        cur_idx.eq(0),
+                        cur_vidx.eq(0),
+                        cur_vl.eq(self.req.bits.uop.vl),
+                        is_masked.eq(~self.req.bits.uop.vm),
+                        cur_mask_data.eq(self.req.bits.mask),
+                        cur_mask_offset.eq(0),
+                    ]
+
+                    m.next = 'SKIP'
+
+            with m.State('SKIP'):
+                m.d.comb += [
+                    self.resp.valid.eq(self.st_data.valid),
+                    next_addr.eq(
+                        cur_addr +
+                        Mux(skipping, stride << skip_count_oh, stride)),
+                ]
+
+                with m.If(self.resp.fire):
+                    m.d.comb += [
+                        self.st_data.ready.eq(1),
+                        self.st_data.bits.skip.eq(self.resp.bits.last
+                                                  | next_vreg
+                                                  | (skipping & skip_vreg)),
+                    ]
+
+                    with m.If(next_vreg | (skipping & skip_vreg)):
+                        m.d.sync += cur_vidx.eq(0)
+                    with m.Else():
+                        m.d.sync += cur_vidx.eq(
+                            cur_vidx + Mux(skipping, skip_count, vl_count))
+
+                    with m.If(next_seg | skipping):
+                        m.d.comb += self.st_data.bits.data_incr.eq(
+                            Mux(skipping, skip_count << mem_size,
+                                1 << mem_size))
+                        m.d.sync += [
+                            cur_idx.eq(cur_idx + Mux(skipping, skip_count, 1)),
+                            cur_seg_id.eq(0),
+                            cur_addr.eq(next_addr),
+                            cur_mask_offset.eq(cur_mask_offset +
+                                               Mux(skipping, skip_count, 1)),
+                            cur_mask_data.eq(
+                                cur_mask_data >> Mux(skipping, skip_count, 1)),
+                        ]
+                    with m.Else():
+                        m.d.comb += self.st_data.bits.data_incr.eq(
+                            vl_count << mem_size)
+                        m.d.sync += cur_seg_id.eq(cur_seg_id + vl_count)
+
+                    with m.If(self.resp.bits.last):
+                        m.next = 'IDLE'
+
+        return m
+
+
 class IndexedStoreGenerator(BaseStoreGenerator):
 
     def __init__(self, params):
@@ -845,6 +985,10 @@ class VStoreGenerator(BaseStoreGenerator):
             self.params)
         m.d.comb += packed_gen.req.bits.eq(self.req.bits)
 
+        masked_gen = m.submodules.masked_gen = MaskedStoreGenerator(
+            self.params)
+        m.d.comb += masked_gen.req.bits.eq(self.req.bits)
+
         indexed_gen = m.submodules.indexed_gen = IndexedStoreGenerator(
             self.params)
         m.d.comb += [
@@ -855,11 +999,16 @@ class VStoreGenerator(BaseStoreGenerator):
         with m.FSM():
             with m.State('IDLE'):
                 can_pack = self.req.bits.uop.unit_stride & ~self.req.bits.uop.mask_ls
+                can_skip = ~self.req.bits.uop.vm & ~self.req.bits.uop.indexed
 
                 with m.If(self.req.valid & self.req.bits.uop.vl.any()):
                     with m.If(can_pack):
                         m.d.comb += packed_gen.req.valid.eq(1)
                         m.next = 'PACK'
+
+                    with m.Elif(can_skip):
+                        m.d.comb += masked_gen.req.valid.eq(1)
+                        m.next = 'SKIP'
 
                     with m.Else():
                         m.d.comb += indexed_gen.req.valid.eq(1)
@@ -869,6 +1018,15 @@ class VStoreGenerator(BaseStoreGenerator):
                 m.d.comb += [
                     packed_gen.resp.connect(self.resp),
                     self.st_data.connect(packed_gen.st_data),
+                ]
+
+                with m.If(self.resp.fire & self.resp.bits.last):
+                    m.next = 'IDLE'
+
+            with m.State('SKIP'):
+                m.d.comb += [
+                    masked_gen.resp.connect(self.resp),
+                    self.st_data.connect(masked_gen.st_data),
                 ]
 
                 with m.If(self.resp.fire & self.resp.bits.last):
