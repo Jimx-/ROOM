@@ -114,6 +114,12 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                 with m.If(uop.indexed):  # vsu/oxei*
                     m.d.comb += uop.lrs2_rtype.eq(RegisterType.VEC)
 
+                with m.If(uop.whole_reg):  # vs<nr>r
+                    with m.Switch(uop.nf):
+                        for i in range(4):
+                            with m.Case((1 << i) - 1):
+                                m.d.comb += uop.vl.eq(self.vlen_bytes << i)
+
             with m.Case(0b1010111):
                 with m.Switch(uop.funct3):
                     with m.Case(0b000):  # OPIVV
