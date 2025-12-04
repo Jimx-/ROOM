@@ -228,7 +228,7 @@ class MaskedLoadGenerator(BaseLoadGenerator):
 
         cur_uop = VMicroOp(self.params)
         stride = Signal(self.xlen)
-        dest_eew = Mux(cur_uop.indexed, cur_uop.vsew, cur_uop.mem_size)
+        dest_eew = cur_uop.mem_size
 
         base_addr = Signal(self.xlen)
         cur_addr = Signal(self.xlen)
@@ -299,7 +299,11 @@ class MaskedLoadGenerator(BaseLoadGenerator):
                 with m.If(self.req.valid):
                     m.d.sync += [
                         cur_uop.eq(self.req.bits.uop),
-                        stride.eq(self.req.bits.stride),
+                        stride.eq(
+                            Mux(self.req.bits.uop.strided,
+                                self.req.bits.stride,
+                                (self.req.bits.uop.nf + 1) <<
+                                self.req.bits.uop.mem_size)),
                         base_addr.eq(self.req.bits.base_addr),
                         cur_addr.eq(self.req.bits.base_addr),
                         cur_vdest.eq(self.req.bits.uop.ldst),
@@ -998,7 +1002,10 @@ class VStoreGenerator(BaseStoreGenerator):
 
         with m.FSM():
             with m.State('IDLE'):
-                can_pack = self.req.bits.uop.unit_stride & ~self.req.bits.uop.mask_ls
+                is_seg = ~self.req.bits.uop.whole_reg & self.req.bits.uop.nf.any(
+                )
+                can_pack = (self.req.bits.uop.unit_stride
+                            & ~self.req.bits.uop.mask_ls) & ~is_seg
                 can_skip = ~self.req.bits.uop.vm & ~self.req.bits.uop.indexed
 
                 with m.If(self.req.valid & self.req.bits.uop.vl.any()):
