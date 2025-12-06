@@ -289,9 +289,10 @@ class MaskedLoadGenerator(BaseLoadGenerator):
             self.resp.bits.elem_offset.eq(cur_offset),
             self.resp.bits.elem_count.eq(vl_count),
             self.resp.bits.mask_valid.eq(is_masked),
-            self.resp.bits.mask.eq(cur_mask_data & 1),
+            self.resp.bits.mask.eq(cur_mask_data[0]),
             self.resp.bits.noop.eq(is_masked & skipping),
-            self.resp.bits.last.eq((cur_idx == cur_vl - 1) & next_seg),
+            self.resp.bits.last.eq((cur_idx == cur_vl - 1)
+                                   & (next_seg | skipping)),
         ]
 
         with m.FSM():
@@ -1209,7 +1210,10 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
                 ]
 
                 with m.If(ld_gen.resp.valid & ld_gen.resp.bits.noop):
-                    m.d.comb += ld_gen.resp.ready.eq(1)
+                    m.d.comb += [
+                        ld_gen.resp.ready.eq(1),
+                        self.ld_resp.valid.eq(1),
+                    ]
 
                     with m.If(ld_gen.resp.bits.last):
                         m.next = 'IDLE'
