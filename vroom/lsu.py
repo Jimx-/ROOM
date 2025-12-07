@@ -732,8 +732,10 @@ class MaskedStoreGenerator(BaseStoreGenerator):
         for i in reversed(range(self.vlen)):
             with m.If(cur_mask_data[i]):
                 m.d.comb += skip_count_mask.eq(i)
-        skip_count_vreg = Mux(skip_count_mask > rem_vreg, rem_vreg,
-                              skip_count_mask)
+        skip_count_seg = Mux(is_seg & (skip_count_mask > 0), 1,
+                             skip_count_mask)
+        skip_count_vreg = Mux(skip_count_seg > rem_vreg, rem_vreg,
+                              skip_count_seg)
         skip_count_vl = Mux(skip_count_vreg > rem_vl, rem_vl, skip_count_vreg)
 
         skip_count = Signal(range(self.vlen))
@@ -754,13 +756,14 @@ class MaskedStoreGenerator(BaseStoreGenerator):
         vl_count = vreg_count
 
         next_seg = vl_count == rem_seg
-        next_vreg = vl_count == rem_vreg
+        next_vreg = cur_vidx + Mux(skipping, skip_count, 1) == cur_vmax
 
         m.d.comb += [
             self.resp.bits.addr.eq(cur_addr + (cur_seg_id << dest_eew)),
             self.resp.bits.data.eq(self.st_data.bits.data),
             self.resp.bits.noop.eq(is_masked & skipping),
-            self.resp.bits.last.eq((cur_idx == cur_vl - 1) & next_seg),
+            self.resp.bits.last.eq((cur_idx == cur_vl - 1)
+                                   & (next_seg | skipping)),
         ]
 
         m.d.comb += self.resp.bits.mem_size.eq(mem_size)
@@ -774,7 +777,11 @@ class MaskedStoreGenerator(BaseStoreGenerator):
                 with m.If(self.req.valid):
                     m.d.sync += [
                         cur_uop.eq(self.req.bits.uop),
-                        stride.eq(self.req.bits.stride),
+                        stride.eq(
+                            Mux(self.req.bits.uop.strided,
+                                self.req.bits.stride,
+                                (self.req.bits.uop.nf + 1) <<
+                                self.req.bits.uop.mem_size)),
                         base_addr.eq(self.req.bits.base_addr),
                         cur_addr.eq(self.req.bits.base_addr),
                         mem_size.eq(self.req.bits.uop.mem_size),
@@ -804,33 +811,39 @@ class MaskedStoreGenerator(BaseStoreGenerator):
                 with m.If(self.resp.fire):
                     m.d.comb += [
                         self.st_data.ready.eq(1),
+                        self.st_data.bits.data_incr.eq(
+                            Mux(skipping, skip_count << mem_size,
+                                vl_count << mem_size)),
                         self.st_data.bits.skip.eq(self.resp.bits.last
                                                   | next_vreg
+                                                  | (is_seg & next_seg)
                                                   | (skipping & skip_vreg)),
                     ]
 
-                    with m.If(next_vreg | (skipping & skip_vreg)):
-                        m.d.sync += cur_vidx.eq(0)
-                    with m.Else():
-                        m.d.sync += cur_vidx.eq(
-                            cur_vidx + Mux(skipping, skip_count, vl_count))
-
                     with m.If(next_seg | skipping):
-                        m.d.comb += self.st_data.bits.data_incr.eq(
-                            Mux(skipping, skip_count << mem_size,
-                                1 << mem_size))
                         m.d.sync += [
                             cur_idx.eq(cur_idx + Mux(skipping, skip_count, 1)),
-                            cur_seg_id.eq(0),
                             cur_addr.eq(next_addr),
                             cur_mask_offset.eq(cur_mask_offset +
                                                Mux(skipping, skip_count, 1)),
                             cur_mask_data.eq(
                                 cur_mask_data >> Mux(skipping, skip_count, 1)),
                         ]
+
+                        with m.If(next_vreg):
+                            m.d.sync += [
+                                cur_seg_id.eq(0),
+                                cur_vidx.eq(0),
+                            ]
+
+                        with m.Else():
+                            m.d.sync += [
+                                cur_seg_id.eq(0),
+                                cur_vidx.eq(cur_vidx +
+                                            Mux(skipping, skip_count, 1)),
+                            ]
+
                     with m.Else():
-                        m.d.comb += self.st_data.bits.data_incr.eq(
-                            vl_count << mem_size)
                         m.d.sync += cur_seg_id.eq(cur_seg_id + vl_count)
 
                     with m.If(self.resp.bits.last):
@@ -1060,7 +1073,7 @@ class StoreDataBuffer(HasVectorParams, Elaboratable):
             HasVectorParams.__init__(self, params)
 
             Record.__init__(self, [
-                ('data', self.xlen, Direction.FANOUT),
+                ('data', 512, Direction.FANOUT),
                 ('data_incr', range(self.vlen // 8), Direction.FANIN),
                 ('skip', 1, Direction.FANIN),
             ],
@@ -1070,6 +1083,8 @@ class StoreDataBuffer(HasVectorParams, Elaboratable):
     def __init__(self, params):
         super().__init__(params)
 
+        self.uop = VMicroOp(params)
+
         self.write = Valid(Signal, self.vlen)
         self.read = Decoupled(StoreDataBuffer.Read, params)
 
@@ -1078,26 +1093,66 @@ class StoreDataBuffer(HasVectorParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        buffer = Array(Signal(self.vlen, name=f'buffer{i}') for i in range(8))
+        buffer = Array(
+            Valid(Signal, self.vlen, name=f'buffer{i}') for i in range(8))
         r_ptr = Signal(range(8))
         w_ptr = Signal(range(8))
+        cur_idx = Signal(range(self.vlen // 8))
 
         with m.If(self.write.valid):
             m.d.sync += [
-                buffer[w_ptr].eq(self.write.bits),
+                buffer[w_ptr].bits.eq(self.write.bits),
+                buffer[w_ptr].valid.eq(1),
                 w_ptr.eq(w_ptr + 1),
             ]
 
-        cur_idx = Signal(range(self.vlen // 8))
-        with m.If(self.clear):
-            m.d.sync += cur_idx.eq(0)
+        vlmul_mag = self.uop.vlmul_mag
+        vlmul_sign = self.uop.vlmul_sign
+        emul_vd = vlmul_to_lmul(vlmul_sign, vlmul_mag)
+        dest_eew = Mux(self.uop.indexed, self.uop.vsew, self.uop.mem_size)
 
-        m.d.comb += self.read.valid.eq(1)
-        with m.Switch(cur_idx):
-            for i in range(self.vlen // 8):
-                with m.Case(i):
-                    m.d.comb += self.read.bits.data.eq(
-                        buffer[r_ptr][i * 8:i * 8 + self.xlen])
+        emul_shamt = Signal(2)
+        with m.Switch(emul_vd):
+            for i in range(3):
+                with m.Case(2**i):
+                    m.d.comb += emul_shamt.eq(i)
+
+        r_ptr_lsb = Signal(range(self.vlen_bytes))
+        r_ptr_msb = Signal(range(8))
+        with m.Switch(dest_eew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (w + 3)
+                    n_elems = self.vlen // n
+                    m.d.comb += [
+                        r_ptr_lsb.eq(r_ptr[:log2_int(n_elems)]),
+                        r_ptr_msb.eq(r_ptr[log2_int(n_elems):]),
+                    ]
+
+        is_seg = ~self.uop.whole_reg & self.uop.nf.any()
+        seg_max = Mux(is_seg, self.uop.nf + 1, 1)
+        segment_data = Signal(512)
+        segment_valid = Signal(8)
+        with m.Switch(dest_eew):
+            for w in range(4):
+                with m.Case(w):
+                    n = 1 << (w + 3)
+
+                    for i in range(8):
+                        entry = buffer[r_ptr_msb + (i << emul_shamt)]
+                        m.d.comb += [
+                            segment_valid[i].eq(entry.valid | (i >= seg_max)),
+                            segment_data.word_select(i, n).eq(
+                                entry.bits.word_select(r_ptr_lsb, n)),
+                        ]
+
+        m.d.comb += [
+            self.read.valid.eq(
+                Mux(is_seg, segment_valid.all(), buffer[r_ptr].valid)),
+            self.read.bits.data.eq(
+                Mux(is_seg, segment_data.bit_select(cur_idx << 3, self.xlen),
+                    buffer[r_ptr].bits.bit_select(cur_idx << 3, self.xlen))),
+        ]
 
         with m.If(self.read.fire):
             with m.If(self.read.bits.skip):
@@ -1107,6 +1162,15 @@ class StoreDataBuffer(HasVectorParams, Elaboratable):
                 ]
             with m.Else():
                 m.d.sync += cur_idx.eq(cur_idx + self.read.bits.data_incr)
+
+        with m.If(self.clear):
+            m.d.sync += [
+                w_ptr.eq(0),
+                r_ptr.eq(0),
+                cur_idx.eq(0),
+            ]
+            for b in buffer:
+                m.d.sync += b.valid.eq(0)
 
         return m
 
@@ -1160,8 +1224,10 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
 
         st_data_buf = m.submodules.st_data_buf = StoreDataBuffer(self.params)
         m.d.comb += [
+            st_data_buf.uop.eq(req.uop),
             st_data_buf.write.eq(self.st_data),
             st_data_buf.read.connect(st_gen.st_data),
+            st_data_buf.clear.eq(st_gen.resp.fire & st_gen.resp.bits.last),
         ]
 
         idx_queue = m.submodules.idx_queue = Queue(4, IndexData, flow=True)
@@ -1193,10 +1259,7 @@ class MemTransactionGenerator(HasVectorParams, Elaboratable):
                         m.d.comb += ld_gen.req.valid.eq(1)
                         m.next = 'LOAD_REQ'
                     with m.Else():
-                        m.d.comb += [
-                            st_gen.req.valid.eq(1),
-                            st_data_buf.clear.eq(1),
-                        ]
+                        m.d.comb += st_gen.req.valid.eq(1)
                         m.next = 'STORE_REQ'
 
             with m.State('LOAD_REQ'):
