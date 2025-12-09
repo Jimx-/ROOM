@@ -815,33 +815,24 @@ class MaskedStoreGenerator(BaseStoreGenerator):
                             Mux(skipping, skip_count << mem_size,
                                 vl_count << mem_size)),
                         self.st_data.bits.skip.eq(self.resp.bits.last
-                                                  | next_vreg
-                                                  | (is_seg & next_seg)
+                                                  | (next_seg
+                                                     & (next_vreg | is_seg))
                                                   | (skipping & skip_vreg)),
                     ]
 
                     with m.If(next_seg | skipping):
                         m.d.sync += [
                             cur_idx.eq(cur_idx + Mux(skipping, skip_count, 1)),
+                            cur_seg_id.eq(0),
+                            cur_vidx.eq(
+                                Mux(next_vreg, 0,
+                                    cur_vidx + Mux(skipping, skip_count, 1))),
                             cur_addr.eq(next_addr),
                             cur_mask_offset.eq(cur_mask_offset +
                                                Mux(skipping, skip_count, 1)),
                             cur_mask_data.eq(
                                 cur_mask_data >> Mux(skipping, skip_count, 1)),
                         ]
-
-                        with m.If(next_vreg):
-                            m.d.sync += [
-                                cur_seg_id.eq(0),
-                                cur_vidx.eq(0),
-                            ]
-
-                        with m.Else():
-                            m.d.sync += [
-                                cur_seg_id.eq(0),
-                                cur_vidx.eq(cur_vidx +
-                                            Mux(skipping, skip_count, 1)),
-                            ]
 
                     with m.Else():
                         m.d.sync += cur_seg_id.eq(cur_seg_id + vl_count)
@@ -893,7 +884,7 @@ class IndexedStoreGenerator(BaseStoreGenerator):
         vl_count = vreg_count
 
         next_seg = vl_count == rem_seg
-        next_vreg = vl_count == rem_vreg
+        next_vreg = cur_vidx == cur_vmax - 1
 
         m.d.comb += [
             self.resp.bits.addr.eq(cur_addr + (cur_seg_id << dest_eew)),
@@ -965,19 +956,16 @@ class IndexedStoreGenerator(BaseStoreGenerator):
                     m.d.comb += [
                         self.st_data.ready.eq(1),
                         self.st_data.bits.skip.eq(self.resp.bits.last
-                                                  | next_vreg),
+                                                  | next_seg
+                                                  & (next_vreg | is_seg)),
                     ]
-
-                    with m.If(next_vreg):
-                        m.d.sync += cur_vidx.eq(0)
-                    with m.Else():
-                        m.d.sync += cur_vidx.eq(cur_vidx + vl_count)
 
                     with m.If(next_seg):
                         m.d.comb += self.idx_data.ready.eq(1)
                         m.d.sync += [
                             cur_idx.eq(cur_idx + 1),
                             cur_seg_id.eq(0),
+                            cur_vidx.eq(Mux(next_vreg, 0, cur_vidx + 1)),
                             cur_addr.eq(next_addr),
                             cur_mask_offset.eq(cur_mask_offset + 1),
                             cur_mask_data.eq(cur_mask_data >> 1),
