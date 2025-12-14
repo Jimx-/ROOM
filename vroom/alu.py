@@ -47,8 +47,8 @@ class RoundAdder(Elaboratable):
                 m.d.comb += cin[w].eq(
                     Mux(~sew.any(), self.incr[w], self.cout[w - 1]))
 
-            s = self.din[w * 8:(w + 1) * 8] + cin[w]
-            m.d.comb += Cat(self.dout[w * 8:(w + 1) * 8], self.cout[w]).eq(s)
+            s = self.din.word_select(w, 8) + cin[w]
+            m.d.comb += Cat(self.dout.word_select(w, 8), self.cout[w]).eq(s)
 
         return m
 
@@ -101,8 +101,7 @@ class VALU(Elaboratable):
             with m.Switch(uop_idx[:log2_int(self.width // elem_width)]):
                 for i in range(self.width // elem_width):
                     with m.Case(i):
-                        m.d.comb += elem.eq(data[i * elem_width:(i + 1) *
-                                                 elem_width])
+                        m.d.comb += elem.eq(data.word_select(i, elem_width))
 
         in1_w = Signal(32)
         in2_w = Signal(32)
@@ -117,18 +116,18 @@ class VALU(Elaboratable):
                     n = 1 << (3 + i)
                     for j in range(self.width // (2 * n)):
                         m.d.comb += [
-                            in1_widen[j * 2 * n:(j + 1) * 2 * n].eq(
+                            in1_widen.word_select(j, 2 * n).eq(
                                 Mux(
                                     signed,
-                                    sign_extend(in1_w[j * n:(j + 1) * n],
-                                                2 * n),
-                                    in1_w[j * n:(j + 1) * n])),
-                            in2_widen[j * 2 * n:(j + 1) * 2 * n].eq(
+                                    sign_extend(in1_w.word_select(j,
+                                                                  n), 2 * n),
+                                    in1_w.word_select(j, n))),
+                            in2_widen.word_select(j, 2 * n).eq(
                                 Mux(
                                     signed,
-                                    sign_extend(in2_w[j * n:(j + 1) * n],
-                                                2 * n),
-                                    in2_w[j * n:(j + 1) * n])),
+                                    sign_extend(in2_w.word_select(j,
+                                                                  n), 2 * n),
+                                    in2_w.word_select(j, n))),
                         ]
 
         in1_adjust = Mux(self.widen | self.widen2, in1_widen, self.in1)
@@ -140,7 +139,7 @@ class VALU(Elaboratable):
                 with m.Case(w):
                     n = 1 << w
                     for i in range(lane_bytes // n):
-                        m.d.comb += vmask_adjust[i * n:(i + 1) * n].eq(
+                        m.d.comb += vmask_adjust.word_select(i, n).eq(
                             self.vmask[i])
 
         in1_inv = Mux(is_sub, ~in1_adjust, in1_adjust)
@@ -176,9 +175,9 @@ class VALU(Elaboratable):
             else:
                 m.d.comb += cin[w].eq(Mux(eew == 0, carry_in[w], cout[w - 1]))
 
-            s = Cat(cin[w], in1_inv[w * 8:(w + 1) * 8], Const(0, 1)) + Cat(
-                cin[w], in2_inv[w * 8:(w + 1) * 8], Const(0, 1))
-            m.d.comb += Cat(adder_out[w * 8:(w + 1) * 8], cout[w]).eq(s[1:])
+            s = Cat(cin[w], in1_inv.word_select(w, 8), Const(0, 1)) + Cat(
+                cin[w], in2_inv.word_select(w, 8), Const(0, 1))
+            m.d.comb += Cat(adder_out.word_select(w, 8), cout[w]).eq(s[1:])
 
         m.d.comb += [
             self.adder_out.eq(adder_out),
@@ -202,8 +201,8 @@ class VALU(Elaboratable):
                     Mux(signed,
                         self.in2[i * 8 + 7] ^ in1_inv[i * 8 + 7] ^ cout[i],
                         ~cout[i])),
-                eq_vec[i].eq(self.in1[i * 8:(i + 1) *
-                                      8] == self.in2[i * 8:(i + 1) * 8]),
+                eq_vec[i].eq(
+                    self.in1.word_select(i, 8) == self.in2.word_select(i, 8)),
             ]
 
         cmp_eq = Signal(lane_bytes)
@@ -212,7 +211,8 @@ class VALU(Elaboratable):
                 with m.Case(i):
                     sew = 1 << i
                     m.d.comb += cmp_eq.eq(
-                        Cat(eq_vec[w:w + sew].all().replicate(sew)
+                        Cat(
+                            eq_vec.bit_select(w, sew).all().replicate(sew)
                             for w in range(0, lane_bytes, sew)))
 
         cmp_result = Signal(lane_bytes)
@@ -246,7 +246,7 @@ class VALU(Elaboratable):
                         n = 1 << (3 + w)
                         m.d.comb += in1_rev.eq(
                             Cat([
-                                self.in1[i:i + n]
+                                self.in1.bit_select(i, n)
                                 for i in range(0, self.width, n)
                             ][::-1]))
 
@@ -255,12 +255,11 @@ class VALU(Elaboratable):
         with m.If(self.narrow):
             for w in range(self.width // 16):
                 with m.If(self.uop_idx[0]):
-                    m.d.comb += shamts[w * 16:(w + 1) * 16].eq(
-                        in1_rev[(w + self.width // 16) *
-                                8:(w + self.width // 16 + 1) * 8])
+                    m.d.comb += shamts.word_select(w, 16).eq(
+                        in1_rev.word_select(w + self.width // 16, 8))
                 with m.Else():
-                    m.d.comb += shamts[w * 16:(w + 1) * 16].eq(
-                        in1_rev[w * 8:(w + 1) * 8])
+                    m.d.comb += shamts.word_select(w, 16).eq(
+                        in1_rev.word_select(w, 8))
 
         shout_r = Signal(self.width)
         m.d.comb += self.shift_out.eq(shout_r)
@@ -272,35 +271,35 @@ class VALU(Elaboratable):
                     for i in range(self.width // n):
                         if w == 3:
                             shamt = Cat(
-                                shamts[i * n:i * n + (2 + w)],
+                                shamts.bit_select(i * n, 2 + w),
                                 Mux(self.vi, 0, shamts[i * n + (2 + w)]))
                         else:
-                            shamt = shamts[i * n:i * n + (3 + w)]
-                        m.d.comb += shout_r[i * n:(i + 1) * n].eq(
-                            Cat(shin[i * n:(i + 1) * n], is_sub
+                            shamt = shamts.bit_select(i * n, 3 + w)
+                        m.d.comb += shout_r.word_select(i, n).eq(
+                            Cat(shin.word_select(i, n), is_sub
                                 & shin[(i + 1) * n - 1]).as_signed() >> shamt)
 
                         with m.Switch(shamt):
                             with m.Case(0):
                                 pass
                             with m.Case(1):
-                                m.d.comb += self.round_high[i * nb:(
-                                    i + 1) * nb].eq(shin[i * n].replicate(nb))
+                                m.d.comb += self.round_high.word_select(
+                                    i, nb).eq(shin[i * n].replicate(nb))
                             for j in range(2, n):
                                 with m.Case(j):
                                     m.d.comb += [
-                                        self.round_high[i * nb:(i + 1) * nb].
-                                        eq(shin[i * n + j - 1].replicate(nb)),
+                                        self.round_high.word_select(i, nb).eq(
+                                            shin[i * n + j - 1].replicate(nb)),
                                         self.round_tail[i * nb:(
-                                            i + 1) * nb].eq(
-                                                (shin[i * n:i * n + j -
-                                                      1].any().replicate(nb))),
+                                            i + 1) * nb].eq((shin.bit_select(
+                                                i * n,
+                                                j - 1).any().replicate(nb))),
                                     ]
                             with m.Default():
-                                m.d.comb += self.round_tail[i * nb:(
-                                    i + 1) * nb].eq(
-                                        shin[i * n:(i + 1) *
-                                             n].any().replicate(nb))
+                                m.d.comb += self.round_tail.word_select(
+                                    i, nb).eq(
+                                        shin.word_select(
+                                            i, n).any().replicate(nb))
 
         shout_l = shout_r[::-1]
         shout = Mux(
@@ -312,7 +311,8 @@ class VALU(Elaboratable):
                 with m.Case(w):
                     n = 1 << (3 + w)
                     m.d.comb += self.narrow_out.eq(
-                        Cat(shout[i * 2 * n:(i * 2 + 1) * n]
+                        Cat(
+                            shout.word_select(i * 2, n)
                             for i in range(self.width // (2 * n))))
 
         #
@@ -333,9 +333,9 @@ class VALU(Elaboratable):
                         m.d.comb += sel.eq(select_vs[(w // sew) * sew +
                                                      (sew - 1)])
 
-            m.d.comb += minmax[w * 8:(w + 1) * 8].eq(
-                Mux(sel, self.in1[w * 8:(w + 1) * 8],
-                    self.in2[w * 8:(w + 1) * 8]))
+            m.d.comb += minmax.word_select(w, 8).eq(
+                Mux(sel, self.in1.word_select(w, 8),
+                    self.in2.word_select(w, 8)))
 
         #
         # AND, OR, XOR
@@ -366,12 +366,12 @@ class VALU(Elaboratable):
             ext_width = len(ext_data) // n_elems
 
             for i in range(n_elems):
-                m.d.comb += ext_data[i * ext_width:(i + 1) * ext_width].eq(
+                m.d.comb += ext_data.word_select(i, ext_width).eq(
                     Mux(
                         signed,
-                        sign_extend(data[i * elem_width:(i + 1) * elem_width],
-                                    ext_width),
-                        data[i * elem_width:(i + 1) * elem_width]))
+                        sign_extend(data.word_select(i,
+                                                     elem_width), ext_width),
+                        data.word_select(i, elem_width)))
 
         ext_out = Signal(self.width)
         with m.Switch(self.in1[1:3]):
@@ -403,9 +403,9 @@ class VALU(Elaboratable):
 
         merge_result = Signal(self.width)
         for w in range(lane_bytes):
-            m.d.comb += merge_result[w * 8:(w + 1) * 8].eq(
-                Mux(merge_mask[w], self.in1[w * 8:(w + 1) * 8],
-                    self.in2[w * 8:(w + 1) * 8]))
+            m.d.comb += merge_result.word_select(w, 8).eq(
+                Mux(merge_mask[w], self.in1.word_select(w, 8),
+                    self.in2.word_select(w, 8)))
 
         merge_out = Mux(self.vm, self.in1, merge_result)
 
@@ -510,7 +510,7 @@ class VFixPointALU(Elaboratable):
                 with m.Case(w):
                     n = 1 << w
                     for i in range(len(sat_bytes) // n):
-                        m.d.comb += sat_bytes[i * n:(i + 1) * n].eq(
+                        m.d.comb += sat_bytes.word_select(i, n).eq(
                             sat[(i + 1) * n - 1].replicate(n))
 
         sat_result = Signal(self.width)
@@ -524,16 +524,16 @@ class VFixPointALU(Elaboratable):
                         is_msb = (i & (n - 1)) == (n - 1)
                         with m.If(sat_bytes[i]):
                             with m.If(signed):
-                                m.d.comb += sat_result[i * 8:(i + 1) * 8].eq(
+                                m.d.comb += sat_result.word_select(i, 8).eq(
                                     Mux(underflow, Cat(Const(0, 7), is_msb),
                                         Cat(Const(~0, 7), not is_msb)))
                             with m.Else():
-                                m.d.comb += sat_result[i * 8:(i + 1) * 8].eq(
+                                m.d.comb += sat_result.word_select(i, 8).eq(
                                     overflow.replicate(8))
 
                         with m.Else():
-                            m.d.comb += sat_result[i * 8:(i + 1) * 8].eq(
-                                self.alu_out[i * 8:(i + 1) * 8])
+                            m.d.comb += sat_result.word_select(i, 8).eq(
+                                self.alu_out.word_select(i, 8))
 
         #
         # VAADD, VASUB
@@ -557,10 +557,10 @@ class VFixPointALU(Elaboratable):
         avg_round_inc = Signal(self.width // 8)
         for i in range(self.width // 8):
             m.d.comb += [
-                avg_pre_round[i * 8:(i + 1) * 8].eq(
-                    Cat(self.alu_out[i * 8 + 1:(i + 1) * 8], avg_high_bit[i])),
+                avg_pre_round.word_select(i, 8).eq(
+                    Cat(self.alu_out.word_select(i, 8), avg_high_bit[i])),
                 avg_round_inc[i].eq(
-                    get_round_inc(self.vxrm, self.alu_out[i * 8:(i + 1) * 8],
+                    get_round_inc(self.vxrm, self.alu_out.word_select(i, 8),
                                   1)),
             ]
 
@@ -593,8 +593,8 @@ class VFixPointALU(Elaboratable):
         all_0s_mask = Signal(self.width // 8)
         for i in range(self.width // 8):
             m.d.comb += [
-                all_1s_mask[i].eq(rnd_adder.din[i * 8:(i + 1) * 8].all()),
-                all_0s_mask[i].eq(~rnd_adder.din[i * 8:(i + 1) * 8].any()),
+                all_1s_mask[i].eq(rnd_adder.din.word_select(i, 8).all()),
+                all_0s_mask[i].eq(~rnd_adder.din.word_select(i, 8).any()),
             ]
 
         nclip_sat = Signal(self.width // 16)
@@ -606,7 +606,7 @@ class VFixPointALU(Elaboratable):
                     nw = n << 1
 
                     for i in range(self.width // nw):
-                        data = rnd_adder.dout[i * nw:(i + 1) * nw]
+                        data = rnd_adder.dout.word_select(i, nw)
                         all_1s = all_1s_mask[i * nb + nb // 2:(i + 1) *
                                              nb].all()
                         all_0s = all_0s_mask[i * nb + nb // 2:(i + 1) *
@@ -616,23 +616,23 @@ class VFixPointALU(Elaboratable):
                         with m.If(signed):
                             with m.If(all_0s & ~carry & ~data[n - 1] | all_1s
                                       & (carry | ~carry & data[n - 1])):
-                                m.d.comb += self.narrow_out[i * n:(i + 1) *
-                                                            n].eq(data[:n])
+                                m.d.comb += self.narrow_out.word_select(
+                                    i, n).eq(data[:n])
                             with m.Else():
                                 m.d.comb += [
-                                    self.narrow_out[i * n:(i + 1) * n].eq(
+                                    self.narrow_out.word_select(i, n).eq(
                                         Cat(~data[n - 1].replicate(n - 1),
                                             data[n - 1])),
-                                    nclip_sat[i * nb:(i + 1) * nb].eq(~0),
+                                    nclip_sat.word_select(i, nb).eq(~0),
                                 ]
                         with m.Else():
                             with m.If(all_0s & ~carry):
-                                m.d.comb += self.narrow_out[i * n:(i + 1) *
-                                                            n].eq(data[:n])
+                                m.d.comb += self.narrow_out.word_select(
+                                    i, n).eq(data[:n])
                             with m.Else():
                                 m.d.comb += [
-                                    self.narrow_out[i * n:(i + 1) * n].eq(~0),
-                                    nclip_sat[i * nb:(i + 1) * nb].eq(~0),
+                                    self.narrow_out.word_select(i, n).eq(~0),
+                                    nclip_sat.word_select(i, nb).eq(~0),
                                 ]
 
         m.d.comb += [
@@ -802,7 +802,7 @@ class VMultiplier(Elaboratable):
             in2_blocks.append([])
             sew = 1 << (3 + i)
             for bidx in range(self.width // sew):
-                in2_block = self.in2[bidx * sew:(bidx + 1) * sew]
+                in2_block = self.in2.word_select(bidx, sew)
                 in2_elem = Signal(2 * sew, name=f'in2_elem{bidx}_e{sew}')
                 m.d.comb += in2_elem.eq(
                     Mux(lhs_signed, sign_extend(in2_block, 2 * sew),
@@ -844,7 +844,7 @@ class VMultiplier(Elaboratable):
                     comps = []
                     for i in range(self.width // sew):
                         hi = Mux(self.in1[(i + 1) * sew - 1] & ~rhs_signed,
-                                 self.in2[i * sew:(i + 1) * sew], 0)
+                                 self.in2.word_select(i, sew), 0)
                         lo = Cat(
                             Cat(b.neg, Const(0, 1))
                             for b in in1_booth[i * sew // 2:(i + 1) * sew //
@@ -859,10 +859,8 @@ class VMultiplier(Elaboratable):
                 with m.Case(w):
                     sew = 1 << (w + 3)
                     for i in range(self.width // sew):
-                        m.d.comb += in3_adjust[i * 2 * sew:(i + 1) * 2 *
-                                               sew].eq(
-                                                   self.in3[i * sew:(i + 1) *
-                                                            sew])
+                        m.d.comb += in3_adjust.word_select(i, 2 * sew).eq(
+                            self.in3.word_select(i, sew))
 
         with m.If(VALUOperator.is_macc(self.fn)):
             with m.If(self.widen):
@@ -972,9 +970,9 @@ class VMultiplier(Elaboratable):
             else:
                 m.d.comb += cin[w].eq(s1_sew.any() & cout[w - 1])
 
-            s = Cat(cin[w], addens[0][w * 16:(w + 1) * 16], Const(0, 1)) + Cat(
-                cin[w], addens[1][w * 16:(w + 1) * 16], Const(0, 1))
-            m.d.comb += Cat(adder_out[w * 16:(w + 1) * 16], cout[w]).eq(s[1:])
+            s = Cat(cin[w], addens[0].word_select(w, 16), Const(0, 1)) + Cat(
+                cin[w], addens[1].word_select(w, 16), Const(0, 1))
+            m.d.comb += Cat(adder_out.word_select(w, 16), cout[w]).eq(s[1:])
 
         wal_out = Signal(self.width * 2)
         m.d.sync += wal_out.eq(adder_out)
@@ -1005,9 +1003,9 @@ class VMultiplier(Elaboratable):
                 with m.Case(w):
                     n = 1 << (3 + w)
                     for i in range(self.width // n):
-                        m.d.comb += mul_out[i * n:(i + 1) * n].eq(
-                            Mux(s2_h, wal_out[(2 * i + 1) * n:(2 * i + 2) * n],
-                                wal_out[(2 * i) * n:(2 * i + 1) * n]))
+                        m.d.comb += mul_out.word_select(i, n).eq(
+                            Mux(s2_h, wal_out.word_select(2 * i + 1, n),
+                                wal_out.word_select(2 * i, n)))
 
         with m.If(s2_widen):
             m.d.comb += mul_out.eq(
@@ -1019,7 +1017,7 @@ class VMultiplier(Elaboratable):
                 with m.Case(w):
                     n = 1 << (3 + w)
                     for i in range(self.width // n):
-                        m.d.comb += vxsat[i * n // 8:(i + 1) * n // 8].eq(
+                        m.d.comb += vxsat.word_select(i, n // 8).eq(
                             (wal_out[(i + 1) * n * 2 - 2:(i + 1) * n *
                                      2] == 1).replicate(n // 8))
 
@@ -1031,12 +1029,12 @@ class VMultiplier(Elaboratable):
                     n = 1 << (3 + w)
                     for i in range(self.width // n):
                         m.d.comb += [
-                            wal_out_rnd[i * n:(i + 1) * n].eq(
+                            wal_out_rnd.word_select(i, n).eq(
                                 wal_out[i * n * 2 + n - 1:(i + 1) * n * 2 -
                                         1]),
                             wal_rnd_inc[i * n // 8].eq(
                                 get_round_inc(s2_vxrm,
-                                              wal_out[i * n * 2:i * n * 2 + n],
+                                              wal_out.bit_select(i * n * 2, n),
                                               n - 1)),
                         ]
 
@@ -1056,7 +1054,7 @@ class VMultiplier(Elaboratable):
                     n = 1 << (3 + w)
                     for i in range(self.width // n):
                         with m.If(vxsat[i * n // 8]):
-                            m.d.comb += fixp_out[i * n:(i + 1) * n].eq(
+                            m.d.comb += fixp_out.word_select(i, n).eq(
                                 Const(~0, n - 1))
 
         out = Signal(self.width)
@@ -1116,8 +1114,8 @@ class VIntDiv(Elaboratable):
                             m.d.comb += div.req.bits.fn.eq(alu_fn)
 
                 m.d.comb += [
-                    div.req.bits.in1.eq(self.in2[i * sew:(i + 1) * sew]),
-                    div.req.bits.in2.eq(self.in1[i * sew:(i + 1) * sew]),
+                    div.req.bits.in1.eq(self.in2.word_select(i, sew)),
+                    div.req.bits.in2.eq(self.in1.word_select(i, sew)),
                 ]
 
                 ms.append(div)
@@ -1249,7 +1247,7 @@ class ReductionSlice(Elaboratable):
 
         logic_out = [Signal(64, name=f'logic_out{w}') for w in range(4)]
         in_data_64b = [
-            self.in_data[i * 64:(i + 1) * 64] for i in range(self.width // 64)
+            self.in_data.word_select(i, 64) for i in range(self.width // 64)
         ]
         with m.Switch(self.opcode):
             with m.Case(VOpCode.VREDAND):
@@ -1281,7 +1279,7 @@ class ReductionSlice(Elaboratable):
         for w in range(4):
             n = 1 << (3 + w)
             addens = [
-                self.in_data[i * n:(i + 1) * n]
+                self.in_data.word_select(i, n)
                 for i in range(len(self.in_data) // n)
             ]
 
@@ -1316,7 +1314,7 @@ class ReductionSlice(Elaboratable):
         for w in range(4):
             n = 1 << (3 + w)
             comparands = [
-                self.in_data[i * n:(i + 1) * n]
+                self.in_data.word_select(i, n)
                 for i in range(len(self.in_data) // n)
             ]
 
@@ -1476,11 +1474,8 @@ class VMask(Elaboratable):
                     n = 1 << (3 + w)
                     stride = self.width // n
 
-                    with m.Switch(self.uop_idx):
-                        for i in range(8):
-                            with m.Case(i):
-                                m.d.comb += vs2_masked_uop.eq(
-                                    vs2_masked[i * stride:(i + 1) * stride])
+                    m.d.comb += vs2_masked_uop.eq(
+                        vs2_masked.word_select(self.uop_idx, stride))
 
         one_count = Signal(self.width + 8)
         one_count_acc = Signal(self.width + 8)
@@ -1490,13 +1485,14 @@ class VMask(Elaboratable):
             m.submodules += popcount
             m.d.comb += [
                 popcount.inp.eq(vs2_masked_vid[:i + 1]),
-                one_count[(i + 1) * 8:(i + 2) * 8].eq(popcount.out),
+                one_count.word_select(i + 1, 8).eq(popcount.out),
             ]
 
         for i in range(self.width // 8 + 1):
-            m.d.comb += one_count_acc[i * 8:(i + 1) * 8].eq(
-                Mux(self.uop_idx.any(), one_count[i * 8:(i + 1) * 8] + one_sum,
-                    one_count[i * 8:(i + 1) * 8]))
+            m.d.comb += one_count_acc.word_select(i, 8).eq(
+                Mux(self.uop_idx.any(),
+                    one_count.word_select(i, 8) + one_sum,
+                    one_count.word_select(i, 8)))
 
         cur_count = Signal(range(self.width + 1))
         with m.Switch(self.sew):
@@ -1504,8 +1500,8 @@ class VMask(Elaboratable):
                 with m.Case(w):
                     n = 1 << (3 + w)
                     stride = self.width // n
-                    m.d.comb += cur_count.eq(one_count_acc[stride *
-                                                           8:(stride + 1) * 8])
+                    m.d.comb += cur_count.eq(
+                        one_count_acc.word_select(stride, 8))
         m.d.sync += one_sum.eq(cur_count)
 
         s1_sew = Signal.like(self.sew)
@@ -1544,8 +1540,8 @@ class VMask(Elaboratable):
                         with m.Case(w):
                             n = 1 << (3 + w)
                             for i in range(self.width // n):
-                                m.d.comb += vd_out[i * n:i * n + 8].eq(
-                                    vd_reg[i * 8:(i + 1) * 8])
+                                m.d.comb += vd_out.bit_select(i * n, 8).eq(
+                                    vd_reg.word_select(i, 8))
 
             with m.Default():
                 m.d.comb += vd_out.eq(vd_reg)

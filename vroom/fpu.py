@@ -39,12 +39,9 @@ class VFPUFMA(Elaboratable):
                     dfma.inp.bits.fn.eq(self.inp.bits.fn),
                     dfma.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
                     dfma.inp.bits.rm.eq(self.inp.bits.rm),
-                    dfma.inp.bits.in1.eq(self.inp.bits.in1[i * 64:(i + 1) *
-                                                           64]),
-                    dfma.inp.bits.in2.eq(self.inp.bits.in2[i * 64:(i + 1) *
-                                                           64]),
-                    dfma.inp.bits.in3.eq(self.inp.bits.in3[i * 64:(i + 1) *
-                                                           64]),
+                    dfma.inp.bits.in1.eq(self.inp.bits.in1.word_select(i, 64)),
+                    dfma.inp.bits.in2.eq(self.inp.bits.in2.word_select(i, 64)),
+                    dfma.inp.bits.in3.eq(self.inp.bits.in3.word_select(i, 64)),
                     dfma.inp.bits.src_fmt.eq(self.inp.bits.src_fmt),
                     dfma.inp.bits.dst_fmt.eq(self.inp.bits.dst_fmt),
                     dfma.inp.bits.int_fmt.eq(self.inp.bits.int_fmt),
@@ -62,9 +59,9 @@ class VFPUFMA(Elaboratable):
                 sfma.inp.bits.fn.eq(self.inp.bits.fn),
                 sfma.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
                 sfma.inp.bits.rm.eq(self.inp.bits.rm),
-                sfma.inp.bits.in1.eq(self.inp.bits.in1[i * 32:(i + 1) * 32]),
-                sfma.inp.bits.in2.eq(self.inp.bits.in2[i * 32:(i + 1) * 32]),
-                sfma.inp.bits.in3.eq(self.inp.bits.in3[i * 32:(i + 1) * 32]),
+                sfma.inp.bits.in1.eq(self.inp.bits.in1.word_select(i, 32)),
+                sfma.inp.bits.in2.eq(self.inp.bits.in2.word_select(i, 32)),
+                sfma.inp.bits.in3.eq(self.inp.bits.in3.word_select(i, 32)),
                 sfma.inp.bits.src_fmt.eq(self.inp.bits.src_fmt),
                 sfma.inp.bits.dst_fmt.eq(self.inp.bits.dst_fmt),
                 sfma.inp.bits.int_fmt.eq(self.inp.bits.int_fmt),
@@ -114,12 +111,9 @@ class VFPUComp(Elaboratable):
                     dcmp.inp.bits.fn.eq(self.inp.bits.fn),
                     dcmp.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
                     dcmp.inp.bits.rm.eq(self.inp.bits.rm),
-                    dcmp.inp.bits.in1.eq(self.inp.bits.in1[i * 64:(i + 1) *
-                                                           64]),
-                    dcmp.inp.bits.in2.eq(self.inp.bits.in2[i * 64:(i + 1) *
-                                                           64]),
-                    dcmp.inp.bits.in3.eq(self.inp.bits.in3[i * 64:(i + 1) *
-                                                           64]),
+                    dcmp.inp.bits.in1.eq(self.inp.bits.in1.word_select(i, 64)),
+                    dcmp.inp.bits.in2.eq(self.inp.bits.in2.word_select(i, 64)),
+                    dcmp.inp.bits.in3.eq(self.inp.bits.in3.word_select(i, 64)),
                     dcmp.inp.bits.src_fmt.eq(self.inp.bits.src_fmt),
                     dcmp.inp.bits.dst_fmt.eq(self.inp.bits.dst_fmt),
                     dcmp.inp.bits.int_fmt.eq(self.inp.bits.int_fmt),
@@ -137,9 +131,9 @@ class VFPUComp(Elaboratable):
                 scmp.inp.bits.fn.eq(self.inp.bits.fn),
                 scmp.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
                 scmp.inp.bits.rm.eq(self.inp.bits.rm),
-                scmp.inp.bits.in1.eq(self.inp.bits.in1[i * 32:(i + 1) * 32]),
-                scmp.inp.bits.in2.eq(self.inp.bits.in2[i * 32:(i + 1) * 32]),
-                scmp.inp.bits.in3.eq(self.inp.bits.in3[i * 32:(i + 1) * 32]),
+                scmp.inp.bits.in1.eq(self.inp.bits.in1.word_select(i, 32)),
+                scmp.inp.bits.in2.eq(self.inp.bits.in2.word_select(i, 32)),
+                scmp.inp.bits.in3.eq(self.inp.bits.in3.word_select(i, 32)),
                 scmp.inp.bits.src_fmt.eq(self.inp.bits.src_fmt),
                 scmp.inp.bits.dst_fmt.eq(self.inp.bits.dst_fmt),
                 scmp.inp.bits.int_fmt.eq(self.inp.bits.int_fmt),
@@ -211,20 +205,19 @@ class VFPUDivSqrt(Elaboratable):
             ]
             if i & 1:
                 m.d.comb += [
-                    fdiv.a.eq(self.a[i * 32:(i + 1) * 32]),
-                    fdiv.b.eq(self.b[i * 32:(i + 1) * 32]),
+                    fdiv.a.eq(self.a.word_select(i, 32)),
+                    fdiv.b.eq(self.b.word_select(i, 32)),
                     fdiv.in_valid.eq(self.in_valid & self.in_ready
                                      & (self.fmt == FPFormat.S)),
-                    resp_data_s[i * 32:(i + 1) * 32].eq(fdiv.out.bits),
+                    resp_data_s.word_select(i, 32).eq(fdiv.out.bits),
                 ]
             else:
                 m.d.comb += [
-                    fdiv.a.eq(self.a[(i // 2) * 64:(i // 2 + 1) * 64]),
-                    fdiv.b.eq(self.b[(i // 2) * 64:(i // 2 + 1) * 64]),
+                    fdiv.a.eq(self.a.word_select(i // 2, 64)),
+                    fdiv.b.eq(self.b.word_select(i // 2, 64)),
                     fdiv.in_valid.eq(self.in_valid & self.in_ready),
-                    resp_data_s[i * 32:(i + 1) * 32].eq(fdiv.out.bits),
-                    resp_data_d[(i // 2) * 64:(i // 2 + 1) * 64].eq(
-                        fdiv.out.bits),
+                    resp_data_s.word_select(i, 32).eq(fdiv.out.bits),
+                    resp_data_d.word_select(i // 2, 64).eq(fdiv.out.bits),
                 ]
 
         resp_mask = Signal(self.width // 32)
@@ -282,20 +275,18 @@ class VFPUCast(Elaboratable):
             ]
             if i & 1:
                 m.d.comb += [
-                    cast.inp.bits.in1.eq(self.inp.bits.in2[i * 32:(i + 1) *
-                                                           32]),
+                    cast.inp.bits.in1.eq(self.inp.bits.in2.word_select(i, 32)),
                     cast.inp.valid.eq(self.inp.valid
                                       & (self.inp.bits.src_fmt == FPFormat.S)),
-                    resp_data_s[i * 32:(i + 1) * 32].eq(cast.out.bits.data),
+                    resp_data_s.word_select(i, 32).eq(cast.out.bits.data),
                 ]
             else:
                 m.d.comb += [
                     cast.inp.bits.in1.eq(
-                        self.inp.bits.in2[(i // 2) * 64:(i // 2 + 1) * 64]),
+                        self.inp.bits.in2.word_select(i // 2, 64)),
                     cast.inp.valid.eq(self.inp.valid),
-                    resp_data_s[i * 32:(i + 1) * 32].eq(cast.out.bits.data),
-                    resp_data_d[(i // 2) * 64:(i // 2 + 1) * 64].eq(
-                        cast.out.bits.data),
+                    resp_data_s.word_select(i, 32).eq(cast.out.bits.data),
+                    resp_data_d.word_select(i // 2, 64).eq(cast.out.bits.data),
                 ]
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
@@ -347,8 +338,7 @@ class VFPURec(Elaboratable):
                     drec.inp.bits.fn.eq(self.inp.bits.fn),
                     drec.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
                     drec.inp.bits.rm.eq(self.inp.bits.rm),
-                    drec.inp.bits.in1.eq(self.inp.bits.in2[i * 64:(i + 1) *
-                                                           64]),
+                    drec.inp.bits.in1.eq(self.inp.bits.in2.word_select(i, 64)),
                 ]
 
                 drec_res.append(drec.out.bits.data)
@@ -363,7 +353,7 @@ class VFPURec(Elaboratable):
                 srec.inp.bits.fn.eq(self.inp.bits.fn),
                 srec.inp.bits.fn_mod.eq(self.inp.bits.fn_mod),
                 srec.inp.bits.rm.eq(self.inp.bits.rm),
-                srec.inp.bits.in1.eq(self.inp.bits.in2[i * 32:(i + 1) * 32]),
+                srec.inp.bits.in1.eq(self.inp.bits.in2.word_select(i, 32)),
             ]
 
             srec_res.append(srec.out.bits.data)

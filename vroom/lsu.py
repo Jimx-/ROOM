@@ -1608,11 +1608,8 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                 with m.Case(w):
                     n = 1 << (w + 3)
 
-                    with m.Switch(idx_offset):
-                        for i in range(self.vlen * 8 // n):
-                            with m.Case(i):
-                                m.d.comb += mem_txn.idx_data.bits.index.eq(
-                                    Cat(idx_buf)[i * n:(i + 1) * n])
+                    m.d.comb += mem_txn.idx_data.bits.index.eq(
+                        Cat(idx_buf).word_select(idx_offset, n))
 
         with m.Switch(idx_offset):
             for i in range(self.vlen):
@@ -1650,14 +1647,13 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                     with m.Switch(s1_ld_elem_idx[:3 - w]):
                         for off in range(2**(3 - w)):
                             with m.Case(off):
-                                m.d.comb += seg_wmask[off * n:(
-                                    off + 1) * n].eq(
-                                        s1_ld_byte_mask[0].replicate(n))
+                                m.d.comb += seg_wmask.word_select(off, n).eq(
+                                    s1_ld_byte_mask[0].replicate(n))
                                 for reg_idx in range(8):
                                     seg_data_select(
                                         req_emul_vd, seg_data_shift, reg_idx,
-                                        n, seg_wdata[reg_idx][off *
-                                                              n:(off + 1) * n])
+                                        n,
+                                        seg_wdata[reg_idx].word_select(off, n))
 
             with m.Case(3):
                 m.d.comb += seg_wmask.eq(s1_ld_byte_mask[0].replicate(64))
@@ -1685,7 +1681,7 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                             with m.Case(w):
                                 n = log2_int(self.vlen) - (w + 3)
 
-                                with m.Switch(s1_ld_elem_idx[n:n + i]):
+                                with m.Switch(s1_ld_elem_idx.bit_select(n, i)):
                                     for j in range(2**i):
                                         with m.Case(j):
                                             m.d.comb += emul_seg_mask.eq(
@@ -1705,12 +1701,12 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
                     with m.Case(i):
                         for reg_idx in range(8):
                             with m.If(seg_mask_shift[reg_idx]):
-                                m.d.sync += ld_data_buf[reg_idx][i * 64:(
-                                    i + 1) * 64].eq(
-                                        (seg_wdata[reg_idx] & seg_wmask)
-                                        | (ld_data_buf[reg_idx][i * 64:
-                                                                (i + 1) * 64]
-                                           & ~seg_wmask))
+                                m.d.sync += ld_data_buf[reg_idx].word_select(
+                                    i,
+                                    64).eq((seg_wdata[reg_idx] & seg_wmask)
+                                           | (ld_data_buf[reg_idx].word_select(
+                                               i, 64)
+                                              & ~seg_wmask))
 
         with m.FSM():
             with m.State('IDLE'):

@@ -289,7 +289,8 @@ class PerLaneFunctionalUnit(FunctionalUnit):
             vs1_data = Signal(self.lane_width, name=f'vs1_data{w}')
             with m.If(uop.widen | uop.widen2 | uop.narrow):
                 m.d.comb += vs1_data.eq(
-                    Cat(self.req.bits.vs1_data[i * 32:(i + 1) * 32]
+                    Cat(
+                        self.req.bits.vs1_data.word_select(i, 32)
                         for i in range(w, self.vlen // 32, self.n_lanes)))
             with m.Else():
                 m.d.comb += vs1_data.eq(
@@ -297,12 +298,15 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                                            self.lane_width])
 
             vs2_data = Signal(self.lane_width, name=f'vs2_data{w}')
-            vs2_f2 = Cat(self.req.bits.vs2_data[i * 32:(i + 1) * 32]
-                         for i in range(w, self.vlen // 32, self.n_lanes))
-            vs2_f4 = Cat(self.req.bits.vs2_data[i * 16:(i + 1) * 16]
-                         for i in range(w, self.vlen // 16, self.n_lanes))
-            vs2_f8 = Cat(self.req.bits.vs2_data[i * 8:(i + 1) * 8]
-                         for i in range(w, self.vlen // 8, self.n_lanes))
+            vs2_f2 = Cat(
+                self.req.bits.vs2_data.word_select(i, 32)
+                for i in range(w, self.vlen // 32, self.n_lanes))
+            vs2_f4 = Cat(
+                self.req.bits.vs2_data.word_select(i, 16)
+                for i in range(w, self.vlen // 16, self.n_lanes))
+            vs2_f8 = Cat(
+                self.req.bits.vs2_data.word_select(i, 8)
+                for i in range(w, self.vlen // 8, self.n_lanes))
             with m.If(uop.widen | (VALUOperator.is_ext(uop.alu_fn)
                                    & (uop.lrs1[1:3] == 3))):
                 m.d.comb += vs2_data.eq(vs2_f2)
@@ -316,8 +320,7 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                 m.d.comb += vs2_data.eq(vs2_f8)
             with m.Else():
                 m.d.comb += vs2_data.eq(
-                    self.req.bits.vs2_data[w * self.lane_width:(w + 1) *
-                                           self.lane_width])
+                    self.req.bits.vs2_data.word_select(w, self.lane_width))
 
             opa_data = Signal(self.lane_width, name=f'opa_data{w}')
             opb_data = Signal(self.lane_width, name=f'opb_data{w}')
@@ -330,12 +333,11 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                 with m.Case(VOpA.VS1_HALF):
                     m.d.comb += opa_data.eq(
                         Cat(
-                            self.req.bits.vs1_data[w * self.lane_width //
-                                                   2:(w + 1) *
-                                                   self.lane_width // 2],
-                            self.req.bits.vs1_data[(w + 2) * self.lane_width //
-                                                   2:(w + 3) *
-                                                   self.lane_width // 2]))
+                            self.req.bits.vs1_data.word_select(
+                                w, self.lane_width // 2),
+                            self.req.bits.vs1_data.word_select(
+                                w + 2, self.lane_width // 2)))
+
                 with m.Case(VOpA.IMM):
                     with m.Switch(sew):
                         for i in range(4):
@@ -360,23 +362,19 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                 with m.Case(VOpB.VS2_HALF):
                     m.d.comb += opb_data.eq(
                         Cat(
-                            self.req.bits.vs2_data[w * self.lane_width //
-                                                   2:(w + 1) *
-                                                   self.lane_width // 2],
-                            self.req.bits.vs2_data[(w + 2) * self.lane_width //
-                                                   2:(w + 3) *
-                                                   self.lane_width // 2]))
+                            self.req.bits.vs2_data.word_select(
+                                w, self.lane_width // 2),
+                            self.req.bits.vs2_data.word_select(
+                                w + 2, self.lane_width // 2)))
 
                 with m.Case(VOpB.OLD_VD):
                     m.d.comb += opb_data.eq(
-                        self.req.bits.vs3_data[w * self.lane_width:(w + 1) *
-                                               self.lane_width])
+                        self.req.bits.vs3_data.word_select(w, self.lane_width))
 
             with m.Switch(uop.opc_sel):
                 with m.Case(VOpC.OLD_VD):
                     m.d.comb += old_vd.eq(
-                        self.req.bits.vs3_data[w * self.lane_width:(w + 1) *
-                                               self.lane_width])
+                        self.req.bits.vs3_data.word_select(w, self.lane_width))
 
                 with m.Case(VOpC.VS2):
                     m.d.comb += old_vd.eq(vs2_data)
@@ -415,7 +413,7 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                     with m.Case(i):
                         tail_width = self.lane_width // (8 << i)
                         m.d.comb += lane_tail.eq(
-                            tail_gen.tail[w * tail_width:(w + 1) * tail_width])
+                            tail_gen.tail.word_select(w, tail_width))
 
             with m.Switch(self.req.bits.uop.dest_eew()):
                 for i in range(3):
@@ -423,11 +421,9 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                         tail_width = self.lane_width // (16 << i)
                         m.d.comb += lane_tail_narrow.eq(
                             Cat(
-                                tail_gen.tail[w * tail_width:(w + 1) *
-                                              tail_width],
-                                tail_gen.tail[(w + self.n_lanes) *
-                                              tail_width:(w + self.n_lanes +
-                                                          1) * tail_width]))
+                                tail_gen.tail.word_select(w, tail_width),
+                                tail_gen.tail.word_select(
+                                    w + self.n_lanes, tail_width)))
 
             m.d.comb += lane_req.bits.tail.eq(
                 Mux(self.req.bits.uop.narrow, lane_tail_narrow, lane_tail))
@@ -437,15 +433,14 @@ class PerLaneFunctionalUnit(FunctionalUnit):
         #
 
         mask = Signal(self.vlen_bytes)
-        with m.Switch(self.req.bits.uop.expd_idx >> self.req.bits.uop.narrow):
-            for i in range(8):
-                with m.Case(i):
-                    with m.Switch(self.req.bits.uop.dest_eew()):
-                        for w in range(4):
-                            with m.Case(w):
-                                n = self.vlen_bytes // (1 << w)
-                                m.d.comb += mask.eq(
-                                    self.req.bits.mask[i * n:(i + 1) * n])
+        with m.Switch(self.req.bits.uop.dest_eew()):
+            for w in range(4):
+                with m.Case(w):
+                    n = self.vlen_bytes // (1 << w)
+                    m.d.comb += mask.eq(
+                        self.req.bits.mask.word_select(
+                            self.req.bits.uop.expd_idx >>
+                            self.req.bits.uop.narrow, n))
 
         for w, lane_req in enumerate(self.lane_reqs):
             lane_mask = Signal(self.lane_width // 8, name=f'lane_mask{w}')
@@ -456,19 +451,17 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                 for i in range(4):
                     with m.Case(i):
                         mask_width = self.lane_width // (8 << i)
-                        m.d.comb += lane_mask.eq(mask[w * mask_width:(w + 1) *
-                                                      mask_width])
+                        m.d.comb += lane_mask.eq(
+                            mask.word_select(w, mask_width))
 
             with m.Switch(self.req.bits.uop.dest_eew()):
                 for i in range(3):
                     with m.Case(i):
                         mask_width = self.lane_width // (16 << i)
                         m.d.comb += lane_mask_narrow.eq(
-                            Cat(
-                                mask[w * mask_width:(w + 1) * mask_width],
-                                mask[(w + self.n_lanes) *
-                                     mask_width:(w + self.n_lanes + 1) *
-                                     mask_width]))
+                            Cat(mask.word_select(w, mask_width),
+                                mask.word_select(w + self.n_lanes,
+                                                 mask_width)))
 
             m.d.comb += lane_req.bits.mask.eq(
                 Mux(self.req.bits.uop.narrow, lane_mask_narrow, lane_mask))
@@ -524,12 +517,11 @@ class PerLaneFunctionalUnit(FunctionalUnit):
             with m.Else():
                 m.d.comb += lane_vd_data.eq(lane_resp.bits.vd_data)
 
-            m.d.comb += self.resp.bits.vd_data[w * self.lane_width:(
-                w + 1) * self.lane_width].eq(
-                    Mux(
-                        self.resp.bits.uop.narrow_to_1,
-                        vd_cmp_out[w * self.lane_width:(w + 1) *
-                                   self.lane_width], lane_vd_data))
+            m.d.comb += self.resp.bits.vd_data.word_select(
+                w, self.lane_width).eq(
+                    Mux(self.resp.bits.uop.narrow_to_1,
+                        vd_cmp_out.word_select(w, self.lane_width),
+                        lane_vd_data))
 
         return m
 
@@ -558,13 +550,13 @@ class MaskDataGen(HasVectorParams, Elaboratable):
             with m.If(self.tail[i]):
                 with m.If(self.uop.vta | self.uop.narrow_to_1):
                     m.d.comb += [
-                        self.mask_off[i * 8:(i + 1) * 8].eq(~0),
+                        self.mask_off.word_select(i, 8).eq(~0),
                         self.mask_off_cmp[i].eq(1),
                     ]
                 with m.Else():
                     m.d.comb += [
-                        self.mask_off[i * 8:(i + 1) * 8].eq(
-                            self.old_vd[i * 8:(i + 1) * 8]),
+                        self.mask_off.word_select(i, 8).eq(
+                            self.old_vd.word_select(i, 8)),
                         self.mask_off_cmp[i].eq(self.old_vd[i]),
                     ]
 
@@ -572,26 +564,26 @@ class MaskDataGen(HasVectorParams, Elaboratable):
                     VALUOperator.is_add_with_carry(self.uop.alu_fn)
                     | VALUOperator.is_vmerge(self.uop.alu_fn)):
                 m.d.comb += [
-                    self.mask_keep[i * 8:(i + 1) * 8].eq(~0),
+                    self.mask_keep.word_select(i, 8).eq(~0),
                     self.mask_keep_cmp[i].eq(1),
                 ]
 
             with m.Elif(~self.uop.vm & ~self.mask[i]):
                 with m.If(self.uop.vma):
                     m.d.comb += [
-                        self.mask_off[i * 8:(i + 1) * 8].eq(~0),
+                        self.mask_off.word_select(i, 8).eq(~0),
                         self.mask_off_cmp[i].eq(1),
                     ]
                 with m.Else():
                     m.d.comb += [
-                        self.mask_off[i * 8:(i + 1) * 8].eq(
-                            self.old_vd[i * 8:(i + 1) * 8]),
+                        self.mask_off.word_select(i, 8).eq(
+                            self.old_vd.word_select(i, 8)),
                         self.mask_off_cmp[i].eq(self.old_vd[i]),
                     ]
 
             with m.Else():
                 m.d.comb += [
-                    self.mask_keep[i * 8:(i + 1) * 8].eq(~0),
+                    self.mask_keep.word_select(i, 8).eq(~0),
                     self.mask_keep_cmp[i].eq(1),
                 ]
 
@@ -974,11 +966,8 @@ class VReductionUnit(PipelinedFunctionalUnit):
                     n = 1 << (3 + w)
                     stride = self.vlen // n
 
-                    with m.Switch(s0_uop_idx):
-                        for i in range(8):
-                            with m.Case(i):
-                                m.d.comb += s0_vmask_uop.eq(
-                                    s0_vmask_vl[i * stride:(i + 1) * stride])
+                    m.d.comb += s0_vmask_uop.eq(
+                        s0_vmask_vl.word_select(s0_uop_idx, stride))
 
         vl_rem = Signal(self.vl_bits)
         with m.If(s0_vl > (
@@ -995,19 +984,18 @@ class VReductionUnit(PipelinedFunctionalUnit):
                         with m.If((~s0_vm & ~s0_vmask_uop[i]) | (i >= vl_rem)):
                             with m.Switch(s0_opc):
                                 with m.Case(VOpCode.VREDMAX):
-                                    m.d.comb += vs2_masked_data[i * n:(i + 1) *
-                                                                n].eq(1 << (n -
-                                                                            1))
+                                    m.d.comb += vs2_masked_data.word_select(
+                                        i, n).eq(1 << (n - 1))
                                 with m.Case(VOpCode.VREDMIN):
-                                    m.d.comb += vs2_masked_data[i * n:(
-                                        i + 1) * n].eq((1 << (n - 1)) - 1)
+                                    m.d.comb += vs2_masked_data.word_select(
+                                        i, n).eq((1 << (n - 1)) - 1)
                                 with m.Case(VOpCode.VREDMINU, VOpCode.VREDAND):
-                                    m.d.comb += vs2_masked_data[i * n:(i + 1) *
-                                                                n].eq(~0)
+                                    m.d.comb += vs2_masked_data.word_select(
+                                        i, n).eq(~0)
 
                         with m.Else():
-                            m.d.comb += vs2_masked_data[i * n:(i + 1) * n].eq(
-                                self.req.bits.vs2_data[i * n:(i + 1) * n])
+                            m.d.comb += vs2_masked_data.word_select(i, n).eq(
+                                self.req.bits.vs2_data.word_select(i, n))
 
         vs2_masked_data_widen = Signal(self.vlen * 2)
         m.d.comb += vs2_masked_data_widen.eq(vs2_masked_data)
@@ -1017,10 +1005,10 @@ class VReductionUnit(PipelinedFunctionalUnit):
                     with m.Case(w):
                         n = 1 << (3 + w)
                         for i in range(self.vlen // n):
-                            m.d.comb += vs2_masked_data_widen[i * 2 * n:(
-                                i + 1) * 2 * n].eq(
+                            m.d.comb += vs2_masked_data_widen.word_select(
+                                i, 2 * n).eq(
                                     bit_extend(
-                                        vs2_masked_data[i * n:(i + 1) * n],
+                                        vs2_masked_data.word_select(i, n),
                                         2 * n, s0_opc[0]))
 
         vs1_masked_data = Signal(self.elen)
@@ -1058,14 +1046,10 @@ class VReductionUnit(PipelinedFunctionalUnit):
                 slice.in_data.eq(
                     Mux(
                         self.uops[0].widen,
-                        s1_vs2_data_widen[i * 2 * slice_width:(i + 1) * 2 *
-                                          slice_width],
-                        Cat(
-                            s1_vs2_data_widen[i * slice_width:(i + 1) *
-                                              slice_width],
+                        s1_vs2_data_widen.word_select(i, 2 * slice_width),
+                        Cat(s1_vs2_data_widen.word_select(i, slice_width),
                             Const(0, slice_width)))),
-                slice_vd[i * slice_width:(i + 1) * slice_width].eq(
-                    slice.resp_data),
+                slice_vd.word_select(i, slice_width).eq(slice.resp_data),
             ]
 
             slices.append(slice)
@@ -1099,7 +1083,7 @@ class VReductionUnit(PipelinedFunctionalUnit):
 
         logic_out = Signal(self.vlen)
         logic_operands = [
-            slice_vd[i * 64:(i + 1) * 64] for i in range(len(slice_vd) // 64)
+            slice_vd.word_select(i, 64) for i in range(len(slice_vd) // 64)
         ]
         logic_operands.append(s2_vs1_vd)
         with m.Switch(self.uops[1].opcode):
@@ -1122,9 +1106,8 @@ class VReductionUnit(PipelinedFunctionalUnit):
             n = 1 << (3 + w)
             addens = []
             for i in range(n_slices):
-                addens.append(slice_vd[i * slice_width:i * slice_width + n])
-                addens.append(slice_vd[i * slice_width + n:i * slice_width +
-                                       2 * n])
+                addens.append(slice_vd.bit_select(i * slice_width, n))
+                addens.append(slice_vd.bit_select(i * slice_width + n, n))
             addens.append(s2_vs1_vd)
 
             while len(addens) > 2:
@@ -1166,8 +1149,7 @@ class VReductionUnit(PipelinedFunctionalUnit):
             n = 1 << (3 + w)
             comparands = []
             for i in range(n_slices):
-                comparands.append(slice_vd[i * slice_width:i * slice_width +
-                                           n])
+                comparands.append(slice_vd.bit_select(i * slice_width, n))
             comparands.append(s2_vs1_vd[:n])
 
             while len(comparands) > 1:
@@ -1317,7 +1299,7 @@ class VMaskUnit(IterativeFunctionalUnit):
                             with m.Case(w):
                                 n = self.vlen_bytes // (1 << w)
                                 m.d.comb += vid_mask.eq(
-                                    self.req.bits.mask[i * n:(i + 1) * n])
+                                    self.req.bits.mask.word_select(i, n))
 
         vid_tail = Signal(self.vlen_bytes)
         tail_gen = m.submodules.tail_gen = TailGen(self.params)
@@ -1620,13 +1602,13 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                     n = 1 << (3 + w)
                     for i in range(self.data_width // n):
                         m.d.comb += [
-                            vs1_data_inv[i * n:(i + 1) * n].eq(
+                            vs1_data_inv.word_select(i, n).eq(
                                 Cat(
                                     self.req.bits.opa_data[i * n:(i + 1) * n -
                                                            1],
                                     self.req.bits.opa_data[(i + 1) * n - 1]
                                     ^ neg_vs1)),
-                            vs2_data_inv[i * n:(i + 1) * n].eq(
+                            vs2_data_inv.word_select(i, n).eq(
                                 Cat(
                                     self.req.bits.opb_data[i * n:(i + 1) * n -
                                                            1],
@@ -1689,18 +1671,14 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                             fcvt_widen_vs1.inp.valid.eq(uop.widen
                                                         | uop.widen2),
                             fcvt_widen_vs1.inp.bits.in1.eq(
-                                vs1_data_inv[w * (self.data_width // 2) +
-                                             i * 32:w *
-                                             (self.data_width // 2) +
-                                             (i + 1) * 32]),
+                                vs1_data_inv.bit_select(
+                                    w * (self.data_width // 2) + i * 32, 32)),
                             fcvt_widen_vs1.inp.bits.src_fmt.eq(FPFormat.S),
                             fcvt_widen_vs1.inp.bits.dst_fmt.eq(FPFormat.D),
                             fcvt_widen_vs2.inp.valid.eq(uop.widen),
                             fcvt_widen_vs2.inp.bits.in1.eq(
-                                vs2_data_inv[w * (self.data_width // 2) +
-                                             i * 32:w *
-                                             (self.data_width // 2) +
-                                             (i + 1) * 32]),
+                                vs2_data_inv.bit_select(
+                                    w * (self.data_width // 2) + i * 32, 32)),
                             fcvt_widen_vs2.inp.bits.src_fmt.eq(FPFormat.S),
                             fcvt_widen_vs2.inp.bits.dst_fmt.eq(FPFormat.D),
                         ]
@@ -1708,9 +1686,9 @@ class VFPULane(PipelinedLaneFunctionalUnit):
             s1_vs2_data_bypass = Signal(64)
             m.d.sync += s1_vs2_data_bypass.eq(fcvt_widen_vs2.inp.bits.in1)
             m.d.comb += [
-                s1_vs1_data_widen[i * 64:(i + 1) * 64].eq(
-                    fcvt_widen_vs1.out.bits),
-                s1_vs2_data_widen[i * 64:(i + 1) * 64].eq(
+                s1_vs1_data_widen.word_select(i,
+                                              64).eq(fcvt_widen_vs1.out.bits),
+                s1_vs2_data_widen.word_select(i, 64).eq(
                     Mux(s1_cast_en, s1_vs2_data_bypass,
                         fcvt_widen_vs2.out.bits)),
             ]
@@ -2058,11 +2036,8 @@ class VFReductionUnit(IterativeFunctionalUnit):
                     n = 1 << (3 + w)
                     stride = self.vlen // n
 
-                    with m.Switch(req_uop_idx):
-                        for i in range(8):
-                            with m.Case(i):
-                                m.d.comb += req_vmask_uop.eq(
-                                    req_vmask_vl[i * stride:(i + 1) * stride])
+                    m.d.comb += req_vmask_uop.eq(
+                        req_vmask_vl.word_select(req_uop_idx, stride))
 
         vl_rem = Signal(self.vl_bits)
         with m.If(req_vl > (
@@ -2080,18 +2055,18 @@ class VFReductionUnit(IterativeFunctionalUnit):
                         with m.If((~req_vm & ~req_vmask_uop[i])
                                   | (i >= vl_rem)):
                             with m.If(is_redsum(req_opc)):
-                                m.d.comb += vs2_masked_data[i * n:(i + 1) *
-                                                            n].eq(0)
+                                m.d.comb += vs2_masked_data.word_select(
+                                    i, n).eq(0)
                             with m.Elif(req_opc == VOpCode.VFREDMIN):
-                                m.d.comb += vs2_masked_data[i * n:(
-                                    i + 1) * n].eq(ftyp.greatest_finite(0))
+                                m.d.comb += vs2_masked_data.word_select(
+                                    i, n).eq(ftyp.greatest_finite(0))
                             with m.Elif(req_opc == VOpCode.VFREDMAX):
-                                m.d.comb += vs2_masked_data[i * n:(
-                                    i + 1) * n].eq(ftyp.greatest_finite(1))
+                                m.d.comb += vs2_masked_data.word_select(
+                                    i, n).eq(ftyp.greatest_finite(1))
 
                         with m.Else():
-                            m.d.comb += vs2_masked_data[i * n:(i + 1) * n].eq(
-                                self.req.bits.vs2_data[i * n:(i + 1) * n])
+                            m.d.comb += vs2_masked_data.word_select(i, n).eq(
+                                self.req.bits.vs2_data.word_select(i, n))
 
         vs2_masked_data_reg = Signal.like(vs2_masked_data)
         with m.If(self.req.fire):
@@ -2146,15 +2121,15 @@ class VFReductionUnit(IterativeFunctionalUnit):
 
             m.d.comb += [
                 lane.inp.valid.eq(req_fired | red_in_valid),
-                lane.inp.bits.in1.eq(red_vs1_data[i * self.lane_width:(i + 1) *
-                                                  self.lane_width]),
-                lane.inp.bits.in2.eq(red_vs2_data[i * self.lane_width:(i + 1) *
-                                                  self.lane_width]),
+                lane.inp.bits.in1.eq(
+                    red_vs1_data.word_select(i, self.lane_width)),
+                lane.inp.bits.in2.eq(
+                    red_vs2_data.word_select(i, self.lane_width)),
                 lane.inp.bits.src_fmt.eq(
                     Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 lane.inp.bits.dst_fmt.eq(
                     Mux(uop.fp_single & ~uop.widen, FPFormat.S, FPFormat.D)),
-                red_out_data[i * self.lane_width:(i + 1) * self.lane_width].eq(
+                red_out_data.word_select(i, self.lane_width).eq(
                     lane.out.bits.data),
             ]
 

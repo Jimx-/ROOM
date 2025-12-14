@@ -62,7 +62,7 @@ class VSlideUnit(HasVectorParams, Elaboratable):
                         for i in range(8):
                             with m.Case(i):
                                 m.d.comb += vmask_uop.eq(
-                                    self.vmask[i * stride:(i + 1) * stride])
+                                    self.vmask.word_select(i, stride))
 
         byte_mask = Signal(self.vlen_bytes)
         with m.Switch(self.vsew):
@@ -89,61 +89,60 @@ class VSlideUnit(HasVectorParams, Elaboratable):
         vslide_bytes = vslide_offset << self.vsew
         vslide_byte_off = vslide_bytes[:log2_int(self.vlen_bytes)]
 
-        old_vd_bytes = Array(self.old_vd[i * 8:(i + 1) * 8]
-                             for i in range(self.vlen_bytes))
-        vs2_lo_bytes = Array(self.vs2_lo.bits[i * 8:(i + 1) * 8]
-                             for i in range(self.vlen_bytes))
-        vs2_hi_bytes = Array(self.vs2_hi.bits[i * 8:(i + 1) * 8]
-                             for i in range(self.vlen_bytes))
-        rs1_bytes = Array(self.rs1_data[i * 8:(i + 1) * 8]
-                          for i in range(self.xlen // 8))
+        old_vd_bytes = Array(
+            self.old_vd.word_select(i, 8) for i in range(self.vlen_bytes))
+        vs2_lo_bytes = Array(
+            self.vs2_lo.bits.word_select(i, 8) for i in range(self.vlen_bytes))
+        vs2_hi_bytes = Array(
+            self.vs2_hi.bits.word_select(i, 8) for i in range(self.vlen_bytes))
+        rs1_bytes = Array(
+            self.rs1_data.word_select(i, 8) for i in range(self.xlen // 8))
 
         for i in range(self.vlen_bytes):
             with m.If(~self.vs2_lo.valid & ~self.vs2_hi.valid):
-                m.d.comb += vslideup_data[i * 8:(i + 1) * 8].eq(
-                    old_vd_bytes[i])
+                m.d.comb += vslideup_data.word_select(i, 8).eq(old_vd_bytes[i])
             with m.Elif(~self.vs2_lo.valid & self.vs2_hi.valid):
                 with m.If(i < vslide_byte_off):
-                    m.d.comb += vslideup_data[i * 8:(i + 1) * 8].eq(
+                    m.d.comb += vslideup_data.word_select(i, 8).eq(
                         old_vd_bytes[i])
                 with m.Elif(vmask_byte[i]):
-                    m.d.comb += vslideup_data[i * 8:(i + 1) * 8].eq(
+                    m.d.comb += vslideup_data.word_select(i, 8).eq(
                         vs2_hi_bytes[i - vslide_byte_off])
                 with m.Else():
-                    m.d.comb += vslideup_data[i * 8:(i + 1) * 8].eq(
+                    m.d.comb += vslideup_data.word_select(i, 8).eq(
                         Mux(self.vma, 0xff, old_vd_bytes[i]))
             with m.Elif(self.vs2_lo.valid & self.vs2_hi.valid):
                 with m.If(vmask_byte[i]):
                     with m.If(i < vslide_byte_off):
-                        m.d.comb += vslideup_data[i * 8:(i + 1) * 8].eq(
+                        m.d.comb += vslideup_data.word_select(i, 8).eq(
                             vs2_lo_bytes[self.vlen_bytes - vslide_byte_off +
                                          i])
                     with m.Else():
-                        m.d.comb += vslideup_data[i * 8:(i + 1) * 8].eq(
+                        m.d.comb += vslideup_data.word_select(i, 8).eq(
                             vs2_hi_bytes[i - vslide_byte_off])
                 with m.Else():
-                    m.d.comb += vslideup_data[i * 8:(i + 1) * 8].eq(
+                    m.d.comb += vslideup_data.word_select(i, 8).eq(
                         Mux(self.vma, 0xff, old_vd_bytes[i]))
 
         for i in range(self.vlen_bytes):
             with m.If(vmask_byte[i]):
                 with m.If((vslide_byte_off + i < vlmax_bytes)
                           & self.vs2_lo.valid):
-                    m.d.comb += vslidedown_data[i * 8:(i + 1) * 8].eq(
+                    m.d.comb += vslidedown_data.word_select(i, 8).eq(
                         vs2_lo_bytes[vslide_byte_off + i])
                 with m.If((vslide_byte_off + i >= self.vlen_bytes)
                           & self.vs2_hi.valid):
-                    m.d.comb += vslidedown_data[i * 8:(i + 1) * 8].eq(
+                    m.d.comb += vslidedown_data.word_select(i, 8).eq(
                         vs2_hi_bytes[vslide_byte_off + i - self.vlen_bytes])
             with m.Else():
-                m.d.comb += vslidedown_data[i * 8:(i + 1) * 8].eq(
+                m.d.comb += vslidedown_data.word_select(i, 8).eq(
                     Mux(self.vma, 0xff, old_vd_bytes[i]))
 
         m.d.comb += vslide1up_data.eq(vslideup_data)
         with m.If(self.uop_idx == 0):
             for i in range(self.xlen // 8):
                 with m.If(i < vsew_bytes):
-                    m.d.comb += vslide1up_data[i * 8:(i + 1) * 8].eq(
+                    m.d.comb += vslide1up_data.word_select(i, 8).eq(
                         Mux(vmask_byte[i], rs1_bytes[i],
                             Mux(self.vma, 0xff, old_vd_bytes[i])))
 
@@ -151,7 +150,7 @@ class VSlideUnit(HasVectorParams, Elaboratable):
         with m.If(self.uop_idx == vl_idx):
             for i in range(self.vlen_bytes):
                 with m.If((i >= vl_remain_bytes - vsew_bytes) & vmask_byte[i]):
-                    m.d.comb += vslide1down_data[i * 8:(i + 1) * 8].eq(
+                    m.d.comb += vslide1down_data.word_select(i, 8).eq(
                         rs1_bytes[i + vsew_bytes - vl_remain_bytes])
 
         with m.Switch(self.opcode):
@@ -213,7 +212,7 @@ class VGatherUnit(HasVectorParams, Elaboratable):
                         for i in range(8):
                             with m.Case(i):
                                 m.d.comb += vmask_uop.eq(
-                                    vmask_vl[i * stride:(i + 1) * stride])
+                                    vmask_vl.word_select(i, stride))
 
         byte_mask = Signal(self.vlen_bytes)
         with m.Switch(self.vsew):
@@ -233,12 +232,12 @@ class VGatherUnit(HasVectorParams, Elaboratable):
         vs2_max = Mux(self.vlmul_sign, vlmax_bytes,
                       (self.vs2_idx + 1) << log2_int(self.vlen_bytes))
 
-        old_vd_bytes = Array(self.old_vd[i * 8:(i + 1) * 8]
-                             for i in range(self.vlen_bytes))
-        vs2_bytes = Array(self.vs2_data[i * 8:(i + 1) * 8]
-                          for i in range(self.vlen_bytes))
-        vd_reg_bytes = Array(self.vd_reg[i * 8:(i + 1) * 8]
-                             for i in range(self.vlen_bytes))
+        old_vd_bytes = Array(
+            self.old_vd.word_select(i, 8) for i in range(self.vlen_bytes))
+        vs2_bytes = Array(
+            self.vs2_data.word_select(i, 8) for i in range(self.vlen_bytes))
+        vd_reg_bytes = Array(
+            self.vd_reg.word_select(i, 8) for i in range(self.vlen_bytes))
 
         byte_sel = [
             Signal(range(self.xlen * self.elen // 8), name=f'byte_sel{i}')
@@ -258,9 +257,8 @@ class VGatherUnit(HasVectorParams, Elaboratable):
                         if w == 0:
                             with m.Elif(is_gather16):
                                 m.d.comb += sel_base.eq(
-                                    self.vs1_data.replicate(2)[i * nb *
-                                                               16:(i + 1) *
-                                                               nb * 16])
+                                    self.vs1_data.replicate(2).word_select(
+                                        i, nb * 16))
                         elif w > 1:
                             with m.Elif(is_gather16):
                                 with m.Switch(self.uop_idx[:w - 1]):
@@ -269,12 +267,11 @@ class VGatherUnit(HasVectorParams, Elaboratable):
                                             word_idx = i + j * (
                                                 self.vlen_bytes // nb)
                                             m.d.comb += sel_base.eq(
-                                                self.vs1_data[word_idx *
-                                                              16:(word_idx +
-                                                                  1) * 16])
+                                                self.vs1_data.word_select(
+                                                    word_idx, 16))
                         with m.Else():
                             m.d.comb += sel_base.eq(
-                                self.vs1_data[i * nb * 8:(i + 1) * nb * 8])
+                                self.vs1_data.word_select(i, nb * 8))
 
                         for j in range(nb):
                             bidx = i * nb + j
@@ -340,10 +337,10 @@ class VCompressUnit(HasVectorParams, Elaboratable):
             rd_old_vd_d1.eq(self.rd_old_vd),
         ]
 
-        old_vd_bytes = Array(old_vd_d1[i * 8:(i + 1) * 8]
-                             for i in range(self.vlen_bytes))
-        vs2_bytes = Array(vs2_data_d1[i * 8:(i + 1) * 8]
-                          for i in range(self.vlen_bytes))
+        old_vd_bytes = Array(
+            old_vd_d1.word_select(i, 8) for i in range(self.vlen_bytes))
+        vs2_bytes = Array(
+            vs2_data_d1.word_select(i, 8) for i in range(self.vlen_bytes))
 
         vmask_uop = Signal(self.vlen_bytes)
         with m.Switch(self.vsew):
@@ -356,7 +353,7 @@ class VCompressUnit(HasVectorParams, Elaboratable):
                         for i in range(8):
                             with m.Case(i):
                                 m.d.comb += vmask_uop.eq(
-                                    self.vmask[i * stride:(i + 1) * stride])
+                                    self.vmask.word_select(i, stride))
 
         byte_mask = Signal(self.vlen_bytes)
         byte_mask_d1 = Signal.like(byte_mask)
@@ -737,7 +734,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
                         for i in range(8):
                             with m.Case(i):
                                 m.d.comb += vmask_uop.eq(
-                                    vmask_vl[i * stride:(i + 1) * stride])
+                                    vmask_vl.word_select(i, stride))
 
         byte_mask = Signal(self.vlen_bytes)
         with m.Switch(uop.vsew):
