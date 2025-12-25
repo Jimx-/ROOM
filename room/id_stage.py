@@ -1213,9 +1213,6 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                         IMM_SEL_V,
                                     ]
 
-                        with m.Default():
-                            m.d.comb += ILL_INSN
-
             with m.Default():
                 m.d.comb += ILL_INSN
 

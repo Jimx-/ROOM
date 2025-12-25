@@ -29,7 +29,7 @@ module vl_trace_if
    // {% endfor %}
 
    // Execute
-   // {% for i in range(core.int_width) %}
+   // {% for i in range(core.int_width + core.use_vector) %}
    input wire                                     ex_debug{{i}}_valid,
    input wire [{{UOP_ID_WIDTH}}-1:0]              ex_debug{{i}}_uop_id,
    input wire [15:0]                              ex_debug{{i}}_opcode,
@@ -51,7 +51,7 @@ module vl_trace_if
    // {% endfor %}
 
    // Writeback
-   // {% for i in range(core.int_width + core.mem_width) %}
+   // {% for i in range(core.int_width + core.mem_width + core.use_vector) %}
    input wire                                     wb_debug{{i}}_valid,
    input wire [{{UOP_ID_WIDTH}}-1:0]              wb_debug{{i}}_uop_id,
    input wire [$clog2({{core.num_pregs}}-1):0]    wb_debug{{i}}_pdst,

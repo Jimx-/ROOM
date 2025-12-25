@@ -40,7 +40,8 @@ set(RTL_INCLUDE /tmp
 set(VL_FLAGS -O2 --language 1800-2009 --assert -Wall -Wpedantic
              -Wno-WIDTH -Wno-DECLFILENAME -Wno-REDEFMACRO
              -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-CASEOVERLAP
-             -Wno-CMPCONST -Wno-UNOPTFLAT -Wno-UNSIGNED
+             -Wno-CMPCONST -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-UNDRIVEN
+             -Wno-PROCASSINIT -Wno-SYNCASYNCNET -Wno-ALWNEVER
              --x-initial unique --x-assign unique)
 
 set(LIBRARIES spdlog::spdlog

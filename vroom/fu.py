@@ -1318,7 +1318,7 @@ class VMaskUnit(IterativeFunctionalUnit):
             vid_tail_reg.eq(vid_tail),
         ]
 
-        vmask = m.submodules.vmask = VMask(self.vlen)
+        vmask = m.submodules.vmask_unit = VMask(self.vlen)
         m.d.comb += [
             vmask.valid.eq(self.req.valid | cpop_busy),
             vmask.sew.eq(
