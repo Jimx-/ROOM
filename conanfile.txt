@@ -1,6 +1,7 @@
 [requires]
 spdlog/[>=1.4.1]
 cxxopts/[>=2.2.0]
+elfio/3.12
 
 [generators]
 CMakeDeps

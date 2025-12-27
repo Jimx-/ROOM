@@ -11,13 +11,10 @@ SECTIONS
   }
 
   . = ALIGN(0x1000);
-  .data : { *(.data) }
-
-  .sdata : {
+  .data : {
     _sdata = .;
     __global_pointer$ = . + 0x800;
-    *(.srodata.cst16) *(.srodata.cst8) *(.srodata.cst4) *(.srodata.cst2) *(.srodata*)
-    *(.sdata .sdata.* .gnu.linkonce.s.*)
+    *(.data)
     . = ALIGN(4);
     _edata = .;
   }

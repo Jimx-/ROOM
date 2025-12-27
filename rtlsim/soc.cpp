@@ -16,6 +16,7 @@
 #include "snapshot.h"
 
 #include "spdlog/spdlog.h"
+#include "elfio/elfio.hpp"
 
 #ifdef VCD_OUTPUT
 #include <verilated_vcd_c.h>
@@ -84,7 +85,7 @@ public:
 
         ram_ = &register_ram(memory_addr, (uint64_t)memory_size);
 
-        if (!bootrom.empty()) load_bootrom(bootrom);
+        if (!bootrom.empty() && !load_elf(bootrom)) load_bootrom(bootrom);
         if (!initrd.empty()) load_initrd(initrd, initrd_offset);
 
         dut_.reset(new Vsoc_wrapper());
@@ -345,6 +346,45 @@ private:
 
         ::fclose(f);
         return len;
+    }
+
+    bool load_elf(std::string_view elf_file)
+    {
+        ELFIO::elfio reader;
+        std::ifstream ifs;
+
+        ifs.open(elf_file.data(), std::ios::in | std::ios::binary);
+        if (!ifs.is_open()) {
+            spdlog::error("Failed to read ELF image \"{}\"", elf_file);
+            throw std::runtime_error("Failed to open ELF image");
+        }
+
+        if (!reader.load(ifs)) return false;
+
+        ELFIO::Elf_Half seg_num = reader.segments.size();
+        spdlog::debug("Loading ELF segments:");
+        for (int i = 0; i < seg_num; ++i) {
+            const ELFIO::segment* pseg = reader.segments[i];
+
+            if (pseg->get_type() != ELFIO::PT_LOAD ||
+                pseg->get_memory_size() == 0) {
+                continue;
+            }
+            spdlog::debug(" [{}] {:x}\t{:x}\t{:x}\t{:x}", i, pseg->get_flags(),
+                          pseg->get_virtual_address(), pseg->get_file_size(),
+                          pseg->get_memory_size());
+
+            auto* ram_ptr = get_ram_ptr(pseg->get_virtual_address());
+            ::memcpy(ram_ptr, reader.segments[i]->get_data(),
+                     pseg->get_file_size());
+
+            if (pseg->get_file_size() < pseg->get_memory_size()) {
+                ::memset(ram_ptr + pseg->get_file_size(), 0,
+                         pseg->get_memory_size() - pseg->get_file_size());
+            }
+        }
+
+        return true;
     }
 
     size_t load_initrd(std::string_view initrd_name, off_t initrd_offset)

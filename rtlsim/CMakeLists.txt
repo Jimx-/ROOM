@@ -14,6 +14,8 @@ if (NOT verilator_FOUND)
   message(FATAL_ERROR "Verilator was not found. Either install it, or set the VERILATOR_ROOT environment variable")
 endif()
 
+find_package(elfio REQUIRED)
+
 if (USE_RAMULATOR)
    file(GLOB_RECURSE RAMULATOR_SRCLIST "ramulator/src/*.cpp")
 
@@ -45,7 +47,8 @@ set(VL_FLAGS -O2 --language 1800-2009 --assert -Wall -Wpedantic
              --x-initial unique --x-assign unique)
 
 set(LIBRARIES spdlog::spdlog
-              cxxopts::cxxopts)
+              cxxopts::cxxopts
+              elfio::elfio)
 
 if (USE_TRACE)
    add_definitions(-DVCD_OUTPUT)
