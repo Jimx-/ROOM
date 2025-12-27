@@ -14,6 +14,7 @@
 #include "sdcard.h"
 #include "tracer.h"
 #include "snapshot.h"
+#include "htif.h"
 
 #include "spdlog/spdlog.h"
 #include "elfio/elfio.hpp"
@@ -164,6 +165,10 @@ public:
                 break;
             }
 
+            if (htif_ && htif_->should_stop()) {
+                break;
+            }
+
 #ifdef ITRACE
             if (Tracer::get_singleton().should_stop()) {
                 if (!fork_snapshot_ || !fork_snapshot_->is_child()) {
@@ -219,6 +224,8 @@ public:
     {
         const auto* pr = get_memory_range(addr);
 
+        if (htif_ && htif_->write(addr, data)) return;
+
         uint64_t bit_mask = 0;
 
         for (int i = 0; i < 1 << log_size; i++) {
@@ -266,6 +273,7 @@ private:
     VerilatedFstC* trace_;
 #endif
     std::unique_ptr<ForkSnapshot> fork_snapshot_;
+    std::unique_ptr<Htif> htif_;
 
     uint64_t ram_addr_;
 
@@ -384,7 +392,43 @@ private:
             }
         }
 
+        load_symbols(reader);
         return true;
+    }
+
+    void load_symbols(ELFIO::elfio& reader)
+    {
+        static const std::vector<std::string> symbol_list{"tohost", "fromhost"};
+        std::unordered_map<std::string, uint64_t> symbols;
+
+        ELFIO::Elf_Half sec_num = reader.sections.size();
+        for (int i = 0; i < sec_num; ++i) {
+            ELFIO::section* psec = reader.sections[i];
+
+            if (psec->get_type() == ELFIO::SHT_SYMTAB) {
+                const ELFIO::symbol_section_accessor symbol_accessor(reader,
+                                                                     psec);
+                for (auto& name : symbol_list) {
+                    ELFIO::Elf64_Addr value;
+                    ELFIO::Elf_Xword size;
+                    unsigned char bind;
+                    unsigned char type;
+                    ELFIO::Elf_Half section_index;
+                    unsigned char other;
+
+                    if (symbol_accessor.get_symbol(name, value, size, bind,
+                                                   type, section_index,
+                                                   other)) {
+                        symbols.emplace(name, value);
+                    }
+                }
+            }
+        }
+
+        if (symbols.count("tohost") && symbols.count("fromhost")) {
+            htif_ = std::make_unique<Htif>(symbols.at("tohost"),
+                                           symbols.at("fromhost"));
+        }
     }
 
     size_t load_initrd(std::string_view initrd_name, off_t initrd_offset)

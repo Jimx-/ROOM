@@ -31,6 +31,7 @@ set(SOURCE_FILES main.cpp
                  sdcard.cpp
                  tracer.cpp
                  snapshot.cpp
+                 htif.cpp
                  jtagdpi/tcp_server.c
                  jtagdpi/jtagdpi.c)
 
