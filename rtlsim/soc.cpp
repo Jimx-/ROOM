@@ -4,6 +4,7 @@
 #include <iostream>
 #include <list>
 #include <queue>
+#include <iomanip>
 
 #include <verilated.h>
 
@@ -75,8 +76,10 @@ public:
     Impl(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
          std::string_view bootrom, std::string_view dtb,
          std::string_view initrd, off_t initrd_offset,
-         std::string_view trace_log, bool enable_fork, size_t fork_interval)
-        : ram_addr_(memory_addr)
+         std::string_view trace_log, bool enable_fork, size_t fork_interval,
+         std::string_view sig_file, int sig_line_size)
+        : ram_addr_(memory_addr), sig_file_(sig_file),
+          sig_line_size_(sig_line_size)
     {
         Verilated::randReset(VERILATOR_RESET_VALUE);
         Verilated::randSeed(50);
@@ -188,6 +191,10 @@ public:
             fork_snapshot_->finalize();
         }
 
+        if (!sig_file_.empty() && sig_len_) {
+            write_signature();
+        }
+
         return 0;
     }
 
@@ -274,6 +281,11 @@ private:
 #endif
     std::unique_ptr<ForkSnapshot> fork_snapshot_;
     std::unique_ptr<Htif> htif_;
+
+    uint64_t sig_addr_{0};
+    uint64_t sig_len_{0};
+    std::string sig_file_;
+    int sig_line_size_;
 
     uint64_t ram_addr_;
 
@@ -398,7 +410,8 @@ private:
 
     void load_symbols(ELFIO::elfio& reader)
     {
-        static const std::vector<std::string> symbol_list{"tohost", "fromhost"};
+        static const std::vector<std::string> symbol_list{
+            "tohost", "fromhost", "begin_signature", "end_signature"};
         std::unordered_map<std::string, uint64_t> symbols;
 
         ELFIO::Elf_Half sec_num = reader.sections.size();
@@ -428,6 +441,12 @@ private:
         if (symbols.count("tohost") && symbols.count("fromhost")) {
             htif_ = std::make_unique<Htif>(symbols.at("tohost"),
                                            symbols.at("fromhost"));
+        }
+
+        if (symbols.count("begin_signature") &&
+            symbols.count("end_signature")) {
+            sig_addr_ = symbols.at("begin_signature");
+            sig_len_ = symbols.at("end_signature") - sig_addr_;
         }
     }
 
@@ -702,6 +721,29 @@ private:
         dut_->ram_bus___05Faw___05Fready = 1;
     }
 #endif
+
+    void write_signature()
+    {
+        const auto* buf = get_ram_ptr(sig_addr_);
+        std::ofstream sigs(sig_file_);
+        if (!sigs.is_open()) {
+            spdlog::error("Can't open signature file");
+            return;
+        }
+
+        sigs << std::setfill('0') << std::hex;
+
+        for (uint64_t i = 0; i < sig_len_; i += sig_line_size_) {
+            for (uint64_t j = sig_line_size_; j > 0; j--)
+                if (i + j <= sig_len_)
+                    sigs << std::setw(2) << (uint16_t)buf[i + j - 1];
+                else
+                    sigs << std::setw(2) << (uint16_t)0;
+            sigs << '\n';
+        }
+
+        sigs.close();
+    }
 };
 
 template <> SoC* Singleton<SoC>::m_singleton = nullptr;
@@ -709,9 +751,11 @@ template <> SoC* Singleton<SoC>::m_singleton = nullptr;
 SoC::SoC(std::string_view sd_image, uint64_t memory_addr, size_t memory_size,
          std::string_view bootrom, std::string_view dtb,
          std::string_view initrd, off_t initrd_offset,
-         std::string_view trace_log, bool enable_fork, size_t fork_interval)
+         std::string_view trace_log, bool enable_fork, size_t fork_interval,
+         std::string_view sig_file, int sig_line_size)
     : impl_(new Impl(sd_image, memory_addr, memory_size, bootrom, dtb, initrd,
-                     initrd_offset, trace_log, enable_fork, fork_interval))
+                     initrd_offset, trace_log, enable_fork, fork_interval,
+                     sig_file, sig_line_size))
 {}
 
 SoC::~SoC() { delete impl_; }

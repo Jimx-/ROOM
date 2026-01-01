@@ -23,6 +23,8 @@ cxxopts::ParseResult parse_arguments(int argc, char* argv[])
             ("t,trace", "Path to trace log file", cxxopts::value<std::string>()->default_value(""))
             ("f,fork", "Enable fork snapshot", cxxopts::value<bool>()->default_value("false"))
             ("I,interval", "Fork interval", cxxopts::value<size_t>()->default_value("10000"))
+            ("signature", "Torture test signature file", cxxopts::value<std::string>()->default_value(""))
+            ("signature-granularity", "Torture test signature line size", cxxopts::value<int>()->default_value("16"))
             ("h,help", "Print help");
         // clang-format on
 
@@ -58,6 +60,8 @@ int main(int argc, char* argv[])
     std::string trace_log;
     bool enable_fork;
     size_t fork_interval;
+    std::string sig_file;
+    int sig_line_size;
 
     try {
         sd_image = options["sd-image"].as<std::string>();
@@ -70,6 +74,8 @@ int main(int argc, char* argv[])
         trace_log = options["trace"].as<std::string>();
         enable_fork = options["fork"].as<bool>();
         fork_interval = options["interval"].as<size_t>();
+        sig_file = options["signature"].as<std::string>();
+        sig_line_size = options["signature-granularity"].as<int>();
     } catch (const cxxopts::exceptions::exception& e) {
         spdlog::error("Failed to parse options: {}", e.what());
         exit(EXIT_FAILURE);
@@ -77,7 +83,7 @@ int main(int argc, char* argv[])
 
     room::SoC soc(sd_image, memory_addr, (size_t)memory_size_mb << 20UL,
                   bootrom, dtb, initrd, initrd_offset, trace_log, enable_fork,
-                  fork_interval);
+                  fork_interval, sig_file, sig_line_size);
 
     try {
         soc.run();
