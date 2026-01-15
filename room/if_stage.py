@@ -15,6 +15,7 @@ from room.mmu import PTBR, PageTableWalker
 from room.tlb import TLB, TLBResp, SFenceReq
 from room.branch import GlobalHistory, FTQEntry, GetPCResp, BranchUpdate
 from room.bpd import BranchPredictor, BranchPredictionUpdate, BranchPredictions
+from room.pmp import PMPReg
 
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
@@ -625,6 +626,8 @@ class IFStage(HasFrontendParams, Elaboratable):
         self.status = MStatus(self.xlen)
         self.ptbr = PTBR(self.xlen)
 
+        self.pmp = [PMPReg(params, name=f'pmp{i}') for i in range(self.n_pmps)]
+
         self.ptw_req = Decoupled(PageTableWalker.Request, params)
         self.ptw_resp = Valid(PageTableWalker.Response, params)
 
@@ -657,6 +660,9 @@ class IFStage(HasFrontendParams, Elaboratable):
                 tlb.ptw_req.connect(self.ptw_req),
                 tlb.ptw_resp.eq(self.ptw_resp),
             ]
+
+            for a, b in zip(tlb.pmp, self.pmp):
+                m.d.comb += a.eq(b)
 
         bpd = m.submodules.bpd = BranchPredictor(self.params)
 

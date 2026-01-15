@@ -6,6 +6,7 @@ from room.consts import *
 from room.types import HasCoreParams
 from room.mmu import PTBR, PageTableWalker, PMAChecker
 from room.exc import MStatus
+from room.pmp import PMPReg, PMPChecker
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
@@ -118,6 +119,8 @@ class TLB(HasCoreParams, Elaboratable):
         self.prv = Signal(PrivilegeMode)
         self.status = MStatus(self.xlen)
         self.ptbr = PTBR(self.xlen)
+
+        self.pmp = [PMPReg(params, name=f'pmp{i}') for i in range(self.n_pmps)]
 
         self.req = [
             Decoupled(TLBReq, log_max_size, params, name=f'req{w}')
@@ -477,13 +480,26 @@ class TLB(HasCoreParams, Elaboratable):
         for w in range(self.req_width):
             pma = PMAChecker(self.params)
             setattr(m.submodules, f'pma{w}', pma)
+            m.d.comb += pma.paddr.eq(mpu_paddr[w])
+
+            pmp = PMPChecker(self.log_max_size, self.params)
+            setattr(m.submodules, f'pmp{w}', pmp)
+            m.d.comb += [
+                pmp.paddr.eq(mpu_paddr[w]),
+                pmp.size.eq(s1_req[w].size),
+                pmp.prv.eq(
+                    Mux(self.use_vm & (refill_done | s1_req[w].passthru),
+                        PrivilegeMode.S, self.prv)),
+            ]
+
+            for a, b in zip(pmp.pmp, self.pmp):
+                m.d.comb += a.eq(b)
 
             m.d.comb += [
-                pma.paddr.eq(mpu_paddr[w]),
                 cacheable[w].eq(pma.resp.cacheable),
-                prot_r[w].eq(pma.resp.r),
-                prot_w[w].eq(pma.resp.w),
-                prot_x[w].eq(pma.resp.x),
+                prot_r[w].eq(pma.resp.r & pmp.r),
+                prot_w[w].eq(pma.resp.w & pmp.w),
+                prot_x[w].eq(pma.resp.x & pmp.x),
             ]
 
         #

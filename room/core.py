@@ -20,6 +20,7 @@ from room.exc import ExceptionUnit, CoreInterrupts, Cause
 from room.breakpoint import BreakpointUnit
 from room.fp_pipeline import FPPipeline
 from room.mmu import PageTableWalker, CoreMemRequest
+from room.pmp import PMPCSRUnit
 from room.utils import Arbiter
 
 from vroom.core import VectorDebug
@@ -260,6 +261,14 @@ class Core(HasCoreParams, Elaboratable):
                     m.d.comb += a.eq(b)
 
         #
+        # PMP unit
+        #
+
+        if self.n_pmps > 0:
+            pmp_unit = m.submodules.pmp = PMPCSRUnit(self.params)
+            csr.add_csrs(pmp_unit.iter_csrs())
+
+        #
         # Instruction fetch
         #
 
@@ -272,6 +281,10 @@ class Core(HasCoreParams, Elaboratable):
             if_stage.prv.eq(exc_unit.prv),
             if_stage.status.eq(exc_unit.mstatus.r),
         ]
+
+        if self.n_pmps > 0:
+            for a, b in zip(if_stage.pmp, pmp_unit.pmp):
+                m.d.comb += a.eq(b)
 
         for if_bp, bp in zip(if_stage.bp, bp_unit.bp):
             m.d.comb += if_bp.eq(bp)
@@ -376,6 +389,10 @@ class Core(HasCoreParams, Elaboratable):
             lsu.prv.eq(exc_unit.dprv),
             lsu.status.eq(exc_unit.mstatus.r),
         ]
+
+        if self.n_pmps > 0:
+            for a, b in zip(lsu.pmp, pmp_unit.pmp):
+                m.d.comb += a.eq(b)
 
         dispatcher = m.submodules.dispatcher = Dispatcher(self.params)
 

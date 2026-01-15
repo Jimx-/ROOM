@@ -12,6 +12,7 @@ from room.utils import wrap_incr, is_older, sign_extend
 from room.dcache import LoadGen, StoreGen, DCache, SimpleDCache
 from room.mmu import PTBR, PageTableWalker, CoreMemRequest, CoreMemResponse
 from room.tlb import TLB
+from room.pmp import PMPReg
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -231,6 +232,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         self.status = MStatus(self.xlen)
         self.ptbr = PTBR(self.xlen)
 
+        self.pmp = [PMPReg(params, name=f'pmp{i}') for i in range(self.n_pmps)]
+
         self.ptw_req = Decoupled(PageTableWalker.Request, params)
         self.ptw_resp = Valid(PageTableWalker.Response, params)
 
@@ -270,6 +273,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         ]
         tlb_miss_ready = Signal()
         m.d.sync += tlb_miss_ready.eq(tlb.miss_ready)
+
+        for a, b in zip(tlb.pmp, self.pmp):
+            m.d.comb += a.eq(b)
 
         ldq = Array(
             LDQEntry(self.params, name=f'ldq{i}')

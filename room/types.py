@@ -131,6 +131,13 @@ class HasCoreParams:
             self.n_dtlb_sets = params['n_dtlb_sets']
             self.n_dtlb_ways = params['n_dtlb_ways']
 
+            #
+            # PMP
+            #
+
+            self.n_pmps = params.get('n_pmps', 8)
+            self.pmp_granularity = 4
+
         #
         # GROOM
         #
