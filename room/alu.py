@@ -390,9 +390,10 @@ class IntDiv(Elaboratable):
                     m.next = 'IDLE'
 
         result_lo = result[:self.width // 2]
-        result_hi = Mux(half_width,
+        result_hi = Mux((self.width > 32) & (req.dw == ALUWidth.DW_32),
                         Repl(result[self.width // 2 - 1], self.width // 2),
                         result[self.width // 2:])
+
         m.d.comb += self.resp.bits.eq(Cat(result_lo, result_hi))
 
         return m
