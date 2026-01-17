@@ -214,25 +214,26 @@ class RVCDecoder(Elaboratable):
 
                     with m.Case(0b100):
                         with m.If(instr_i[12] == 0):
-                            with m.If((rs2 == 0) & rd.any()):  # c.jr
-                                m.d.comb += instr_o.eq(
-                                    Cat(OPV7('JALR'), Const(0, 8),
-                                        instr_i[7:12], Const(0, 12)))
-                            with m.Elif(rs2.any() & rd.any()):  # c.mv
+                            with m.If(rs2.any()):  # c.mv (HINT, rd==0)
                                 m.d.comb += instr_o.eq(
                                     Cat(OPV7('ADD'), instr_i[7:12],
                                         Const(0, 8), instr_i[2:7], Const(0,
                                                                          7)))
 
+                            with m.Elif(rd.any()):  # c.jr (RES, rs1==0)
+                                m.d.comb += instr_o.eq(
+                                    Cat(OPV7('JALR'), Const(0, 8),
+                                        instr_i[7:12], Const(0, 12)))
+
                         with m.Else():
-                            with m.If(rs2.any() & rd.any()):  # c.add
+                            with m.If(rs2.any()):  # c.add (HINT, rd==0)
                                 m.d.comb += instr_o.eq(
                                     Cat(OPV7('ADD'), rd, Const(0, 3), rd, rs2))
-                            with m.Elif((rs2 == 0) & rd.any()):  # c.jalr
+                            with m.Elif(rd.any()):  # c.jalr
                                 m.d.comb += instr_o.eq(
                                     Cat(OPV7('JALR'), ra, Const(0, 3), rd,
                                         rs2))
-                            with m.Elif((rs2 == 0) & (rd == 0)):  # c.ebreak
+                            with m.Else():  # c.ebreak
                                 m.d.comb += instr_o.eq(
                                     OPV7('EBREAK') | (1 << 20))
 
