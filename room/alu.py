@@ -423,7 +423,7 @@ class AMODataGen(Elaboratable):
         logic_xor = (self.cmd == MemoryCommand.AMO_XOR) | (
             self.cmd == MemoryCommand.AMO_OR)
 
-        adder_mask = ~((~self.mask[3]) << 31)
+        adder_mask = ~(((~self.mask[3]) << 31) | Const(0, self.width))
         adder_out = (self.lhs & adder_mask) + (self.rhs & adder_mask)
 
         signed = (self.cmd == MemoryCommand.AMO_MAX) | (
