@@ -1081,6 +1081,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                     uop.dst_rtype.eq(RegisterType.FIX),
                     uop.lrs1_rtype.eq(RegisterType.FIX),
                     uop.mem_size.eq(inuop.inst[12:14]),
+                    uop.mem_signed.eq(~inuop.inst[14]),
                     uop.clear_pipeline.eq(1),
                     uop.flush_on_commit.eq(1),
                 ]
