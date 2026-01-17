@@ -366,7 +366,9 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         is_debug_int = cause.interrupt & (cause.ecode == Cause.DEBUG_INTERRUPT)
         is_debug_trigger = ~cause.interrupt & (cause.ecode
                                                == Cause.DEBUG_TRIGGER)
-        is_debug_break = ~cause.interrupt & insn_break
+        is_debug_break = ~cause.interrupt & insn_break & Cat(
+            self.dcsr.r.ebreaku, self.dcsr.r.ebreaks, Const(0, 1),
+            self.dcsr.r.ebreakm).bit_select(self.prv, 1)
         trap_to_debug = single_stepped | is_debug_int | is_debug_trigger | is_debug_break | self.debug_mode
 
         debug_vector = Mux(
