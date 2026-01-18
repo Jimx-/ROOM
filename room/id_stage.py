@@ -362,7 +362,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 with m.Case(0b0000000):  # slliw
                                     m.d.comb += UOPC(UOpCode.SLLIW)
                                 if self.use_zba:
-                                    with m.Case(0b0000010):
+                                    with m.Case('000010-'):
                                         m.d.comb += UOPC(UOpCode.SLLI_UW)
                                 if self.use_zbb:
                                     with m.Case(0b0110000):
