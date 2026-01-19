@@ -152,9 +152,8 @@ class room_rtlsim(pluginTemplate):
 
             compile_macros = ' -D' + " -D".join(testentry['macros'])
 
-            cmd = self.compile_cmd.format(
-                testentry['isa'].lower().replace('zicsr', ' ', 2), self.xlen,
-                test, elf, compile_macros)
+            cmd = self.compile_cmd.format(testentry['isa'].lower(), self.xlen,
+                                          test, elf, compile_macros)
 
             if self.target_run:
                 simcmd = self.dut_exe + ' {0} -b {1} --signature={2} --signature-granularity=8'.format(
