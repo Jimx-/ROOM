@@ -6,7 +6,7 @@ from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.branch import GetPCResp, BranchResolution, BranchUpdate
 from room.alu import ALU, Multiplier, IntDiv
-from room.fpu import FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
+from room.fpu import HasFPUParams, FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
 from room.exc import Cause
 from room.tlb import SFenceReq
 from room.utils import sign_extend, generate_imm, generate_imm_type, generate_imm_rm, Pipe
@@ -496,7 +496,7 @@ class DivUnit(IterativeFunctionalUnit):
         return m
 
 
-class IntToFPUnit(PipelinedFunctionalUnit):
+class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
 
     def __init__(self, width, latency, params):
         self.width = width
@@ -542,10 +542,10 @@ class IntToFPUnit(PipelinedFunctionalUnit):
             out_single_pipe.in_data.eq(self.req.bits.uop.fp_single),
         ]
 
-        box = Cat(Const(0, 32), out_single_pipe.out.bits.replicate(32))
-
         m.d.comb += self.resp.bits.data.eq(
-            Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits) | box)
+            self.nan_box(
+                Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits),
+                ~out_single_pipe.out.bits))
 
         return m
 

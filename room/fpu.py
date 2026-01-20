@@ -3,6 +3,7 @@ from amaranth.lib.coding import PriorityEncoder
 from enum import IntEnum
 
 from room.consts import *
+from room.types import HasCoreParams
 from room.utils import Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -44,6 +45,10 @@ class FType:
     def __init__(self, exp, man):
         self.exp = exp
         self.man = man
+
+    @property
+    def width(self):
+        return 1 + self.exp + self.man
 
     def bias(self):
         return (2**(self.exp - 1)) - 1
@@ -92,6 +97,25 @@ _fmt_ftypes = {
     FPFormat.S: FType.FP32,
     FPFormat.D: FType.FP64,
 }
+
+
+class HasFPUParams(HasCoreParams):
+
+    def __init__(self, params, *args, **kwargs):
+        super().__init__(params)
+
+        self.min_flen = 32
+        self.float_types = [
+            typ for _, typ in _fmt_ftypes.items()
+            if typ.width >= self.min_flen and typ.width <= self.flen
+        ]
+
+    def _nan_box(self, x, from_typ, to_type):
+        return x | ((1 << to_type.width) - (1 << from_typ.width))
+
+    def nan_box(self, x, tag):
+        return Mux(tag, x,
+                   self._nan_box(x, self.float_types[0], self.float_types[-1]))
 
 
 class ClassMask(IntEnum):

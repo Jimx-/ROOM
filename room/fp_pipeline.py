@@ -1,7 +1,8 @@
 from amaranth import *
 
 from room.consts import *
-from room.types import HasCoreParams, MicroOp
+from room.types import MicroOp
+from room.fpu import HasFPUParams
 from room.fu import ExecResp
 from room.regfile import RegisterFile, RegisterRead, WritebackDebug
 from room.branch import BranchUpdate
@@ -12,7 +13,7 @@ from room.utils import Arbiter
 from roomsoc.interconnect.stream import Valid, Decoupled
 
 
-class FPPipeline(HasCoreParams, Elaboratable):
+class FPPipeline(HasFPUParams, Elaboratable):
 
     def __init__(self, params, sim_debug=False):
         super().__init__(params)
@@ -174,7 +175,9 @@ class FPPipeline(HasCoreParams, Elaboratable):
                 mem_wbarb.out.valid & mem_wbarb.out.bits.uop.rf_wen()
                 & (mem_wbarb.out.bits.uop.dst_rtype == RegisterType.FLT)),
             fregfile.write_ports[0].bits.addr.eq(mem_wbarb.out.bits.uop.pdst),
-            fregfile.write_ports[0].bits.data.eq(mem_wbarb.out.bits.data),
+            fregfile.write_ports[0].bits.data.eq(
+                self.nan_box(mem_wbarb.out.bits.data,
+                             mem_wbarb.out.bits.uop.mem_size != 2)),
         ]
 
         if self.sim_debug:
@@ -197,7 +200,9 @@ class FPPipeline(HasCoreParams, Elaboratable):
                 wp.valid.eq(fresp.valid & fresp.bits.uop.rf_wen()
                             & (fresp.bits.uop.dst_rtype == RegisterType.FLT)),
                 wp.bits.addr.eq(fresp.bits.uop.pdst),
-                wp.bits.data.eq(fresp.bits.data),
+                wp.bits.data.eq(
+                    self.nan_box(fresp.bits.data, fresp.bits.uop.mem_size
+                                 != 2)),
             ]
 
             if self.sim_debug:
