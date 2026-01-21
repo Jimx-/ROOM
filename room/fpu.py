@@ -4,7 +4,7 @@ from enum import IntEnum
 
 from room.consts import *
 from room.types import HasCoreParams
-from room.utils import Pipe
+from room.utils import Pipe, sign_extend
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -1051,8 +1051,11 @@ class FPUCastMulti(Elaboratable):
         with m.If(s2_dst_is_int):
             m.d.comb += denorm_shamt.eq(self.width - 1 - s2_input_exp)
 
-            with m.If(s2_input_exp >= (1 << (s2_inp.int_fmt + 3)) - 1 +
-                      s2_inp.fn_mod):
+            with m.If((s2_input_exp >= (1 << (s2_inp.int_fmt + 3)) - 1 +
+                       s2_inp.fn_mod)
+                      & ~(~s2_inp.fn_mod & s2_input_sign & (
+                          (s2_input_exp == (1 << (s2_inp.int_fmt + 3)) - 1))
+                          & s2_input_mant[-1] & ~s2_input_mant[:-1].any())):
                 m.d.comb += [
                     denorm_shamt.eq(0),
                     of_before_round.eq(1),
@@ -1130,10 +1133,11 @@ class FPUCastMulti(Elaboratable):
                             Cat(rounding.rounded_abs[:ftyp.man + ftyp.exp],
                                 rounding.out_sign)))
 
-        rounded_int_res = Mux(rounding.out_sign,
-                              (-rounding.rounded_abs).as_unsigned(),
-                              rounding.rounded_abs)
+        rounded_uint_res = Mux(rounding.out_sign,
+                               (-rounding.rounded_abs).as_unsigned(),
+                               rounding.rounded_abs)[:rounding.abs_width]
 
+        rounded_int_res = Signal.like(rounded_uint_res)
         ifmt_special_result = Signal(self.width)
         with m.Switch(s2_inp.int_fmt):
             for fmt in IntFormat:
@@ -1150,6 +1154,9 @@ class FPUCastMulti(Elaboratable):
                     neg_result = s2_input_sign & ~s2_src_info.is_nan
 
                     m.d.comb += [
+                        rounded_int_res.eq(
+                            sign_extend(rounded_uint_res[:width],
+                                        len(rounded_int_res))),
                         ifmt_special_result.eq(
                             Repl(neg_result ^ special_result[-1],
                                  len(ifmt_special_result))),
@@ -1190,11 +1197,12 @@ class FPUCastMulti(Elaboratable):
         result = Mux(s2_dst_is_int, int_result, fp_result)
         status = Mux(s2_dst_is_int, int_status, fp_status)
 
-        out_pipe = m.submodules.out_pipe = Pipe(width=self.width + 5,
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(result) +
+                                                len(status),
                                                 depth=max(self.latency - 2, 1))
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
-            out_pipe.in_data.eq(Cat(result[:self.width], status)),
+            out_pipe.in_data.eq(Cat(result, status)),
             self.out.valid.eq(out_pipe.out.valid),
             Cat(self.out.bits.data,
                 self.out.bits.status).eq(out_pipe.out.bits),
