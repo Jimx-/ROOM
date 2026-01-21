@@ -78,6 +78,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.has_fdiv = has_fdiv
         self.has_ifpu = has_ifpu
         self.has_fpiu = has_fpiu
+        self.has_fflags = has_fpu or has_fdiv
         self.has_vec = has_vec
         self.sim_debug = sim_debug
 
@@ -516,6 +517,7 @@ class FPUExecUnit(ExecUnit):
                 m.d.comb += [
                     self.fresp.bits.data.eq(fu.resp.bits.data),
                     self.fresp.bits.uop.eq(fu.resp.bits.uop),
+                    self.fresp.bits.fflags.eq(fu.resp.bits.fflags),
                 ]
 
         m.d.comb += self.fresp.valid.eq(

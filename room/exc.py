@@ -5,10 +5,12 @@ import riscvmodel.insn as insn
 import riscvmodel.csrnames as csrnames
 from enum import IntEnum
 
-from room.consts import PrivilegeMode
+from room.consts import PrivilegeMode, RoundingMode
 from room.csr import *
 from room.types import HasCoreParams
 from room.utils import sign_extend
+
+from roomsoc.interconnect.stream import Valid
 
 
 class CoreInterrupts(Record):
@@ -221,9 +223,9 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
         self.prv = Signal(PrivilegeMode, reset=PrivilegeMode.M)
         self.dprv = Signal(PrivilegeMode)
 
-        self.set_fs_dirty = Signal()
         self.single_step = Signal()
         self.csr_stall = Signal()
+        self.fcsr_flags = Valid(Signal, 5)
 
         self.mstatus = CSR(csrnames.mstatus, mstatus_layout(self.xlen))
         self.mip = CSR(csrnames.mip, mip_layout(self.xlen))
@@ -251,6 +253,10 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
                              [('value', self.xlen, CSRAccess.RW)])
         self.dscratch1 = CSR(csrnames.dscratch1,
                              [('value', self.xlen, CSRAccess.RW)])
+
+        self.fflags = CSR(csrnames.fflags, [('value', 5, CSRAccess.RW)])
+        self.frm = CSR(csrnames.frm, [('value', 3, CSRAccess.RW)])
+        self.fcsr = CSR(csrnames.fcsr, [('value', self.xlen, CSRAccess.RW)])
 
     def elaborate(self, platform):
         m = Module()
@@ -553,8 +559,22 @@ class ExceptionUnit(HasCoreParams, Elaboratable, AutoCSR):
 
             m.d.sync += self.prv.eq(ret_prv)
 
-        with m.If(self.set_fs_dirty):
+        set_fs_dirty = Signal()
+        m.d.comb += set_fs_dirty.eq(self.fcsr_flags.valid)
+        with m.If(set_fs_dirty):
             m.d.sync += self.mstatus.r.fs.eq(3)
+        m.d.comb += self.fcsr.r.eq(Cat(self.fflags.r, self.frm.r))
+        with m.If(self.fflags.we):
+            m.d.comb += set_fs_dirty.eq(1)
+            m.d.sync += self.fflags.r.eq(self.fflags.w)
+        with m.If(self.frm.we):
+            m.d.comb += set_fs_dirty.eq(1)
+            m.d.sync += self.frm.r.eq(self.frm.w)
+        with m.If(self.fcsr.we):
+            m.d.comb += set_fs_dirty.eq(1)
+            m.d.sync += Cat(self.fflags.r, self.frm.r).eq(self.fcsr.w)
+        with m.If(self.fcsr_flags.valid):
+            m.d.sync += self.fflags.r.eq(self.fflags.r | self.fcsr_flags.bits)
 
         m.d.comb += self.dprv.eq(
             Mux(self.mstatus.r.mprv & ~self.debug_mode, self.mstatus.r.mpp,

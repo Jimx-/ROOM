@@ -517,7 +517,7 @@ class Core(HasCoreParams, Elaboratable):
 
         rob = m.submodules.rob = ReorderBuffer(
             exec_units.irf_write_ports + self.mem_width + num_fp_wakeup_ports,
-            self.params)
+            num_fp_wakeup_ports, self.params)
         rob_flush_d1 = Valid(Record, rob.flush.bits.layout)
         m.d.sync += rob_flush_d1.eq(rob.flush)
 
@@ -1159,15 +1159,36 @@ class Core(HasCoreParams, Elaboratable):
                                  lsu.exec_iresps[1:]):
             m.d.comb += rob_wb.eq(iresp)
 
+        fflags_idx = 0
         for rob_wb, eu in zip(rob.wb_resps[self.mem_width:],
                               [eu for eu in exec_units if eu.irf_write]):
             m.d.comb += rob_wb.eq(eu.iresp)
+
+            if eu.has_fflags:
+                m.d.comb += [
+                    rob.fflags[fflags_idx].valid.eq(
+                        eu.iresp.bits.fflags.valid),
+                    rob.fflags[fflags_idx].bits.uop.eq(eu.iresp.bits.uop),
+                    rob.fflags[fflags_idx].bits.fflags.eq(
+                        eu.iresp.bits.fflags.bits),
+                ]
+                fflags_idx += 1
 
         if self.use_fpu:
             for rob_wb, fresp in zip(
                     rob.wb_resps[self.mem_width + exec_units.irf_write_ports:],
                     fp_pipeline.wakeups):
                 m.d.comb += rob_wb.eq(fresp)
+
+                m.d.comb += [
+                    rob.fflags[fflags_idx].valid.eq(fresp.bits.fflags.valid),
+                    rob.fflags[fflags_idx].bits.uop.eq(fresp.bits.uop),
+                    rob.fflags[fflags_idx].bits.fflags.eq(
+                        fresp.bits.fflags.bits),
+                ]
+                fflags_idx += 1
+
+        assert fflags_idx == num_fp_wakeup_ports
 
         for a, b in zip(rob.lsu_clear_busy, lsu.clear_busy):
             m.d.comb += a.eq(b)
@@ -1205,7 +1226,7 @@ class Core(HasCoreParams, Elaboratable):
                     tval_valid, commit_exc_badaddr_d1,
                     Mux(exc_unit.cause == Cause.ILLEGAL_INSTRUCTION,
                         commit_exc_inst_d1, 0))),
-            exc_unit.set_fs_dirty.eq(rob.commit_req.fflags.valid),
+            exc_unit.fcsr_flags.eq(rob.commit_req.fflags),
         ]
 
         m.d.sync += [

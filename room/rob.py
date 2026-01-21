@@ -1,7 +1,9 @@
 from amaranth import *
 from amaranth import tracer
-
+from amaranth.hdl.ast import ValueCastable
 from enum import IntEnum
+import functools
+import operator
 
 from room.consts import *
 from room.fu import ExecResp
@@ -93,9 +95,34 @@ class Exception(HasCoreParams):
         ]
 
 
+class FFlagsResp(HasCoreParams, ValueCastable):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.uop = MicroOp(params, name=f'{name}_uop')
+        self.fflags = Signal(5, name=f'{name}_fflags')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.uop, self.fflags)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
+
+
 class ReorderBuffer(HasCoreParams, Elaboratable):
 
-    def __init__(self, num_wakeup_ports, params):
+    def __init__(self, num_wakeup_ports, num_fp_wakeup_ports, params):
         super().__init__(params)
 
         self.enq_uops = [
@@ -111,6 +138,11 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                   max(self.xlen, self.flen),
                   params,
                   name=f'wb_resp{i}') for i in range(num_wakeup_ports)
+        ]
+
+        self.fflags = [
+            Valid(FFlagsResp, params, name=f'fflags{i}')
+            for i in range(num_fp_wakeup_ports)
         ]
 
         self.lsu_clear_busy = [
@@ -190,6 +222,10 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         rob_head_valids = Signal(self.core_width)
         rob_head_busy = Signal(self.core_width)
         rob_head_uses_ldq = Signal(self.core_width)
+        rob_head_fflags = [
+            Signal(5, name=f'rob_head_fflags{i}')
+            for i in range(self.core_width)
+        ]
         rob_pnr_unsafe = Signal(self.core_width)
         rob_tail_valids = Signal(self.core_width)
 
@@ -209,6 +245,9 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
             rob_exception = Array(
                 Signal(name=f'rob_bank{w}_exception{i}')
                 for i in range(self.num_rob_rows))
+            rob_fflags = Array(
+                Signal(5, name=f'rob_bank{w}_fflags{i}')
+                for i in range(self.num_rob_rows))
 
             with m.If(self.enq_valids[w]):
                 m.d.sync += [
@@ -218,6 +257,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                     rob_unsafe[rob_tail].eq(self.enq_uops[w].is_unsafe()),
                     rob_uop[rob_tail].eq(self.enq_uops[w]),
                     rob_exception[rob_tail].eq(self.enq_uops[w].exception),
+                    rob_fflags[rob_tail].eq(0),
                 ]
 
             for wb in self.wb_resps:
@@ -235,6 +275,12 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                         rob_busy[get_row(clr.bits)].eq(0),
                         rob_unsafe[get_row(clr.bits)].eq(0),
                     ]
+
+            for fflags in self.fflags:
+                with m.If(fflags.valid
+                          & (get_bank(fflags.bits.uop.rob_idx) == w)):
+                    m.d.sync += rob_fflags[get_row(
+                        fflags.bits.uop.rob_idx)].eq(fflags.bits.fflags)
 
             with m.If(self.lsu_exc.valid
                       & (get_bank(self.lsu_exc.bits.uop.rob_idx) == w)):
@@ -279,6 +325,7 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
                 rob_head_valids[w].eq(rob_valid[rob_head]),
                 rob_head_busy[w].eq(rob_busy[rob_head]),
                 rob_head_uses_ldq[w].eq(rob_uop[rob_head].uses_ldq),
+                rob_head_fflags[w].eq(rob_fflags[rob_head]),
                 rob_pnr_unsafe[w].eq(rob_valid[rob_pnr]
                                      & (rob_unsafe[rob_pnr]
                                         | rob_exception[rob_pnr])),
@@ -422,11 +469,18 @@ class ReorderBuffer(HasCoreParams, Elaboratable):
         #
 
         fflags_valid = Signal(self.core_width)
+        fflags = []
         for w in range(self.core_width):
             m.d.comb += fflags_valid[w].eq(self.commit_req.valids[w]
                                            & self.commit_req.uops[w].fp_valid
                                            & ~self.commit_req.uops[w].uses_stq)
-        m.d.comb += self.commit_req.fflags.valid.eq(fflags_valid.any())
+            fflags.append(Mux(fflags_valid[w], rob_head_fflags[w], 0))
+
+        m.d.comb += [
+            self.commit_req.fflags.valid.eq(fflags_valid.any()),
+            self.commit_req.fflags.bits.eq(
+                functools.reduce(operator.or_, fflags)),
+        ]
 
         do_enq = Signal()
         do_deq = Signal()

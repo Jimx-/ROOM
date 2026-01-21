@@ -46,11 +46,13 @@ class ExecResp(HasCoreParams):
         self.data = Signal(data_width, name=f'{name}_data')
         self.addr = Signal(self.vaddr_bits + 1, name=f'{name}_addr')
 
-        self.mem_exc = Valid(Signal, Cause)
-        self.sfence = Valid(SFenceReq, params)
+        self.mem_exc = Valid(Signal, Cause, name=f'{name}_mem_exc')
+        self.sfence = Valid(SFenceReq, params, name=f'{name}_sfence')
+
+        self.fflags = Valid(Signal, 5, name=f'{name}_fflags')
 
     def eq(self, rhs):
-        attrs = ['uop', 'addr', 'data', 'mem_exc', 'sfence']
+        attrs = ['uop', 'addr', 'data', 'mem_exc', 'sfence', 'fflags']
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
@@ -542,10 +544,14 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
             out_single_pipe.in_data.eq(self.req.bits.uop.fp_single),
         ]
 
-        m.d.comb += self.resp.bits.data.eq(
-            self.nan_box(
-                Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits),
-                ~out_single_pipe.out.bits))
+        m.d.comb += [
+            self.resp.bits.data.eq(
+                self.nan_box(
+                    Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits),
+                    ~out_single_pipe.out.bits)),
+            self.resp.bits.fflags.valid.eq(ifpu.out.valid),
+            self.resp.bits.fflags.bits.eq(ifpu.out.bits.status),
+        ]
 
         return m
 
@@ -790,17 +796,30 @@ class FPUUnit(PipelinedFunctionalUnit):
         m.d.comb += scmp.inp.valid.eq(self.req.valid & cmp_en
                                       & (fmt_in == FPFormat.S))
 
-        m.d.comb += self.resp.bits.data.eq(
-            Mux(
-                dfma.out.valid, dfma.out.bits.data,
+        m.d.comb += [
+            self.resp.bits.data.eq(
                 Mux(
-                    sfma.out.valid, sfma.out.bits.data,
+                    dfma.out.valid, dfma.out.bits.data,
                     Mux(
-                        fpiu.out.valid, fpiu.out.bits.data,
+                        sfma.out.valid, sfma.out.bits.data,
                         Mux(
-                            dcmp.out.valid, dcmp.out.bits.data,
-                            Mux(scmp.out.valid, scmp.out.bits.data,
-                                in_pipe.out.bits))))))
+                            fpiu.out.valid, fpiu.out.bits.data,
+                            Mux(
+                                dcmp.out.valid, dcmp.out.bits.data,
+                                Mux(scmp.out.valid, scmp.out.bits.data,
+                                    in_pipe.out.bits)))))),
+            self.resp.bits.fflags.valid.eq(self.resp.valid),
+            self.resp.bits.fflags.bits.eq(
+                Mux(
+                    dfma.out.valid, dfma.out.bits.status,
+                    Mux(
+                        sfma.out.valid, sfma.out.bits.status,
+                        Mux(
+                            fpiu.out.valid, fpiu.out.bits.status,
+                            Mux(dcmp.out.valid, dcmp.out.bits.status,
+                                Mux(scmp.out.valid, scmp.out.bits.status,
+                                    0)))))),
+        ]
 
         return m
 

@@ -131,6 +131,20 @@ class ClassMask(IntEnum):
     QNAN = (1 << 9)
 
 
+class FPException(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('nx', 1),
+            ('uf', 1),
+            ('of', 1),
+            ('dz', 1),
+            ('nv', 1),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class FPUInput(Record):
 
     def __init__(self, width, name=None, src_loc_at=0):
@@ -154,6 +168,7 @@ class FPUResult(Record):
     def __init__(self, width, name=None, src_loc_at=0):
         super().__init__([
             ('data', width),
+            ('status', 5),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -1142,23 +1157,32 @@ class FPUCastMulti(Elaboratable):
                             Mux(neg_result, ~special_result, special_result)),
                     ]
 
-        int_result_is_special = of_before_round | (s2_input_sign
-                                                   & s2_inp.fn_mod &
-                                                   (rounded_int_res != 0))
+        int_result_is_special = s2_src_info.is_nan | s2_src_info.is_inf | of_before_round | (
+            s2_input_sign
+            & s2_inp.fn_mod & (rounded_int_res != 0))
 
         fp_result = fmt_result
         int_result = Mux(int_result_is_special, ifmt_special_result,
                          rounded_int_res)
 
-        result = Mux(s2_dst_is_int, int_result, fp_result)
+        int_status = FPException()
+        m.d.comb += [
+            int_status.nx.eq(~int_result_is_special
+                             & int_round_sticky_bits.any()),
+            int_status.nv.eq(int_result_is_special),
+        ]
 
-        out_pipe = m.submodules.out_pipe = Pipe(width=len(result),
+        result = Mux(s2_dst_is_int, int_result, fp_result)
+        status = Mux(s2_dst_is_int, int_status, 0)
+
+        out_pipe = m.submodules.out_pipe = Pipe(width=self.width + 5,
                                                 depth=max(self.latency - 2, 1))
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
-            out_pipe.in_data.eq(result),
+            out_pipe.in_data.eq(Cat(result[:self.width], status)),
             self.out.valid.eq(out_pipe.out.valid),
-            self.out.bits.data.eq(out_pipe.out.bits),
+            Cat(self.out.bits.data,
+                self.out.bits.status).eq(out_pipe.out.bits),
         ]
 
         return m
