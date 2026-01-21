@@ -53,6 +53,8 @@ class FPPipeline(HasFPUParams, Elaboratable):
 
         self.flush_pipeline = Signal()
 
+        self.frm = Signal(RoundingMode)
+
         if self.sim_debug:
             self.wb_debug = [
                 Valid(WritebackDebug, params, name=f'wb_debug{i}')
@@ -64,6 +66,9 @@ class FPPipeline(HasFPUParams, Elaboratable):
 
         exec_units = m.submodules.exec_units = ExecUnits(
             True, self.params, sim_debug=self.sim_debug)
+
+        for eu in exec_units:
+            m.d.comb += eu.frm.eq(self.frm)
 
         #
         # Dispatch

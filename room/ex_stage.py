@@ -79,6 +79,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.has_ifpu = has_ifpu
         self.has_fpiu = has_fpiu
         self.has_fflags = has_fpu or has_fdiv
+        self.has_frm = has_ifpu or has_fpu or has_fdiv
         self.has_vec = has_vec
         self.sim_debug = sim_debug
 
@@ -115,6 +116,9 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.lsu_req = None
         if has_mem:
             self.lsu_req = Valid(ExecResp, self.data_width, params)
+
+        if self.has_frm:
+            self.frm = Signal(RoundingMode)
 
         if has_vec:
             self.rob_head_idx = Signal(
@@ -267,6 +271,7 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                 ifpu.req.valid.eq(self.req.valid
                                   &
                                   (self.req.bits.uop.fu_type_has(FUType.I2F))),
+                ifpu.frm.eq(self.frm),
                 ifpu.br_update.eq(self.br_update),
             ]
 
@@ -430,6 +435,7 @@ class FPUExecUnit(ExecUnit):
                     self.req.valid
                     & (self.req.bits.uop.fu_type_has(FUType.FPU)
                        | self.req.bits.uop.fu_type_has(FUType.F2I))),
+                fpu.frm.eq(self.frm),
                 fpu.br_update.eq(self.br_update),
             ]
 
@@ -447,6 +453,7 @@ class FPUExecUnit(ExecUnit):
                 fdiv.req.valid.eq(
                     self.req.valid
                     & (self.req.bits.uop.fu_type_has(FUType.FDIV))),
+                fdiv.frm.eq(self.frm),
                 fdiv.br_update.eq(self.br_update),
                 fdiv.resp.ready.eq(~fdiv_resp_busy),
                 fdiv_busy.eq(~fdiv.req.ready | fdiv.req.valid),

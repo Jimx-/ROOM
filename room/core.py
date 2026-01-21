@@ -254,6 +254,7 @@ class Core(HasCoreParams, Elaboratable):
         if self.use_fpu:
             fp_pipeline = m.submodules.fp_pipeline = FPPipeline(
                 self.params, sim_debug=self.sim_debug)
+            m.d.comb += fp_pipeline.frm.eq(exc_unit.frm.r)
 
             if self.sim_debug:
                 for a, b in zip(self.core_debug.fp_wb_debug,
@@ -376,6 +377,10 @@ class Core(HasCoreParams, Elaboratable):
                 fp_ren_stage.dis_ready.eq(dis_ready),
                 fp_ren_stage.br_update.eq(br_update),
             ]
+
+        for eu in exec_units:
+            if eu.has_frm:
+                m.d.comb += eu.frm.eq(exc_unit.frm.r)
 
         #
         # Dispatcher

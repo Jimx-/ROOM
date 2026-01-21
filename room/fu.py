@@ -63,7 +63,8 @@ class FunctionalUnit(HasCoreParams, Elaboratable):
                  num_bypass_stages,
                  params,
                  is_jmp=False,
-                 is_alu=False):
+                 is_alu=False,
+                 needs_frm=False):
         super().__init__(params)
 
         self.num_bypass_stages = num_bypass_stages
@@ -85,6 +86,9 @@ class FunctionalUnit(HasCoreParams, Elaboratable):
         if is_jmp:
             self.get_pc = GetPCResp(params, name='get_pc')
 
+        if needs_frm:
+            self.frm = Signal(RoundingMode)
+
 
 class PipelinedFunctionalUnit(FunctionalUnit):
 
@@ -94,7 +98,8 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                  data_width,
                  params,
                  is_jmp=False,
-                 is_alu=False):
+                 is_alu=False,
+                 needs_frm=False):
         self.params = params
         self.num_stages = num_stages
 
@@ -102,7 +107,8 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                          num_bypass_stages,
                          params,
                          is_jmp=is_jmp,
-                         is_alu=is_alu)
+                         is_alu=is_alu,
+                         needs_frm=needs_frm)
 
     def elaborate(self, platform):
         m = Module()
@@ -437,12 +443,12 @@ class MultiplierUnit(PipelinedFunctionalUnit):
 
 class IterativeFunctionalUnit(FunctionalUnit):
 
-    def __init__(self, data_width, params):
+    def __init__(self, data_width, params, needs_frm=False):
         self.params = params
 
         self.do_kill = Signal()
 
-        super().__init__(data_width, 0, params)
+        super().__init__(data_width, 0, params, needs_frm=needs_frm)
 
     def elaborate(self, platform):
         m = Module()
@@ -504,7 +510,7 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
         self.width = width
         self.latency = latency
 
-        super().__init__(latency, 0, width, params)
+        super().__init__(latency, 0, width, params, needs_frm=True)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -531,6 +537,7 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
             ifpu.inp.valid.eq(self.req.valid & cast_en),
             ifpu.inp.bits.fn.eq(FPUOperator.I2F),
             ifpu.inp.bits.fn_mod.eq(typ[0]),
+            ifpu.inp.bits.rm.eq(self.frm),
             ifpu.inp.bits.in1.eq(self.req.bits.rs1_data),
             ifpu.inp.bits.dst_fmt.eq(
                 Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
@@ -561,7 +568,11 @@ class FPUUnit(PipelinedFunctionalUnit):
     def __init__(self, width, params):
         self.width = width
 
-        super().__init__(params['fma_latency'], 0, width, params)
+        super().__init__(params['fma_latency'],
+                         0,
+                         width,
+                         params,
+                         needs_frm=True)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -588,7 +599,7 @@ class FPUUnit(PipelinedFunctionalUnit):
         swap32 = Signal()
 
         fp_rm = Mux(
-            generate_imm_rm(self.req.bits.uop.imm_packed) == 7, 0,
+            generate_imm_rm(self.req.bits.uop.imm_packed) == 7, self.frm,
             generate_imm_rm(self.req.bits.uop.imm_packed))
 
         with m.Switch(self.req.bits.uop.opcode):
@@ -829,7 +840,7 @@ class FDivUnit(IterativeFunctionalUnit):
     def __init__(self, width, params):
         self.width = width
 
-        super().__init__(width, params)
+        super().__init__(width, params, needs_frm=True)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -843,6 +854,7 @@ class FDivUnit(IterativeFunctionalUnit):
                             | (self.req.bits.uop.opcode == UOpCode.FSQRT_D)),
             fdiv.fmt.eq(
                 Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
+            fdiv.rm.eq(self.frm),
             fdiv.in_valid.eq(self.req.valid),
             self.req.ready.eq(fdiv.in_ready),
             self.resp.bits.data.eq(fdiv.out.bits),
