@@ -563,7 +563,7 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
         return m
 
 
-class FPUUnit(PipelinedFunctionalUnit):
+class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
 
     def __init__(self, width, params):
         self.width = width
@@ -807,18 +807,26 @@ class FPUUnit(PipelinedFunctionalUnit):
         m.d.comb += scmp.inp.valid.eq(self.req.valid & cmp_en
                                       & (fmt_in == FPFormat.S))
 
+        fmv_data = Signal.like(in_pipe.out.bits)
+        m.d.comb += fmv_data.eq(
+            Mux(self.resp.bits.uop.fp_single,
+                sign_extend(in_pipe.out.bits[:32], len(fmv_data)),
+                in_pipe.out.bits))
+
         m.d.comb += [
             self.resp.bits.data.eq(
                 Mux(
-                    dfma.out.valid, dfma.out.bits.data,
+                    dfma.out.valid, self.nan_box(dfma.out.bits.data, 1),
                     Mux(
-                        sfma.out.valid, sfma.out.bits.data,
+                        sfma.out.valid, self.nan_box(sfma.out.bits.data, 0),
                         Mux(
                             fpiu.out.valid, fpiu.out.bits.data,
                             Mux(
-                                dcmp.out.valid, dcmp.out.bits.data,
-                                Mux(scmp.out.valid, scmp.out.bits.data,
-                                    in_pipe.out.bits)))))),
+                                dcmp.out.valid,
+                                self.nan_box(dcmp.out.bits.data, 1),
+                                Mux(scmp.out.valid,
+                                    self.nan_box(scmp.out.bits.data, 0),
+                                    fmv_data)))))),
             self.resp.bits.fflags.valid.eq(self.resp.valid),
             self.resp.bits.fflags.bits.eq(
                 Mux(
