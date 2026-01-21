@@ -824,9 +824,12 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                             Mux(
                                 dcmp.out.valid,
                                 self.nan_box(dcmp.out.bits.data, 1),
-                                Mux(scmp.out.valid,
-                                    self.nan_box(scmp.out.bits.data, 0),
-                                    fmv_data)))))),
+                                Mux(
+                                    scmp.out.valid,
+                                    self.nan_box(
+                                        scmp.out.bits.data,
+                                        self.resp.bits.uop.fu_type_has(
+                                            FUType.F2I)), fmv_data)))))),
             self.resp.bits.fflags.valid.eq(self.resp.valid),
             self.resp.bits.fflags.bits.eq(
                 Mux(

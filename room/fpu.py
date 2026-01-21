@@ -1272,6 +1272,8 @@ class FPUComp(Elaboratable):
         #
 
         minmax_result = Record(self.ftyp.record_layout())
+        minmax_status = FPException()
+        m.d.comb += minmax_status.nv.eq(info1.is_snan | info2.is_snan)
 
         with m.If(info1.is_nan & info2.is_nan):
             m.d.comb += [
@@ -1281,10 +1283,10 @@ class FPUComp(Elaboratable):
             ]
 
         with m.Elif(info1.is_nan):
-            m.d.comb += minmax_result.eq(in1)
+            m.d.comb += minmax_result.eq(in2)
 
         with m.Elif(info2.is_nan):
-            m.d.comb += minmax_result.eq(in2)
+            m.d.comb += minmax_result.eq(in1)
 
         with m.Else():
             with m.Switch(s1_inp.rm):
@@ -1299,18 +1301,35 @@ class FPUComp(Elaboratable):
         #
 
         cmp_result = Record(self.ftyp.record_layout())
+        cmp_status = FPException()
 
-        with m.Switch(s1_inp.rm):
-            with m.Case(RoundingMode.RNE):
-                m.d.comb += cmp_result.eq((in1_smaller | in_equal)
-                                          ^ s1_inp.fn_mod)
+        with m.If(info1.is_snan | info2.is_snan):
+            m.d.comb += [
+                cmp_status.nv.eq(1),
+                cmp_result.eq((s1_inp.rm == RoundingMode.RDN) & s1_inp.fn_mod),
+            ]
 
-            with m.Case(RoundingMode.RTZ):
-                m.d.comb += cmp_result.eq((in1_smaller & ~in_equal)
-                                          ^ s1_inp.fn_mod)
+        with m.Else():
+            with m.Switch(s1_inp.rm):
+                with m.Case(RoundingMode.RNE):
+                    with m.If(info1.is_nan | info2.is_nan):
+                        m.d.comb += cmp_status.nv.eq(1)
+                    with m.Else():
+                        m.d.comb += cmp_result.eq((in1_smaller | in_equal)
+                                                  ^ s1_inp.fn_mod)
 
-            with m.Case(RoundingMode.RDN):
-                m.d.comb += cmp_result.eq(in_equal ^ s1_inp.fn_mod)
+                with m.Case(RoundingMode.RTZ):
+                    with m.If(info1.is_nan | info2.is_nan):
+                        m.d.comb += cmp_status.nv.eq(1)
+                    with m.Else():
+                        m.d.comb += cmp_result.eq((in1_smaller & ~in_equal)
+                                                  ^ s1_inp.fn_mod)
+
+                with m.Case(RoundingMode.RDN):
+                    with m.If(info1.is_nan | info2.is_nan):
+                        m.d.comb += cmp_result.eq(s1_inp.fn_mod)
+                    with m.Else():
+                        m.d.comb += cmp_result.eq(in_equal ^ s1_inp.fn_mod)
 
         #
         # Classification
@@ -1339,27 +1358,36 @@ class FPUComp(Elaboratable):
                 Mux(info1.is_snan, ClassMask.SNAN, ClassMask.QNAN))
 
         result = Record(self.ftyp.record_layout())
+        status = FPException()
 
         with m.Switch(s1_inp.fn):
             with m.Case(FPUOperator.SGNJ):
                 m.d.comb += result.eq(sgnj_result)
 
             with m.Case(FPUOperator.MINMAX):
-                m.d.comb += result.eq(minmax_result)
+                m.d.comb += [
+                    result.eq(minmax_result),
+                    status.eq(minmax_status),
+                ]
 
             with m.Case(FPUOperator.CMP):
-                m.d.comb += result.eq(cmp_result)
+                m.d.comb += [
+                    result.eq(cmp_result),
+                    status.eq(cmp_status),
+                ]
 
             with m.Case(FPUOperator.CLASSIFY):
                 m.d.comb += result.eq(class_result)
 
-        out_pipe = m.submodules.out_pipe = Pipe(width=len(result),
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(result) +
+                                                len(status),
                                                 depth=self.latency - 1)
         m.d.comb += [
             out_pipe.in_valid.eq(s1_valid),
-            out_pipe.in_data.eq(result),
+            out_pipe.in_data.eq(Cat(result, status)),
             self.out.valid.eq(out_pipe.out.valid),
-            self.out.bits.data.eq(out_pipe.out.bits),
+            Cat(self.out.bits.data,
+                self.out.bits.status).eq(out_pipe.out.bits),
         ]
 
         return m
