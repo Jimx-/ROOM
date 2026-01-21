@@ -1157,6 +1157,8 @@ class FPUCastMulti(Elaboratable):
                             Mux(neg_result, ~special_result, special_result)),
                     ]
 
+        fp_result_is_speical = ~s2_src_is_int & (s2_src_info.is_zero
+                                                 | s2_src_info.is_nan)
         int_result_is_special = s2_src_info.is_nan | s2_src_info.is_inf | of_before_round | (
             s2_input_sign
             & s2_inp.fn_mod & (rounded_int_res != 0))
@@ -1164,6 +1166,19 @@ class FPUCastMulti(Elaboratable):
         fp_result = fmt_result
         int_result = Mux(int_result_is_special, ifmt_special_result,
                          rounded_int_res)
+
+        fp_regular_status = FPException()
+        fp_special_status = FPException()
+        fp_status = Mux(fp_result_is_speical, fp_special_status,
+                        fp_regular_status)
+        m.d.comb += [
+            fp_regular_status.of.eq((s2_src_is_int | ~s2_src_info.is_inf)
+                                    & of_before_round),
+            fp_regular_status.nx.eq(fp_round_sticky_bits.any()
+                                    | (s2_src_is_int | ~s2_src_info.is_inf)
+                                    & of_before_round),
+            fp_special_status.nv.eq(s2_src_info.is_snan),
+        ]
 
         int_status = FPException()
         m.d.comb += [
@@ -1173,7 +1188,7 @@ class FPUCastMulti(Elaboratable):
         ]
 
         result = Mux(s2_dst_is_int, int_result, fp_result)
-        status = Mux(s2_dst_is_int, int_status, 0)
+        status = Mux(s2_dst_is_int, int_status, fp_status)
 
         out_pipe = m.submodules.out_pipe = Pipe(width=self.width + 5,
                                                 depth=max(self.latency - 2, 1))
