@@ -215,7 +215,11 @@ class FPURounding(Elaboratable):
 
         m.d.comb += [
             self.rounded_abs.eq(self.in_abs + round_up),
-            self.out_sign.eq(self.in_sign),
+            self.out_sign.eq(
+                Mux(
+                    self.eff_subtraction & ~self.in_abs.any()
+                    & ~self.round_sticky_bits.any(),
+                    self.round_mode == RoundingMode.RDN, self.in_sign)),
         ]
 
         return m
@@ -295,6 +299,45 @@ class FPUFMA(Elaboratable):
         s1_eff_subtraction = in1.sign ^ in2.sign ^ in3.sign
         tentative_sign = in1.sign ^ in2.sign
 
+        #
+        # Special case
+        #
+
+        s1_special_result = Record(self.ftyp.record_layout())
+        s1_special_status = FPException()
+        s1_result_is_special = Signal()
+        m.d.comb += s1_special_result.eq(self.ftyp.default_nan())
+
+        with m.If((info1.is_inf & info2.is_zero)
+                  | (info1.is_zero & info2.is_inf)):
+            m.d.comb += [
+                s1_result_is_special.eq(1),
+                s1_special_status.nv.eq(1),
+            ]
+        with m.Elif(info1.is_nan | info2.is_nan | info3.is_nan):
+            m.d.comb += [
+                s1_result_is_special.eq(1),
+                s1_special_status.nv.eq(info1.is_snan | info2.is_snan
+                                        | info3.is_snan),
+            ]
+        with m.Elif(info1.is_inf | info2.is_inf | info3.is_inf):
+            m.d.comb += s1_result_is_special.eq(1)
+            with m.If((info1.is_inf | info2.is_inf) & info3.is_inf
+                      & s1_eff_subtraction):
+                m.d.comb += s1_special_status.nv.eq(1)
+            with m.Elif(info1.is_inf | info2.is_inf):
+                m.d.comb += [
+                    s1_special_result.sign.eq(in1.sign ^ in2.sign),
+                    s1_special_result.exp.eq(~0),
+                    s1_special_result.man.eq(0),
+                ]
+            with m.Elif(info3.is_inf):
+                m.d.comb += [
+                    s1_special_result.sign.eq(in3.sign),
+                    s1_special_result.exp.eq(~0),
+                    s1_special_result.man.eq(0),
+                ]
+
         exp_addend = Signal(signed(exp_width))
         s1_exp_product = Signal(signed(exp_width))
         s1_exp_diff = Signal(signed(exp_width))
@@ -341,7 +384,7 @@ class FPUFMA(Elaboratable):
 
         addend_shifted = Signal(3 * prec_bits + 4)
         addend_sticky_bits = Signal(prec_bits)
-        s1_sticky_before_add = (addend_sticky_bits != 0)
+        s1_sticky_before_add = addend_sticky_bits.any()
 
         m.d.comb += Cat(addend_sticky_bits, addend_shifted).eq(
             (man3 << (3 * prec_bits + 4)) >> s1_addend_shamt)
@@ -353,7 +396,7 @@ class FPUFMA(Elaboratable):
             sum_raw.eq(
                 (product << 2) +
                 Mux(s1_eff_subtraction, ~addend_shifted, addend_shifted) +
-                (s1_eff_subtraction & (addend_sticky_bits != 0))),
+                (s1_eff_subtraction & ~s1_sticky_before_add)),
             s1_sum.eq(Mux(s1_eff_subtraction & ~sum_raw[-1], -sum_raw,
                           sum_raw)),
         ]
@@ -375,16 +418,21 @@ class FPUFMA(Elaboratable):
         s2_sum = Signal.like(s1_sum)
         s2_final_sign = Signal.like(s1_final_sign)
         s2_round_mode = Signal.like(s1_inp.rm)
+        s2_special_result = Signal.like(s1_special_result)
+        s2_special_status = Signal.like(s1_special_status)
+        s2_result_is_special = Signal()
         s2_valid = Signal()
 
         s2_pipe_in = Cat(s1_eff_subtraction, s1_exp_product, s1_exp_diff,
                          s1_tentative_exp, s1_addend_shamt,
                          s1_sticky_before_add, s1_sum, s1_final_sign,
-                         s1_inp.rm)
+                         s1_inp.rm, s1_special_result, s1_special_status,
+                         s1_result_is_special)
         s2_pipe_out = Cat(s2_eff_subtraction, s2_exp_product, s2_exp_diff,
                           s2_tentative_exp, s2_addend_shamt,
                           s2_sticky_before_add, s2_sum, s2_final_sign,
-                          s2_round_mode)
+                          s2_round_mode, s2_special_result, s2_special_status,
+                          s2_result_is_special)
 
         s2_pipe = m.submodules.s2_pipe = Pipe(
             width=len(s2_pipe_in), depth=1 if self.latency > 1 else 0)
@@ -458,11 +506,12 @@ class FPUFMA(Elaboratable):
                 Cat(sum_sticky_bits, final_mantissa).eq(sum_shifted << 1),
                 final_exponent.eq(exp_normalized - 1),
             ]
+        with m.Else():
+            m.d.comb += final_exponent.eq(0)
 
         sticky_after_norm = (sum_sticky_bits != 0) | s2_sticky_before_add
 
         of_before_round = final_exponent >= (2**self.ftyp.exp - 1)
-        uf_before_round = final_exponent == 0
 
         pre_round_sign = s2_final_sign
         pre_round_exponent = Mux(of_before_round, 2**self.ftyp.exp - 2,
@@ -490,19 +539,29 @@ class FPUFMA(Elaboratable):
                                                   1, self.ftyp.exp)
 
         regular_result = Cat(rounding.rounded_abs, rounding.out_sign)
+        regular_status = FPException()
+        m.d.comb += [
+            regular_status.of.eq(of_before_round | of_after_round),
+            regular_status.uf.eq(uf_after_round & regular_status.nx),
+            regular_status.nx.eq(round_sticky_bits.any() | of_before_round
+                                 | of_after_round),
+        ]
 
-        result = regular_result
+        result = Mux(s2_result_is_special, s2_special_result, regular_result)
+        status = Mux(s2_result_is_special, s2_special_status, regular_status)
 
         #
         # S3 - Output
         #
 
-        out_pipe = m.submodules.out_pipe = Pipe(width=len(result))
+        out_pipe = m.submodules.out_pipe = Pipe(width=len(result) +
+                                                len(status))
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
-            out_pipe.in_data.eq(result),
+            out_pipe.in_data.eq(Cat(result, status)),
             self.out.valid.eq(out_pipe.out.valid),
-            self.out.bits.data.eq(out_pipe.out.bits),
+            Cat(self.out.bits.data,
+                self.out.bits.status).eq(out_pipe.out.bits),
         ]
 
         return m
