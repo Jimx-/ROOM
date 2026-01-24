@@ -290,7 +290,7 @@ class FPUFMA(Elaboratable):
 
             with m.Case(FPUOperator.MUL):
                 m.d.comb += [
-                    in3.sign.eq(1),
+                    in3.sign.eq(s1_inp.rm != RoundingMode.RDN),
                     in3.exp.eq(0),
                     in3.man.eq(0),
                     info3.is_zero.eq(1),
@@ -460,7 +460,7 @@ class FPUFMA(Elaboratable):
                 ]
 
         norm_shamt = Signal.like(s2_addend_shamt)
-        exp_normalized = Signal(self.ftyp.exp)
+        exp_normalized = Signal(signed(exp_width))
 
         with m.If((s2_exp_diff <= 0)
                   | (s2_eff_subtraction & (s2_exp_diff <= 2))):
@@ -486,7 +486,7 @@ class FPUFMA(Elaboratable):
         m.d.comb += sum_shifted.eq(s2_sum << norm_shamt)
 
         final_mantissa = Signal(prec_bits + 1)
-        final_exponent = Signal(self.ftyp.exp)
+        final_exponent = Signal(signed(exp_width))
         sum_sticky_bits = Signal(2 * prec_bits + 3)
 
         m.d.comb += [
