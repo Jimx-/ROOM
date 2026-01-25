@@ -78,7 +78,7 @@ def fdiv_unittest(fdiv, a, b, is_sqrt, fmt, expected):
         while not (yield fdiv.out.valid):
             yield
 
-        out = yield fdiv.out.bits
+        out = yield fdiv.out.bits.data
         assert out == expected
 
     return proc

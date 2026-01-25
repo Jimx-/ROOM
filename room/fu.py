@@ -846,7 +846,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
         return m
 
 
-class FDivUnit(IterativeFunctionalUnit):
+class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
 
     def __init__(self, width, params):
         self.width = width
@@ -868,7 +868,11 @@ class FDivUnit(IterativeFunctionalUnit):
             fdiv.rm.eq(self.frm),
             fdiv.in_valid.eq(self.req.valid),
             self.req.ready.eq(fdiv.in_ready),
-            self.resp.bits.data.eq(fdiv.out.bits),
+            self.resp.bits.data.eq(
+                self.nan_box(fdiv.out.bits.data,
+                             ~self.resp.bits.uop.fp_single)),
+            self.resp.bits.fflags.valid.eq(self.resp.valid),
+            self.resp.bits.fflags.bits.eq(fdiv.out.bits.status),
             self.resp.valid.eq(fdiv.out.valid),
             fdiv.out.ready.eq(self.resp.ready),
             fdiv.kill.eq(self.do_kill),

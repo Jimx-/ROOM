@@ -209,15 +209,15 @@ class VFPUDivSqrt(Elaboratable):
                     fdiv.b.eq(self.b.word_select(i, 32)),
                     fdiv.in_valid.eq(self.in_valid & self.in_ready
                                      & (self.fmt == FPFormat.S)),
-                    resp_data_s.word_select(i, 32).eq(fdiv.out.bits),
+                    resp_data_s.word_select(i, 32).eq(fdiv.out.bits.data),
                 ]
             else:
                 m.d.comb += [
                     fdiv.a.eq(self.a.word_select(i // 2, 64)),
                     fdiv.b.eq(self.b.word_select(i // 2, 64)),
                     fdiv.in_valid.eq(self.in_valid & self.in_ready),
-                    resp_data_s.word_select(i, 32).eq(fdiv.out.bits),
-                    resp_data_d.word_select(i // 2, 64).eq(fdiv.out.bits),
+                    resp_data_s.word_select(i, 32).eq(fdiv.out.bits.data),
+                    resp_data_d.word_select(i // 2, 64).eq(fdiv.out.bits.data),
                 ]
 
         resp_mask = Signal(self.width // 32)
