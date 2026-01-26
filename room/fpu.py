@@ -597,9 +597,9 @@ class FPUDivSqrtMulti(Elaboratable):
 
         m.d.comb += [
             in_a.eq(self.a),
-            in_b.eq(self.b),
+            in_b.eq(Mux(self.is_sqrt, 0, self.b)),
             in_info_a.eq(self.ftyp.classify(self.a)),
-            in_info_b.eq(self.ftyp.classify(self.b)),
+            in_info_b.eq(Mux(self.is_sqrt, 0, self.ftyp.classify(self.b))),
         ]
 
         with m.Switch(self.fmt):
@@ -609,7 +609,8 @@ class FPUDivSqrtMulti(Elaboratable):
 
                     m.d.comb += [
                         in_info_a.eq(ftyp.classify(self.a)),
-                        in_info_b.eq(ftyp.classify(self.b)),
+                        in_info_b.eq(
+                            Mux(self.is_sqrt, 0, ftyp.classify(self.b))),
                     ]
 
         #
@@ -633,6 +634,9 @@ class FPUDivSqrtMulti(Elaboratable):
         round_mode = Signal.like(self.rm)
         final_sign = Signal()
 
+        quotient = Signal(PREC_BITS + 1)  # 59 bits
+        remainder = Signal(PREC_BITS + 2)  # 60 bits
+
         m.d.sync += start.eq(self.in_valid & self.in_ready)
 
         #
@@ -655,6 +659,8 @@ class FPUDivSqrtMulti(Elaboratable):
                 do_sqrt.eq(self.is_sqrt),
                 fmt_sel.eq(self.fmt),
                 round_mode.eq(self.rm),
+                quotient.eq(0),
+                remainder.eq(0),
             ]
 
             with m.Switch(self.fmt):
@@ -707,12 +713,14 @@ class FPUDivSqrtMulti(Elaboratable):
 
         count = Signal(range(64))
         max_iters = Signal.like(count)
-        do_adjust = ~do_sqrt & (count == max_iters)
+        do_adjust = count == max_iters
 
         with m.Switch(fmt_sel):
             for fmt in [FPFormat.S, FPFormat.D]:
                 with m.Case(fmt):
-                    m.d.comb += max_iters.eq(N_ITERS[fmt] + ~do_sqrt)
+                    m.d.comb += max_iters.eq(
+                        N_ITERS[fmt] + 1
+                    )  # +1 cycle to adjust remainder for detecting inexact
 
         with m.If(self.kill | (count == max_iters)):
             m.d.sync += count.eq(0)
@@ -729,9 +737,6 @@ class FPUDivSqrtMulti(Elaboratable):
             m.d.sync += self.out.valid.eq(1)
         with m.Elif(self.out.fire):
             m.d.sync += self.out.valid.eq(0)
-
-        quotient = Signal(PREC_BITS + 1)  # 59 bits
-        remainder = Signal(PREC_BITS + 2)  # 60 bits
 
         adder_in_div_a = [Signal.like(remainder) for _ in range(2)]
         adder_in_div_b = [Signal.like(remainder) for _ in range(2)]
@@ -776,6 +781,10 @@ class FPUDivSqrtMulti(Elaboratable):
                                   len(sqrt_Q[1]) - s * 2 - 1))
                     m.d.comb += sqrt_Q[1].eq(Mux(adder_carry[0], ~Q1, Q1))
 
+        with m.If(do_adjust):
+            # FSQRT adjust: if R is negative, R = R + ((Q << 1) | 1)
+            m.d.comb += sqrt_Q[0].eq(Cat(Const(1, 1), quotient))
+
         m.d.comb += [
             sqrt_R[0].eq(Mux(start, 0, remainder)),
             sqrt_R[1].eq(
@@ -793,6 +802,8 @@ class FPUDivSqrtMulti(Elaboratable):
                 x[self.ftyp.man - FType.FP32.man:],
             )
 
+        # Normal: R = 2 * R - D
+        # Adjust: If R is negative, R = R + D
         m.d.comb += [
             adder_in_div_a[0].eq(
                 Mux(
@@ -872,7 +883,8 @@ class FPUDivSqrtMulti(Elaboratable):
                     ftyp = _fmt_ftypes[fmt.value]
 
                     m.d.comb += sticky_before_norm.eq(
-                        ~do_sqrt & remainder[-(ftyp.man + 1):].any())
+                        Mux(do_sqrt, remainder[:ftyp.man + 1].any(),
+                            remainder[-(ftyp.man + 1):].any()))
 
                     if fmt.value == FPFormat.S:
                         m.d.comb += final_quotient.eq(quotient[:ftyp.man +
@@ -1018,7 +1030,9 @@ class FPUDivSqrtMulti(Elaboratable):
                     with m.Elif(info_a.is_inf):
                         m.d.comb += result_is_special.eq(1)
 
-                        with m.If(info_b.is_inf):
+                        with m.If(~do_sqrt & info_b.is_inf):
+                            m.d.comb += special_status.nv.eq(1)
+                        with m.Elif(do_sqrt & final_sign):  # sqrt(-inf)
                             m.d.comb += special_status.nv.eq(1)
                         with m.Else():
                             m.d.comb += special_result.eq(ftyp.inf(final_sign))
@@ -1039,10 +1053,17 @@ class FPUDivSqrtMulti(Elaboratable):
                                 special_result.eq(ftyp.inf(final_sign)),
                                 special_status.dz.eq(1),
                             ]
-                    with m.Elif(~do_sqrt & info_a.is_zero):  # Zero result
+
+                    with m.Elif(info_a.is_zero):  # Zero result
                         m.d.comb += [
                             result_is_special.eq(1),
                             special_result.eq(ftyp.zero(final_sign)),
+                        ]
+
+                    with m.Elif(do_sqrt & final_sign):  # sqrt(-a)
+                        m.d.comb += [
+                            result_is_special.eq(1),
+                            special_status.nv.eq(1),
                         ]
 
         regular_result = Signal(64)
