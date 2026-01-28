@@ -1144,7 +1144,9 @@ class FPUCastMulti(Elaboratable):
         fmt_bias = Signal(signed(EXP_WIDTH))
         fmt_subnormal = Signal(signed(EXP_WIDTH))
         fmt_info = Record(self.ftyp.INFO_LAYOUT)
+        fmt_is_boxed = Signal()
 
+        m.d.comb += fmt_is_boxed.eq(1)
         with m.Switch(s1_inp.src_fmt):
             for fmt in FPFormat:
                 with m.Case(fmt.value):
@@ -1162,6 +1164,10 @@ class FPUCastMulti(Elaboratable):
                         fmt_bias.eq(ftyp.bias()),
                         fmt_subnormal.eq(Cat(fmt_info.is_subnormal, 0)),
                     ]
+
+                    if ftyp.width < self.width:
+                        m.d.comb += fmt_is_boxed.eq(
+                            s1_inp.in1[ftyp.width:self.width].all())
 
         int_sign = Signal()
         int_value = Signal(MAN_WIDTH)
@@ -1235,13 +1241,15 @@ class FPUCastMulti(Elaboratable):
         s2_src_is_int = Signal()
         s2_dst_is_int = Signal()
         s2_mant_is_zero = Signal()
+        s2_is_boxed = Signal()
         s2_valid = Signal()
 
         s2_pipe_in = Cat(input_sign, input_exp, input_mant, fmt_info, dst_exp,
-                         s1_inp, src_is_int, dst_is_int, mant_is_zero)
+                         s1_inp, src_is_int, dst_is_int, mant_is_zero,
+                         fmt_is_boxed)
         s2_pipe_out = Cat(s2_input_sign, s2_input_exp, s2_input_mant,
                           s2_src_info, s2_dst_exp, s2_inp, s2_src_is_int,
-                          s2_dst_is_int, s2_mant_is_zero)
+                          s2_dst_is_int, s2_mant_is_zero, s2_is_boxed)
 
         s2_pipe = m.submodules.s2_pipe = Pipe(width=len(s2_pipe_in),
                                               depth=int(self.latency > 1))
@@ -1304,6 +1312,42 @@ class FPUCastMulti(Elaboratable):
                     uf_before_round.eq(1),
                 ]
 
+        with m.Else():
+            with m.Switch(s2_inp.dst_fmt):
+                for fmt in FPFormat:
+                    with m.Case(fmt.value):
+                        ftyp = _fmt_ftypes[fmt.value]
+
+                        with m.If(~s2_src_is_int & s2_src_info.is_inf):
+                            m.d.comb += [
+                                final_exp.eq(Const(1, 1).replicate(ftyp.exp)),
+                                preshift_mant.eq(0),
+                            ]
+
+                        with m.Elif(s2_dst_exp >= 2**ftyp.exp - 1):
+                            m.d.comb += [
+                                final_exp.eq(2**ftyp.exp - 2),
+                                preshift_mant.eq(~0),
+                                of_before_round.eq(1),
+                            ]
+
+                        with m.Elif((s2_dst_exp < 1)
+                                    & (s2_dst_exp >= -ftyp.man)):
+                            m.d.comb += [
+                                final_exp.eq(0),
+                                denorm_shamt.eq(self.ftyp.man - dst_man_bits +
+                                                1 - s2_dst_exp),
+                                uf_before_round.eq(1),
+                            ]
+
+                        with m.Elif(s2_dst_exp < -ftyp.man):
+                            m.d.comb += [
+                                final_exp.eq(0),
+                                denorm_shamt.eq(self.ftyp.man - dst_man_bits +
+                                                2 + ftyp.man),
+                                uf_before_round.eq(1),
+                            ]
+
         m.d.comb += [
             dst_mant.eq(preshift_mant >> denorm_shamt),
             Cat(fp_round_sticky_bits[1],
@@ -1358,18 +1402,34 @@ class FPUCastMulti(Elaboratable):
         ]
 
         fmt_result = Signal(self.width)
-        m.d.comb += fmt_result.eq(Repl(1, len(fmt_result)))
-
+        fmt_special_result = Signal(self.width)
+        fmt_of_after_round = Signal()
+        fmt_uf_after_round = Signal()
+        m.d.comb += [
+            fmt_result.eq(~0),
+            fmt_special_result.eq(~0),
+        ]
         with m.Switch(s2_inp.dst_fmt):
             for fmt in FPFormat:
                 with m.Case(fmt.value):
                     ftyp = _fmt_ftypes[fmt.value]
 
-                    m.d.comb += fmt_result[:ftyp.man + ftyp.exp + 1].eq(
-                        Mux(
-                            s2_src_is_int & s2_mant_is_zero, 0,
-                            Cat(rounding.rounded_abs[:ftyp.man + ftyp.exp],
-                                rounding.out_sign)))
+                    m.d.comb += [
+                        fmt_result[:ftyp.width].eq(
+                            Mux(
+                                s2_src_is_int & s2_mant_is_zero, 0,
+                                Cat(rounding.rounded_abs[:ftyp.man + ftyp.exp],
+                                    rounding.out_sign))),
+                        fmt_special_result[:ftyp.width].eq(
+                            Mux(s2_src_info.is_zero & s2_is_boxed,
+                                ftyp.zero(s2_input_sign), ftyp.default_nan())),
+                        fmt_of_after_round.eq(
+                            rounding.rounded_abs[ftyp.man:ftyp.man +
+                                                 ftyp.exp].all()),
+                        fmt_uf_after_round.eq(
+                            ~rounding.rounded_abs[ftyp.man:ftyp.man +
+                                                  ftyp.exp].any()),
+                    ]
 
         rounded_uint_res = Mux(rounding.out_sign,
                                (-rounding.rounded_abs).as_unsigned(),
@@ -1377,6 +1437,7 @@ class FPUCastMulti(Elaboratable):
 
         rounded_int_res = Signal.like(rounded_uint_res)
         ifmt_special_result = Signal(self.width)
+        ifmt_of_after_round = Signal()
         with m.Switch(s2_inp.int_fmt):
             for fmt in IntFormat:
                 with m.Case(fmt.value):
@@ -1402,26 +1463,38 @@ class FPUCastMulti(Elaboratable):
                             Mux(neg_result, ~special_result, special_result)),
                     ]
 
-        fp_result_is_speical = ~s2_src_is_int & (s2_src_info.is_zero
-                                                 | s2_src_info.is_nan)
+                    with m.If(~rounding.out_sign
+                              & (s2_input_exp == width - 2 + s2_inp.fn_mod)):
+                        m.d.comb += ifmt_of_after_round.eq(
+                            ~rounded_int_res.bit_select(
+                                width - 2 + s2_inp.fn_mod, 1))
+
+        uf_after_round = fmt_uf_after_round
+        of_after_round = Mux(s2_dst_is_int, ifmt_of_after_round,
+                             fmt_of_after_round)
+
+        fp_result_is_special = ~s2_src_is_int & (s2_src_info.is_zero
+                                                 | s2_src_info.is_nan
+                                                 | ~s2_is_boxed)
         int_result_is_special = s2_src_info.is_nan | s2_src_info.is_inf | of_before_round | (
             s2_input_sign
             & s2_inp.fn_mod & (rounded_int_res != 0))
 
-        fp_result = fmt_result
+        fp_result = Mux(fp_result_is_special, fmt_special_result, fmt_result)
         int_result = Mux(int_result_is_special, ifmt_special_result,
                          rounded_int_res)
 
         fp_regular_status = FPException()
         fp_special_status = FPException()
-        fp_status = Mux(fp_result_is_speical, fp_special_status,
+        fp_status = Mux(fp_result_is_special, fp_special_status,
                         fp_regular_status)
         m.d.comb += [
             fp_regular_status.of.eq((s2_src_is_int | ~s2_src_info.is_inf)
-                                    & of_before_round),
+                                    & (of_before_round | of_after_round)),
+            fp_regular_status.uf.eq(uf_after_round & fp_regular_status.nx),
             fp_regular_status.nx.eq(fp_round_sticky_bits.any()
                                     | (s2_src_is_int | ~s2_src_info.is_inf)
-                                    & of_before_round),
+                                    & (of_before_round | of_after_round)),
             fp_special_status.nv.eq(s2_src_info.is_snan),
         ]
 
