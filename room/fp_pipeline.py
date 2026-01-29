@@ -175,6 +175,10 @@ class FPPipeline(HasFPUParams, Elaboratable):
         if self.use_vector:
             m.d.comb += self.from_vec.connect(mem_wbarb.inp[2])
 
+        def mem_size_to_tag(mem_size):
+            return Mux(mem_size == 1, self.type_tag.H,
+                       Mux(mem_size == 2, self.type_tag.S, self.type_tag.D))
+
         m.d.sync += [
             fregfile.write_ports[0].valid.eq(
                 mem_wbarb.out.valid & mem_wbarb.out.bits.uop.rf_wen()
@@ -182,7 +186,8 @@ class FPPipeline(HasFPUParams, Elaboratable):
             fregfile.write_ports[0].bits.addr.eq(mem_wbarb.out.bits.uop.pdst),
             fregfile.write_ports[0].bits.data.eq(
                 self.nan_box(mem_wbarb.out.bits.data,
-                             mem_wbarb.out.bits.uop.mem_size != 2)),
+                             mem_size_to_tag(
+                                 mem_wbarb.out.bits.uop.mem_size))),
         ]
 
         if self.sim_debug:
@@ -206,8 +211,8 @@ class FPPipeline(HasFPUParams, Elaboratable):
                             & (fresp.bits.uop.dst_rtype == RegisterType.FLT)),
                 wp.bits.addr.eq(fresp.bits.uop.pdst),
                 wp.bits.data.eq(
-                    self.nan_box(fresp.bits.data, fresp.bits.uop.mem_size
-                                 != 2)),
+                    self.nan_box(fresp.bits.data,
+                                 mem_size_to_tag(fresp.bits.uop.mem_size))),
             ]
 
             if self.sim_debug:

@@ -814,34 +814,41 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                 in_pipe.out.bits))
 
         m.d.comb += [
-            self.resp.bits.data.eq(
-                Mux(
-                    dfma.out.valid, self.nan_box(dfma.out.bits.data, 1),
-                    Mux(
-                        sfma.out.valid, self.nan_box(sfma.out.bits.data, 0),
-                        Mux(
-                            fpiu.out.valid, fpiu.out.bits.data,
-                            Mux(
-                                dcmp.out.valid,
-                                self.nan_box(dcmp.out.bits.data, 1),
-                                Mux(
-                                    scmp.out.valid,
-                                    self.nan_box(
-                                        scmp.out.bits.data,
-                                        self.resp.bits.uop.fu_type_has(
-                                            FUType.F2I)), fmv_data)))))),
+            self.resp.bits.data.eq(fmv_data),
             self.resp.bits.fflags.valid.eq(self.resp.valid),
-            self.resp.bits.fflags.bits.eq(
-                Mux(
-                    dfma.out.valid, dfma.out.bits.status,
-                    Mux(
-                        sfma.out.valid, sfma.out.bits.status,
-                        Mux(
-                            fpiu.out.valid, fpiu.out.bits.status,
-                            Mux(dcmp.out.valid, dcmp.out.bits.status,
-                                Mux(scmp.out.valid, scmp.out.bits.status,
-                                    0)))))),
         ]
+        with m.If(dfma.out.valid):
+            m.d.comb += [
+                self.resp.bits.data.eq(
+                    self.nan_box(dfma.out.bits.data, self.type_tag.D)),
+                self.resp.bits.fflags.bits.eq(dfma.out.bits.status),
+            ]
+        with m.Elif(sfma.out.valid):
+            m.d.comb += [
+                self.resp.bits.data.eq(
+                    self.nan_box(sfma.out.bits.data, self.type_tag.S)),
+                self.resp.bits.fflags.bits.eq(sfma.out.bits.status),
+            ]
+        with m.Elif(fpiu.out.valid):
+            m.d.comb += [
+                self.resp.bits.data.eq(fpiu.out.bits.data),
+                self.resp.bits.fflags.bits.eq(fpiu.out.bits.status),
+            ]
+        with m.Elif(dcmp.out.valid):
+            m.d.comb += [
+                self.resp.bits.data.eq(
+                    self.nan_box(dcmp.out.bits.data, self.type_tag.D)),
+                self.resp.bits.fflags.bits.eq(dcmp.out.bits.status),
+            ]
+        with m.Elif(scmp.out.valid):
+            m.d.comb += [
+                self.resp.bits.data.eq(
+                    self.nan_box(
+                        scmp.out.bits.data,
+                        Mux(self.resp.bits.uop.fu_type_has(FUType.F2I),
+                            self.type_tag.I, self.type_tag.S))),
+                self.resp.bits.fflags.bits.eq(scmp.out.bits.status),
+            ]
 
         return m
 

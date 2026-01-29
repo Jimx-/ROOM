@@ -28,6 +28,7 @@ class FPUOperator(IntEnum):
 class FPFormat(IntEnum):
     S = 0
     D = 1
+    H = 2
 
 
 class IntFormat(IntEnum):
@@ -91,10 +92,12 @@ class FType:
                    is_signalling, is_quiet)
 
 
+FType.FP16 = FType(5, 11)
 FType.FP32 = FType(8, 23)
 FType.FP64 = FType(11, 52)
 
 _fmt_ftypes = {
+    FPFormat.H: FType.FP16,
     FPFormat.S: FType.FP32,
     FPFormat.D: FType.FP64,
 }
@@ -106,17 +109,31 @@ class HasFPUParams(HasCoreParams):
         super().__init__(params)
 
         self.min_flen = 32
-        self.float_types = [
+        self.float_types = Array(
             typ for _, typ in _fmt_ftypes.items()
-            if typ.width >= self.min_flen and typ.width <= self.flen
-        ]
+            if typ.width >= self.min_flen and typ.width <= self.flen)
+        self.max_type = self.float_types[-1]
+
+        self.type_tag = IntEnum(
+            'type_tag', {
+                'H': self._type_to_tag(FType.FP16),
+                'S': self._type_to_tag(FType.FP32),
+                'D': self._type_to_tag(FType.FP64),
+                'I': self._type_to_tag(self.max_type),
+            })
+
+    def _type_to_tag(self, typ):
+        for i, ftyp in enumerate(self.float_types):
+            if typ is ftyp:
+                return i
+        return len(self.float_types) - 1
 
     def _nan_box(self, x, from_typ, to_type):
         return x | ((1 << to_type.width) - (1 << from_typ.width))
 
     def nan_box(self, x, tag):
-        return Mux(tag, x,
-                   self._nan_box(x, self.float_types[0], self.float_types[-1]))
+        return Mux(tag == len(self.float_types) - 1, x,
+                   self._nan_box(x, self.float_types[tag], self.max_type))
 
 
 class ClassMask(IntEnum):
@@ -150,15 +167,15 @@ class FPUInput(Record):
 
     def __init__(self, width, name=None, src_loc_at=0):
         super().__init__([
-            ('fn', Shape.cast(FPUOperator).width),
+            ('fn', FPUOperator),
             ('fn_mod', 1),
-            ('rm', Shape.cast(RoundingMode).width),
+            ('rm', RoundingMode),
             ('in1', width),
             ('in2', width),
             ('in3', width),
-            ('src_fmt', Shape.cast(FPFormat).width),
-            ('dst_fmt', Shape.cast(FPFormat).width),
-            ('int_fmt', Shape.cast(IntFormat).width),
+            ('src_fmt', FPFormat),
+            ('dst_fmt', FPFormat),
+            ('int_fmt', IntFormat),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -630,7 +647,7 @@ class FPUDivSqrtMulti(Elaboratable):
 
         start = Signal()
         do_sqrt = Signal()
-        fmt_sel = Signal()
+        fmt_sel = Signal(FPFormat)
         round_mode = Signal.like(self.rm)
         final_sign = Signal()
 
