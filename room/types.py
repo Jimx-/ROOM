@@ -251,6 +251,8 @@ class MicroOp(HasCoreParams, Record):
             ('fp_valid', 1),
             ('fp_single', 1),
             ('frs3_en', 1),
+            ('fp_in_tag', 2),
+            ('fp_out_tag', 2),
         ]
 
         if self.is_groom:

@@ -5,6 +5,7 @@ from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.fu import ExecReq, ExecResp
 from room.branch import BranchUpdate
+from room.fpu import HasFPUParams
 
 from roomsoc.interconnect.stream import Decoupled, Valid
 
@@ -563,6 +564,64 @@ class RegReadDecoder(HasCoreParams, Elaboratable):
         return m
 
 
+class FPRegReadDecoder(HasFPUParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.iss_uop = MicroOp(params)
+        self.iss_valid = Signal()
+
+        self.rrd_uop = MicroOp(params)
+        self.rrd_valid = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += [
+            self.rrd_valid.eq(self.iss_valid),
+            self.rrd_uop.eq(self.iss_uop),
+        ]
+
+        IN_TAG = lambda tag: self.rrd_uop.fp_in_tag.eq(tag)
+        OUT_TAG = lambda tag: self.rrd_uop.fp_out_tag.eq(tag)
+
+        with m.Switch(self.iss_uop.opcode):
+            for typ in ('H', 'S', 'D'):
+                with m.Case(getattr(UOpCode, f'FMV_{typ}_X'),
+                            getattr(UOpCode, f'FCVT_{typ}_X')):
+                    m.d.comb += [
+                        IN_TAG(self.type_tag.I),
+                        OUT_TAG(getattr(self.type_tag, typ)),
+                    ]
+
+                with m.Case(getattr(UOpCode, f'FMV_X_{typ}'),
+                            getattr(UOpCode, f'FCVT_X_{typ}')):
+                    m.d.comb += [
+                        IN_TAG(getattr(self.type_tag, typ)),
+                        OUT_TAG(self.type_tag.I),
+                    ]
+
+                for op in ('FSGNJ', 'FMINMAX', 'FADD', 'FSUB', 'FMUL', 'FMADD',
+                           'FMSUB', 'FNMADD', 'FNMSUB', 'FDIV', 'FSQRT'):
+                    with m.Case(getattr(UOpCode, f'{op}_{typ}')):
+                        m.d.comb += [
+                            IN_TAG(getattr(self.type_tag, typ)),
+                            OUT_TAG(getattr(self.type_tag, typ)),
+                        ]
+
+                for other_typ in ('H', 'S', 'D'):
+                    if typ != other_typ:
+                        with m.Case(getattr(UOpCode,
+                                            f'FCVT_{other_typ}_{typ}')):
+                            m.d.comb += [
+                                IN_TAG(getattr(self.type_tag, typ)),
+                                OUT_TAG(getattr(self.type_tag, other_typ)),
+                            ]
+
+        return m
+
+
 class RegisterRead(HasCoreParams, Elaboratable):
 
     def __init__(self, issue_width, num_rports, rports_array, num_bypass_ports,
@@ -616,12 +675,22 @@ class RegisterRead(HasCoreParams, Elaboratable):
                 dec.iss_valid.eq(iss_v),
             ]
 
+            fp_dec = FPRegReadDecoder(self.params)
+            m.submodules += fp_dec
+            m.d.comb += [
+                fp_dec.iss_uop.eq(iss_uop),
+                fp_dec.iss_valid.eq(iss_v),
+            ]
+
             m.d.sync += [
-                rrd_uop.eq(dec.rrd_uop),
+                rrd_uop.eq(
+                    Mux(
+                        iss_uop.fp_valid & ~iss_uop.uses_ldq
+                        & ~iss_uop.uses_stq, fp_dec.rrd_uop, dec.rrd_uop)),
                 rrd_uop.br_mask.eq(
-                    self.br_update.get_new_br_mask(dec.rrd_uop.br_mask)),
-                rrd_v.eq(dec.rrd_valid
-                         & ~self.br_update.uop_killed(dec.rrd_uop)),
+                    self.br_update.get_new_br_mask(iss_uop.br_mask)),
+                rrd_v.eq(iss_v
+                         & ~self.br_update.uop_killed(iss_uop)),
             ]
 
         rrd_rs1_data = [

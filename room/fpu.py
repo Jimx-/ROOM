@@ -110,9 +110,9 @@ class HasFPUParams(HasCoreParams):
 
         self.min_flen = 32
         self.float_types = Array(
-            typ for _, typ in _fmt_ftypes.items()
+            (fmt, typ) for fmt, typ in _fmt_ftypes.items()
             if typ.width >= self.min_flen and typ.width <= self.flen)
-        self.max_type = self.float_types[-1]
+        self.max_type = self.float_types[-1][1]
 
         self.type_tag = IntEnum(
             'type_tag', {
@@ -123,17 +123,20 @@ class HasFPUParams(HasCoreParams):
             })
 
     def _type_to_tag(self, typ):
-        for i, ftyp in enumerate(self.float_types):
+        for i, (_, ftyp) in enumerate(self.float_types):
             if typ is ftyp:
                 return i
         return len(self.float_types) - 1
 
-    def _nan_box(self, x, from_typ, to_type):
-        return x | ((1 << to_type.width) - (1 << from_typ.width))
+    def tag_to_format(self, tag):
+        return self.float_types[tag][0]
+
+    def _nan_box(self, x, from_typ, to_typ):
+        return x | ((1 << to_typ.width) - (1 << from_typ.width))
 
     def nan_box(self, x, tag):
         return Mux(tag == len(self.float_types) - 1, x,
-                   self._nan_box(x, self.float_types[tag], self.max_type))
+                   self._nan_box(x, self.float_types[tag][1], self.max_type))
 
 
 class ClassMask(IntEnum):

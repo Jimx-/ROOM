@@ -595,6 +595,10 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
         fmt_in = Signal(FPFormat)
         fmt_out = Signal(FPFormat)
         fmt_int = Signal(2)
+        m.d.comb += [
+            fmt_in.eq(self.tag_to_format(self.req.bits.uop.fp_in_tag)),
+            fmt_out.eq(self.tag_to_format(self.req.bits.uop.fp_out_tag)),
+        ]
 
         swap32 = Signal()
 
@@ -607,12 +611,6 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                     swap32.eq(1),
                 ]
 
@@ -621,12 +619,6 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
                     fma_op_mod.eq(1),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                     swap32.eq(1),
                 ]
 
@@ -634,24 +626,12 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.MUL),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FMADD_S, UOpCode.FMADD_D):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FMSUB_S, UOpCode.FMSUB_D):
@@ -659,24 +639,12 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
                     fma_op_mod.eq(1),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FNMSUB_S, UOpCode.FNMSUB_D):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FNMADD_S, UOpCode.FNMADD_D):
@@ -684,12 +652,6 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
                     fma_op_mod.eq(1),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FCVT_X_S, UOpCode.FCVT_X_D):
@@ -699,9 +661,6 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                     cast_en.eq(1),
                     fma_op.eq(FPUOperator.F2I),
                     fma_op_mod.eq(typ[0]),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                     fmt_int.eq(Cat(typ[1], 1)),
                 ]
 
@@ -709,54 +668,30 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                 m.d.comb += [
                     cast_en.eq(1),
                     fma_op.eq(FPUOperator.F2F),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.D,
-                            FPFormat.S)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FSGNJ_S, UOpCode.FSGNJ_D):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.SGNJ),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FMINMAX_S, UOpCode.FMINMAX_D):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.MINMAX),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
-                    fmt_out.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.CMPR_S, UOpCode.CMPR_D):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.CMP),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
             with m.Case(UOpCode.FCLASS_S, UOpCode.FCLASS_D):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.CLASSIFY),
-                    fmt_in.eq(
-                        Mux(self.req.bits.uop.fp_single, FPFormat.S,
-                            FPFormat.D)),
                 ]
 
         def set_fu_input(inp):
@@ -870,14 +805,13 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
             fdiv.b.eq(self.req.bits.rs2_data),
             fdiv.is_sqrt.eq((self.req.bits.uop.opcode == UOpCode.FSQRT_S)
                             | (self.req.bits.uop.opcode == UOpCode.FSQRT_D)),
-            fdiv.fmt.eq(
-                Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
+            fdiv.fmt.eq(self.tag_to_format(self.req.bits.uop.fp_in_tag)),
             fdiv.rm.eq(self.frm),
             fdiv.in_valid.eq(self.req.valid),
             self.req.ready.eq(fdiv.in_ready),
             self.resp.bits.data.eq(
                 self.nan_box(fdiv.out.bits.data,
-                             ~self.resp.bits.uop.fp_single)),
+                             self.resp.bits.uop.fp_out_tag)),
             self.resp.bits.fflags.valid.eq(self.resp.valid),
             self.resp.bits.fflags.bits.eq(fdiv.out.bits.status),
             self.resp.valid.eq(fdiv.out.valid),

@@ -74,66 +74,87 @@ class UOpCode(IntEnum):
     REMUW = 64
 
     FENCEI = 65
-    AMO_AG = 67
+    AMO_AG = 66
 
+    FMV_H_X = 67
     FMV_S_X = 68
     FMV_D_X = 69
-    FMV_X_S = 70
-    FMV_X_D = 71
+    FMV_X_H = 70
+    FMV_X_S = 71
+    FMV_X_D = 72
 
-    FSGNJ_S = 72
-    FSGNJ_D = 73
+    FSGNJ_H = 73
+    FSGNJ_S = 74
+    FSGNJ_D = 75
 
-    FCVT_S_D = 74
-    FCVT_D_S = 75
+    FCVT_S_H = 76
+    FCVT_H_S = 77
+    FCVT_D_H = 78
+    FCVT_H_D = 79
+    FCVT_S_D = 80
+    FCVT_D_S = 81
 
-    FCVT_S_X = 76
-    FCVT_D_X = 77
+    FCVT_H_X = 82
+    FCVT_S_X = 83
+    FCVT_D_X = 84
 
-    FCVT_X_S = 78
-    FCVT_X_D = 79
+    FCVT_X_H = 85
+    FCVT_X_S = 86
+    FCVT_X_D = 87
 
-    CMPR_S = 80
-    CMPR_D = 81
+    CMPR_H = 88
+    CMPR_S = 89
+    CMPR_D = 90
 
-    FCLASS_S = 82
-    FCLASS_D = 83
+    FCLASS_H = 91
+    FCLASS_S = 92
+    FCLASS_D = 93
 
-    FMINMAX_S = 84
-    FMINMAX_D = 85
+    FMINMAX_H = 94
+    FMINMAX_S = 95
+    FMINMAX_D = 96
 
-    FADD_S = 87
-    FSUB_S = 88
-    FMUL_S = 89
-    FADD_D = 90
-    FSUB_D = 91
-    FMUL_D = 92
+    FADD_H = 97
+    FSUB_H = 98
+    FMUL_H = 99
+    FADD_S = 100
+    FSUB_S = 101
+    FMUL_S = 102
+    FADD_D = 103
+    FSUB_D = 104
+    FMUL_D = 105
 
-    FMADD_S = 93
-    FMSUB_S = 94
-    FNMADD_S = 95
-    FNMSUB_S = 96
-    FMADD_D = 97
-    FMSUB_D = 98
-    FNMADD_D = 99
-    FNMSUB_D = 100
+    FMADD_H = 106
+    FMSUB_H = 107
+    FNMADD_H = 108
+    FNMSUB_H = 109
+    FMADD_S = 110
+    FMSUB_S = 111
+    FNMADD_S = 112
+    FNMSUB_S = 113
+    FMADD_D = 114
+    FMSUB_D = 115
+    FNMADD_D = 116
+    FNMSUB_D = 117
 
-    FDIV_S = 101
-    FDIV_D = 102
-    FSQRT_S = 103
-    FSQRT_D = 104
+    FDIV_H = 118
+    FDIV_S = 119
+    FDIV_D = 120
+    FSQRT_H = 121
+    FSQRT_S = 122
+    FSQRT_D = 123
 
-    WFI = 105
-    ERET = 106
-    SFENCE = 107
+    WFI = 124
+    ERET = 125
+    SFENCE = 126
 
-    GPU_TMC = 108
-    GPU_WSPAWN = 109
-    GPU_SPLIT = 110
-    GPU_JOIN = 111
-    GPU_BARRIER = 112
-    GPU_PRED = 113
-    GPU_RAST = 114
+    GPU_TMC = 127
+    GPU_WSPAWN = 128
+    GPU_SPLIT = 129
+    GPU_JOIN = 130
+    GPU_BARRIER = 131
+    GPU_PRED = 132
+    GPU_RAST = 133
 
     # Zicond
     CZERO_EQZ = 160
