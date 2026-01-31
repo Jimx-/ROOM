@@ -791,14 +791,14 @@ class DecodeUnit(HasCoreParams, Elaboratable):
 
             if self.use_fpu or self.use_vector:
                 #
-                # FSW/FSD
+                # FSH/FSW/FSD
                 #
 
                 with m.Case(0b0100111):
                     with m.Switch(inuop.inst[12:15]):
 
                         if self.use_fpu:
-                            with m.Case('01-'):
+                            with m.Case('01-', '001'):
                                 m.d.comb += [
                                     uop.fp_valid.eq(1),
                                     UOPC(UOpCode.STA),
@@ -817,6 +817,9 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                         m.d.comb += uop.fp_single.eq(1)
                                     with m.Case(0b011):
                                         pass
+                                    if self.use_zfh:
+                                        with m.Case(0b001):
+                                            pass
                                     with m.Default():
                                         m.d.comb += ILL_INSN
 
@@ -838,14 +841,14 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             m.d.comb += ILL_INSN
 
                 #
-                # FLW/FLD
+                # FLH/FLW/FLD
                 #
 
                 with m.Case(0b0000111):
                     with m.Switch(inuop.inst[12:15]):
 
                         if self.use_fpu:
-                            with m.Case('01-'):
+                            with m.Case('01-', '001'):
                                 m.d.comb += [
                                     uop.fp_valid.eq(1),
                                     UOPC(UOpCode.LD),
@@ -865,6 +868,9 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                         m.d.comb += uop.fp_single.eq(1)
                                     with m.Case(0b011):
                                         pass
+                                    if self.use_zfh:
+                                        with m.Case(0b01):
+                                            pass
                                     with m.Default():
                                         m.d.comb += ILL_INSN
 
@@ -905,130 +911,148 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                     ]
 
                     with m.Switch(inuop.inst[25:27]):
-                        with m.Case(FPFormat.S):
-                            m.d.comb += uop.fp_single.eq(1)
-                        with m.Case(FPFormat.D):
-                            pass
-                        with m.Default():
-                            m.d.comb += ILL_INSN
+                        fmts = ['S', 'D'] + (['H'] if self.use_zfh else [])
+                        for fmt in fmts:
+                            fp_fmt = getattr(FPFormat, fmt)
+                            with m.Case(fp_fmt):
+                                if fp_fmt == FPFormat.S:
+                                    m.d.comb += uop.fp_single.eq(1)
 
-                    with m.Switch(inuop.inst[27:32]):
-                        with m.Case(0b00000):  # fadd.fmt
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FADD_S,
-                                    UOpCode.FADD_D))
+                                with m.Switch(inuop.inst[27:32]):
+                                    with m.Case(0b00000):  # fadd.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FADD_{fmt}'))
 
-                        with m.Case(0b00001):  # fsub.fmt
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FSUB_S,
-                                    UOpCode.FSUB_D))
+                                    with m.Case(0b00001):  # fsub.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FSUB_{fmt}'))
 
-                        with m.Case(0b00010):  # fmul.fmt
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FMUL_S,
-                                    UOpCode.FMUL_D))
+                                    with m.Case(0b00010):  # fmul.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FMUL_{fmt}'))
 
-                        with m.Case(0b00011):  # fdiv.fmt
-                            m.d.comb += [
-                                UOPC(
-                                    Mux(uop.fp_single, UOpCode.FDIV_S,
-                                        UOpCode.FDIV_D)),
-                                uop.fu_type.eq(FUType.FDIV),
-                            ]
+                                    with m.Case(0b00011):  # fdiv.fmt
+                                        m.d.comb += [
+                                            UOPC(
+                                                getattr(
+                                                    UOpCode, f'FDIV_{fmt}')),
+                                            uop.fu_type.eq(FUType.FDIV),
+                                        ]
 
-                        with m.Case(0b01011):  # fsqrt.fmt
-                            m.d.comb += [
-                                UOPC(
-                                    Mux(uop.fp_single, UOpCode.FSQRT_S,
-                                        UOpCode.FSQRT_D)),
-                                uop.fu_type.eq(FUType.FDIV),
-                                uop.lrs2_rtype.eq(RegisterType.FLT),
-                            ]
+                                    with m.Case(0b01011):  # fsqrt.fmt
+                                        m.d.comb += [
+                                            UOPC(
+                                                getattr(
+                                                    UOpCode, f'FSQRT_{fmt}')),
+                                            uop.fu_type.eq(FUType.FDIV),
+                                            uop.lrs2_rtype.eq(
+                                                RegisterType.FLT),
+                                        ]
 
-                        with m.Case(0b00100):  # fsgnj.fmt
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FSGNJ_S,
-                                    UOpCode.FSGNJ_D))
+                                    with m.Case(0b00100):  # fsgnj.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FSGNJ_{fmt}'))
 
-                        with m.Case(0b00101):  # fmin/fmax.fmt
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FMINMAX_S,
-                                    UOpCode.FMINMAX_D))
+                                    with m.Case(0b00101):  # fmin/fmax.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FMINMAX_{fmt}'))
 
-                        with m.Case(0b01000):  # fcvt.fmt.fmt
-                            m.d.comb += [
-                                UOPC(
-                                    Mux(uop.fp_single, UOpCode.FCVT_S_D,
-                                        UOpCode.FCVT_D_S)),
-                                uop.lrs2_rtype.eq(RegisterType.X),
-                                IMM_SEL_I,
-                            ]
+                                    with m.Case(0b01000):  # fcvt.fmt.fmt
+                                        m.d.comb += [
+                                            uop.lrs2_rtype.eq(RegisterType.X),
+                                            IMM_SEL_I,
+                                        ]
 
-                        with m.Case(0b10100):  # feq/flt/fle.fmt
-                            m.d.comb += [
-                                UOPC(
-                                    Mux(uop.fp_single, UOpCode.CMPR_S,
-                                        UOpCode.CMPR_D)),
-                                uop.fu_type.eq(FUType.F2I),
-                                uop.dst_rtype.eq(RegisterType.FIX),
-                            ]
+                                        with m.Switch(inuop.inst[20:22]):
+                                            for src_fmt in fmts:
+                                                if src_fmt == fmt:
+                                                    continue
 
-                        with m.Case(0b11000):  # fcvt.int.fmt
-                            m.d.comb += [
-                                UOPC(
-                                    Mux(uop.fp_single, UOpCode.FCVT_X_S,
-                                        UOpCode.FCVT_X_D)),
-                                uop.fu_type.eq(FUType.F2I),
-                                uop.dst_rtype.eq(RegisterType.FIX),
-                                uop.lrs2_rtype.eq(RegisterType.X),
-                                IMM_SEL_I,
-                            ]
+                                                with m.Case(
+                                                        getattr(
+                                                            FPFormat,
+                                                            src_fmt)):
+                                                    m.d.comb += UOPC(
+                                                        getattr(
+                                                            UOpCode,
+                                                            f'FCVT_{fmt}_{src_fmt}'
+                                                        ))
 
-                        with m.Case(0b11010):  # fcvt.fmt.int
-                            m.d.comb += [
-                                UOPC(
-                                    Mux(uop.fp_single, UOpCode.FCVT_S_X,
-                                        UOpCode.FCVT_D_X)),
-                                uop.iq_type.eq(IssueQueueType.INT),
-                                uop.fu_type.eq(FUType.I2F),
-                                uop.lrs1_rtype.eq(RegisterType.FIX),
-                                uop.lrs2_rtype.eq(RegisterType.X),
-                                IMM_SEL_I,
-                            ]
+                                            with m.Default():
+                                                m.d.comb += ILL_INSN
 
-                        with m.Case(0b11100):
-                            m.d.comb += [
-                                uop.fu_type.eq(FUType.F2I),
-                                uop.dst_rtype.eq(RegisterType.FIX),
-                                uop.lrs2_rtype.eq(RegisterType.X),
-                                IMM_SEL_I,
-                            ]
+                                    with m.Case(0b10100):  # feq/flt/fle.fmt
+                                        m.d.comb += [
+                                            UOPC(
+                                                getattr(
+                                                    UOpCode, f'CMPR_{fmt}')),
+                                            uop.fu_type.eq(FUType.F2I),
+                                            uop.dst_rtype.eq(RegisterType.FIX),
+                                        ]
 
-                            with m.Switch(inuop.inst[12:15]):
-                                with m.Case(0b000):  # fmv.x.fmt
-                                    m.d.comb += UOPC(
-                                        Mux(uop.fp_single, UOpCode.FMV_X_S,
-                                            UOpCode.FMV_X_D))
+                                    with m.Case(0b11000):  # fcvt.int.fmt
+                                        m.d.comb += [
+                                            UOPC(
+                                                getattr(
+                                                    UOpCode, f'FCVT_X_{fmt}')),
+                                            uop.fu_type.eq(FUType.F2I),
+                                            uop.dst_rtype.eq(RegisterType.FIX),
+                                            uop.lrs2_rtype.eq(RegisterType.X),
+                                            IMM_SEL_I,
+                                        ]
 
-                                with m.Case(0b001):  # fclass.fmt
-                                    m.d.comb += UOPC(
-                                        Mux(uop.fp_single, UOpCode.FCLASS_S,
-                                            UOpCode.FCLASS_D)),
+                                    with m.Case(0b11010):  # fcvt.fmt.int
+                                        m.d.comb += [
+                                            UOPC(
+                                                getattr(
+                                                    UOpCode, f'FCVT_{fmt}_X')),
+                                            uop.iq_type.eq(IssueQueueType.INT),
+                                            uop.fu_type.eq(FUType.I2F),
+                                            uop.lrs1_rtype.eq(
+                                                RegisterType.FIX),
+                                            uop.lrs2_rtype.eq(RegisterType.X),
+                                            IMM_SEL_I,
+                                        ]
 
-                                with m.Default():
-                                    m.d.comb += ILL_INSN
+                                    with m.Case(0b11100):
+                                        m.d.comb += [
+                                            uop.fu_type.eq(FUType.F2I),
+                                            uop.dst_rtype.eq(RegisterType.FIX),
+                                            uop.lrs2_rtype.eq(RegisterType.X),
+                                            IMM_SEL_I,
+                                        ]
 
-                        with m.Case(0b11110):  # fmv.fmt.x
-                            m.d.comb += [
-                                UOPC(
-                                    Mux(uop.fp_single, UOpCode.FMV_S_X,
-                                        UOpCode.FMV_D_X)),
-                                uop.iq_type.eq(IssueQueueType.INT),
-                                uop.fu_type.eq(FUType.I2F),
-                                uop.lrs1_rtype.eq(RegisterType.FIX),
-                                uop.lrs2_rtype.eq(RegisterType.X),
-                                IMM_SEL_I,
-                            ]
+                                        with m.Switch(inuop.inst[12:15]):
+                                            with m.Case(0b000):  # fmv.x.fmt
+                                                m.d.comb += UOPC(
+                                                    getattr(
+                                                        UOpCode,
+                                                        f'FMV_X_{fmt}'))
+
+                                            with m.Case(0b001):  # fclass.fmt
+                                                m.d.comb += UOPC(
+                                                    getattr(
+                                                        UOpCode,
+                                                        f'FCLASS_{fmt}')),
+
+                                            with m.Default():
+                                                m.d.comb += ILL_INSN
+
+                                    with m.Case(0b11110):  # fmv.fmt.x
+                                        m.d.comb += [
+                                            UOPC(
+                                                getattr(
+                                                    UOpCode, f'FMV_{fmt}_X')),
+                                            uop.iq_type.eq(IssueQueueType.INT),
+                                            uop.fu_type.eq(FUType.I2F),
+                                            uop.lrs1_rtype.eq(
+                                                RegisterType.FIX),
+                                            uop.lrs2_rtype.eq(RegisterType.X),
+                                            IMM_SEL_I,
+                                        ]
+
+                                    with m.Default():
+                                        m.d.comb += ILL_INSN
 
                         with m.Default():
                             m.d.comb += ILL_INSN
@@ -1046,33 +1070,32 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                     ]
 
                     with m.Switch(inuop.inst[25:27]):
-                        with m.Case(FPFormat.S):
-                            m.d.comb += uop.fp_single.eq(1)
-                        with m.Case(FPFormat.D):
-                            pass
+                        fmts = ['S', 'D'] + (['H'] if self.use_zfh else [])
+                        for fmt in fmts:
+                            fp_fmt = getattr(FPFormat, fmt)
+                            with m.Case(fp_fmt):
+                                if fp_fmt == FPFormat.S:
+                                    m.d.comb += uop.fp_single.eq(1)
+
+                                with m.Switch(inuop.inst[0:7]):  # fmadd.fmt
+                                    with m.Case(0b1000011):
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FMADD_{fmt}'))
+
+                                    with m.Case(0b1000111):  # fmsub.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FMSUB_{fmt}'))
+
+                                    with m.Case(0b1001011):  # fnmadd.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FNMADD_{fmt}'))
+
+                                    with m.Case(0b1001111):  # fnmsub.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FNMSUB_{fmt}'))
+
                         with m.Default():
                             m.d.comb += ILL_INSN
-
-                    with m.Switch(inuop.inst[0:7]):  # fmadd.fmt
-                        with m.Case(0b1000011):
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FMADD_S,
-                                    UOpCode.FMADD_D))
-
-                        with m.Case(0b1000111):  # fmsub.fmt
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FMSUB_S,
-                                    UOpCode.FMSUB_D))
-
-                        with m.Case(0b1001011):  # fnmadd.fmt
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FNMADD_S,
-                                    UOpCode.FNMADD_D))
-
-                        with m.Case(0b1001111):  # fnmsub.fmt
-                            m.d.comb += UOPC(
-                                Mux(uop.fp_single, UOpCode.FNMSUB_S,
-                                    UOpCode.FNMSUB_D))
 
             with m.Case(OPV('AMOADD')):
                 m.d.comb += [

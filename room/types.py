@@ -46,6 +46,7 @@ class HasCoreParams:
         self.use_zbb = params.get('use_zbb', False)
         self.use_zbs = params.get('use_zbs', False)
         self.use_zicond = params.get('use_zicond', False)
+        self.use_zfh = params.get('use_zfh', False)
 
         if not self.is_groom:
             self.core_width = params['core_width']

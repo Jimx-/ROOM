@@ -92,7 +92,7 @@ class FType:
                    is_signalling, is_quiet)
 
 
-FType.FP16 = FType(5, 11)
+FType.FP16 = FType(5, 10)
 FType.FP32 = FType(8, 23)
 FType.FP64 = FType(11, 52)
 
@@ -108,7 +108,7 @@ class HasFPUParams(HasCoreParams):
     def __init__(self, params, *args, **kwargs):
         super().__init__(params)
 
-        self.min_flen = 32
+        self.min_flen = 16 if self.use_zfh else 32
         self.float_types = Array(
             (fmt, typ) for fmt, typ in _fmt_ftypes.items()
             if typ.width >= self.min_flen and typ.width <= self.flen)
@@ -607,6 +607,7 @@ class FPUDivSqrtMulti(Elaboratable):
         N_ITERS = {
             FPFormat.S: PREC_BITS // 4,
             FPFormat.D: PREC_BITS // 2 - 1,
+            FPFormat.H: PREC_BITS // 8,
         }
 
         in_a = Record(self.ftyp.record_layout())
@@ -736,10 +737,10 @@ class FPUDivSqrtMulti(Elaboratable):
         do_adjust = count == max_iters
 
         with m.Switch(fmt_sel):
-            for fmt in [FPFormat.S, FPFormat.D]:
+            for fmt, iters in N_ITERS.items():
                 with m.Case(fmt):
                     m.d.comb += max_iters.eq(
-                        N_ITERS[fmt] + 1
+                        iters + 1
                     )  # +1 cycle to adjust remainder for detecting inexact
 
         with m.If(self.kill | (count == max_iters)):
@@ -819,7 +820,11 @@ class FPUDivSqrtMulti(Elaboratable):
                 x[:self.ftyp.man - FType.FP32.man - 1],
                 Mux(fmt_sel == FPFormat.S, carry,
                     x[self.ftyp.man - FType.FP32.man - 1]),
-                x[self.ftyp.man - FType.FP32.man:],
+                x[self.ftyp.man - FType.FP32.man:self.ftyp.man -
+                  FType.FP16.man - 1],
+                Mux(fmt_sel == FPFormat.H, carry,
+                    x[self.ftyp.man - FType.FP16.man - 1]),
+                x[self.ftyp.man - FType.FP16.man:],
             )
 
         # Normal: R = 2 * R - D

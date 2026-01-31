@@ -518,7 +518,7 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
         cast_en = Signal()
 
         with m.Switch(self.req.bits.uop.opcode):
-            with m.Case(UOpCode.FCVT_S_X, UOpCode.FCVT_D_X):
+            with m.Case(UOpCode.FCVT_S_X, UOpCode.FCVT_D_X, UOpCode.FCVT_H_X):
                 m.d.comb += cast_en.eq(1)
 
         in_pipe = m.submodules.in_pipe = Pipe(width=len(
@@ -540,22 +540,15 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
             ifpu.inp.bits.rm.eq(self.frm),
             ifpu.inp.bits.in1.eq(self.req.bits.rs1_data),
             ifpu.inp.bits.dst_fmt.eq(
-                Mux(self.req.bits.uop.fp_single, FPFormat.S, FPFormat.D)),
+                self.tag_to_format(self.req.bits.uop.fp_out_tag)),
             ifpu.inp.bits.int_fmt.eq(Cat(typ[1], 1)),
-        ]
-
-        out_single_pipe = m.submodules.out_single_pipe = Pipe(
-            width=1, depth=self.latency)
-        m.d.comb += [
-            out_single_pipe.in_valid.eq(self.req.valid),
-            out_single_pipe.in_data.eq(self.req.bits.uop.fp_single),
         ]
 
         m.d.comb += [
             self.resp.bits.data.eq(
                 self.nan_box(
                     Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits),
-                    ~out_single_pipe.out.bits)),
+                    self.resp.bits.uop.fp_out_tag)),
             self.resp.bits.fflags.valid.eq(ifpu.out.valid),
             self.resp.bits.fflags.bits.eq(ifpu.out.bits.status),
         ]
@@ -607,14 +600,14 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
             generate_imm_rm(self.req.bits.uop.imm_packed))
 
         with m.Switch(self.req.bits.uop.opcode):
-            with m.Case(UOpCode.FADD_S, UOpCode.FADD_D):
+            with m.Case(UOpCode.FADD_S, UOpCode.FADD_D, UOpCode.FADD_H):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
                     swap32.eq(1),
                 ]
 
-            with m.Case(UOpCode.FSUB_S, UOpCode.FSUB_D):
+            with m.Case(UOpCode.FSUB_S, UOpCode.FSUB_D, UOpCode.FSUB_H):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.ADD),
@@ -622,39 +615,39 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                     swap32.eq(1),
                 ]
 
-            with m.Case(UOpCode.FMUL_S, UOpCode.FMUL_D):
+            with m.Case(UOpCode.FMUL_S, UOpCode.FMUL_D, UOpCode.FMUL_H):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.MUL),
                 ]
 
-            with m.Case(UOpCode.FMADD_S, UOpCode.FMADD_D):
+            with m.Case(UOpCode.FMADD_S, UOpCode.FMADD_D, UOpCode.FMADD_H):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
                 ]
 
-            with m.Case(UOpCode.FMSUB_S, UOpCode.FMSUB_D):
+            with m.Case(UOpCode.FMSUB_S, UOpCode.FMSUB_D, UOpCode.FMSUB_H):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FMADD),
                     fma_op_mod.eq(1),
                 ]
 
-            with m.Case(UOpCode.FNMSUB_S, UOpCode.FNMSUB_D):
+            with m.Case(UOpCode.FNMSUB_S, UOpCode.FNMSUB_D, UOpCode.FNMSUB_H):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
                 ]
 
-            with m.Case(UOpCode.FNMADD_S, UOpCode.FNMADD_D):
+            with m.Case(UOpCode.FNMADD_S, UOpCode.FNMADD_D, UOpCode.FNMADD_H):
                 m.d.comb += [
                     fma_en.eq(1),
                     fma_op.eq(FPUOperator.FNMSUB),
                     fma_op_mod.eq(1),
                 ]
 
-            with m.Case(UOpCode.FCVT_X_S, UOpCode.FCVT_X_D):
+            with m.Case(UOpCode.FCVT_X_S, UOpCode.FCVT_X_D, UOpCode.FCVT_X_H):
                 typ = generate_imm_type(self.req.bits.uop.imm_packed)
 
                 m.d.comb += [
@@ -664,31 +657,33 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                     fmt_int.eq(Cat(typ[1], 1)),
                 ]
 
-            with m.Case(UOpCode.FCVT_D_S, UOpCode.FCVT_S_D):
+            with m.Case(UOpCode.FCVT_D_S, UOpCode.FCVT_S_D, UOpCode.FCVT_H_S,
+                        UOpCode.FCVT_S_H, UOpCode.FCVT_D_H, UOpCode.FCVT_H_D):
                 m.d.comb += [
                     cast_en.eq(1),
                     fma_op.eq(FPUOperator.F2F),
                 ]
 
-            with m.Case(UOpCode.FSGNJ_S, UOpCode.FSGNJ_D):
+            with m.Case(UOpCode.FSGNJ_S, UOpCode.FSGNJ_D, UOpCode.FSGNJ_H):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.SGNJ),
                 ]
 
-            with m.Case(UOpCode.FMINMAX_S, UOpCode.FMINMAX_D):
+            with m.Case(UOpCode.FMINMAX_S, UOpCode.FMINMAX_D,
+                        UOpCode.FMINMAX_H):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.MINMAX),
                 ]
 
-            with m.Case(UOpCode.CMPR_S, UOpCode.CMPR_D):
+            with m.Case(UOpCode.CMPR_S, UOpCode.CMPR_D, UOpCode.CMPR_H):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.CMP),
                 ]
 
-            with m.Case(UOpCode.FCLASS_S, UOpCode.FCLASS_D):
+            with m.Case(UOpCode.FCLASS_S, UOpCode.FCLASS_D, UOpCode.FCLASS_H):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.CLASSIFY),
@@ -724,6 +719,14 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
         m.d.comb += sfma.inp.valid.eq(self.req.valid & fma_en
                                       & (fmt_out == FPFormat.S))
 
+        if self.use_zfh:
+            hfma = m.submodules.hfma = FPUFMA(16,
+                                              FPFormat.H,
+                                              latency=self.fma_latency)
+            set_fu_input(hfma.inp)
+            m.d.comb += hfma.inp.valid.eq(self.req.valid & fma_en
+                                          & (fmt_out == FPFormat.H))
+
         fpiu = m.submodules.fpiu = FPUCastMulti(latency=self.fma_latency)
         set_fu_input(fpiu.inp)
         m.d.comb += fpiu.inp.valid.eq(self.req.valid & cast_en)
@@ -741,6 +744,14 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
         set_fu_input(scmp.inp)
         m.d.comb += scmp.inp.valid.eq(self.req.valid & cmp_en
                                       & (fmt_in == FPFormat.S))
+
+        if self.use_zfh:
+            hcmp = m.submodules.hcmp = FPUComp(16,
+                                               FPFormat.H,
+                                               latency=self.fma_latency)
+            set_fu_input(hcmp.inp)
+            m.d.comb += hcmp.inp.valid.eq(self.req.valid & cmp_en
+                                          & (fmt_in == FPFormat.H))
 
         fmv_data = Signal.like(in_pipe.out.bits)
         m.d.comb += fmv_data.eq(
@@ -784,6 +795,22 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                             self.type_tag.I, self.type_tag.S))),
                 self.resp.bits.fflags.bits.eq(scmp.out.bits.status),
             ]
+        if self.use_zfh:
+            with m.Elif(hfma.out.valid):
+                m.d.comb += [
+                    self.resp.bits.data.eq(
+                        self.nan_box(hfma.out.bits.data, self.type_tag.H)),
+                    self.resp.bits.fflags.bits.eq(hfma.out.bits.status),
+                ]
+            with m.Elif(hcmp.out.valid):
+                m.d.comb += [
+                    self.resp.bits.data.eq(
+                        self.nan_box(
+                            hcmp.out.bits.data,
+                            Mux(self.resp.bits.uop.fu_type_has(FUType.F2I),
+                                self.type_tag.I, self.type_tag.H))),
+                    self.resp.bits.fflags.bits.eq(hcmp.out.bits.status),
+                ]
 
         return m
 
@@ -804,7 +831,8 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
             fdiv.a.eq(self.req.bits.rs1_data),
             fdiv.b.eq(self.req.bits.rs2_data),
             fdiv.is_sqrt.eq((self.req.bits.uop.opcode == UOpCode.FSQRT_S)
-                            | (self.req.bits.uop.opcode == UOpCode.FSQRT_D)),
+                            | (self.req.bits.uop.opcode == UOpCode.FSQRT_D)
+                            | (self.req.bits.uop.opcode == UOpCode.FSQRT_H)),
             fdiv.fmt.eq(self.tag_to_format(self.req.bits.uop.fp_in_tag)),
             fdiv.rm.eq(self.frm),
             fdiv.in_valid.eq(self.req.valid),
