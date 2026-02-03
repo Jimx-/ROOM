@@ -44,11 +44,9 @@
     bnez x1, 2b                     ;\
     addi t0, t0, 4                  ;\
     bgtu t1, t0, 1b                 ;\
-    li x1, 1                        ;\
-1:                                  ;\
-    sw x1, tohost, t2               ;\
+3:                                  ;\
     wfi                             ;\
-    j 1b
+    j 3b
 
 // clang-format on
 

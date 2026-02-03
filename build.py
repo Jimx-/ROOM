@@ -166,8 +166,10 @@ def generate_trace_if(m, core, output_dir):
         signals[f'i_mem_debug{i}_valid'] = mem_debug.valid
         signals[f'i_mem_debug{i}_uop_id'] = mem_debug.bits.uop_id
         signals[f'i_mem_debug{i}_opcode'] = mem_debug.bits.opcode
+        signals[f'i_mem_debug{i}_mem_size'] = mem_debug.bits.mem_size
         signals[f'i_mem_debug{i}_addr'] = mem_debug.bits.addr
         signals[f'i_mem_debug{i}_data'] = mem_debug.bits.data
+        signals[f'i_mem_debug{i}_data_valid'] = mem_debug.bits.data_valid
         signals[f'i_mem_debug{i}_prs1'] = mem_debug.bits.prs1
         signals[f'i_mem_debug{i}_prs2'] = mem_debug.bits.prs2
 

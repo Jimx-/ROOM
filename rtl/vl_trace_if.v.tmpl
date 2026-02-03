@@ -3,7 +3,7 @@
 import "DPI-C" function void dpi_trace_if(int uop_id, longint pc, int insn);
 import "DPI-C" function void dpi_trace_id(int uop_id, int br_mask);
 import "DPI-C" function void dpi_trace_ex(int uop_id, int opcode, int prs1, longint rs1_data, int prs2, longint rs2_data);
-import "DPI-C" function void dpi_trace_mem(int uop_id, int opcode, longint addr, longint data, int prs1, int prs2);
+import "DPI-C" function void dpi_trace_mem(int uop_id, int opcode, int mem_size, longint addr, longint data, bit data_valid, int prs1, int prs2);
 import "DPI-C" function void dpi_trace_wb(int uop_id, int pdst, longint data);
 import "DPI-C" function void dpi_trace_commit(int uop_id);
 import "DPI-C" function void dpi_trace_exception(longint cause, int insn);
@@ -44,8 +44,10 @@ module vl_trace_if
    input wire                                     mem_debug{{i}}_valid,
    input wire [{{UOP_ID_WIDTH}}-1:0]              mem_debug{{i}}_uop_id,
    input wire [15:0]                              mem_debug{{i}}_opcode,
+   input wire [1:0]                               mem_debug{{i}}_mem_size,
    input wire [63:0]                              mem_debug{{i}}_addr,
    input wire [63:0]                              mem_debug{{i}}_data,
+   input wire                                     mem_debug{{i}}_data_valid,
    input wire [$clog2({{core.num_pregs}}-1):0]    mem_debug{{i}}_prs1,
    input wire [$clog2({{core.num_pregs}}-1):0]    mem_debug{{i}}_prs2,
    // {% endfor %}
@@ -111,8 +113,8 @@ module vl_trace_if
 
          // {% for i in range(core.mem_width) %}
          if (mem_debug{{i}}_valid) begin
-            dpi_trace_mem(mem_debug{{i}}_uop_id, mem_debug{{i}}_opcode, mem_debug{{i}}_addr, mem_debug{{i}}_data,
-                          mem_debug{{i}}_prs1, mem_debug{{i}}_prs2);
+            dpi_trace_mem(mem_debug{{i}}_uop_id, mem_debug{{i}}_opcode, mem_debug{{i}}_mem_size, mem_debug{{i}}_addr,
+                          mem_debug{{i}}_data, mem_debug{{i}}_data_valid, mem_debug{{i}}_prs1, mem_debug{{i}}_prs2);
          end
          // {% endfor %}
 

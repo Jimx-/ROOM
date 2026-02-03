@@ -12,9 +12,11 @@ public:
         : tohost_(tohost), fromhost_(fromhost)
     {}
 
-    bool write(uint64_t addr, uint64_t data);
+    bool write(uint64_t addr, uint64_t data, int log_size);
 
     bool should_stop() const { return exitcode_.has_value(); }
+
+    int exit_code() const { return exitcode_.value_or(0) >> 1; }
 
 private:
     class Command {
@@ -33,7 +35,7 @@ private:
 
     uint64_t tohost_;
     uint64_t fromhost_;
-    std::optional<uint64_t> exitcode_;
+    std::optional<int> exitcode_;
 };
 
 } // namespace room

@@ -56,10 +56,10 @@ static void dromajo_error_log(int hartid, const char* fmt, ...)
 }
 #endif
 
-Tracer::Tracer(uint64_t memory_addr, size_t memory_size,
+Tracer::Tracer(Htif* htif, uint64_t memory_addr, size_t memory_size,
                std::string_view bootrom, std::string_view dtb,
                std::string_view initrd, std::string_view trace_log_path)
-    : should_stop_(false), cycle_(0), last_commit_cycle_(0)
+    : htif_(htif), should_stop_(false), cycle_(0), last_commit_cycle_(0)
 {
     if (!trace_log_path.empty()) {
         trace_log_ =
@@ -176,8 +176,8 @@ void Tracer::trace_ex(int uop_id, int opcode, int prs1, uint64_t rs1_data,
     }
 }
 
-void Tracer::trace_mem(int uop_id, int opcode, uint64_t addr, uint64_t data,
-                       int prs1, int prs2)
+void Tracer::trace_mem(int uop_id, int opcode, int mem_size, uint64_t addr,
+                       uint64_t data, bool data_valid, int prs1, int prs2)
 {
     auto it = insts_.find(uop_id);
     if (it == insts_.end()) {
@@ -185,21 +185,28 @@ void Tracer::trace_mem(int uop_id, int opcode, uint64_t addr, uint64_t data,
         return;
     }
 
+    it->second.mem_size = mem_size;
     it->second.prs1 = prs1;
     it->second.prs2 = prs2;
 
-    if (opcode == 2)
+    if (opcode == 2) {
         it->second.addr = addr;
-    else if (opcode == 3)
+        it->second.is_store = true;
+    } else if (opcode == 3) {
         it->second.data = data;
-    else {
+        it->second.is_store = true;
+    } else
         it->second.addr = addr;
+
+    if (data_valid) {
         it->second.data = data;
+        it->second.is_store = true;
     }
 
     if (trace_log_) {
-        (*trace_log_) << fmt::format("MEM {} {} {} {} {:x} {:x}", uop_id,
-                                     opcode, prs1, prs2, addr, data)
+        (*trace_log_) << fmt::format("MEM {} {} {} {} {} {:x} {:x} {}", uop_id,
+                                     opcode, mem_size, prs1, prs2, addr, data,
+                                     static_cast<int>(data_valid))
                       << std::endl;
     }
 }
@@ -308,6 +315,10 @@ void Tracer::commit(const Instruction& inst)
 
     last_commit_cycle_ = cycle_;
 
+    if (htif_ && inst.is_store) {
+        htif_->write(inst.addr, inst.data, inst.mem_size);
+    }
+
 #ifdef DROMAJO
     int exit_code = dromajo_cosim_step(dromajo_state_, 0, inst.pc, inst.inst,
                                        inst.rd_data, 0, true);
@@ -346,13 +357,14 @@ extern "C" void dpi_trace_ex(int uop_id, int opcode, int prs1,
 #endif
 }
 
-extern "C" void dpi_trace_mem(int uop_id, int opcode, uint64_t addr,
-                              uint64_t data, int prs1, int prs2)
+extern "C" void dpi_trace_mem(int uop_id, int opcode, int mem_size,
+                              uint64_t addr, uint64_t data, bool data_valid,
+                              int prs1, int prs2)
 {
     spdlog::trace("MEM uop_id={}", uop_id);
 #ifdef ITRACE
-    room::Tracer::get_singleton().trace_mem(uop_id, opcode, addr, data, prs1,
-                                            prs2);
+    room::Tracer::get_singleton().trace_mem(uop_id, opcode, mem_size, addr,
+                                            data, data_valid, prs1, prs2);
 #endif
 }
 

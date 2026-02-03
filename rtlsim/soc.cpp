@@ -97,8 +97,8 @@ public:
         if (!sd_image.empty()) sdcard_.reset(new SDCard(sd_image));
 
 #ifdef ITRACE
-        (void)new Tracer(memory_addr, memory_size, bootrom, dtb, initrd,
-                         trace_log);
+        (void)new Tracer(htif_.get(), memory_addr, memory_size, bootrom, dtb,
+                         initrd, trace_log);
 #endif
 
 #if defined(VCD_OUTPUT) || defined(FST_OUTPUT)
@@ -231,7 +231,7 @@ public:
     {
         const auto* pr = get_memory_range(addr);
 
-        if (htif_ && htif_->write(addr, data)) return;
+        if (htif_ && htif_->write(addr, data, log_size)) return;
 
         uint64_t bit_mask = 0;
 

@@ -645,10 +645,12 @@ class TraceParser:
             elif cmd == 'MEM':
                 id = int(args[0])
                 opcode = int(args[1])
-                prs1 = int(args[2])
-                prs2 = int(args[3])
-                addr = int(args[4], base=16)
-                data = int(args[5], base=16)
+                mem_size = int(args[2])
+                prs1 = int(args[3])
+                prs2 = int(args[4])
+                addr = int(args[5], base=16)
+                data = int(args[6], base=16)
+                data_valid = int(args[7])
 
                 inst = self.insts.get(id)
                 if inst is None:
@@ -663,6 +665,8 @@ class TraceParser:
                     inst.data = data
                 else:
                     inst.addr = addr
+
+                if data_valid:
                     inst.data = data
 
             elif cmd == 'WB':

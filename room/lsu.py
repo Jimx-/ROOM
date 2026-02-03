@@ -27,6 +27,8 @@ class LSUDebug(HasCoreParams, Record):
             ('opcode', UOpCode),
             ('addr', self.xlen),
             ('data', self.xlen),
+            ('data_valid', 1),
+            ('mem_size', 2),
             ('prs1', range(self.num_pregs)),
             ('prs2', range(self.num_pregs)),
         ],
@@ -396,6 +398,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                     lsu_debug.bits.addr.eq(
                         sign_extend(req.bits.addr, self.xlen)),
                     lsu_debug.bits.data.eq(req.bits.data),
+                    lsu_debug.bits.data_valid.eq(req.bits.uop.is_std),
+                    lsu_debug.bits.mem_size.eq(req.bits.uop.mem_size),
                     lsu_debug.bits.prs1.eq(req.bits.uop.prs1),
                     lsu_debug.bits.prs2.eq(req.bits.uop.prs2),
                 ]
