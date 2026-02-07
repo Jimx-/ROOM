@@ -48,3 +48,8 @@ int Uart::tick(int i_tx)
 }
 
 } // namespace room
+
+extern "C" void dpi_putchar(int ch)
+{
+    std::cout << std::unitbuf << (char)ch;
+}

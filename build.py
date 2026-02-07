@@ -10,6 +10,7 @@ from room import Core
 from roomsoc.soc import SoC
 from roomsoc.interconnect import axi, wishbone, tilelink as tl
 from roomsoc.interconnect.stream import Decoupled
+from roomsoc.peripheral import Peripheral
 from roomsoc.peripheral.l2cache import L2Cache
 from roomsoc.peripheral.uart import UART
 from roomsoc.peripheral.debug import JTAGInterface, DebugModule
@@ -284,6 +285,35 @@ class JTAGDPI(Elaboratable):
         return m
 
 
+class DebugConsole(Peripheral, Elaboratable):
+
+    def __init__(self, *, name=None):
+        super().__init__(name=name)
+
+        bank = self.csr_bank()
+        self._enabled = bank.csr(1, 'w')
+        self._data = bank.csr(8, 'rw')
+        self._status = bank.csr(32, 'r')
+
+        self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
+        self.bus = self._bridge.bus
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.bridge = self._bridge
+
+        m.submodules.debug_console = Instance(
+            'debug_console',
+            #
+            i_clk_i=ClockSignal(),
+            i_rst_i=ResetSignal(),
+            i_dat_i=self._data.w_data,
+            i_we_i=self._data.w_stb,
+        )
+
+        return m
+
+
 class Top(Elaboratable):
 
     mem_map = {
@@ -509,6 +539,10 @@ class Top(Elaboratable):
         soc.add_peripheral('clint', clint)
 
         soc.add_peripheral('plic', plic)
+
+        if self.sim:
+            dbg_con = DebugConsole()
+            soc.add_peripheral('dbg_con', dbg_con)
 
         raw_core.pma_regions = list(soc.regions())
 
