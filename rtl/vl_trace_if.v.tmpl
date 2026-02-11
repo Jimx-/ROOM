@@ -11,84 +11,132 @@ import "DPI-C" function void dpi_trace_branch_mispredict(int mispredict_mask);
 import "DPI-C" function void dpi_trace_branch_resolve(int resolve_mask);
 import "DPI-C" function void dpi_trace_flush();
 
+// {% if core.use_vector %}
+// Vector interface
+import "DPI-C" function void dpi_trace_vid(int uop_id, int vlmul, int vsew, int vl);
+import "DPI-C" function void dpi_trace_vex(int uop_id, int opcode, int lrs1, bit [{{core.vlen}}-1:0] vs1_data, int lrs2, bit [{{core.vlen}}-1:0] vs2_data, int lrs3, bit [{{core.vlen}}-1:0] vs3_data, bit [{{core.vlen}}-1:0] mask, int vlen);
+import "DPI-C" function void dpi_trace_vwb(int uop_id, int ldst, bit [{{core.vlen}}-1:0] data, int vlen);
+// {% endif %}
+
 module vl_trace_if
   (
    // Instruction fetch
    // {% for i in range(core.fetch_width) %}
-   input wire                                     if_debug{{i}}_valid,
-   input wire [{{UOP_ID_WIDTH}}-1:0]              if_debug{{i}}_uop_id,
-   input wire [63:0]                              if_debug{{i}}_pc,
-   input wire [31:0]                              if_debug{{i}}_inst,
+    input wire                                     if_debug{{i}}_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              if_debug{{i}}_uop_id,
+    input wire [63:0]                              if_debug{{i}}_pc,
+    input wire [31:0]                              if_debug{{i}}_inst,
    // {% endfor %}
 
    // Instruction decode
    // {% for i in range(core.core_width) %}
-   input wire                                     id_debug{{i}}_valid,
-   input wire [{{UOP_ID_WIDTH}}-1:0]              id_debug{{i}}_uop_id,
-   input wire [{{core.max_br_count}}-1:0]         id_debug{{i}}_br_mask,
+    input wire                                     id_debug{{i}}_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              id_debug{{i}}_uop_id,
+    input wire [{{core.max_br_count}}-1:0]         id_debug{{i}}_br_mask,
    // {% endfor %}
 
    // Execute
    // {% for i in range(core.int_width + core.use_vector) %}
-   input wire                                     ex_debug{{i}}_valid,
-   input wire [{{UOP_ID_WIDTH}}-1:0]              ex_debug{{i}}_uop_id,
-   input wire [15:0]                              ex_debug{{i}}_opcode,
-   input wire [$clog2({{core.num_pregs}}-1):0]    ex_debug{{i}}_prs1,
-   input wire [63:0]                              ex_debug{{i}}_rs1_data,
-   input wire [$clog2({{core.num_pregs}}-1):0]    ex_debug{{i}}_prs2,
-   input wire [63:0]                              ex_debug{{i}}_rs2_data,
+    input wire                                     ex_debug{{i}}_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              ex_debug{{i}}_uop_id,
+    input wire [15:0]                              ex_debug{{i}}_opcode,
+    input wire [$clog2({{core.num_pregs}})-1:0]    ex_debug{{i}}_prs1,
+    input wire [63:0]                              ex_debug{{i}}_rs1_data,
+    input wire [$clog2({{core.num_pregs}})-1:0]    ex_debug{{i}}_prs2,
+    input wire [63:0]                              ex_debug{{i}}_rs2_data,
    // {% endfor %}
 
    // Memory load/store
    // {% for i in range(core.mem_width) %}
-   input wire                                     mem_debug{{i}}_valid,
-   input wire [{{UOP_ID_WIDTH}}-1:0]              mem_debug{{i}}_uop_id,
-   input wire [15:0]                              mem_debug{{i}}_opcode,
-   input wire [1:0]                               mem_debug{{i}}_mem_size,
-   input wire [63:0]                              mem_debug{{i}}_addr,
-   input wire [63:0]                              mem_debug{{i}}_data,
-   input wire                                     mem_debug{{i}}_data_valid,
-   input wire [$clog2({{core.num_pregs}}-1):0]    mem_debug{{i}}_prs1,
-   input wire [$clog2({{core.num_pregs}}-1):0]    mem_debug{{i}}_prs2,
+    input wire                                     mem_debug{{i}}_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              mem_debug{{i}}_uop_id,
+    input wire [15:0]                              mem_debug{{i}}_opcode,
+    input wire [1:0]                               mem_debug{{i}}_mem_size,
+    input wire [63:0]                              mem_debug{{i}}_addr,
+    input wire [63:0]                              mem_debug{{i}}_data,
+    input wire                                     mem_debug{{i}}_data_valid,
+    input wire [$clog2({{core.num_pregs}})-1:0]    mem_debug{{i}}_prs1,
+    input wire [$clog2({{core.num_pregs}})-1:0]    mem_debug{{i}}_prs2,
    // {% endfor %}
 
    // Writeback
    // {% for i in range(core.int_width + core.mem_width + core.use_vector) %}
-   input wire                                     wb_debug{{i}}_valid,
-   input wire [{{UOP_ID_WIDTH}}-1:0]              wb_debug{{i}}_uop_id,
-   input wire [$clog2({{core.num_pregs}}-1):0]    wb_debug{{i}}_pdst,
-   input wire [63:0]                              wb_debug{{i}}_data,
+    input wire                                     wb_debug{{i}}_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              wb_debug{{i}}_uop_id,
+    input wire [$clog2({{core.num_pregs}})-1:0]    wb_debug{{i}}_pdst,
+    input wire [63:0]                              wb_debug{{i}}_data,
    // {% endfor %}
 
    // {% if core.core_debug.fp_wb_debug is defined %}
    // FP writeback
    // {% for i in range(core.core_debug.fp_wb_debug|length) %}
-   input wire                                     fp_wb_debug{{i}}_valid,
-   input wire [{{UOP_ID_WIDTH}}-1:0]              fp_wb_debug{{i}}_uop_id,
-   input wire [$clog2({{core.num_fp_pregs}}-1):0] fp_wb_debug{{i}}_pdst,
-   input wire [63:0]                              fp_wb_debug{{i}}_data,
+    input wire                                     fp_wb_debug{{i}}_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              fp_wb_debug{{i}}_uop_id,
+    input wire [$clog2({{core.num_fp_pregs}})-1:0] fp_wb_debug{{i}}_pdst,
+    input wire [63:0]                              fp_wb_debug{{i}}_data,
    // {% endfor %}
+   // {% endif %}
+
+   // {% if core.use_vector %}
+   // Vector instruction decode
+    input wire                                     vid_debug_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              vid_debug_uop_id,
+    input wire [2:0]                               vid_debug_vlmul,
+    input wire [2:0]                               vid_debug_vsew,
+    input wire [$clog2({{core.vlen}})-1:0]         vid_debug_vl,
+
+   // Vector execute
+    input wire                                     vex_debug_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              vex_debug_uop_id,
+    input wire [15:0]                              vex_debug_opcode,
+    input wire [4:0]                               vex_debug_lrs1,
+    input wire [{{core.vlen}}-1:0]                 vex_debug_vs1_data,
+    input wire [4:0]                               vex_debug_lrs2,
+    input wire [{{core.vlen}}-1:0]                 vex_debug_vs2_data,
+    input wire [4:0]                               vex_debug_lrs3,
+    input wire [{{core.vlen}}-1:0]                 vex_debug_vs3_data,
+    input wire [{{core.vlen}}-1:0]                 vex_debug_mask,
+
+   // Vector FP execute
+   // {% if core.vec_debug.fp_ex_debug is defined %}
+    input wire                                     vfp_ex_debug_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              vfp_ex_debug_uop_id,
+    input wire [15:0]                              vfp_ex_debug_opcode,
+    input wire [4:0]                               vfp_ex_debug_lrs1,
+    input wire [{{core.vlen}}-1:0]                 vfp_ex_debug_vs1_data,
+    input wire [4:0]                               vfp_ex_debug_lrs2,
+    input wire [{{core.vlen}}-1:0]                 vfp_ex_debug_vs2_data,
+    input wire [4:0]                               vfp_ex_debug_lrs3,
+    input wire [{{core.vlen}}-1:0]                 vfp_ex_debug_vs3_data,
+    input wire [{{core.vlen}}-1:0]                 vfp_ex_debug_mask,
+   // {% endif %}
+
+   // Vector writeback
+    input wire                                     vwb_debug_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              vwb_debug_uop_id,
+    input wire [4:0]                               vwb_debug_ldst,
+    input wire [{{core.vlen}}-1:0]                 vwb_debug_data,
    // {% endif %}
 
    // Commit
    // {% for i in range(core.core_width) %}
-   input wire                                     commit_debug{{i}}_valid,
-   input wire [{{UOP_ID_WIDTH}}-1:0]              commit_debug{{i}}_uop_id,
+    input wire                                     commit_debug{{i}}_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              commit_debug{{i}}_uop_id,
    // {% endfor %}
 
    // Exception
-   input wire                                     exc_debug_valid,
-   input wire [63:0]                              exc_debug_cause,
-   input wire [31:0]                              exc_debug_inst,
+    input wire                                     exc_debug_valid,
+    input wire [63:0]                              exc_debug_cause,
+    input wire [31:0]                              exc_debug_inst,
 
-   input wire [{{core.max_br_count}}-1:0]         branch_resolve,
-   input wire [{{core.max_br_count}}-1:0]         branch_mispredict,
+    input wire [{{core.max_br_count}}-1:0]         branch_resolve,
+    input wire [{{core.max_br_count}}-1:0]         branch_mispredict,
 
-   input wire                                     flush_pipeline,
+    input wire                                     flush_pipeline,
 
-   input wire                                     clk,
-   input wire                                     rst
-);
+    input wire                                     clk,
+    input wire                                     rst
+   );
 
    always @(posedge clk or negedge rst) begin
       if (~rst) begin
@@ -104,7 +152,7 @@ module vl_trace_if
          end
          // {% endfor %}
 
-         // {% for i in range(core.int_width) %}
+         // {% for i in range(core.int_width + core.use_vector) %}
          if (ex_debug{{i}}_valid) begin
             dpi_trace_ex(ex_debug{{i}}_uop_id, ex_debug{{i}}_opcode, ex_debug{{i}}_prs1, ex_debug{{i}}_rs1_data,
                          ex_debug{{i}}_prs2, ex_debug{{i}}_rs2_data);
@@ -118,13 +166,7 @@ module vl_trace_if
          end
          // {% endfor %}
 
-         // {% for i in range(core.int_width + core.mem_width) %}
-         if (wb_debug{{i}}_valid) begin
-            dpi_trace_wb(wb_debug{{i}}_uop_id, wb_debug{{i}}_pdst, wb_debug{{i}}_data);
-         end
-         // {% endfor %}
-
-         // {% for i in range(core.core_debug.fp_wb_debug|length) %}
+         // {% for i in range(core.int_width + core.mem_width + core.use_vector) %}
          if (wb_debug{{i}}_valid) begin
             dpi_trace_wb(wb_debug{{i}}_uop_id, wb_debug{{i}}_pdst, wb_debug{{i}}_data);
          end
@@ -136,6 +178,26 @@ module vl_trace_if
             dpi_trace_wb(fp_wb_debug{{i}}_uop_id, fp_wb_debug{{i}}_pdst, fp_wb_debug{{i}}_data);
          end
          // {% endfor %}
+         // {% endif %}
+
+         // {% if core.use_vector %}
+         if (vid_debug_valid) begin
+            dpi_trace_vid(vid_debug_uop_id, vid_debug_vlmul, vid_debug_vsew, vid_debug_vl);
+         end
+
+         if (vex_debug_valid) begin
+            dpi_trace_vex(vex_debug_uop_id, vex_debug_opcode, vex_debug_lrs1, vex_debug_vs1_data, vex_debug_lrs2, vex_debug_vs2_data, vex_debug_lrs3, vex_debug_vs3_data, vex_debug_mask, {{core.vlen}});
+         end
+
+         // {% if core.vec_debug.fp_ex_debug is defined %}
+         if (vfp_ex_debug_valid) begin
+            dpi_trace_vex(vfp_ex_debug_uop_id, vfp_ex_debug_opcode, vfp_ex_debug_lrs1, vfp_ex_debug_vs1_data, vfp_ex_debug_lrs2, vfp_ex_debug_vs2_data, vfp_ex_debug_lrs3, vfp_ex_debug_vs3_data, vfp_ex_debug_mask, {{core.vlen}});
+         end
+         // {% endif %}
+
+         if (vwb_debug_valid) begin
+            dpi_trace_vwb(vwb_debug_uop_id, vwb_debug_ldst, vwb_debug_data, {{core.vlen}});
+         end
          // {% endif %}
 
          // {% for i in range(core.core_width) %}

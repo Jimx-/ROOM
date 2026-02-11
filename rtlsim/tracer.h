@@ -36,6 +36,12 @@ public:
     void trace_branch_resolve(int resolve_mask);
     void trace_flush();
 
+    void trace_vid(int uop_id, int vlmul, int vsew, int vl);
+    void trace_vex(int uop_id, int opcode, int lrs1, const uint32_t vs1_data[],
+                   int lrs2, const uint32_t vs2_data[], int lrs3,
+                   const uint32_t vs3_data[], const uint32_t mask[], int vlen);
+    void trace_vwb(int uop_id, int ldst, const uint32_t data[], int vlen);
+
     void tick();
 
     bool should_stop() const { return should_stop_; }

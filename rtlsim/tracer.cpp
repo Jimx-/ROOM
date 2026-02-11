@@ -292,6 +292,58 @@ void Tracer::trace_flush()
     }
 }
 
+void Tracer::trace_vid(int uop_id, int vlmul, int vsew, int vl)
+{
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("VID {} {} {} {}", uop_id, vlmul, vsew, vl)
+                      << std::endl;
+    }
+}
+
+void Tracer::trace_vex(int uop_id, int opcode, int lrs1,
+                       const uint32_t vs1_data[], int lrs2,
+                       const uint32_t vs2_data[], int lrs3,
+                       const uint32_t vs3_data[], const uint32_t mask[],
+                       int vlen)
+{
+    auto print_vs_data = [this, vlen](const uint32_t vs_data[]) {
+        int num_data = vlen / (sizeof(uint32_t) << 3);
+        for (int i = num_data - 1; i >= 0; i--) {
+            (*trace_log_) << fmt::format("{:08x}", vs_data[i]);
+        }
+    };
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("VEX {} {}", uop_id, opcode);
+        (*trace_log_) << fmt::format(" {} ", lrs1);
+        print_vs_data(vs1_data);
+        (*trace_log_) << fmt::format(" {} ", lrs2);
+        print_vs_data(vs2_data);
+        (*trace_log_) << fmt::format(" {} ", lrs3);
+        print_vs_data(vs3_data);
+        (*trace_log_) << " ";
+        print_vs_data(mask);
+        (*trace_log_) << std::endl;
+    }
+}
+
+void Tracer::trace_vwb(int uop_id, int ldst, const uint32_t data[], int vlen)
+{
+    auto print_vs_data = [this, vlen](const uint32_t vs_data[]) {
+        int num_data = vlen / (sizeof(uint32_t) << 3);
+        for (int i = num_data - 1; i >= 0; i--) {
+            (*trace_log_) << fmt::format("{:08x}", vs_data[i]);
+        }
+    };
+
+    if (trace_log_) {
+        (*trace_log_) << fmt::format("VWB {}", uop_id);
+        (*trace_log_) << fmt::format(" {} ", ldst);
+        print_vs_data(data);
+        (*trace_log_) << std::endl;
+    }
+}
+
 void Tracer::tick()
 {
     cycle_++;
@@ -413,5 +465,38 @@ extern "C" void dpi_trace_flush(void)
     spdlog::trace("FLUSH");
 #ifdef ITRACE
     room::Tracer::get_singleton().trace_flush();
+#endif
+}
+
+extern "C" void dpi_trace_vid(int uop_id, int vlmul, int vsew, int vl)
+{
+    spdlog::trace("VID uop_id={} vlmul={} vsew={} vl={}", uop_id, vlmul, vsew,
+                  vl);
+#ifdef ITRACE
+    room::Tracer::get_singleton().trace_vid(uop_id, vlmul, vsew, vl);
+#endif
+}
+
+extern "C" void dpi_trace_vex(int uop_id, int opcode, int lrs1,
+                              const uint32_t vs1_data[], int lrs2,
+                              const uint32_t vs2_data[], int lrs3,
+                              const uint32_t vs3_data[], const uint32_t mask[],
+                              int vlen)
+{
+    spdlog::trace("VEX uop_id={} opcode={} lrs1={} lrs2={} lrs3={} vlen={}",
+                  uop_id, opcode, lrs1, lrs2, lrs3, vlen);
+#ifdef ITRACE
+    room::Tracer::get_singleton().trace_vex(uop_id, opcode, lrs1, vs1_data,
+                                            lrs2, vs2_data, lrs3, vs3_data,
+                                            mask, vlen);
+#endif
+}
+
+extern "C" void dpi_trace_vwb(int uop_id, int ldst, const uint32_t data[],
+                              int vlen)
+{
+    spdlog::trace("VWB uop_id={} ldst={} vlen={}", uop_id, ldst, vlen);
+#ifdef ITRACE
+    room::Tracer::get_singleton().trace_vwb(uop_id, ldst, data, vlen);
 #endif
 }

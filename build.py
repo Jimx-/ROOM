@@ -187,6 +187,45 @@ def generate_trace_if(m, core, output_dir):
             signals[f'i_fp_wb_debug{i}_pdst'] = wb_debug.bits.pdst
             signals[f'i_fp_wb_debug{i}_data'] = wb_debug.bits.data
 
+    if core.use_vector:
+        vid_debug = core.vec_debug.id_debug
+        signals['i_vid_debug_valid'] = vid_debug.valid
+        signals['i_vid_debug_uop_id'] = vid_debug.bits.uop_id
+        signals['i_vid_debug_vlmul'] = vid_debug.bits.vlmul
+        signals['i_vid_debug_vsew'] = vid_debug.bits.vsew
+        signals['i_vid_debug_vl'] = vid_debug.bits.vl
+
+        vex_debug = core.vec_debug.ex_debug
+        signals['i_vex_debug_valid'] = vex_debug.valid
+        signals['i_vex_debug_uop_id'] = vex_debug.bits.uop_id
+        signals['i_vex_debug_opcode'] = vex_debug.bits.opcode
+        signals['i_vex_debug_lrs1'] = vex_debug.bits.lrs1
+        signals['i_vex_debug_vs1_data'] = vex_debug.bits.vs1_data
+        signals['i_vex_debug_lrs2'] = vex_debug.bits.lrs2
+        signals['i_vex_debug_vs2_data'] = vex_debug.bits.vs2_data
+        signals['i_vex_debug_lrs3'] = vex_debug.bits.lrs3
+        signals['i_vex_debug_vs3_data'] = vex_debug.bits.vs3_data
+        signals['i_vex_debug_mask'] = vex_debug.bits.mask
+
+        if hasattr(core.vec_debug, 'fp_ex_debug'):
+            vex_debug = core.vec_debug.fp_ex_debug
+            signals['i_vfp_ex_debug_valid'] = vex_debug.valid
+            signals['i_vfp_ex_debug_uop_id'] = vex_debug.bits.uop_id
+            signals['i_vfp_ex_debug_opcode'] = vex_debug.bits.opcode
+            signals['i_vfp_ex_debug_lrs1'] = vex_debug.bits.lrs1
+            signals['i_vfp_ex_debug_vs1_data'] = vex_debug.bits.vs1_data
+            signals['i_vfp_ex_debug_lrs2'] = vex_debug.bits.lrs2
+            signals['i_vfp_ex_debug_vs2_data'] = vex_debug.bits.vs2_data
+            signals['i_vfp_ex_debug_lrs3'] = vex_debug.bits.lrs3
+            signals['i_vfp_ex_debug_vs3_data'] = vex_debug.bits.vs3_data
+            signals['i_vfp_ex_debug_mask'] = vex_debug.bits.mask
+
+        vwb_debug = core.vec_debug.wb_debug
+        signals['i_vwb_debug_valid'] = vwb_debug.valid
+        signals['i_vwb_debug_uop_id'] = vwb_debug.bits.uop_id
+        signals['i_vwb_debug_ldst'] = vwb_debug.bits.ldst
+        signals['i_vwb_debug_data'] = vwb_debug.bits.data
+
     for i, com_debug in enumerate(core.core_debug.commit_debug):
         signals[f'i_commit_debug{i}_valid'] = com_debug.valid
         signals[f'i_commit_debug{i}_uop_id'] = com_debug.bits.uop_id
