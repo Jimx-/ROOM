@@ -532,13 +532,17 @@ class VLoadGenerator(BaseLoadGenerator):
             with m.State('IDLE'):
                 is_seg = ~self.req.bits.uop.whole_reg & self.req.bits.uop.nf.any(
                 )
+                can_bypass = ~self.req.bits.uop.vl.any()
                 can_pack = (self.req.bits.uop.unit_stride |
                             (self.req.bits.uop.strided
                              & stride_cls.out[1:].any())) & ~is_seg
                 can_skip = ~self.req.bits.uop.vm & ~self.req.bits.uop.indexed
 
-                with m.If(self.req.valid & self.req.bits.uop.vl.any()):
-                    with m.If(can_pack):
+                with m.If(self.req.valid):
+                    with m.If(can_bypass):
+                        m.next = 'BYPASS'
+
+                    with m.Elif(can_pack):
                         m.d.comb += packed_gen.req.valid.eq(1)
                         m.next = 'PACK'
 
@@ -549,6 +553,16 @@ class VLoadGenerator(BaseLoadGenerator):
                     with m.Else():
                         m.d.comb += indexed_gen.req.valid.eq(1)
                         m.next = 'SCAN'
+
+            with m.State('BYPASS'):
+                m.d.comb += [
+                    self.resp.valid.eq(1),
+                    self.resp.bits.noop.eq(1),
+                    self.resp.bits.last.eq(1),
+                ]
+
+                with m.If(self.resp.fire):
+                    m.next = 'IDLE'
 
             with m.State('PACK'):
                 m.d.comb += packed_gen.resp.connect(self.resp)
@@ -1006,12 +1020,16 @@ class VStoreGenerator(BaseStoreGenerator):
             with m.State('IDLE'):
                 is_seg = ~self.req.bits.uop.whole_reg & self.req.bits.uop.nf.any(
                 )
+                can_bypass = ~self.req.bits.uop.vl.any()
                 can_pack = (self.req.bits.uop.unit_stride
                             & ~self.req.bits.uop.mask_ls) & ~is_seg
                 can_skip = ~self.req.bits.uop.vm & ~self.req.bits.uop.indexed
 
-                with m.If(self.req.valid & self.req.bits.uop.vl.any()):
-                    with m.If(can_pack):
+                with m.If(self.req.valid):
+                    with m.If(can_bypass):
+                        m.next = 'BYPASS'
+
+                    with m.Elif(can_pack):
                         m.d.comb += packed_gen.req.valid.eq(1)
                         m.next = 'PACK'
 
@@ -1022,6 +1040,16 @@ class VStoreGenerator(BaseStoreGenerator):
                     with m.Else():
                         m.d.comb += indexed_gen.req.valid.eq(1)
                         m.next = 'SCAN'
+
+            with m.State('BYPASS'):
+                m.d.comb += [
+                    self.resp.valid.eq(1),
+                    self.resp.bits.noop.eq(1),
+                    self.resp.bits.last.eq(1),
+                ]
+
+                with m.If(self.resp.fire):
+                    m.next = 'IDLE'
 
             with m.State('PACK'):
                 m.d.comb += [
