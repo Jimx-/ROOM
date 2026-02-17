@@ -1,11 +1,10 @@
 from amaranth import *
-from amaranth.lib.coding import PriorityEncoder
 from amaranth.utils import log2_int
 import riscvmodel.insn as insn
 import riscvmodel.csrnames as csrnames
 from enum import IntEnum
 
-from room.consts import PrivilegeMode, RoundingMode
+from room.consts import PrivilegeMode
 from room.csr import *
 from room.types import HasCoreParams
 from room.utils import sign_extend

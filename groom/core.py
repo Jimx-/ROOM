@@ -63,6 +63,7 @@ class Core(HasCoreParams, Elaboratable):
 
         if self.use_fpu:
             fp_pipeline = m.submodules.fp_pipeline = FPPipeline(self.params)
+            csr.add_csrs(fp_pipeline.iter_csrs())
 
         #
         # Instruction fetch

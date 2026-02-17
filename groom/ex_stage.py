@@ -25,6 +25,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         mem_frf_write=False,
         has_alu=False,
         has_mem=False,
+        has_fpu=False,
         has_ifpu=False,
         has_gpu=False,
         has_raster=False,
@@ -38,7 +39,9 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.mem_frf_write = mem_frf_write
         self.has_alu = has_alu
         self.has_mem = has_mem
+        self.has_fpu = has_fpu
         self.has_ifpu = has_ifpu
+        self.has_frm = has_ifpu or has_fpu
         self.has_gpu = has_gpu
         self.has_raster = has_raster
 
@@ -58,6 +61,9 @@ class ExecUnit(HasCoreParams, Elaboratable):
 
         if has_alu:
             self.br_res = Valid(BranchResolution, params)
+
+        if self.has_frm:
+            self.frm = Signal(RoundingMode)
 
         if has_gpu:
             self.warp_ctrl = Valid(WarpControlReq, params)
@@ -259,6 +265,7 @@ class FPUExecUnit(ExecUnit):
     def __init__(self, params, name=None):
         super().__init__(params['flen'],
                          params,
+                         has_fpu=True,
                          frf_write=True,
                          mem_irf_write=True)
         self.name = name
@@ -272,6 +279,7 @@ class FPUExecUnit(ExecUnit):
 
         m.d.comb += [
             self.req.connect(fpu.req),
+            fpu.frm.eq(self.frm),
             fpu.req.valid.eq(self.req.valid & self.req.ready
                              & (self.req.bits.uop.fu_type_has(FUType.FPU)
                                 | self.req.bits.uop.fu_type_has(FUType.F2I))),
@@ -287,6 +295,7 @@ class FPUExecUnit(ExecUnit):
 
         m.d.comb += [
             self.req.connect(fdiv.req),
+            fdiv.frm.eq(self.frm),
             fdiv.req.valid.eq(self.req.valid
                               & self.req.bits.uop.fu_type_has(FUType.FDIV)),
             fdiv.resp.ready.eq(~fdiv_resp_busy),
@@ -343,6 +352,8 @@ class FPUExecUnit(ExecUnit):
                     Cat(*self.fresp.bits.data).eq(Cat(*fu.resp.bits.data)),
                     self.fresp.bits.uop.eq(fu.resp.bits.uop),
                     self.fresp.bits.wid.eq(fu.resp.bits.wid),
+                    self.fresp.bits.fflags_valid.eq(fu.resp.bits.fflags_valid),
+                    Cat(*self.fresp.bits.fflags).eq(Cat(*fu.resp.bits.fflags)),
                 ]
 
         m.d.comb += self.fresp.valid.eq(

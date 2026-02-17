@@ -75,9 +75,15 @@ class ExecResp(HasCoreParams, ValueCastable):
             Signal(32, name=f'{name}_addr{t}') for t in range(self.n_threads)
         ]
 
+        self.fflags_valid = Signal(name=f'{name}__flags_valid')
+        self.fflags = [
+            Signal(5, name=f'{name}__fflags{t}') for t in range(self.n_threads)
+        ]
+
     @ValueCastable.lowermethod
     def as_value(self):
-        return Cat(self.wid, self.uop, *self.data, *self.addr)
+        return Cat(self.wid, self.uop, *self.data, *self.addr,
+                   self.fflags_valid, *self.fflags)
 
     def shape(self):
         return self.as_value().shape()
@@ -95,6 +101,7 @@ class FunctionalUnit(HasCoreParams, Elaboratable):
                  data_width,
                  params,
                  is_alu=False,
+                 needs_frm=False,
                  is_gpu=False,
                  is_raster=False):
         super().__init__(params)
@@ -104,6 +111,9 @@ class FunctionalUnit(HasCoreParams, Elaboratable):
 
         if is_alu:
             self.br_res = Valid(BranchResolution, params)
+
+        if needs_frm:
+            self.frm = Signal(RoundingMode)
 
         if is_gpu:
             self.warp_ctrl = Valid(WarpControlReq, params)
@@ -119,11 +129,16 @@ class PipelinedFunctionalUnit(FunctionalUnit):
                  data_width,
                  params,
                  is_alu=False,
+                 needs_frm=False,
                  is_gpu=False):
         self.params = params
         self.num_stages = num_stages
 
-        super().__init__(data_width, params, is_alu=is_alu, is_gpu=is_gpu)
+        super().__init__(data_width,
+                         params,
+                         is_alu=is_alu,
+                         needs_frm=needs_frm,
+                         is_gpu=is_gpu)
 
     def elaborate(self, platform):
         m = Module()
@@ -505,10 +520,13 @@ class GPUControlUnit(PipelinedFunctionalUnit):
 
 class IterativeFunctionalUnit(FunctionalUnit):
 
-    def __init__(self, data_width, params, is_raster=False):
+    def __init__(self, data_width, params, is_raster=False, needs_frm=False):
         self.params = params
 
-        super().__init__(data_width, params, is_raster=is_raster)
+        super().__init__(data_width,
+                         params,
+                         is_raster=is_raster,
+                         needs_frm=needs_frm)
 
     def elaborate(self, platform):
         m = Module()
@@ -583,7 +601,7 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
         self.width = width
         self.latency = latency
 
-        super().__init__(latency, width, params)
+        super().__init__(latency, width, params, needs_frm=True)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -612,16 +630,21 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
                 ifpu.inp.valid.eq(self.req.valid & cast_en),
                 ifpu.inp.bits.fn.eq(FPUOperator.I2F),
                 ifpu.inp.bits.fn_mod.eq(typ[0]),
+                ifpu.inp.bits.rm.eq(self.frm),
                 ifpu.inp.bits.in1.eq(self.req.bits.rs1_data[w]),
                 ifpu.inp.bits.dst_fmt.eq(
                     self.tag_to_format(self.req.bits.uop.fp_out_tag)),
                 ifpu.inp.bits.int_fmt.eq(Cat(typ[1], 1)),
             ]
 
-            m.d.comb += self.resp.bits.data[w].eq(
-                self.nan_box(
-                    Mux(ifpu.out.valid, ifpu.out.bits.data, in_pipe.out.bits),
-                    self.resp.bits.uop.fp_out_tag))
+            m.d.comb += [
+                self.resp.bits.data[w].eq(
+                    self.nan_box(
+                        Mux(ifpu.out.valid, ifpu.out.bits.data,
+                            in_pipe.out.bits), self.resp.bits.uop.fp_out_tag)),
+                self.resp.bits.fflags_valid.eq(ifpu.out.valid),
+                self.resp.bits.fflags[w].eq(ifpu.out.bits.status),
+            ]
 
         return m
 
@@ -631,7 +654,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
     def __init__(self, width, params):
         self.width = width
 
-        super().__init__(params['fma_latency'], width, params)
+        super().__init__(params['fma_latency'], width, params, needs_frm=True)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -654,7 +677,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
         swap32 = Signal()
 
         fp_rm = Mux(
-            generate_imm_rm(self.req.bits.uop.imm_packed) == 7, 0,
+            generate_imm_rm(self.req.bits.uop.imm_packed) == 7, self.frm,
             generate_imm_rm(self.req.bits.uop.imm_packed))
 
         with m.Switch(self.req.bits.uop.opcode):
@@ -791,16 +814,28 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
 
             m.d.comb += self.resp.bits.data[w].eq(in_pipe.out.bits)
             with m.If(sfma.out.valid):
-                m.d.comb += self.resp.bits.data[w].eq(
-                    self.nan_box(sfma.out.bits.data, self.type_tag.S))
+                m.d.comb += [
+                    self.resp.bits.data[w].eq(
+                        self.nan_box(sfma.out.bits.data, self.type_tag.S)),
+                    self.resp.bits.fflags[w].eq(sfma.out.bits.status),
+                ]
             with m.Elif(fpiu.out.valid):
-                m.d.comb += self.resp.bits.data[w].eq(fpiu.out.bits.data)
+                m.d.comb += [
+                    self.resp.bits.data[w].eq(fpiu.out.bits.data),
+                    self.resp.bits.fflags[w].eq(fpiu.out.bits.status),
+                ]
+
             with m.Elif(scmp.out.valid):
-                m.d.comb += self.resp.bits.data[w].eq(
-                    self.nan_box(
-                        scmp.out.bits.data,
-                        Mux(self.resp.bits.uop.fu_type_has(FUType.F2I),
-                            self.type_tag.I, self.type_tag.S)))
+                m.d.comb += [
+                    self.resp.bits.data[w].eq(
+                        self.nan_box(
+                            scmp.out.bits.data,
+                            Mux(self.resp.bits.uop.fu_type_has(FUType.F2I),
+                                self.type_tag.I, self.type_tag.S))),
+                    self.resp.bits.fflags[w].eq(scmp.out.bits.status),
+                ]
+
+        m.d.comb += self.resp.bits.fflags_valid.eq(self.resp.valid)
 
         return m
 
@@ -810,7 +845,7 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
     def __init__(self, width, params):
         self.width = width
 
-        super().__init__(width, params)
+        super().__init__(width, params, needs_frm=True)
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -842,16 +877,21 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
                                 |
                                 (self.req.bits.uop.opcode == UOpCode.FSQRT_D)),
                 fdiv.fmt.eq(self.tag_to_format(self.req.bits.uop.fp_in_tag)),
+                fdiv.rm.eq(self.frm),
                 fdiv.in_valid.eq(self.req.fire & self.req.bits.uop.tmask[w]),
                 self.resp.bits.data[w].eq(
                     self.nan_box(fdiv.out.bits.data,
                                  self.resp.bits.uop.fp_out_tag)),
+                self.resp.bits.fflags[w].eq(fdiv.out.bits.status),
                 div_resp_valid[w].eq(fdiv.out.valid),
                 fdiv.out.ready.eq(~tmask_valid | self.resp.fire),
             ]
 
-        m.d.comb += self.resp.valid.eq(tmask_valid
-                                       & ((tmask & div_resp_valid) == tmask))
+        m.d.comb += [
+            self.resp.valid.eq(tmask_valid
+                               & ((tmask & div_resp_valid) == tmask)),
+            self.resp.bits.fflags_valid.eq(self.resp.valid),
+        ]
 
         return m
 

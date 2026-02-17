@@ -1,9 +1,11 @@
 from amaranth import *
+import riscvmodel.csrnames as csrnames
 
 from groom.issue import Scoreboard
 from groom.regfile import RegisterFile, RegisterRead
 from groom.ex_stage import FPUExecUnit
 from groom.fu import ExecResp
+from groom.csr import CSRAccess, AutoCSR, CSR, BankedCSR, ThreadLocalCSR
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
@@ -12,7 +14,7 @@ from room.utils import Arbiter
 from roomsoc.interconnect.stream import Valid, Decoupled
 
 
-class FPPipeline(HasCoreParams, Elaboratable):
+class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
 
     def __init__(self, params):
         super().__init__(params)
@@ -35,8 +37,36 @@ class FPPipeline(HasCoreParams, Elaboratable):
         self.to_int = Decoupled(ExecResp, self.xlen, params)
         self.to_lsu = Decoupled(ExecResp, self.xlen, params)
 
+        self.fflags = BankedCSR(ThreadLocalCSR, csrnames.fflags,
+                                [('value', 5, CSRAccess.RW)], params)
+        self.frm = BankedCSR(CSR, csrnames.frm, [('value', 3, CSRAccess.RW)],
+                             params)
+        self.fcsr = BankedCSR(ThreadLocalCSR, csrnames.fcsr,
+                              [('value', self.xlen, CSRAccess.RW)], params)
+
     def elaborate(self, platform):
         m = Module()
+
+        #
+        # CSR access
+        #
+
+        for w in range(self.n_warps):
+            for t in range(self.n_threads):
+                m.d.comb += self.fcsr.warps[w].r[t].eq(
+                    Cat(self.fflags.warps[w].r[t], self.frm.warps[w].r))
+
+                with m.If(self.fflags.warps[w].we[t]):
+                    m.d.sync += self.fflags.warps[w].r[t].eq(
+                        self.fflags.warps[w].w[t])
+
+                with m.If(self.fcsr.warps[w].we[t]):
+                    m.d.sync += Cat(self.fflags.warps[w].r[t],
+                                    self.frm.warps[w].r).eq(
+                                        self.fcsr.warps[w].w[t])
+
+            with m.If(self.frm.warps[w].we):
+                m.d.sync += self.frm.warps[w].r.eq(self.frm.warps[w].w)
 
         #
         # Issue
@@ -101,6 +131,11 @@ class FPPipeline(HasCoreParams, Elaboratable):
         exec_unit = m.submodules.exec_unit = FPUExecUnit(self.params)
         m.d.comb += fregread.exec_req.connect(exec_unit.req)
 
+        with m.Switch(exec_unit.req.bits.wid):
+            for w in range(self.n_warps):
+                with m.Case(w):
+                    m.d.comb += exec_unit.frm.eq(self.frm.warps[w].r)
+
         #
         # Writeback
         #
@@ -143,5 +178,15 @@ class FPPipeline(HasCoreParams, Elaboratable):
             exec_unit.mem_iresp.ready.eq(
                 Mux(fpiu_is_stq, self.to_lsu.ready, self.to_int.ready)),
         ]
+
+        # Accrue FP exception flags
+        with m.If(exec_unit.fresp.bits.fflags_valid):
+            with m.Switch(exec_unit.fresp.bits.wid):
+                for w in range(self.n_warps):
+                    with m.Case(w):
+                        for t in range(self.n_threads):
+                            with m.If(exec_unit.fresp.bits.uop.tmask[t]):
+                                m.d.sync += self.fflags.warps[w].r[t].eq(
+                                    exec_unit.fresp.bits.fflags[t])
 
         return m

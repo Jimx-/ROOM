@@ -75,8 +75,8 @@ class ThreadLocalCSR(HasCoreParams):
         self.w = [
             Record(fields, name=f'{name}__w{i}') for i in range(self.n_threads)
         ]
-        self.re = Signal(self.n_warps, name=f'{name}__re')
-        self.we = Signal(self.n_warps, name=f'{name}__we')
+        self.re = Signal(self.n_threads, name=f'{name}__re')
+        self.we = Signal(self.n_threads, name=f'{name}__we')
 
 
 class BankedCSR(HasCoreParams):
