@@ -4,7 +4,7 @@ from groom.fu import ExecReq
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
-from room.regfile import RFReadPort, RFWritePort, RegReadDecoder as CommonDecoder
+from room.regfile import RFReadPort, RFWritePort, RegReadDecoder as CommonDecoder, FPRegReadDecoder
 
 from roomsoc.interconnect.stream import Decoupled, SkidBuffer
 
@@ -120,8 +120,21 @@ class RegReadDecoder(Elaboratable):
         m.d.comb += [
             decoder.iss_uop.eq(self.dis_uop),
             decoder.iss_valid.eq(self.dis_valid),
-            self.rrd_uop.eq(decoder.rrd_uop),
-            self.rrd_valid.eq(decoder.rrd_valid),
+        ]
+
+        fp_decoder = m.submodules.fp_decoder = FPRegReadDecoder(self.params)
+        m.d.comb += [
+            fp_decoder.iss_uop.eq(self.dis_uop),
+            fp_decoder.iss_valid.eq(self.dis_valid),
+        ]
+
+        m.d.comb += [
+            self.rrd_uop.eq(
+                Mux(
+                    self.dis_uop.fp_valid & ~self.dis_uop.uses_ldq
+                    & ~self.dis_uop.uses_stq, fp_decoder.rrd_uop,
+                    decoder.rrd_uop)),
+            self.rrd_valid.eq(self.dis_valid),
         ]
 
         return m
