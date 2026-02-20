@@ -1,6 +1,7 @@
 from amaranth import *
 from amaranth import tracer
 from amaranth.utils import log2_int
+from amaranth.hdl.ast import ValueCastable
 
 from groom.fu import ExecResp
 
@@ -9,8 +10,51 @@ from room.types import HasCoreParams, MicroOp
 from room.dcache import DCacheReq, DCacheResp
 from room.lsu import LoadGen, StoreGen
 from room.mmu import PMAChecker
+from room.utils import sign_extend
 
 from roomsoc.interconnect.stream import Valid, Decoupled
+
+
+class LSUDebug(HasCoreParams, ValueCastable):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.wid = Signal(range(self.n_warps), name=f'{name}__wid')
+        self.uop_id = Signal(MicroOp.ID_WIDTH, name=f'{name}__uop_id')
+        self.opcode = Signal(UOpCode, name=f'{name}__opcode')
+
+        self.addr = [
+            Signal(self.xlen, name=f'{name}__addr{w}')
+            for w in range(self.n_threads)
+        ]
+        self.data = [
+            Signal(self.xlen, name=f'{name}__data{w}')
+            for w in range(self.n_threads)
+        ]
+
+        self.data_valid = Signal(name=f'{name}__data_valid')
+        self.mem_size = Signal(2, name=f'{name}__mem_size')
+
+        self.lrs1 = Signal(range(32), name=f'{name}__lrs1')
+        self.lrs2 = Signal(range(32), name=f'{name}__lrs2')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.wid, self.uop_id, self.opcode, *self.addr, *self.data,
+                   self.data_valid, self.mem_size, self.lrs1, self.lrs2)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
 class SharedMemory(HasCoreParams, Elaboratable):
@@ -269,8 +313,10 @@ class LSQEntry(HasCoreParams):
 
 class LoadStoreUnit(HasCoreParams, Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sim_debug=False):
         super().__init__(params)
+
+        self.sim_debug = sim_debug
 
         self.exec_req = Decoupled(ExecResp, self.xlen, params)
 
@@ -294,6 +340,9 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             Valid(DCacheReq, self.params, name=f'dcache_nack{i}')
             for i in range(self.n_threads)
         ]
+
+        if sim_debug:
+            self.lsu_debug = Valid(LSUDebug, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -355,6 +404,26 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                             Cat(*self.exec_req.bits.data)),
                         lsq[self.exec_req.bits.wid].data_valid.eq(1),
                     ]
+
+        if self.sim_debug:
+            m.d.comb += [
+                self.lsu_debug.valid.eq(self.exec_req.valid),
+                self.lsu_debug.bits.uop_id.eq(self.exec_req.bits.uop.uop_id),
+                self.lsu_debug.bits.opcode.eq(self.exec_req.bits.uop.opcode),
+                self.lsu_debug.bits.data_valid.eq(
+                    self.exec_req.bits.uop.is_std),
+                self.lsu_debug.bits.mem_size.eq(
+                    self.exec_req.bits.uop.mem_size),
+                self.lsu_debug.bits.lrs1.eq(self.exec_req.bits.uop.lrs1),
+                self.lsu_debug.bits.lrs2.eq(self.exec_req.bits.uop.lrs2),
+            ]
+
+            for w in range(self.n_threads):
+                m.d.comb += [
+                    self.lsu_debug.bits.addr[w].eq(
+                        sign_extend(self.exec_req.bits.addr[w], self.xlen)),
+                    self.lsu_debug.bits.data[w].eq(self.exec_req.bits.data[w]),
+                ]
 
         m.d.comb += self.fp_std.ready.eq(1)
         with m.If(self.fp_std.valid):

@@ -2,8 +2,8 @@ from amaranth import *
 import riscvmodel.csrnames as csrnames
 
 from groom.issue import Scoreboard
-from groom.regfile import RegisterFile, RegisterRead
-from groom.ex_stage import FPUExecUnit
+from groom.regfile import RegisterFile, RegisterRead, WritebackDebug
+from groom.ex_stage import FPUExecUnit, ExecDebug
 from groom.fu import ExecResp
 from groom.csr import CSRAccess, AutoCSR, CSR, BankedCSR, ThreadLocalCSR
 
@@ -16,8 +16,10 @@ from roomsoc.interconnect.stream import Valid, Decoupled
 
 class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sim_debug=False):
         super().__init__(params)
+
+        self.sim_debug = sim_debug
 
         self.dis_valid = Signal()
         self.dis_wid = Signal(range(self.n_warps))
@@ -43,6 +45,10 @@ class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
                              params)
         self.fcsr = BankedCSR(ThreadLocalCSR, csrnames.fcsr,
                               [('value', self.xlen, CSRAccess.RW)], params)
+
+        if sim_debug:
+            self.ex_debug = Valid(ExecDebug, params)
+            self.wb_debug = Valid(WritebackDebug, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -128,13 +134,17 @@ class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
         # Execute
         #
 
-        exec_unit = m.submodules.exec_unit = FPUExecUnit(self.params)
+        exec_unit = m.submodules.exec_unit = FPUExecUnit(
+            self.params, sim_debug=self.sim_debug)
         m.d.comb += fregread.exec_req.connect(exec_unit.req)
 
         with m.Switch(exec_unit.req.bits.wid):
             for w in range(self.n_warps):
                 with m.Case(w):
                     m.d.comb += exec_unit.frm.eq(self.frm.warps[w].r)
+
+        if self.sim_debug:
+            m.d.comb += self.ex_debug.eq(exec_unit.exec_debug)
 
         #
         # Writeback
@@ -188,5 +198,15 @@ class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
                             with m.If(exec_unit.fresp.bits.uop.tmask[t]):
                                 m.d.sync += self.fflags.warps[w].r[t].eq(
                                     exec_unit.fresp.bits.fflags[t])
+
+        if self.sim_debug:
+            m.d.comb += [
+                self.wb_debug.valid.eq(wb_req.valid),
+                self.wb_debug.bits.wid.eq(wb_req.bits.wid),
+                self.wb_debug.bits.uop_id.eq(wb_req.bits.uop.uop_id),
+                self.wb_debug.bits.ldst.eq(wb_req.bits.uop.ldst),
+            ]
+            for w in range(self.n_threads):
+                m.d.comb += self.wb_debug.bits.data[w].eq(wb_req.bits.data[w])
 
         return m

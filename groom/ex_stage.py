@@ -1,4 +1,6 @@
 from amaranth import *
+from amaranth import tracer
+from amaranth.hdl.ast import ValueCastable
 
 from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, \
     GPUControlUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit, RasterUnit
@@ -7,10 +9,49 @@ from groom.csr import AutoCSR
 from groom.raster import RasterRequest
 
 from room.consts import *
-from room.types import HasCoreParams
+from room.types import HasCoreParams, MicroOp
 from room.utils import Arbiter, generate_imm
 
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
+
+
+class ExecDebug(HasCoreParams, ValueCastable):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.wid = Signal(range(self.n_warps), name=f'{name}__wid')
+        self.uop_id = Signal(MicroOp.ID_WIDTH, name=f'{name}__uop_id')
+        self.opcode = Signal(UOpCode, name=f'{name}__opcode')
+
+        self.lrs1 = Signal(range(32), name=f'{name}__lrs1')
+        self.rs1_data = [
+            Signal(self.xlen, name=f'{name}__rs1_data{w}')
+            for w in range(self.n_threads)
+        ]
+
+        self.lrs2 = Signal(range(32), name=f'{name}__lrs2')
+        self.rs2_data = [
+            Signal(self.xlen, name=f'{name}__rs2_data{w}')
+            for w in range(self.n_threads)
+        ]
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.wid, self.uop_id, self.opcode, self.lrs1,
+                   *self.rs1_data, self.lrs2, *self.rs2_data)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
 class ExecUnit(HasCoreParams, Elaboratable):
@@ -29,6 +70,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         has_ifpu=False,
         has_gpu=False,
         has_raster=False,
+        sim_debug=False,
     ):
         super().__init__(params)
 
@@ -44,6 +86,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.has_frm = has_ifpu or has_fpu
         self.has_gpu = has_gpu
         self.has_raster = has_raster
+        self.sim_debug = sim_debug
 
         self.req = Decoupled(ExecReq, data_width, params)
 
@@ -74,15 +117,39 @@ class ExecUnit(HasCoreParams, Elaboratable):
         if has_mem:
             self.lsu_req = Decoupled(ExecResp, self.data_width, params)
 
+        if sim_debug:
+            self.exec_debug = Valid(ExecDebug, params)
+
     def elaborate(self, platform):
         m = Module()
+
+        if self.sim_debug:
+            m.d.comb += [
+                self.exec_debug.valid.eq(self.req.valid),
+                self.exec_debug.bits.uop_id.eq(self.req.bits.uop.uop_id),
+                self.exec_debug.bits.opcode.eq(self.req.bits.uop.opcode),
+                self.exec_debug.bits.lrs1.eq(self.req.bits.uop.lrs1),
+                self.exec_debug.bits.lrs2.eq(self.req.bits.uop.lrs2),
+            ]
+
+            for w in range(self.n_threads):
+                m.d.comb += [
+                    self.exec_debug.bits.rs1_data[w].eq(
+                        self.req.bits.rs1_data[w]),
+                    self.exec_debug.bits.rs2_data[w].eq(
+                        self.req.bits.rs2_data[w]),
+                ]
 
         return m
 
 
 class ALUExecUnit(ExecUnit, AutoCSR):
 
-    def __init__(self, params, has_ifpu=False, has_raster=False):
+    def __init__(self,
+                 params,
+                 has_ifpu=False,
+                 has_raster=False,
+                 sim_debug=False):
         super().__init__(params['xlen'],
                          params,
                          irf_write=True,
@@ -91,7 +158,8 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                          has_mem=True,
                          has_ifpu=has_ifpu,
                          has_gpu=True,
-                         has_raster=has_raster)
+                         has_raster=has_raster,
+                         sim_debug=sim_debug)
 
         if has_raster:
             self._raster = RasterUnit(self.data_width, params)
@@ -262,12 +330,13 @@ class ALUExecUnit(ExecUnit, AutoCSR):
 
 class FPUExecUnit(ExecUnit):
 
-    def __init__(self, params, name=None):
+    def __init__(self, params, sim_debug=False, name=None):
         super().__init__(params['flen'],
                          params,
                          has_fpu=True,
                          frf_write=True,
-                         mem_irf_write=True)
+                         mem_irf_write=True,
+                         sim_debug=sim_debug)
         self.name = name
 
     def elaborate(self, platform):

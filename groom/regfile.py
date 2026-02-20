@@ -1,4 +1,6 @@
 from amaranth import *
+from amaranth import tracer
+from amaranth.hdl.ast import ValueCastable
 
 from groom.fu import ExecReq
 
@@ -7,6 +9,36 @@ from room.types import HasCoreParams, MicroOp
 from room.regfile import RFReadPort, RFWritePort, RegReadDecoder as CommonDecoder, FPRegReadDecoder
 
 from roomsoc.interconnect.stream import Decoupled, SkidBuffer
+
+
+class WritebackDebug(HasCoreParams, ValueCastable):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.wid = Signal(range(self.n_warps), name=f'{name}__wid')
+        self.uop_id = Signal(MicroOp.ID_WIDTH, name=f'{name}__uop_id')
+        self.ldst = Signal(range(32), name=f'{name}__pdst')
+        self.data = [
+            Signal(self.xlen, name=f'{name}__data{w}')
+            for w in range(self.n_threads)
+        ]
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.wid, self.uop_id, self.ldst, *self.data)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
 class RegisterFile(Elaboratable):

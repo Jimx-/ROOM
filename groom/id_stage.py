@@ -1,4 +1,6 @@
 from amaranth import *
+from amaranth import tracer
+from amaranth.hdl.ast import ValueCastable
 
 from groom.if_stage import FetchBundle, WarpStallReq
 
@@ -7,6 +9,32 @@ from room.types import HasCoreParams, MicroOp
 from room.id_stage import DecodeUnit as CommonDecodeUnit
 
 from roomsoc.interconnect.stream import Valid, Decoupled
+
+
+class IDDebug(HasCoreParams, ValueCastable):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.wid = Signal(range(self.n_warps), name=f'{name}__wid')
+        self.uop_id = Signal(MicroOp.ID_WIDTH, name=f'{name}__uop_id')
+        self.tmask = Signal(self.n_threads, name=f'{name}__tmask')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.wid, self.uop_id, self.tmask)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
 class DecodeUnit(HasCoreParams, Elaboratable):
@@ -138,8 +166,10 @@ class DecodeUnit(HasCoreParams, Elaboratable):
 
 class DecodeStage(HasCoreParams, Elaboratable):
 
-    def __init__(self, params):
+    def __init__(self, params, sim_debug=False):
         super().__init__(params)
+
+        self.sim_debug = sim_debug
 
         self.fetch_packet = Decoupled(FetchBundle, params)
 
@@ -150,6 +180,9 @@ class DecodeStage(HasCoreParams, Elaboratable):
 
         self.stall_req = Valid(WarpStallReq, params)
         self.join_req = Valid(Signal, range(self.n_warps))
+
+        if sim_debug:
+            self.id_debug = Valid(IDDebug, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -176,5 +209,13 @@ class DecodeStage(HasCoreParams, Elaboratable):
             self.wid.eq(self.fetch_packet.bits.wid),
             self.fetch_packet.ready.eq(self.ready)
         ]
+
+        if self.sim_debug:
+            m.d.comb += [
+                self.id_debug.valid.eq(self.valid & self.ready),
+                self.id_debug.bits.wid.eq(self.wid),
+                self.id_debug.bits.uop_id.eq(self.uop.uop_id),
+                self.id_debug.bits.tmask.eq(self.uop.tmask),
+            ]
 
         return m

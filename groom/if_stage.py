@@ -10,6 +10,21 @@ from room.icache import ICache
 from roomsoc.interconnect.stream import Valid, Decoupled
 
 
+class IFDebug(HasCoreParams, Record):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasCoreParams.__init__(self, params)
+
+        Record.__init__(self, [
+            ('wid', range(self.n_warps)),
+            ('uop_id', MicroOp.ID_WIDTH),
+            ('pc', 32),
+            ('inst', 32),
+        ],
+                        name=name,
+                        src_loc_at=1 + src_loc_at)
+
+
 class IFetchReq(HasCoreParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
@@ -374,10 +389,11 @@ class FetchBundle(HasCoreParams):
 
 class IFStage(HasCoreParams, AutoCSR, Elaboratable):
 
-    def __init__(self, ibus, params):
+    def __init__(self, ibus, params, sim_debug=False):
         super().__init__(params)
 
         self.ibus = ibus
+        self.sim_debug = sim_debug
 
         self.reset_vector = Signal(32)
 
@@ -391,6 +407,9 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
         self._warp_sched = WarpScheduler(self.params)
 
         self.busy = Signal()
+
+        if sim_debug:
+            self.if_debug = Valid(IFDebug, params)
 
     def elaborate(self, platform):
         m = Module()
@@ -488,5 +507,23 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
             self.fetch_packet.bits.uop.tmask.eq(s2_tmask),
             self.fetch_packet.bits.wid.eq(s2_wid),
         ]
+
+        if self.sim_debug:
+            id_counter = Array(
+                Signal(MicroOp.ID_WIDTH, name=f'id_counter{w}')
+                for w in range(self.n_warps))
+            m.d.comb += [
+                self.fetch_packet.bits.uop.uop_id.eq(id_counter[s2_wid]),
+                self.if_debug.valid.eq(self.fetch_packet.fire),
+                self.if_debug.bits.wid.eq(s2_wid),
+                self.if_debug.bits.uop_id.eq(
+                    self.fetch_packet.bits.uop.uop_id),
+                self.if_debug.bits.pc.eq(self.fetch_packet.bits.uop.pc),
+                self.if_debug.bits.inst.eq(self.fetch_packet.bits.uop.inst),
+            ]
+
+            with m.If(self.fetch_packet.fire):
+                m.d.sync += id_counter[self.fetch_packet.bits.wid].eq(
+                    id_counter[self.fetch_packet.bits.wid] + 1)
 
         return m

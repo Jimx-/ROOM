@@ -1,7 +1,7 @@
 from amaranth import *
 
 from room.dcache import DCache
-from groom.core import Core
+from groom.core import Core, CoreDebug
 from groom.ctrl import GroomController
 from groom.raster import RasterUnit
 
@@ -30,10 +30,11 @@ class HasClusterParams:
 
 class Cluster(HasClusterParams, Elaboratable):
 
-    def __init__(self, cluster_id, params):
+    def __init__(self, cluster_id, params, sim_debug=False):
         super().__init__(params)
 
         self.cluster_id = cluster_id
+        self.sim_debug = sim_debug
 
         self.reset_vector = Signal(32)
         self.core_enable = Signal()
@@ -66,6 +67,12 @@ class Cluster(HasClusterParams, Elaboratable):
                                       name='dbus_mmio')
 
         self.periph_buses = [self.dbus, self.dbus_mmio]
+
+        if sim_debug:
+            self.core_debug = [
+                CoreDebug(self.core_params, name=f'core_debug{i}')
+                for i in range(self.num_cores)
+            ]
 
     @property
     def pma_regions(self):
@@ -115,11 +122,15 @@ class Cluster(HasClusterParams, Elaboratable):
             core = DomainRenamer(f'core{i}')(Core(
                 core_params,
                 ibus_source_width=self.source_id_width,
-                ibus_sink_width=self.sink_id_width))
+                ibus_sink_width=self.sink_id_width,
+                sim_debug=self.sim_debug))
             setattr(m.submodules, f'core{i}', core)
             cores.append(core)
 
             m.d.comb += core.reset_vector.eq(self.reset_vector)
+
+            if self.sim_debug:
+                m.d.comb += self.core_debug[i].eq(core.core_debug)
 
             ibus_a = Decoupled(tl.ChannelA,
                                data_width=core.ibus.data_width,
@@ -297,9 +308,11 @@ class Cluster(HasClusterParams, Elaboratable):
 
 class GroomWrapper(HasClusterParams, Elaboratable):
 
-    def __init__(self, params, bus_master=None):
+    def __init__(self, params, bus_master=None, sim_debug=False):
         super().__init__(params)
         self.bus_master = bus_master
+
+        self.sim_debug = sim_debug
 
         self.reset_vector = Signal(32)
         self.busy = Signal()
@@ -326,6 +339,12 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         self.l2cache = ResetInserter(~self.ctrl.cache_enable)(l2cache)
 
         self.periph_buses = [self.dbus_mmio, self.l2cache.out_bus]
+
+        if sim_debug:
+            self.core_debug = [
+                CoreDebug(self.core_params, name=f'core_debug{i}')
+                for i in range(self.num_clusters * self.num_cores)
+            ]
 
     @property
     def pma_regions(self):
@@ -376,12 +395,16 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         e_arbiter = m.submodules.e_arbiter = tl.Arbiter(
             tl.ChannelE, sink_id_width=self.l2cache.in_sink_id_width)
 
+        core_debug = []
         for i in range(self.num_clusters):
             cluster_params = self.params.copy()
 
-            cluster = Cluster(i, cluster_params)
+            cluster = Cluster(i, cluster_params, sim_debug=self.sim_debug)
             setattr(m.submodules, f'cluster{i}', cluster)
             clusters.append(cluster)
+
+            if self.sim_debug:
+                core_debug.extend(cluster.core_debug)
 
             m.d.comb += [
                 cluster.reset_vector.eq(self.reset_vector),
@@ -434,6 +457,10 @@ class GroomWrapper(HasClusterParams, Elaboratable):
             c_arbiter.add(dbus_c)
 
             e_arbiter.add(cluster.dbus.e)
+
+        if self.sim_debug:
+            for a, b in zip(self.core_debug, core_debug):
+                m.d.comb += a.eq(b)
 
         if self.bus_master is not None:
             bus_master_a = Decoupled(

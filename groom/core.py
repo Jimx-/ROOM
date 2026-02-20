@@ -1,14 +1,16 @@
 from amaranth import *
+from amaranth import tracer
+from amaranth.hdl.ast import ValueCastable
 
-from groom.if_stage import IFStage
-from groom.id_stage import DecodeStage
+from groom.if_stage import IFStage, IFDebug
+from groom.id_stage import DecodeStage, IDDebug
 from groom.dispatch import Dispatcher
 from groom.issue import Scoreboard
-from groom.regfile import RegisterFile, RegisterRead
-from groom.ex_stage import ALUExecUnit
+from groom.regfile import RegisterFile, RegisterRead, WritebackDebug
+from groom.ex_stage import ALUExecUnit, ExecDebug
 from groom.fu import ExecResp
 from groom.csr import CSRFile
-from groom.lsu import LoadStoreUnit
+from groom.lsu import LoadStoreUnit, LSUDebug
 from room.dcache import DCacheReq, DCacheResp
 from groom.fp_pipeline import FPPipeline
 from groom.raster import RasterRequest
@@ -21,10 +23,60 @@ from roomsoc.interconnect import tilelink as tl
 from roomsoc.interconnect.stream import Valid, Decoupled
 
 
+class CoreDebug(HasCoreParams, ValueCastable):
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+
+        self.if_debug = Valid(IFDebug, params, name=f'{name}__if_debug')
+
+        self.id_debug = Valid(IDDebug, params, name=f'{name}__id_debug')
+
+        self.ex_debug = Valid(ExecDebug, params, name=f'{name}__ex_debug')
+        if self.use_fpu:
+            self.fp_ex_debug = Valid(ExecDebug,
+                                     params,
+                                     name=f'{name}__fp_ex_debug')
+
+            self.fp_wb_debug = Valid(WritebackDebug,
+                                     params,
+                                     name=f'{name}__fp_wb_debug')
+
+        self.mem_debug = Valid(LSUDebug, params, name=f'{name}__mem_debug')
+
+        self.wb_debug = Valid(WritebackDebug, params, name=f'{name}__wb_debug')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat([
+            self.if_debug, self.id_debug, self.ex_debug, self.mem_debug, self.
+            wb_debug
+        ] + [self.fp_ex_debug, self.fp_wb_debug] if self.use_fpu else [])
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
+
+
 class Core(HasCoreParams, Elaboratable):
 
-    def __init__(self, params, *, ibus_source_width=8, ibus_sink_width=4):
+    def __init__(self,
+                 params,
+                 *,
+                 ibus_source_width=8,
+                 ibus_sink_width=4,
+                 sim_debug=False):
         super().__init__(params)
+
+        self.sim_debug = sim_debug
 
         self.reset_vector = Signal(32)
         self.busy = Signal()
@@ -56,35 +108,54 @@ class Core(HasCoreParams, Elaboratable):
 
         self.periph_buses = [self.ibus]
 
+        if sim_debug:
+            self.core_debug = CoreDebug(params)
+
     def elaborate(self, platform):
         m = Module()
 
         csr = m.submodules.csr = CSRFile(self.params, width=self.xlen)
 
         if self.use_fpu:
-            fp_pipeline = m.submodules.fp_pipeline = FPPipeline(self.params)
+            fp_pipeline = m.submodules.fp_pipeline = FPPipeline(
+                self.params, sim_debug=self.sim_debug)
             csr.add_csrs(fp_pipeline.iter_csrs())
+
+            if self.sim_debug:
+                m.d.comb += [
+                    self.core_debug.fp_ex_debug.eq(fp_pipeline.ex_debug),
+                    self.core_debug.fp_wb_debug.eq(fp_pipeline.wb_debug),
+                ]
 
         #
         # Instruction fetch
         #
-        if_stage = m.submodules.if_stage = IFStage(self.ibus, self.params)
+        if_stage = m.submodules.if_stage = IFStage(self.ibus,
+                                                   self.params,
+                                                   sim_debug=self.sim_debug)
         csr.add_csrs(if_stage.iter_csrs())
         m.d.comb += [
             if_stage.reset_vector.eq(self.reset_vector),
             self.busy.eq(if_stage.busy),
         ]
 
+        if self.sim_debug:
+            m.d.comb += self.core_debug.if_debug.eq(if_stage.if_debug)
+
         #
         # Decoding
         #
 
-        dec_stage = m.submodules.decode_stage = DecodeStage(self.params)
+        dec_stage = m.submodules.decode_stage = DecodeStage(
+            self.params, sim_debug=self.sim_debug)
         m.d.comb += [
             if_stage.fetch_packet.connect(dec_stage.fetch_packet),
             if_stage.stall_req.eq(dec_stage.stall_req),
             if_stage.join_req.eq(dec_stage.join_req),
         ]
+
+        if self.sim_debug:
+            m.d.comb += self.core_debug.id_debug.eq(dec_stage.id_debug)
 
         #
         # Dispatcher
@@ -176,13 +247,19 @@ class Core(HasCoreParams, Elaboratable):
         #
 
         exec_unit = m.submodules.exec_unit = ALUExecUnit(
-            self.params, has_ifpu=self.use_fpu, has_raster=self.use_raster)
+            self.params,
+            has_ifpu=self.use_fpu,
+            has_raster=self.use_raster,
+            sim_debug=self.sim_debug)
         csr.add_csrs(exec_unit.iter_csrs())
         m.d.comb += [
             iregread.exec_req.connect(exec_unit.req),
             if_stage.br_res.eq(exec_unit.br_res),
             if_stage.warp_ctrl.eq(exec_unit.warp_ctrl),
         ]
+
+        if self.sim_debug:
+            m.d.comb += self.core_debug.ex_debug.eq(exec_unit.exec_debug)
 
         csr_write_data = Signal(self.xlen)
         for w in reversed(range(self.n_threads)):
@@ -208,7 +285,8 @@ class Core(HasCoreParams, Elaboratable):
         #
         # Load/store unit
         #
-        lsu = m.submodules.lsu = LoadStoreUnit(self.params)
+        lsu = m.submodules.lsu = LoadStoreUnit(self.params,
+                                               sim_debug=self.sim_debug)
         m.d.comb += exec_unit.lsu_req.connect(lsu.exec_req)
 
         for dcache_req, lsu_dcache_req in zip(self.dcache_req, lsu.dcache_req):
@@ -225,6 +303,9 @@ class Core(HasCoreParams, Elaboratable):
                 lsu.exec_fresp.connect(fp_pipeline.mem_wb_port),
                 fp_pipeline.to_lsu.connect(lsu.fp_std),
             ]
+
+        if self.sim_debug:
+            m.d.comb += self.core_debug.mem_debug.eq(lsu.lsu_debug)
 
         #
         #
@@ -263,5 +344,17 @@ class Core(HasCoreParams, Elaboratable):
                         csr_port.r_data[i * self.xlen:(i + 1) * self.xlen],
                         wb_req.bits.data[i])),
             ]
+
+        if self.sim_debug:
+            m.d.comb += [
+                self.core_debug.wb_debug.valid.eq(wb_req.valid),
+                self.core_debug.wb_debug.bits.wid.eq(wb_req.bits.wid),
+                self.core_debug.wb_debug.bits.uop_id.eq(
+                    wb_req.bits.uop.uop_id),
+                self.core_debug.wb_debug.bits.ldst.eq(wb_req.bits.uop.ldst),
+            ]
+            for w in range(self.n_threads):
+                m.d.comb += self.core_debug.wb_debug.bits.data[w].eq(
+                    wb_req.bits.data[w])
 
         return m
