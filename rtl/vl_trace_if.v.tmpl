@@ -67,6 +67,19 @@ module vl_trace_if
     input wire [63:0]                              wb_debug{{i}}_data,
    // {% endfor %}
 
+   // {% if core.core_debug.fp_ex_debug is defined %}
+   // FP execute
+   // {% for i in range(core.core_debug.fp_ex_debug|length) %}
+    input wire                                     fp_ex_debug{{i}}_valid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              fp_ex_debug{{i}}_uop_id,
+    input wire [15:0]                              fp_ex_debug{{i}}_opcode,
+    input wire [$clog2({{core.num_fp_pregs}})-1:0] fp_ex_debug{{i}}_prs1,
+    input wire [63:0]                              fp_ex_debug{{i}}_rs1_data,
+    input wire [$clog2({{core.num_fp_pregs}})-1:0] fp_ex_debug{{i}}_prs2,
+    input wire [63:0]                              fp_ex_debug{{i}}_rs2_data,
+   // {% endfor %}
+   // {% endif %}
+
    // {% if core.core_debug.fp_wb_debug is defined %}
    // FP writeback
    // {% for i in range(core.core_debug.fp_wb_debug|length) %}
@@ -171,6 +184,15 @@ module vl_trace_if
             dpi_trace_wb(wb_debug{{i}}_uop_id, wb_debug{{i}}_pdst, wb_debug{{i}}_data);
          end
          // {% endfor %}
+
+         // {% if core.core_debug.fp_ex_debug is defined %}
+         // {% for i in range(core.core_debug.fp_ex_debug|length) %}
+         if (fp_ex_debug{{i}}_valid) begin
+            dpi_trace_ex(fp_ex_debug{{i}}_uop_id, fp_ex_debug{{i}}_opcode, fp_ex_debug{{i}}_prs1, fp_ex_debug{{i}}_rs1_data,
+                         fp_ex_debug{{i}}_prs2, fp_ex_debug{{i}}_rs2_data);
+         end
+         // {% endfor %}
+         // {% endif %}
 
          // {% if core.core_debug.fp_wb_debug is defined %}
          // {% for i in range(core.core_debug.fp_wb_debug|length) %}

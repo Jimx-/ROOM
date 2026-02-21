@@ -387,6 +387,22 @@ if __name__ == "__main__":
                             f'EX {id} {opcode} {prs1} {rs1_data:x} {prs2} {rs2_data:x}',
                             file=log_file)
 
+                if hasattr(dut.core_debug, 'fp_ex_debug'):
+                    for ex_debug in dut.core_debug.fp_ex_debug:
+                        valid = yield ex_debug.valid
+
+                        if valid:
+                            id = yield ex_debug.bits.uop_id
+                            opcode = yield ex_debug.bits.opcode
+                            prs1 = yield ex_debug.bits.prs1
+                            rs1_data = yield ex_debug.bits.rs1_data
+                            prs2 = yield ex_debug.bits.prs2
+                            rs2_data = yield ex_debug.bits.rs2_data
+
+                            print(
+                                f'EX {id} {opcode} {prs1} {rs1_data:x} {prs2} {rs2_data:x}',
+                                file=log_file)
+
                 for mem_debug in dut.core_debug.mem_debug:
                     valid = yield mem_debug.valid
 
@@ -395,11 +411,13 @@ if __name__ == "__main__":
                         opcode = yield mem_debug.bits.opcode
                         addr = yield mem_debug.bits.addr
                         data = yield mem_debug.bits.data
+                        data_valid = yield mem_debug.bits.data_valid
+                        mem_size = yield mem_debug.bits.mem_size
                         prs1 = yield mem_debug.bits.prs1
                         prs2 = yield mem_debug.bits.prs2
 
                         print(
-                            f'MEM {id} {opcode} {prs1} {prs2} {addr:x} {data:x}',
+                            f'MEM {id} {opcode} {mem_size} {prs1} {prs2} {addr:x} {data:x} {data_valid}',
                             file=log_file)
 
                 for wb_debug in dut.core_debug.wb_debug:

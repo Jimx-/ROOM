@@ -87,6 +87,11 @@ class CoreDebug(HasCoreParams):
         if self.use_fpu:
             fp_width = self.issue_params[IssueQueueType.FP]['issue_width']
 
+            self.fp_ex_debug = [
+                Valid(ExecDebug, params, name=f'fp_ex_debug{i}')
+                for i in range(fp_width)
+            ]
+
             self.fp_wb_debug = [
                 Valid(WritebackDebug, params, name=f'fp_wb_debug{i}')
                 for i in range(self.mem_width + fp_width)
@@ -122,6 +127,9 @@ class CoreDebug(HasCoreParams):
             ret.append(l.eq(r))
 
         if self.use_fpu:
+            for l, r in zip(self.fp_ex_debug, rhs.fp_ex_debug):
+                ret.append(l.eq(r))
+
             for l, r in zip(self.fp_wb_debug, rhs.fp_wb_debug):
                 ret.append(l.eq(r))
 
@@ -257,6 +265,10 @@ class Core(HasCoreParams, Elaboratable):
             m.d.comb += fp_pipeline.frm.eq(exc_unit.frm.r)
 
             if self.sim_debug:
+                for a, b in zip(self.core_debug.fp_ex_debug,
+                                fp_pipeline.ex_debug):
+                    m.d.comb += a.eq(b)
+
                 for a, b in zip(self.core_debug.fp_wb_debug,
                                 fp_pipeline.wb_debug):
                     m.d.comb += a.eq(b)

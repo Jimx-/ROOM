@@ -7,7 +7,7 @@ from room.fu import ExecResp
 from room.regfile import RegisterFile, RegisterRead, WritebackDebug
 from room.branch import BranchUpdate
 from room.issue import IssueUnitUnordered
-from room.ex_stage import ExecUnits
+from room.ex_stage import ExecUnits, ExecDebug
 from room.utils import Arbiter
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -56,6 +56,11 @@ class FPPipeline(HasFPUParams, Elaboratable):
         self.frm = Signal(RoundingMode)
 
         if self.sim_debug:
+            self.ex_debug = [
+                Valid(ExecDebug, params, name=f'ex_debug{i}')
+                for i in range(self.iq_params['issue_width'])
+            ]
+
             self.wb_debug = [
                 Valid(WritebackDebug, params, name=f'wb_debug{i}')
                 for i in range(self.num_wakeup_ports)
@@ -69,6 +74,10 @@ class FPPipeline(HasFPUParams, Elaboratable):
 
         for eu in exec_units:
             m.d.comb += eu.frm.eq(self.frm)
+
+        if self.sim_debug:
+            for l, r in zip(self.ex_debug, exec_units.exec_debug):
+                m.d.comb += l.eq(r)
 
         #
         # Dispatch
