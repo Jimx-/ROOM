@@ -146,6 +146,7 @@ class IFStage(HasVectorParams, Elaboratable):
             fetch_buffer.w_en.eq(
                 self.req.valid
                 & ~self.br_update.uop_killed(self.req.bits.uop)),
+            fetch_buffer.br_update.eq(self.br_update),
             self.req.ready.eq(fetch_buffer.w_rdy),
         ]
 
