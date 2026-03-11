@@ -72,20 +72,19 @@
   j 1b                       ;/* Loop */             \
 3:
 
+##### Access Fault #####
+
+#define RVMODEL_ACCESS_FAULT_ADDRESS 0x00000000
+
 ##### Machine Timer #####
 
-# Set the machine timer (mtime) to the value in the register _R1.
-# _R2 can be used as a temporary register (e.g. address of mtime).
-# For RV32, only write the lower 32 bits of mtime and RVMODEL_SET_MTIMEH for upper 32 bits.
-#define RVMODEL_MTIME_ADDR  0x0200BFF8  /* Address of mtime CSR */
-#define RVMODEL_SET_MTIME(_R1, _R2)        \
-    li   _R2, RVMODEL_MTIME_ADDR        ; /* MTIME address */ \
-    SREG _R1, 0(_R2)            ; /* Set MTIME low */
+#define RVMODEL_INTERRUPT_LATENCY 10
 
-#define RVMODEL_SET_MTIMEH(_R1, _R2)       \
-    li   _R2, RVMODEL_MTIME_ADDR        ; /* MTIME address */ \
-    SREG _R1, 4(_R2)            ; /* Set MTIME high */
+#define RVMODEL_TIMER_INT_SOON_DELAY 100
 
+#define RVMODEL_MTIME_ADDRESS  0x0200BFF8  /* Address of mtime CSR */
+
+#define RVMODEL_MTIMECMP_ADDRESS 0x02004000 /* Address of mtimecmp CSR */
 
 ##### Machine Interrupts #####
 
