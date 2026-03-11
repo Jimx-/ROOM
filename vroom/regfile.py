@@ -174,6 +174,9 @@ class RegisterRead(HasVectorParams, Elaboratable):
         self.dis_uop = VMicroOp(params)
         self.dis_ready = Signal()
 
+        self.dis_rs1_data = Signal(self.xlen)
+        self.dis_rs2_data = Signal(self.xlen)
+
         self.read_ports = [
             RFReadPort(5, self.data_width, name=f'read_port{i}')
             for i in range(num_rports)
@@ -219,6 +222,8 @@ class RegisterRead(HasVectorParams, Elaboratable):
             rrd_req.vs1_data.eq(rrd_rs1_data),
             rrd_req.vs2_data.eq(rrd_rs2_data),
             rrd_req.vs3_data.eq(rrd_rs3_data),
+            rrd_req.rs1_data.eq(self.dis_rs1_data),
+            rrd_req.rs2_data.eq(self.dis_rs2_data),
         ]
 
         out_buf = m.submodules.out_buf = SkidBuffer(ExecReq, self.params)

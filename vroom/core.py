@@ -207,6 +207,8 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             if_stage.get_rs1.bits.eq(dispatcher.dis_uop.ftq_idx),
             if_stage.get_rs2.valid.eq(vregread.dis_valid),
             if_stage.get_rs2.bits.eq(dispatcher.dis_uop.ftq_idx),
+            vregread.dis_rs1_data.eq(if_stage.get_rs1_data),
+            vregread.dis_rs2_data.eq(if_stage.get_rs2_data),
         ]
 
         dis_ready = vregread.dis_ready
@@ -222,22 +224,12 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         # Execute
         #
 
-        exec_rs1_data = Signal(self.xlen)
-        exec_rs2_data = Signal(self.xlen)
-        with m.If(vregread.dis_valid & vregread.dis_ready):
-            m.d.sync += [
-                exec_rs1_data.eq(if_stage.get_rs1_data),
-                exec_rs2_data.eq(if_stage.get_rs2_data),
-            ]
-
         exec_unit = m.submodules.exec_unit = ALUExecUnit(
             self.params, sim_debug=self.sim_debug)
         m.d.comb += [
             vregread.exec_req.connect(exec_unit.req),
             exec_unit.req.valid.eq(vregread.exec_req.valid
                                    & ~vregread.exec_req.bits.uop.fp_valid),
-            exec_unit.req.bits.rs1_data.eq(exec_rs1_data),
-            exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
             exec_unit.req.bits.mask.eq(vregfile_v0),
             vregfile.read_ports[-1].addr.eq(exec_unit.perm_rd_port.addr),
         ]
@@ -252,8 +244,6 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
                     vregread.exec_req.valid
                     & vregread.exec_req.bits.uop.fp_valid),
                 fp_exec_unit.req.bits.eq(vregread.exec_req.bits),
-                fp_exec_unit.req.bits.rs1_data.eq(exec_rs1_data),
-                fp_exec_unit.req.bits.rs2_data.eq(exec_rs2_data),
                 fp_exec_unit.req.bits.mask.eq(vregfile_v0),
             ]
 
