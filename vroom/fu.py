@@ -930,7 +930,8 @@ class AddrGenUnit(PipelinedFunctionalUnit):
 
         m.d.comb += [
             self.resp.bits.base_addr.eq(self.req.bits.rs1_data),
-            self.resp.bits.stride.eq(self.req.bits.rs2_data),
+            self.resp.bits.stride.eq(
+                Mux(self.req.bits.uop.strided, self.req.bits.rs2_data, 0)),
             self.resp.bits.index.eq(self.req.bits.vs2_data),
             self.resp.bits.old_vd.eq(self.req.bits.vs3_data),
             self.resp.bits.mask.eq(self.req.bits.mask),

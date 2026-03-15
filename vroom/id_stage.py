@@ -95,6 +95,9 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                             n = self.vlen_bytes >> w
                                             m.d.comb += uop.vl.eq(n << i)
 
+                with m.Elif(uop.mask_ls):
+                    m.d.comb += uop.vl.eq((self.vl + 7) >> 3)
+
             with m.Case(0b0100111):  # vs*
                 mop = inuop.inst[26:28]
                 sumop = inuop.inst[20:25]
@@ -119,6 +122,9 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         for i in range(4):
                             with m.Case((1 << i) - 1):
                                 m.d.comb += uop.vl.eq(self.vlen_bytes << i)
+
+                with m.Elif(uop.mask_ls):
+                    m.d.comb += uop.vl.eq((self.vl + 7) >> 3)
 
             with m.Case(0b1010111):
                 with m.Switch(uop.funct3):

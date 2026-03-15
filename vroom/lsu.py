@@ -5,7 +5,7 @@ from amaranth.utils import log2_int
 from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp
 from vroom.fu import ExecResp
-from vroom.utils import vlmul_to_lmul, TailGen
+from vroom.utils import vlmul_to_lmul, TailGen, EmulDecoder
 
 from room.consts import MemoryCommand
 from room.mmu import CoreMemRequest, CoreMemResponse
@@ -1390,7 +1390,9 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         req_vlmul_sign = req.uop.vlmul_sign
         req_emul_vd = vlmul_to_lmul(req_vlmul_sign, req_vlmul_mag)
         req_eew = req.uop.funct3[:2]
-        req_dest_eew = Mux(req.uop.indexed, req.uop.vsew, req.uop.mem_size)
+        req_dest_eew = Mux(
+            req.uop.mask_ls, 0,
+            Mux(req.uop.indexed, req.uop.vsew, req.uop.mem_size))
         req_vstart = 0
         req_vl = req.uop.vl
         req_nf = req.uop.funct6[3:]
@@ -1406,14 +1408,17 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         buf_rptr = Signal(range(8))
         buf_wptr = Signal(range(8))
 
+        emul_dec = m.submodules.emul_dec = EmulDecoder(self.params)
+        m.d.comb += emul_dec.uop.eq(self.exec_req.bits.uop)
+
         tail_gen = m.submodules.tail_gen = TailGen(self.params)
         m.d.comb += [
             tail_gen.vl.eq(self.exec_req.bits.uop.vl),
             tail_gen.uop_idx.eq(self.exec_req.bits.uop.expd_idx),
-            tail_gen.eew.eq(self.exec_req.bits.uop.dest_eew()),
+            tail_gen.eew.eq(emul_dec.veew_vd),
         ]
         tail_mask = Signal(self.vlen_bytes)
-        with m.Switch(self.exec_req.bits.uop.dest_eew()):
+        with m.Switch(emul_dec.veew_vd):
             for i in range(4):
                 with m.Case(i):
                     m.d.comb += tail_mask.eq(
@@ -1422,8 +1427,10 @@ class LoadStoreUnit(HasVectorParams, Elaboratable):
         write_one_mask = Signal(self.vlen)
         for i in range(self.vlen_bytes):
             with m.If(tail_mask[i]):
+                # XXX: Follow SAIL model's handling of mask load tail elements
                 m.d.comb += write_one_mask[i * 8:(i + 1) * 8].eq(
-                    self.exec_req.bits.uop.vta.replicate(8))
+                    (self.exec_req.bits.uop.vta
+                     & ~self.exec_req.bits.uop.mask_ls).replicate(8))
             with m.Else():
                 m.d.comb += write_one_mask[i * 8:(i + 1) * 8].eq(
                     (self.exec_req.bits.uop.vm
