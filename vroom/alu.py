@@ -558,7 +558,8 @@ class VFixPointALU(Elaboratable):
         for i in range(self.width // 8):
             m.d.comb += [
                 avg_pre_round.word_select(i, 8).eq(
-                    Cat(self.alu_out.word_select(i, 8), avg_high_bit[i])),
+                    Cat(self.alu_out.bit_select(i * 8 + 1, 7),
+                        avg_high_bit[i])),
                 avg_round_inc[i].eq(
                     get_round_inc(self.vxrm, self.alu_out.word_select(i, 8),
                                   1)),

@@ -38,6 +38,14 @@ def vxrm_layout(xlen):
     ]
 
 
+def vcsr_layout(xlen):
+    return [
+        ("vxsat", 1, CSRAccess.RW),
+        ("vxrm", 2, CSRAccess.RW),
+        ("_rsvd", xlen - 3, CSRAccess.RO),
+    ]
+
+
 class VWritebackDebug(HasVectorParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
@@ -93,6 +101,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         self.exception = Signal()
 
         self.vxrm = CSR(0x00A, vxrm_layout(self.xlen))
+        self.vcsr = CSR(0x00F, vcsr_layout(self.xlen))
         self.vl = CSR(0xC20, [('value', self.xlen, CSRAccess.RO)])
         self.vtype = CSR(0xC21, vtype_layout(self.xlen))
         self.vlenb = CSR(0xC22, [('value', self.xlen, CSRAccess.RO)])
@@ -131,10 +140,13 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             self.vtype.r.vill.eq(if_stage.vtype.vill),
             self.vl.r.eq(if_stage.vl),
             self.vlenb.r.eq(self.vlen // 8),
+            self.vcsr.r.vxrm.eq(self.vxrm.r),
         ]
 
         with m.If(self.vxrm.we):
             m.d.sync += self.vxrm.r.eq(self.vxrm.w)
+        with m.If(self.vcsr.we):
+            m.d.sync += self.vxrm.r.eq(self.vcsr.w.vxrm)
 
         #
         # Decoding

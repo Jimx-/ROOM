@@ -1240,6 +1240,14 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                         ]
 
                         with m.Switch(uop.funct6):
+                            with m.Case(0b001000):
+                                m.d.comb += UOPC(VOpCode.VAADDU)
+                            with m.Case(0b001001):
+                                m.d.comb += UOPC(VOpCode.VAADD)
+                            with m.Case(0b001010):
+                                m.d.comb += UOPC(VOpCode.VASUBU)
+                            with m.Case(0b001011):
+                                m.d.comb += UOPC(VOpCode.VASUB)
                             with m.Case(0b001110):
                                 m.d.comb += [
                                     uop.fu_type.eq(VFUType.PERM),
