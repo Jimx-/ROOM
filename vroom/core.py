@@ -100,6 +100,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         self.br_update = BranchUpdate(params)
         self.exception = Signal()
 
+        self.vxsat = CSR(0x009, [('value', 1, CSRAccess.RW)])
         self.vxrm = CSR(0x00A, vxrm_layout(self.xlen))
         self.vcsr = CSR(0x00F, vcsr_layout(self.xlen))
         self.vl = CSR(0xC20, [('value', self.xlen, CSRAccess.RO)])
@@ -140,13 +141,19 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             self.vtype.r.vill.eq(if_stage.vtype.vill),
             self.vl.r.eq(if_stage.vl),
             self.vlenb.r.eq(self.vlen // 8),
+            self.vcsr.r.vxsat.eq(self.vxsat.r),
             self.vcsr.r.vxrm.eq(self.vxrm.r),
         ]
 
+        with m.If(self.vxsat.we):
+            m.d.sync += self.vxsat.r.eq(self.vxsat.w)
         with m.If(self.vxrm.we):
             m.d.sync += self.vxrm.r.eq(self.vxrm.w)
         with m.If(self.vcsr.we):
-            m.d.sync += self.vxrm.r.eq(self.vcsr.w.vxrm)
+            m.d.sync += [
+                self.vxsat.r.eq(self.vcsr.w.vxsat),
+                self.vxrm.r.eq(self.vcsr.w.vxrm),
+            ]
 
         #
         # Decoding
@@ -322,6 +329,9 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
 
             with m.If(wp.valid & (wp.bits.addr == 0)):
                 m.d.sync += vregfile_v0.eq(wp.bits.data)
+
+        with m.If(wb_req.valid):
+            m.d.sync += self.vxsat.r.eq(self.vxsat.r | wb_req.bits.vxsat)
 
         if self.sim_debug:
             m.d.comb += [

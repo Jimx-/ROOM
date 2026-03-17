@@ -15,6 +15,8 @@ from room.consts import RegisterType, RoundingMode
 from room.fpu import FPUOperator, FPFormat, FType, IntFormat, FPUCastMulti
 from room.utils import Decoupled, Pipe, sign_extend, bit_extend
 
+from roomsoc.interconnect.stream import Valid
+
 
 def get_byte_mask(m, mask_out, mask, dest_eew):
     with m.Switch(dest_eew):
@@ -74,10 +76,14 @@ class ExecResp(HasVectorParams, ValueCastable):
 
         self.vd_data = Signal(self.vlen, name=f'{name}__vd_data')
 
+        self.fflags = Valid(Signal, 5, name=f'{name}__fflags')
+        self.vxsat = Signal(name=f'{name}__vxsat')
+
     @ValueCastable.lowermethod
     def as_value(self):
         return Cat(self.uop, self.base_addr, self.stride, self.index,
-                   self.old_vd, self.mask, self.vd_data)
+                   self.old_vd, self.mask, self.vd_data, self.fflags,
+                   self.vxsat)
 
     def shape(self):
         return self.as_value().shape()
@@ -137,9 +143,12 @@ class ExecLaneResp(HasVectorParams, ValueCastable):
 
         self.vd_data = Signal(self.data_width, name=f'{name}__vd_data')
 
+        self.fflags = Valid(Signal, 5, name=f'{name}__fflags')
+        self.vxsat = Signal(name=f'{name}__vxsat')
+
     @ValueCastable.lowermethod
     def as_value(self):
-        return Cat(self.uop, self.vd_data)
+        return Cat(self.uop, self.vd_data, self.fflags, self.vxsat)
 
     def shape(self):
         return self.as_value().shape()
@@ -495,6 +504,7 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                                 self.lane_resps[lane_idx].bits.vd_data[
                                     lmul_idx * 8 + offset])
 
+        lane_vxsat = Signal(self.n_lanes)
         for w, lane_resp in enumerate(self.lane_resps):
             lane_vd_data = Signal(self.lane_width, name=f'lane_vd_data{w}')
             with m.If(self.resp.bits.uop.narrow):
@@ -517,11 +527,15 @@ class PerLaneFunctionalUnit(FunctionalUnit):
             with m.Else():
                 m.d.comb += lane_vd_data.eq(lane_resp.bits.vd_data)
 
-            m.d.comb += self.resp.bits.vd_data.word_select(
-                w, self.lane_width).eq(
+            m.d.comb += [
+                self.resp.bits.vd_data.word_select(w, self.lane_width).eq(
                     Mux(self.resp.bits.uop.narrow_to_1,
                         vd_cmp_out.word_select(w, self.lane_width),
-                        lane_vd_data))
+                        lane_vd_data)),
+                lane_vxsat[w].eq(lane_resp.bits.vxsat),
+            ]
+
+        m.d.comb += self.resp.bits.vxsat.eq(lane_vxsat.any())
 
         return m
 
@@ -649,11 +663,15 @@ class VALULane(PipelinedLaneFunctionalUnit):
         s1_is_fixp = Signal()
         s1_mask_keep = Signal.like(mask_gen.mask_keep)
         s1_mask_off_data = Signal.like(mask_gen.mask_off)
+        s1_tail_mask = Signal.like(tail_mask)
+        s1_byte_mask = Signal.like(byte_mask)
         m.d.sync += [
             s1_alu_out.eq(alu.out),
             s1_is_fixp.eq(is_fixp),
             s1_mask_keep.eq(mask_gen.mask_keep),
             s1_mask_off_data.eq(mask_gen.mask_off),
+            s1_tail_mask.eq(tail_mask),
+            s1_byte_mask.eq(byte_mask),
         ]
 
         s1_cmp_out = [
@@ -718,29 +736,48 @@ class VALULane(PipelinedLaneFunctionalUnit):
         s2_uop = self.uops[1]
         s2_int_out = Signal(self.data_width)
         s2_fixp_out = Signal(self.data_width)
+        s2_fixp_vxsat = Signal(self.data_width // 8)
         s2_is_fixp = Signal()
         s2_mask_keep = Signal.like(s1_mask_keep)
         s2_mask_off_data = Signal.like(s1_mask_off_data)
+        s2_tail_mask = Signal.like(s1_tail_mask)
+        s2_byte_mask = Signal.like(s1_byte_mask)
         s2_fixp_narrow_out = Signal(self.data_width)
+        s2_fixp_narrow_vxsat = Signal(self.data_width // 8)
         m.d.sync += [
             s2_int_out.eq(s1_int_out),
             s2_fixp_out.eq(fixp.out),
+            s2_fixp_vxsat.eq(fixp.vxsat),
             s2_is_fixp.eq(s1_is_fixp),
             s2_mask_keep.eq(s1_mask_keep),
             s2_mask_off_data.eq(s1_mask_off_data),
+            s2_tail_mask.eq(s1_tail_mask),
+            s2_byte_mask.eq(s1_byte_mask),
             s2_fixp_narrow_out.eq(
                 Mux(
                     s1_uop.expd_idx[0],
                     Cat(s2_fixp_narrow_out[:self.data_width // 2],
                         fixp.narrow_out), fixp.narrow_out)),
+            s2_fixp_narrow_vxsat.eq(
+                Mux(
+                    s1_uop.expd_idx[0],
+                    Cat(s2_fixp_narrow_vxsat[:self.data_width // 16],
+                        fixp.vxsat), fixp.vxsat)),
         ]
 
         s2_fixp_out_masked = (
             Mux(s2_uop.narrow, s2_fixp_narrow_out, s2_fixp_out)
             & s2_mask_keep) | s2_mask_off_data
 
-        m.d.comb += self.resp.bits.vd_data.eq(
-            Mux(s2_is_fixp, s2_fixp_out_masked, s2_int_out))
+        s2_fixp_vxsat = Mux(s2_uop.narrow, s2_fixp_narrow_vxsat, s2_fixp_vxsat)
+        s2_vxsat_masked = s2_fixp_vxsat & ~s2_tail_mask & (
+            s2_byte_mask | s2_uop.vm.replicate(self.data_width // 8))
+
+        m.d.comb += [
+            self.resp.bits.vd_data.eq(
+                Mux(s2_is_fixp, s2_fixp_out_masked, s2_int_out)),
+            self.resp.bits.vxsat.eq(s2_is_fixp & s2_vxsat_masked.any()),
+        ]
 
         return m
 
