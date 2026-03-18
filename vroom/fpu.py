@@ -1,4 +1,6 @@
 from amaranth import *
+from functools import reduce
+import operator
 
 from room.consts import RoundingMode
 from room.fpu import FPFormat, IntFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp, FPUDivSqrtMulti, FPUCastMulti, FPURec
@@ -29,6 +31,7 @@ class VFPUFMA(Elaboratable):
         ]
 
         dfma_res = []
+        dfma_status = []
         if self.width >= 64:
             for i in range(self.width // 64):
                 dfma = FPUFMA(64, FPFormat.D, latency=self.latency)
@@ -48,8 +51,10 @@ class VFPUFMA(Elaboratable):
                 ]
 
                 dfma_res.append(dfma.out.bits.data)
+                dfma_status.append(dfma.out.bits.status)
 
         sfma_res = []
+        sfma_status = []
         for i in range(self.width // 32):
             sfma = FPUFMA(32, FPFormat.S, latency=self.latency)
             setattr(m.submodules, f'sfma{i}', sfma)
@@ -68,13 +73,20 @@ class VFPUFMA(Elaboratable):
             ]
 
             sfma_res.append(sfma.out.bits.data)
+            sfma_status.append(sfma.out.bits.status)
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
         with m.Switch(in_pipe_out.dst_fmt):
             with m.Case(FPFormat.D):
-                m.d.comb += self.out.bits.data.eq(Cat(dfma_res))
+                m.d.comb += [
+                    self.out.bits.data.eq(Cat(dfma_res)),
+                    self.out.bits.status.eq(reduce(operator.or_, dfma_status)),
+                ]
             with m.Case(FPFormat.S):
-                m.d.comb += self.out.bits.data.eq(Cat(sfma_res))
+                m.d.comb += [
+                    self.out.bits.data.eq(Cat(sfma_res)),
+                    self.out.bits.status.eq(reduce(operator.or_, sfma_status)),
+                ]
 
         return m
 
@@ -101,6 +113,7 @@ class VFPUComp(Elaboratable):
         ]
 
         dcmp_res = []
+        dcmp_status = []
         if self.width >= 64:
             for i in range(self.width // 64):
                 dcmp = FPUComp(64, FPFormat.D, latency=self.latency)
@@ -120,8 +133,10 @@ class VFPUComp(Elaboratable):
                 ]
 
                 dcmp_res.append(dcmp.out.bits.data)
+                dcmp_status.append(dcmp.out.bits.status)
 
         scmp_res = []
+        scmp_status = []
         for i in range(self.width // 32):
             scmp = FPUComp(32, FPFormat.S, latency=self.latency)
             setattr(m.submodules, f'scmp{i}', scmp)
@@ -140,13 +155,20 @@ class VFPUComp(Elaboratable):
             ]
 
             scmp_res.append(scmp.out.bits.data)
+            scmp_status.append(scmp.out.bits.status)
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
         with m.Switch(in_pipe_out.dst_fmt):
             with m.Case(FPFormat.D):
-                m.d.comb += self.out.bits.data.eq(Cat(dcmp_res))
+                m.d.comb += [
+                    self.out.bits.data.eq(Cat(dcmp_res)),
+                    self.out.bits.status.eq(reduce(operator.or_, dcmp_status)),
+                ]
             with m.Case(FPFormat.S):
-                m.d.comb += self.out.bits.data.eq(Cat(scmp_res))
+                m.d.comb += [
+                    self.out.bits.data.eq(Cat(scmp_res)),
+                    self.out.bits.status.eq(reduce(operator.or_, scmp_status)),
+                ]
 
         with m.If(in_pipe_out.fn == FPUOperator.CMP):
             with m.Switch(in_pipe_out.src_fmt):
@@ -173,7 +195,7 @@ class VFPUDivSqrt(Elaboratable):
         self.in_valid = Signal()
         self.in_ready = Signal()
 
-        self.out = Decoupled(Signal, width)
+        self.out = Decoupled(FPUResult, width)
 
     def elaborate(self, platform):
         m = Module()
@@ -191,7 +213,9 @@ class VFPUDivSqrt(Elaboratable):
 
         resp_valid = Signal(self.width // 32)
         resp_data_s = Signal(self.width)
+        resp_status_s = []
         resp_data_d = Signal(self.width)
+        resp_status_d = []
         for i in range(self.width // 32):
             fdiv = FPUDivSqrtMulti()
             setattr(m.submodules, f'fdiv{i}', fdiv)
@@ -202,6 +226,7 @@ class VFPUDivSqrt(Elaboratable):
                 fdiv.rm.eq(self.rm),
                 resp_valid[i].eq(fdiv.out.valid),
                 fdiv.out.ready.eq(~fdiv_busy | self.out.fire),
+                resp_data_s.word_select(i, 32).eq(fdiv.out.bits.data),
             ]
             if i & 1:
                 m.d.comb += [
@@ -209,27 +234,31 @@ class VFPUDivSqrt(Elaboratable):
                     fdiv.b.eq(self.b.word_select(i, 32)),
                     fdiv.in_valid.eq(self.in_valid & self.in_ready
                                      & (self.fmt == FPFormat.S)),
-                    resp_data_s.word_select(i, 32).eq(fdiv.out.bits.data),
                 ]
             else:
                 m.d.comb += [
                     fdiv.a.eq(self.a.word_select(i // 2, 64)),
                     fdiv.b.eq(self.b.word_select(i // 2, 64)),
                     fdiv.in_valid.eq(self.in_valid & self.in_ready),
-                    resp_data_s.word_select(i, 32).eq(fdiv.out.bits.data),
                     resp_data_d.word_select(i // 2, 64).eq(fdiv.out.bits.data),
                 ]
+                resp_status_d.append(fdiv.out.bits.status)
+            resp_status_s.append(fdiv.out.bits.status)
 
         resp_mask = Signal(self.width // 32)
         with m.Switch(fmt):
             with m.Case(FPFormat.D):
                 m.d.comb += [
-                    self.out.bits.eq(resp_data_d),
+                    self.out.bits.data.eq(resp_data_d),
+                    self.out.bits.status.eq(reduce(operator.or_,
+                                                   resp_status_d)),
                     resp_mask.eq(Const(1, 2).replicate(self.width // 64)),
                 ]
             with m.Case(FPFormat.S):
                 m.d.comb += [
-                    self.out.bits.eq(resp_data_s),
+                    self.out.bits.data.eq(resp_data_s),
+                    self.out.bits.status.eq(reduce(operator.or_,
+                                                   resp_status_s)),
                     resp_mask.eq(~0),
                 ]
 
@@ -260,7 +289,9 @@ class VFPUCast(Elaboratable):
         ]
 
         resp_data_s = Signal(self.width)
+        resp_status_s = []
         resp_data_d = Signal(self.width)
+        resp_status_d = []
         for i in range(self.width // 32):
             cast = FPUCastMulti(latency=self.latency)
             setattr(m.submodules, f'cast{i}', cast)
@@ -272,36 +303,53 @@ class VFPUCast(Elaboratable):
                 cast.inp.bits.src_fmt.eq(self.inp.bits.src_fmt),
                 cast.inp.bits.dst_fmt.eq(self.inp.bits.dst_fmt),
                 cast.inp.bits.int_fmt.eq(self.inp.bits.int_fmt),
+                resp_data_s.word_select(i, 32).eq(cast.out.bits.data),
             ]
             if i & 1:
                 m.d.comb += [
                     cast.inp.bits.in1.eq(self.inp.bits.in2.word_select(i, 32)),
                     cast.inp.valid.eq(self.inp.valid
                                       & (self.inp.bits.src_fmt == FPFormat.S)),
-                    resp_data_s.word_select(i, 32).eq(cast.out.bits.data),
                 ]
             else:
                 m.d.comb += [
                     cast.inp.bits.in1.eq(
                         self.inp.bits.in2.word_select(i // 2, 64)),
                     cast.inp.valid.eq(self.inp.valid),
-                    resp_data_s.word_select(i, 32).eq(cast.out.bits.data),
                     resp_data_d.word_select(i // 2, 64).eq(cast.out.bits.data),
                 ]
+                resp_status_d.append(cast.out.bits.status)
+            resp_status_s.append(cast.out.bits.status)
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
         with m.If(in_pipe_out.fn == FPUOperator.F2I):
             with m.Switch(in_pipe_out.int_fmt):
                 with m.Case(IntFormat.INT64):
-                    m.d.comb += self.out.bits.data.eq(resp_data_d)
+                    m.d.comb += [
+                        self.out.bits.data.eq(resp_data_d),
+                        self.out.bits.status.eq(
+                            reduce(operator.or_, resp_status_d)),
+                    ]
                 with m.Case(IntFormat.INT32):
-                    m.d.comb += self.out.bits.data.eq(resp_data_s)
+                    m.d.comb += [
+                        self.out.bits.data.eq(resp_data_s),
+                        self.out.bits.status.eq(
+                            reduce(operator.or_, resp_status_s)),
+                    ]
         with m.Else():
             with m.Switch(in_pipe_out.dst_fmt):
                 with m.Case(FPFormat.D):
-                    m.d.comb += self.out.bits.data.eq(resp_data_d)
+                    m.d.comb += [
+                        self.out.bits.data.eq(resp_data_d),
+                        self.out.bits.status.eq(
+                            reduce(operator.or_, resp_status_d)),
+                    ]
                 with m.Case(FPFormat.S):
-                    m.d.comb += self.out.bits.data.eq(resp_data_s)
+                    m.d.comb += [
+                        self.out.bits.data.eq(resp_data_s),
+                        self.out.bits.status.eq(
+                            reduce(operator.or_, resp_status_s)),
+                    ]
 
         return m
 
@@ -328,6 +376,7 @@ class VFPURec(Elaboratable):
         ]
 
         drec_res = []
+        drec_status = []
         if self.width >= 64:
             for i in range(self.width // 64):
                 drec = FPURec(64, FPFormat.D, latency=self.latency)
@@ -342,8 +391,10 @@ class VFPURec(Elaboratable):
                 ]
 
                 drec_res.append(drec.out.bits.data)
+                drec_status.append(drec.out.bits.status)
 
         srec_res = []
+        srec_status = []
         for i in range(self.width // 32):
             srec = FPURec(32, FPFormat.S, latency=self.latency)
             setattr(m.submodules, f'srec{i}', srec)
@@ -357,13 +408,21 @@ class VFPURec(Elaboratable):
             ]
 
             srec_res.append(srec.out.bits.data)
+            srec_status.append(srec.out.bits.status)
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
         with m.Switch(in_pipe_out.dst_fmt):
             with m.Case(FPFormat.D):
-                m.d.comb += self.out.bits.data.eq(Cat(drec_res))
+                m.d.comb += [
+                    self.out.bits.data.eq(Cat(drec_res)),
+                    self.out.bits.status.eq(reduce(operator.or_, drec_status)),
+                ]
+
             with m.Case(FPFormat.S):
-                m.d.comb += self.out.bits.data.eq(Cat(srec_res))
+                m.d.comb += [
+                    self.out.bits.data.eq(Cat(srec_res)),
+                    self.out.bits.status.eq(reduce(operator.or_, srec_status)),
+                ]
 
         return m
 

@@ -152,7 +152,7 @@ class IFStage(HasVectorParams, Elaboratable):
 
         ftq_valid = Signal(self.ftq_size)
         ftq_wb = [
-            Valid(Signal, self.xlen, name=f'ftq_wb{i}')
+            Valid(ExecResp, self.xlen, self.params, name=f'ftq_wb{i}')
             for i in range(self.ftq_size)
         ]
         ftq = [
@@ -225,8 +225,9 @@ class IFStage(HasVectorParams, Elaboratable):
                     with m.Case(i):
                         m.d.sync += [
                             ftq_wb[i].valid.eq(1),
-                            ftq_wb[i].bits.eq(
+                            ftq_wb[i].bits.data.eq(
                                 self.wb_req.bits.vd_data[:self.xlen]),
+                            ftq_wb[i].bits.fflags.eq(self.wb_req.bits.fflags),
                         ]
 
         with m.If(vec_config.resp.valid):
@@ -238,6 +239,7 @@ class IFStage(HasVectorParams, Elaboratable):
                 m.d.comb += [
                     resp.valid.eq(1),
                     resp.bits.data.eq(self.wb_req.bits.vd_data[:self.xlen]),
+                    resp.bits.fflags.eq(self.wb_req.bits.fflags),
                     wb_grant.eq(self.wb_req.bits.uop.ftq_idx),
                 ]
                 with m.Switch(self.wb_req.bits.uop.ftq_idx):
@@ -258,7 +260,8 @@ class IFStage(HasVectorParams, Elaboratable):
                         with m.Case(i):
                             m.d.comb += [
                                 resp.bits.uop.eq(ftq[i]),
-                                resp.bits.data.eq(ftq_wb[i].bits),
+                                resp.bits.data.eq(ftq_wb[i].bits.data),
+                                resp.bits.fflags.eq(ftq_wb[i].bits.fflags),
                             ]
 
             with m.If(resp.bits.uop.rf_wen()

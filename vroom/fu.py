@@ -504,9 +504,11 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                                 self.lane_resps[lane_idx].bits.vd_data[
                                     lmul_idx * 8 + offset])
 
+        fflags = 0
         lane_vxsat = Signal(self.n_lanes)
         for w, lane_resp in enumerate(self.lane_resps):
             lane_vd_data = Signal(self.lane_width, name=f'lane_vd_data{w}')
+            lane_fflags = Signal(5, name=f'lane_fflags{w}')
             with m.If(self.resp.bits.uop.narrow):
                 if w < self.n_lanes // 2:
                     m.d.comb += lane_vd_data.eq(
@@ -532,10 +534,19 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                     Mux(self.resp.bits.uop.narrow_to_1,
                         vd_cmp_out.word_select(w, self.lane_width),
                         lane_vd_data)),
+                lane_fflags.eq(fflags | Mux(lane_resp.bits.fflags.valid,
+                                            lane_resp.bits.fflags.bits, 0)),
                 lane_vxsat[w].eq(lane_resp.bits.vxsat),
             ]
 
-        m.d.comb += self.resp.bits.vxsat.eq(lane_vxsat.any())
+            fflags = lane_fflags
+
+        m.d.comb += [
+            self.resp.bits.fflags.valid.eq(
+                Cat(r.bits.fflags.valid for r in self.lane_resps).any()),
+            self.resp.bits.fflags.bits.eq(fflags),
+            self.resp.bits.vxsat.eq(lane_vxsat.any()),
+        ]
 
         return m
 
@@ -1837,6 +1848,16 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                 & mask_gen.mask_keep)
             | mask_gen.mask_off)
 
+        m.d.comb += self.resp.bits.fflags.valid.eq(self.resp.valid)
+        with m.If(fcmp.out.valid):
+            m.d.comb += self.resp.bits.fflags.bits.eq(fcmp.out.bits.status)
+        with m.Elif(cast.out.valid):
+            m.d.comb += self.resp.bits.fflags.bits.eq(cast.out.bits.status)
+        with m.Elif(frec.out.valid):
+            m.d.comb += self.resp.bits.fflags.bits.eq(frec.out.bits.status)
+        with m.Else():
+            m.d.comb += self.resp.bits.fflags.bits.eq(fma.out.bits.status)
+
         return m
 
 
@@ -1881,6 +1902,8 @@ class VFDivLane(IterativeLaneFunctionalUnit):
             fdiv.fmt.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
             fdiv.in_valid.eq(self.req.valid),
             self.req.ready.eq(fdiv.in_ready),
+            self.resp.bits.fflags.valid.eq(self.resp.valid),
+            self.resp.bits.fflags.bits.eq(fdiv.out.bits.status),
             self.resp.valid.eq(fdiv.out.valid),
             fdiv.out.ready.eq(self.resp.ready),
         ]
