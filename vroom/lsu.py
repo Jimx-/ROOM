@@ -128,6 +128,7 @@ class PackedLoadGenerator(BaseLoadGenerator):
         cur_idx = Signal(range(self.max_vlmax))
         cur_vidx = Signal(range(self.vlen_bytes))
         cur_vl = Signal(self.vl_bits)
+        cur_mem_size = Signal(2)
         is_masked = Signal()
         cur_mask_data = Signal(self.vlen)
         cur_mask_offset = Signal(range(self.vlen))
@@ -176,6 +177,7 @@ class PackedLoadGenerator(BaseLoadGenerator):
                         cur_idx.eq(0),
                         cur_vidx.eq(0),
                         cur_vl.eq(self.req.bits.uop.vl),
+                        cur_mem_size.eq(self.req.bits.uop.mem_size),
                         is_masked.eq(~self.req.bits.uop.vm),
                         cur_mask_data.eq(self.req.bits.mask),
                         cur_mask_offset.eq(0),
@@ -195,6 +197,13 @@ class PackedLoadGenerator(BaseLoadGenerator):
                             cur_mask_data >> self.resp.bits.elem_count),
                     ]
 
+                    addr_inc = self.resp.bits.elem_count << (cur_mem_size +
+                                                             log_stride)
+                    with m.If(self.resp.bits.dir):
+                        m.d.sync += cur_addr.eq(cur_addr - addr_inc)
+                    with m.Else():
+                        m.d.sync += cur_addr.eq(cur_addr + addr_inc)
+
                     with m.If(next_vreg):
                         m.d.sync += [
                             cur_vdest.eq(cur_vdest + 1),
@@ -206,11 +215,6 @@ class PackedLoadGenerator(BaseLoadGenerator):
 
                     with m.If(next_line):
                         m.d.sync += cur_offset.eq(0)
-
-                        with m.If(self.resp.bits.dir):
-                            m.d.sync += cur_addr.eq(cur_addr - self.xlen // 8)
-                        with m.Else():
-                            m.d.sync += cur_addr.eq(cur_addr + self.xlen // 8)
                     with m.Else():
                         m.d.sync += cur_offset.eq(cur_offset + (
                             self.resp.bits.elem_count << log_stride))
