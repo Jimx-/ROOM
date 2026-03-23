@@ -1399,7 +1399,7 @@ class VMask(Elaboratable):
         self.opcode = Signal(VOpCode)
         self.in1 = Signal(width)
         self.in2 = Signal(width)
-        self.tail = Signal(width)
+        self.vl = Signal(range(width + 1))
         self.vmask = Signal(width)
 
         self.resp_data = Valid(Signal, width)
@@ -1414,7 +1414,7 @@ class VMask(Elaboratable):
         for i in range(self.width):
             m.d.comb += vs2_masked[i].eq(self.in2[i]
                                          & (self.vm | self.vmask[i])
-                                         & ~self.tail[i])
+                                         & (i < self.vl))
 
         #
         # Logical

@@ -1331,11 +1331,7 @@ class VMaskUnit(IterativeFunctionalUnit):
 
         vl_mask = Signal(self.vlen)
         vl_mask_reg = Signal.like(vl_mask)
-        tail_mask = Signal(self.vlen)
-        m.d.comb += [
-            vl_mask.eq((1 << self.req.bits.uop.vl) - 1),
-            tail_mask.eq(~vl_mask),
-        ]
+        m.d.comb += vl_mask.eq((1 << self.req.bits.uop.vl) - 1)
         with m.If(self.req.fire):
             m.d.sync += vl_mask_reg.eq(vl_mask)
 
@@ -1383,7 +1379,8 @@ class VMaskUnit(IterativeFunctionalUnit):
                     self.req.bits.uop.opcode)),
             vmask.in1.eq(self.req.bits.vs1_data),
             vmask.in2.eq(Mux(cpop_busy, vs2_reg, self.req.bits.vs2_data)),
-            vmask.tail.eq(tail_mask),
+            vmask.vl.eq(
+                Mux(cpop_busy, self.resp.bits.uop.vl, self.req.bits.uop.vl)),
             vmask.vmask.eq(Mux(cpop_busy, mask_reg, self.req.bits.mask)),
         ]
 
