@@ -1503,7 +1503,8 @@ class VMask(Elaboratable):
                     stride = self.width // n
                     m.d.comb += cur_count.eq(
                         one_count_acc.word_select(stride, 8))
-        m.d.sync += one_sum.eq(cur_count)
+        with m.If(self.valid):
+            m.d.sync += one_sum.eq(cur_count)
 
         s1_sew = Signal.like(self.sew)
         s1_opcode = Signal(VOpCode)
