@@ -1427,10 +1427,12 @@ class VMask(Elaboratable):
 
         logic = Mux(
             (self.opcode == VOpCode.VMXOR) | (self.opcode == VOpCode.VMOR) |
-            (self.opcode == VOpCode.VMORNOT) |
+            (self.opcode == VOpCode.VMNOR) | (self.opcode == VOpCode.VMORNOT) |
             (self.opcode == VOpCode.VMXNOR), in1_xor_in2, 0) | Mux(
                 (self.opcode == VOpCode.VMAND) |
+                (self.opcode == VOpCode.VMNAND) |
                 (self.opcode == VOpCode.VMOR) |
+                (self.opcode == VOpCode.VMNOR) |
                 (self.opcode == VOpCode.VMORNOT) |
                 (self.opcode == VOpCode.VMANDNOT), in1_and_in2, 0)
 
@@ -1530,7 +1532,8 @@ class VMask(Elaboratable):
                     m.d.sync += vd_reg.eq(one_count_acc[:self.width])
                 with m.Case(VOpCode.VCPOP):
                     m.d.sync += vd_reg.eq(cur_count)
-
+                with m.Case(VOpCode.VMNAND, VOpCode.VMNOR):
+                    m.d.sync += vd_reg.eq(~logic)
                 with m.Default():
                     m.d.sync += vd_reg.eq(logic)
 
