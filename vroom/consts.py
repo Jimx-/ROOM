@@ -161,12 +161,6 @@ class VOpA(IntEnum):
 class VOpB(IntEnum):
     VS2 = 0
     VS2_HALF = 1
-    OLD_VD = 2
-
-
-class VOpC(IntEnum):
-    OLD_VD = 0
-    VS2 = 1
 
 
 class VALUOperator(IntEnum):

@@ -32,11 +32,7 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
         inuop = self.dis_uop
         uop = self.rrd_uop
 
-        m.d.comb += [
-            uop.opb_sel.eq(VOpB.VS2),
-            uop.opc_sel.eq(VOpC.OLD_VD),
-        ]
-
+        m.d.comb += uop.opb_sel.eq(VOpB.VS2)
         with m.Switch(inuop.funct3):
             with m.Case(0b000):  # OPIVV
                 m.d.comb += uop.opa_sel.eq(VOpA.VS1)
@@ -98,6 +94,8 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
                 (VOpCode.VDIV, VALUOperator.VDIV),
                 (VOpCode.VREMU, VALUOperator.VREMU),
                 (VOpCode.VREM, VALUOperator.VREM),
+                (VOpCode.VMADD, VALUOperator.VMADD),
+                (VOpCode.VNMSUB, VALUOperator.VNMSUB),
                 (VOpCode.VNMSAC, VALUOperator.VNMSAC),
                 (VOpCode.VSADDU, VALUOperator.VSADDU),
                 (VOpCode.VSADD, VALUOperator.VSADD),
@@ -114,17 +112,6 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
             ):
                 with m.Case(opc):
                     m.d.comb += uop.alu_fn.eq(alu_op)
-
-            for opc, alu_op in (
-                (VOpCode.VMADD, VALUOperator.VMADD),
-                (VOpCode.VNMSUB, VALUOperator.VNMSUB),
-            ):
-                with m.Case(opc):
-                    m.d.comb += [
-                        uop.alu_fn.eq(alu_op),
-                        uop.opb_sel.eq(VOpB.OLD_VD),
-                        uop.opc_sel.eq(VOpC.VS2),
-                    ]
 
             for opc, alu_op in (
                 (VOpCode.VMULHU, VALUOperator.VMULHU),

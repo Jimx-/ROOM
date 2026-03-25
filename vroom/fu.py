@@ -376,17 +376,8 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                             self.req.bits.vs2_data.word_select(
                                 w + 2, self.lane_width // 2)))
 
-                with m.Case(VOpB.OLD_VD):
-                    m.d.comb += opb_data.eq(
-                        self.req.bits.vs3_data.word_select(w, self.lane_width))
-
-            with m.Switch(uop.opc_sel):
-                with m.Case(VOpC.OLD_VD):
-                    m.d.comb += old_vd.eq(
-                        self.req.bits.vs3_data.word_select(w, self.lane_width))
-
-                with m.Case(VOpC.VS2):
-                    m.d.comb += old_vd.eq(vs2_data)
+            m.d.comb += old_vd.eq(
+                self.req.bits.vs3_data.word_select(w, self.lane_width))
 
             m.d.comb += [
                 lane_req.valid.eq(
@@ -553,9 +544,10 @@ class PerLaneFunctionalUnit(FunctionalUnit):
 
 class MaskDataGen(HasVectorParams, Elaboratable):
 
-    def __init__(self, data_width, params):
+    def __init__(self, data_width, params, is_alu=False):
         super().__init__(params)
         self.data_width = data_width
+        self.is_alu = is_alu
 
         self.mask = Signal(data_width // 8)
         self.tail = Signal(data_width // 8)
@@ -585,13 +577,14 @@ class MaskDataGen(HasVectorParams, Elaboratable):
                         self.mask_off_cmp[i].eq(self.old_vd[i]),
                     ]
 
-            with m.Elif(
-                    VALUOperator.is_add_with_carry(self.uop.alu_fn)
-                    | VALUOperator.is_vmerge(self.uop.alu_fn)):
-                m.d.comb += [
-                    self.mask_keep.word_select(i, 8).eq(~0),
-                    self.mask_keep_cmp[i].eq(1),
-                ]
+            if self.is_alu:
+                with m.Elif(
+                        VALUOperator.is_add_with_carry(self.uop.alu_fn)
+                        | VALUOperator.is_vmerge(self.uop.alu_fn)):
+                    m.d.comb += [
+                        self.mask_keep.word_select(i, 8).eq(~0),
+                        self.mask_keep_cmp[i].eq(1),
+                    ]
 
             with m.Elif(~self.uop.vm & ~self.mask[i]):
                 with m.If(self.uop.vma):
@@ -658,7 +651,8 @@ class VALULane(PipelinedLaneFunctionalUnit):
             ]
 
         mask_gen = m.submodules.mask_gen = MaskDataGen(self.data_width,
-                                                       self.params)
+                                                       self.params,
+                                                       is_alu=True)
         m.d.comb += [
             mask_gen.mask.eq(byte_mask),
             mask_gen.tail.eq(tail_mask),
@@ -825,6 +819,8 @@ class VMultiplierLane(PipelinedLaneFunctionalUnit):
         m = super().elaborate(platform)
 
         uop = self.req.bits.uop
+        swap23 = (uop.alu_fn == VALUOperator.VMADD) | (uop.alu_fn
+                                                       == VALUOperator.VNMSUB)
 
         mul = m.submodules.mul = VMultiplier(self.data_width, self.num_stages)
         m.d.comb += [
@@ -834,8 +830,10 @@ class VMultiplierLane(PipelinedLaneFunctionalUnit):
             mul.vxrm.eq(uop.vxrm),
             mul.uop_idx.eq(uop.expd_idx),
             mul.in1.eq(self.req.bits.opa_data),
-            mul.in2.eq(self.req.bits.opb_data),
-            mul.in3.eq(self.req.bits.old_vd),
+            mul.in2.eq(
+                Mux(swap23, self.req.bits.old_vd, self.req.bits.opb_data)),
+            mul.in3.eq(
+                Mux(swap23, self.req.bits.opb_data, self.req.bits.old_vd)),
             mul.widen.eq(uop.widen),
         ]
 
