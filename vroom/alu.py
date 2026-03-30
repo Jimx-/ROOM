@@ -357,7 +357,7 @@ class VALU(Elaboratable):
         #
 
         in2_h = Signal(16)
-        in2_b = Signal(16)
+        in2_b = Signal(8)
         get_element(in2_h, self.in2, self.uop_idx, 16)
         get_element(in2_b, self.in2, self.uop_idx, 8)
 
@@ -381,13 +381,13 @@ class VALU(Elaboratable):
             with m.Case(0b10):  # vf4
                 with m.Switch(self.sew):
                     for i in range(2):
-                        with m.Case(i):
+                        with m.Case(i + 2):
                             extend_vector(ext_out, in2_h, 1 << (3 + i), signed)
 
             with m.Case(0b11):  # vf2
                 with m.Switch(self.sew):
                     for i in range(3):
-                        with m.Case(i):
+                        with m.Case(i + 1):
                             extend_vector(ext_out, in2_w, 1 << (3 + i), signed)
 
         #
