@@ -898,7 +898,7 @@ class DecodeUnit(HasVectorParams, Elaboratable):
                                                         m.d.comb += [
                                                             uop.vl.eq(n << i),
                                                             uop.vlmul_mag.eq(
-                                                                w),
+                                                                i),
                                                             uop.vlmul_sign.eq(
                                                                 0),
                                                         ]
