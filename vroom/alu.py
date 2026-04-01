@@ -1315,8 +1315,7 @@ class ReductionSlice(Elaboratable):
         for w in range(4):
             n = 1 << (3 + w)
             comparands = [
-                self.in_data.word_select(i, n)
-                for i in range(len(self.in_data) // n)
+                self.in_data.word_select(i, n) for i in range(self.width // n)
             ]
 
             while len(comparands) > 1:
