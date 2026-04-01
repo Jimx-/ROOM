@@ -1128,11 +1128,12 @@ class VReductionUnit(PipelinedFunctionalUnit):
         # VREDAND, VREDOR, VREDXOR
         #
 
-        logic_out = Signal(self.vlen)
+        logic_out = Signal(self.elen)
         logic_operands = [
-            slice_vd.word_select(i, 64) for i in range(len(slice_vd) // 64)
+            slice_vd.word_select(i, slice_width)[:self.elen]
+            for i in range(len(slice_vd) // slice_width)
         ]
-        logic_operands.append(s2_vs1_vd)
+        logic_operands.append(s2_vs1_vd[:self.elen])
         with m.Switch(self.uops[1].opcode):
             with m.Case(VOpCode.VREDAND):
                 m.d.comb += logic_out.eq(
