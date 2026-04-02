@@ -240,7 +240,7 @@ class VGatherUnit(HasVectorParams, Elaboratable):
             self.vd_reg.word_select(i, 8) for i in range(self.vlen_bytes))
 
         byte_sel = [
-            Signal(range(self.xlen * self.elen // 8), name=f'byte_sel{i}')
+            Signal(self.xlen, name=f'byte_sel{i}')
             for i in range(self.vlen_bytes)
         ]
 
@@ -293,6 +293,8 @@ class VGatherUnit(HasVectorParams, Elaboratable):
                               & (byte_sel[i] < vs2_max)):
                         m.d.comb += vd_bytes[i].eq(vs2_bytes[byte_sel[i] -
                                                              vs2_min])
+                    with m.Elif(self.first):
+                        m.d.comb += vd_bytes[i].eq(0)
 
             with m.Elif(self.uop_idx[0]):
                 m.d.comb += vd_bytes[i].eq(vd_reg_bytes[i])
