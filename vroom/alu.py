@@ -763,10 +763,12 @@ class VMultiplier(Elaboratable):
         lhs_signed = (self.fn == VALUOperator.VMULH) | (
             self.fn == VALUOperator.VMULHSU) | (
                 (self.fn == VALUOperator.VMACC)
-                & self.widen) | (self.fn == VALUOperator.VMACCUS)
+                & self.widen) | (self.fn == VALUOperator.VMACCUS) | (
+                    self.fn == VALUOperator.VSMUL)
         rhs_signed = (self.fn == VALUOperator.VMULH) | (
             (self.fn == VALUOperator.VMACC)
-            & self.widen) | (self.fn == VALUOperator.VMACCSU)
+            & self.widen) | (self.fn == VALUOperator.VMACCSU) | (
+                self.fn == VALUOperator.VSMUL)
 
         is_sub = (self.fn == VALUOperator.VNMSAC) | (self.fn
                                                      == VALUOperator.VNMSUB)
@@ -1055,8 +1057,8 @@ class VMultiplier(Elaboratable):
                     n = 1 << (3 + w)
                     for i in range(self.width // n):
                         with m.If(vxsat[i * n // 8]):
-                            m.d.comb += fixp_out.word_select(i, n).eq(
-                                Const(~0, n - 1))
+                            m.d.comb += fixp_out.word_select(
+                                i, n).eq(2**(n - 1) - 1)
 
         out = Signal(self.width)
         with m.If(s2_is_fixp):
