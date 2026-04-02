@@ -498,7 +498,7 @@ class VFixPointALU(Elaboratable):
         sat = Signal(self.width // 8)
         for i in range(self.width // 8):
             with m.If(signed):
-                m.d.comb += sat[i].eq((is_sub ^ (self.in1h[i] ^ self.in2h[i]))
+                m.d.comb += sat[i].eq((is_sub ^ (self.in1h[i] == self.in2h[i]))
                                       & (self.in2h[i]
                                          ^ self.alu_out[i * 8 + 7]))
             with m.Else():
