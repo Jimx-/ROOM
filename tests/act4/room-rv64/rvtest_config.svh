@@ -39,3 +39,14 @@
 `define COUNTINHIBIT_EN_0
 `define COUNTINHIBIT_EN_2
 `define TIME_CSR_IMPLEMENTED
+
+// Supported SEWs for vector
+`define SEW8_SUPPORTED
+`define SEW16_SUPPORTED
+`define SEW32_SUPPORTED
+`define SEW64_SUPPORTED
+
+// Supported fractional LMULs for vector
+`define LMULf8_SUPPORTED
+`define LMULf4_SUPPORTED
+`define LMULf2_SUPPORTED
