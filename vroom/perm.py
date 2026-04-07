@@ -454,7 +454,9 @@ class PermutationCore(HasVectorParams, Elaboratable):
         rd_vlmul_gather16_sew8 = Mux(is_vrgatherei16_sew8 & ~uop.vlmul_sign,
                                      ((rd_vlmul + 1) << 1) - 1, rd_vlmul)
         with m.If(self.uop.valid):
-            m.d.sync += rs1_data.eq(self.rs1_data)
+            m.d.sync += rs1_data.eq(
+                Mux(self.uop.bits.opa_sel == VOpA.IMM, self.uop.bits.lrs1,
+                    self.rs1_data))
 
             with m.If(self.uop.bits.vlmul_sign):
                 m.d.sync += rd_vlmul.eq(0)
@@ -894,6 +896,9 @@ class PermutationCore(HasVectorParams, Elaboratable):
                     & (vrgather_rd_cnt_d1 == 0)):
             m.d.sync += old_vd_data.eq(self.rd_port.data)
 
+        old_vd_data_d1 = Signal.like(old_vd_data)
+        m.d.sync += old_vd_data_d1.eq(old_vd_data)
+
         with m.If(is_vslide & ~mask_rdata_valid & vs_rdata_valid
                   & (vslide_rd_cnt_d1 == 1)):
             m.d.sync += vs_data.eq(self.rd_port.data)
@@ -925,7 +930,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
                 m.d.comb += vd_masked_data.eq(vd_reg | ~vd_mask)
             with m.Else():
                 m.d.comb += vd_masked_data.eq((vd_reg & vd_mask)
-                                              | (old_vd_data & ~vd_mask))
+                                              | (old_vd_data_d1 & ~vd_mask))
 
         m.d.comb += [
             self.wb_req.bits.eq(vd_masked_data),
