@@ -213,7 +213,6 @@ class VALUOperator(IntEnum):
     VAADDU = 50
     VAADD = 51
     VSSR = 52
-    VSSRA = 53
     VNCLIPU = 54
     VNCLIP = 55
 
@@ -221,6 +220,7 @@ class VALUOperator(IntEnum):
     VSSUB = 57
     VASUBU = 58
     VASUB = 59
+    VSSRA = 60
 
     VMUL = VADD
     VMULH = VSL
