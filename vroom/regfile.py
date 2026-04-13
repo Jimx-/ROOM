@@ -128,10 +128,10 @@ class RegReadDecoder(HasVectorParams, Elaboratable):
                     m.d.comb += uop.alu_fn.eq(alu_op)
 
                     with m.If(inuop.widen):
-                        m.d.comb += [
-                            uop.opa_sel.eq(VOpA.VS1_HALF),
-                            uop.opb_sel.eq(VOpB.VS2_HALF),
-                        ]
+                        m.d.comb += uop.opb_sel.eq(VOpB.VS2_HALF)
+
+                        with m.If(inuop.funct3 == 0b010):  # OPMVV
+                            m.d.comb += uop.opa_sel.eq(VOpA.VS1_HALF)
 
             for opc, alu_op in (
                 (VOpCode.VSEXT, VALUOperator.VSEXT),
