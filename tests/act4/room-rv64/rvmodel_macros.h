@@ -1,5 +1,5 @@
-#ifndef _COMPLIANCE_MODEL_H
-#define _COMPLIANCE_MODEL_H
+#ifndef _RVMODEL_MACROS_H
+#define _RVMODEL_MACROS_H
 
 #define RVMODEL_DATA_SECTION \
         .pushsection .tohost,"aw",@progbits;                \
@@ -78,60 +78,32 @@
 
 ##### Machine Timer #####
 
-#define RVMODEL_INTERRUPT_LATENCY 10
-
-#define RVMODEL_TIMER_INT_SOON_DELAY 100
-
 #define RVMODEL_MTIME_ADDRESS  0x0200BFF8  /* Address of mtime CSR */
 
 #define RVMODEL_MTIMECMP_ADDRESS 0x02004000 /* Address of mtimecmp CSR */
 
 ##### Machine Interrupts #####
 
-#define RVMODEL_SET_MEXT_INT
+#define RVMODEL_INTERRUPT_LATENCY 10
 
-#define RVMODEL_CLR_MEXT_INT
+#define RVMODEL_TIMER_INT_SOON_DELAY 100
 
-#define RVMODEL_SET_MTIMER_INT
+#define RVMODEL_SET_MEXT_INT(_R1, _R2)
 
-#define RVMODEL_CLR_MTIMER_INT
+#define RVMODEL_CLR_MEXT_INT(_R1, _R2)
 
-#define RVMODEL_SET_MTIMER_INT_SOON
+#define RVMODEL_SET_MSW_INT(_R1, _R2)
 
-#define RVMODEL_SET_MSW_INT
-
-#define RVMODEL_CLR_MSW_INT
+#define RVMODEL_CLR_MSW_INT(_R1, _R2)
 
 ##### Supervisor Interrupts #####
 
-#define RVMODEL_SET_SEXT_INT
+#define RVMODEL_SET_SEXT_INT(_R1, _R2)
 
-#define RVMODEL_CLR_SEXT_INT
+#define RVMODEL_CLR_SEXT_INT(_R1, _R2)
 
-#define RVMODEL_SET_STIMER_INT
+#define RVMODEL_SET_SSW_INT(_R1, _R2)
 
-#define RVMODEL_CLR_STIMER_INT
+#define RVMODEL_CLR_SSW_INT(_R1, _R2)
 
-#define RVMODEL_SET_STIMER_INT_SOON
-
-#define RVMODEL_SET_SSW_INT
-
-#define RVMODEL_CLR_SSW_INT
-
-##### Hypervisor Interrupts #####
-
-#define RVMODEL_SET_VEXT_INT
-
-#define RVMODEL_CLR_VEXT_INT
-
-#define RVMODEL_SET_VTIMER_INT
-
-#define RVMODEL_CLR_VTIMER_INT
-
-#define RVMODEL_SET_VTIMER_INT_SOON
-
-#define RVMODEL_SET_VSW_INT
-
-#define RVMODEL_CLR_VSW_INT
-
-#endif // _COMPLIANCE_MODEL_H
+#endif // _RVMODEL_MACROS_H
