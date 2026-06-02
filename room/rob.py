@@ -37,7 +37,7 @@ class CommitReq(HasCoreParams):
             for i in range(self.core_width)
         ]
 
-        self.fflags = Valid(Signal, 5)
+        self.fflags = Valid(Signal, 5, name=f'{name}_fflags')
 
         self.rollback = Signal(name=f'{name}_rollback')
         self.rollback_valids = Signal(self.core_width,

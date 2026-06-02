@@ -30,6 +30,8 @@ class VFPUFMA(Elaboratable):
             in_pipe_out.eq(in_pipe.out.bits),
         ]
 
+        is_active = ~in_pipe_out.tail & in_pipe_out.mask
+
         dfma_res = []
         dfma_status = []
         if self.width >= 64:
@@ -51,7 +53,7 @@ class VFPUFMA(Elaboratable):
                 ]
 
                 dfma_res.append(dfma.out.bits.data)
-                dfma_status.append(dfma.out.bits.status)
+                dfma_status.append(Mux(is_active[i], dfma.out.bits.status, 0))
 
         sfma_res = []
         sfma_status = []
@@ -73,7 +75,7 @@ class VFPUFMA(Elaboratable):
             ]
 
             sfma_res.append(sfma.out.bits.data)
-            sfma_status.append(sfma.out.bits.status)
+            sfma_status.append(Mux(is_active[i], sfma.out.bits.status, 0))
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
         with m.Switch(in_pipe_out.dst_fmt):

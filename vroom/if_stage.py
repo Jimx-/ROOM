@@ -219,15 +219,22 @@ class IFStage(HasVectorParams, Elaboratable):
                     self.fetch_packet.bits.ftq_idx.eq(next_ftq_idx),
                 ]
 
-        with m.If(self.wb_req.valid):
-            with m.Switch(self.wb_req.bits.uop.ftq_idx):
-                for i in range(self.ftq_size):
-                    with m.Case(i):
+        with m.Switch(self.wb_req.bits.uop.ftq_idx):
+            for i in range(self.ftq_size):
+                with m.Case(i):
+                    with m.If(self.wb_req.valid):
                         m.d.sync += [
                             ftq_wb[i].valid.eq(1),
                             ftq_wb[i].bits.data.eq(
                                 self.wb_req.bits.vd_data[:self.xlen]),
-                            ftq_wb[i].bits.fflags.eq(self.wb_req.bits.fflags),
+                        ]
+
+                    with m.If(self.wb_req.bits.fflags.valid):
+                        m.d.sync += [
+                            ftq_wb[i].bits.fflags.valid.eq(1),
+                            ftq_wb[i].bits.fflags.bits.eq(
+                                ftq_wb[i].bits.fflags.bits
+                                | self.wb_req.bits.fflags.bits),
                         ]
 
         with m.If(vec_config.resp.valid):
@@ -245,7 +252,15 @@ class IFStage(HasVectorParams, Elaboratable):
                 with m.Switch(self.wb_req.bits.uop.ftq_idx):
                     for i in range(self.ftq_size):
                         with m.Case(i):
-                            m.d.comb += resp.bits.uop.eq(ftq[i])
+                            m.d.comb += [
+                                resp.bits.uop.eq(ftq[i]),
+                                resp.bits.fflags.valid.eq(
+                                    ftq_wb[i].bits.fflags.valid
+                                    | self.wb_req.bits.fflags.valid),
+                                resp.bits.fflags.bits.eq(
+                                    ftq_wb[i].bits.fflags.bits
+                                    | self.wb_req.bits.fflags.bits),
+                            ]
 
             with m.Else():
                 wb_pe = PriorityEncoder(self.ftq_size)
@@ -277,6 +292,8 @@ class IFStage(HasVectorParams, Elaboratable):
                             m.d.sync += [
                                 ftq_valid[i].eq(0),
                                 ftq_wb[i].valid.eq(0),
+                                ftq_wb[i].bits.fflags.valid.eq(0),
+                                ftq_wb[i].bits.fflags.bits.eq(0),
                             ]
 
         return m

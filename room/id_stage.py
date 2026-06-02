@@ -1156,6 +1156,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 uop.fu_type.eq(FUType.VEC),
                                 uop.lrs1_rtype.eq(RegisterType.VEC),
                                 uop.lrs2_rtype.eq(RegisterType.VEC),
+                                uop.fp_valid.eq(1),
                             ]
 
                             with m.Switch(inuop.inst[26:32]):
@@ -1201,6 +1202,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                 uop.dst_rtype.eq(RegisterType.VEC),
                                 uop.lrs1_rtype.eq(RegisterType.FLT),
                                 uop.lrs2_rtype.eq(RegisterType.VEC),
+                                uop.fp_valid.eq(1),
                             ]
 
                         with m.Case(0b110):  # OPMVX

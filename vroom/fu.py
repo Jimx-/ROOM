@@ -162,9 +162,8 @@ class ExecLaneResp(HasVectorParams, ValueCastable):
 
 class PipelinedFunctionalUnitBase(Elaboratable):
 
-    def __init__(self, num_stages, is_redu=False):
+    def __init__(self, num_stages):
         self.num_stages = num_stages
-        self.is_redu = is_redu
 
     def elaborate(self, platform):
         m = Module()
@@ -261,7 +260,6 @@ class IterativeFunctionalUnit(FunctionalUnit, IterativeFunctionalUnitBase):
 
     def __init__(self, params):
         FunctionalUnit.__init__(self, params)
-        IterativeFunctionalUnitBase.__init__(self)
 
 
 class PerLaneFunctionalUnit(FunctionalUnit):
@@ -1449,6 +1447,7 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         swap32 = Signal()
 
         fp_rm = Signal(RoundingMode)
+        m.d.comb += fp_rm.eq(uop.frm)
 
         with m.Switch(uop.opcode):
             with m.Case(VOpCode.VFADD):
@@ -1675,6 +1674,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         s1_fp_rm = Signal(RoundingMode)
         s1_widen = Signal()
         s1_widen2 = Signal()
+        s1_mask = Signal(self.data_width // 8)
+        s1_tail = Signal(self.data_width // 8)
         m.d.sync += [
             s1_valid.eq(self.req.valid),
             s1_fma_en.eq(fma_en),
@@ -1690,6 +1691,9 @@ class VFPULane(PipelinedLaneFunctionalUnit):
             s1_fp_rm.eq(fp_rm),
             s1_widen.eq(uop.widen),
             s1_widen2.eq(uop.widen2),
+            s1_mask.eq(self.req.bits.mask
+                       | uop.vm.replicate(self.data_width // 8)),
+            s1_tail.eq(self.req.bits.tail),
         ]
 
         s1_vs1_data_inv = Signal(self.data_width)
@@ -1753,6 +1757,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                 inp.bits.src_fmt.eq(s1_fmt_in),
                 inp.bits.dst_fmt.eq(s1_fmt_out),
                 inp.bits.int_fmt.eq(s1_fmt_int),
+                inp.bits.mask.eq(s1_mask),
+                inp.bits.tail.eq(s1_tail),
             ]
 
             with m.If(s1_swap32):

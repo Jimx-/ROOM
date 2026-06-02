@@ -179,6 +179,8 @@ class FPUInput(Record):
             ('src_fmt', FPFormat),
             ('dst_fmt', FPFormat),
             ('int_fmt', IntFormat),
+            ('mask', width // 8),
+            ('tail', width // 8),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)

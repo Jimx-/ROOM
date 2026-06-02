@@ -4,7 +4,7 @@ from vroom.consts import *
 from vroom.types import HasVectorParams, VMicroOp, VType
 from vroom.utils import vlmul_to_lmul, EmulDecoder
 
-from room.consts import RegisterType
+from room.consts import RegisterType, RoundingMode
 from room.utils import Decoupled, Valid
 
 
@@ -31,6 +31,7 @@ class DecodeUnit(HasVectorParams, Elaboratable):
         self.vtype = VType(params)
         self.vl = Signal(self.vl_bits)
         self.vxrm = Signal(VXRoundingMode)
+        self.frm = Signal(RoundingMode)
 
         self.in_uop = VMicroOp(params)
         self.out_uop = VMicroOp(params)
@@ -52,6 +53,7 @@ class DecodeUnit(HasVectorParams, Elaboratable):
             uop.vm.eq(inuop.inst[25]),
             uop.vl.eq(self.vl),
             uop.vxrm.eq(self.vxrm),
+            uop.frm.eq(self.frm),
             uop.funct6.eq(inuop.inst[26:32]),
             uop.funct3.eq(inuop.inst[12:15]),
             uop.ldst.eq(inuop.inst[7:12]),
@@ -1419,6 +1421,7 @@ class DecodeStage(HasVectorParams, Elaboratable):
         self.vtype = VType(params)
         self.vl = Signal(self.vl_bits)
         self.vxrm = Signal(VXRoundingMode)
+        self.frm = Signal(RoundingMode)
 
         self.fetch_packet = Decoupled(VMicroOp, params)
 
@@ -1438,6 +1441,7 @@ class DecodeStage(HasVectorParams, Elaboratable):
             dec_unit.vtype.eq(self.vtype),
             dec_unit.vl.eq(self.vl),
             dec_unit.vxrm.eq(self.vxrm),
+            dec_unit.frm.eq(self.frm),
         ]
 
         m.d.comb += [

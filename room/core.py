@@ -534,7 +534,7 @@ class Core(HasCoreParams, Elaboratable):
 
         rob = m.submodules.rob = ReorderBuffer(
             exec_units.irf_write_ports + self.mem_width + num_fp_wakeup_ports,
-            num_fp_wakeup_ports, self.params)
+            num_fp_wakeup_ports + self.use_vector, self.params)
         rob_flush_d1 = Valid(Record, rob.flush.bits.layout)
         m.d.sync += rob_flush_d1.eq(rob.flush)
 
@@ -1205,7 +1205,7 @@ class Core(HasCoreParams, Elaboratable):
                 ]
                 fflags_idx += 1
 
-        assert fflags_idx == num_fp_wakeup_ports
+        assert fflags_idx == len(rob.fflags)
 
         for a, b in zip(rob.lsu_clear_busy, lsu.clear_busy):
             m.d.comb += a.eq(b)

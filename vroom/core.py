@@ -11,7 +11,7 @@ from vroom.ex_stage import VExecDebug, ALUExecUnit, FPUExecUnit
 from vroom.lsu import LoadStoreUnit
 from vroom.fu import ExecReq as VExecReq, ExecResp as VExecResp
 
-from room.consts import RegisterType
+from room.consts import RegisterType, RoundingMode
 from room.branch import BranchUpdate
 from room.fu import ExecReq, ExecResp
 from room.csr import CSR, AutoCSR, CSRAccess
@@ -100,6 +100,8 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
         self.br_update = BranchUpdate(params)
         self.exception = Signal()
 
+        self.frm = Signal(RoundingMode)
+
         self.vxsat = CSR(0x009, [('value', 1, CSRAccess.RW)])
         self.vxrm = CSR(0x00A, vxrm_layout(self.xlen))
         self.vcsr = CSR(0x00F, vcsr_layout(self.xlen))
@@ -168,6 +170,7 @@ class VectorUnit(HasVectorParams, AutoCSR, Elaboratable):
             dec_stage.vtype.eq(if_stage.vtype),
             dec_stage.vl.eq(if_stage.vl),
             dec_stage.vxrm.eq(self.vxrm.r),
+            dec_stage.frm.eq(self.frm),
         ]
 
         if self.sim_debug:

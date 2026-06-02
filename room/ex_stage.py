@@ -78,8 +78,8 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.has_fdiv = has_fdiv
         self.has_ifpu = has_ifpu
         self.has_fpiu = has_fpiu
-        self.has_fflags = has_fpu or has_fdiv
-        self.has_frm = has_ifpu or has_fpu or has_fdiv
+        self.has_fflags = has_fpu or has_fdiv or has_vec
+        self.has_frm = has_ifpu or has_fpu or has_fdiv or has_vec
         self.has_vec = has_vec
         self.sim_debug = sim_debug
 
@@ -353,6 +353,7 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                 vec.mem_req.connect(self.vec_mem_req),
                 vec.mem_nack.eq(self.vec_mem_nack),
                 vec.mem_resp.eq(self.vec_mem_resp),
+                vec.frm.eq(self.frm),
                 vec.rob_head_idx.eq(self.rob_head_idx),
                 vec.rob_pnr_idx.eq(self.rob_pnr_idx),
                 vec.br_update.eq(self.br_update),

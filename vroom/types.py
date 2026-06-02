@@ -3,7 +3,7 @@ from amaranth.utils import log2_int
 
 from vroom.consts import *
 
-from room.consts import RegisterType
+from room.consts import RegisterType, RoundingMode
 from room.types import HasCoreParams, MicroOp
 
 
@@ -70,6 +70,7 @@ class VMicroOp(HasVectorParams, Record):
             ('vm', 1),
             ('vl', self.vl_bits),
             ('vxrm', VXRoundingMode),
+            ('frm', RoundingMode),
             ('fu_type', VFUType),
             ('funct6', 6),
             ('funct3', 3),
