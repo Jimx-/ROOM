@@ -825,6 +825,10 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
+        fp_rm = Mux(
+            generate_imm_rm(self.req.bits.uop.imm_packed) == 7, self.frm,
+            generate_imm_rm(self.req.bits.uop.imm_packed))
+
         fdiv = m.submodules.fdiv = FPUDivSqrtMulti()
 
         m.d.comb += [
@@ -834,7 +838,7 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
                             | (self.req.bits.uop.opcode == UOpCode.FSQRT_D)
                             | (self.req.bits.uop.opcode == UOpCode.FSQRT_H)),
             fdiv.fmt.eq(self.tag_to_format(self.req.bits.uop.fp_in_tag)),
-            fdiv.rm.eq(self.frm),
+            fdiv.rm.eq(fp_rm),
             fdiv.in_valid.eq(self.req.valid),
             self.req.ready.eq(fdiv.in_ready),
             self.resp.bits.data.eq(

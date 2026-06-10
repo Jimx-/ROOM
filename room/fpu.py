@@ -934,13 +934,24 @@ class FPUDivSqrtMulti(Elaboratable):
         with m.Else():
             m.d.comb += exp_normalized.eq(tentative_exponent)
 
-        quotient_shifted = Signal(PREC_BITS + self.ftyp.man + 1)
-        m.d.comb += quotient_shifted.eq(
-            Cat(Const(0, self.ftyp.man), final_quotient) >> norm_shamt)
+        quotient_shifted = Signal(PREC_BITS + self.ftyp.man + 3)
+        with m.Switch(fmt_sel):
+            for fmt in FPFormat:
+                with m.Case(fmt.value):
+                    ftyp = _fmt_ftypes[fmt.value]
+
+                    with m.If(norm_shamt < (ftyp.man + 2)):
+                        m.d.comb += quotient_shifted.eq(
+                            Cat(Const(0, self.ftyp.man +
+                                      2), final_quotient) >> norm_shamt)
+                    with m.Else():
+                        m.d.comb += quotient_shifted.eq(
+                            Cat(Const(0, self.ftyp.man +
+                                      2), final_quotient) >> (ftyp.man + 2))
 
         final_mantissa = Signal(PREC_BITS + 1)
         final_exponent = Signal(self.ftyp.exp + 2)
-        quotient_sticky_bits = Signal(PREC_BITS - 1)
+        quotient_sticky_bits = Signal(PREC_BITS + 1)
 
         m.d.comb += [
             Cat(quotient_sticky_bits, final_mantissa).eq(quotient_shifted),
@@ -952,7 +963,7 @@ class FPUDivSqrtMulti(Elaboratable):
                 with m.Case(fmt.value):
                     ftyp = _fmt_ftypes[fmt.value]
 
-                    with m.If(quotient_shifted[ftyp.man + PREC_BITS]):
+                    with m.If(quotient_shifted[ftyp.man + PREC_BITS + 2]):
                         pass
                     with m.Elif(exp_normalized > 1):
                         m.d.comb += [
