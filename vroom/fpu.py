@@ -114,6 +114,8 @@ class VFPUComp(Elaboratable):
             in_pipe_out.eq(in_pipe.out.bits),
         ]
 
+        is_active = ~in_pipe_out.tail & in_pipe_out.mask
+
         dcmp_res = []
         dcmp_status = []
         if self.width >= 64:
@@ -135,7 +137,7 @@ class VFPUComp(Elaboratable):
                 ]
 
                 dcmp_res.append(dcmp.out.bits.data)
-                dcmp_status.append(dcmp.out.bits.status)
+                dcmp_status.append(Mux(is_active[i], dcmp.out.bits.status, 0))
 
         scmp_res = []
         scmp_status = []
@@ -157,7 +159,7 @@ class VFPUComp(Elaboratable):
             ]
 
             scmp_res.append(scmp.out.bits.data)
-            scmp_status.append(scmp.out.bits.status)
+            scmp_status.append(Mux(is_active[i], scmp.out.bits.status, 0))
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
         with m.Switch(in_pipe_out.dst_fmt):
@@ -194,6 +196,8 @@ class VFPUDivSqrt(Elaboratable):
         self.is_sqrt = Signal()
         self.fmt = Signal(FPFormat)
         self.rm = Signal(RoundingMode)
+        self.tail = Signal(width // 8)
+        self.mask = Signal(width // 8)
         self.in_valid = Signal()
         self.in_ready = Signal()
 
@@ -204,11 +208,13 @@ class VFPUDivSqrt(Elaboratable):
 
         fdiv_busy = Signal()
         fmt = Signal(FPFormat)
+        is_active = Signal(self.width // 8)
         m.d.comb += self.in_ready.eq(~fdiv_busy)
         with m.If(self.in_valid & self.in_ready):
             m.d.sync += [
                 fdiv_busy.eq(1),
                 fmt.eq(self.fmt),
+                is_active.eq(~self.tail & self.mask),
             ]
         with m.Elif(self.out.fire):
             m.d.sync += fdiv_busy.eq(0)
@@ -244,8 +250,9 @@ class VFPUDivSqrt(Elaboratable):
                     fdiv.in_valid.eq(self.in_valid & self.in_ready),
                     resp_data_d.word_select(i // 2, 64).eq(fdiv.out.bits.data),
                 ]
-                resp_status_d.append(fdiv.out.bits.status)
-            resp_status_s.append(fdiv.out.bits.status)
+                resp_status_d.append(
+                    Mux(is_active[i // 2], fdiv.out.bits.status, 0))
+            resp_status_s.append(Mux(is_active[i], fdiv.out.bits.status, 0))
 
         resp_mask = Signal(self.width // 32)
         with m.Switch(fmt):

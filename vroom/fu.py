@@ -1902,6 +1902,10 @@ class VFDivLane(IterativeLaneFunctionalUnit):
             fdiv.b.eq(self.req.bits.opa_data),
             fdiv.is_sqrt.eq(uop.opcode == VOpCode.VFSQRT),
             fdiv.fmt.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
+            fdiv.rm.eq(uop.frm),
+            fdiv.mask.eq(self.req.bits.mask
+                         | uop.vm.replicate(self.data_width // 8)),
+            fdiv.tail.eq(self.req.bits.tail),
             fdiv.in_valid.eq(self.req.valid),
             self.req.ready.eq(fdiv.in_ready),
             self.resp.bits.fflags.valid.eq(self.resp.valid),

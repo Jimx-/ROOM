@@ -405,7 +405,7 @@ class Instruction:
                 inst_text.append(', ')
                 inst_text.append(vs2_text)
                 inst_text.append(
-                    f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0, is_fp=op.name.startswith("vf") or op.name.startswith("vmf"))}]'
+                    f'[={self.format_vs_data(self.vs2_data, widen=op.name.count("_w") > 0, is_fp=op.name.startswith("vf") and not op.name.startswith("vfirst") or op.name.startswith("vmf"))}]'
                 )
 
             if 'simm5' in op.args:
@@ -575,7 +575,7 @@ class Instruction:
                 str(struct.unpack(typ, x.to_bytes(sew // 8, 'little'))[0])
                 for x in elems[:self.vl]
             ]
-            return ", ".join(fp_vals)
+            return f'({", ".join(fp_vals)})'
 
         return f'({", ".join(f"{x:x}" for x in elems[:self.vl])})'
 
