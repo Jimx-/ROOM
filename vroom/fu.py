@@ -12,7 +12,7 @@ from vroom.fpu import VFPUFMA, VFPUComp, VFPUDivSqrt, VFPUCast, VFPURec, VFPURed
 from vroom.utils import TailGen, vlmul_to_lmul
 
 from room.consts import RegisterType, RoundingMode
-from room.fpu import FPUOperator, FPFormat, FType, IntFormat, FPUCastMulti
+from room.fpu import HasFPUParams, FPUOperator, FPFormat, FType, IntFormat, FPUCastMulti
 from room.utils import Decoupled, Pipe, sign_extend, bit_extend
 
 from roomsoc.interconnect.stream import Valid
@@ -1432,7 +1432,7 @@ class VMaskUnit(IterativeFunctionalUnit):
         return m
 
 
-class VFPULane(PipelinedLaneFunctionalUnit):
+class VFPULane(PipelinedLaneFunctionalUnit, HasFPUParams):
 
     def __init__(self, data_width, params, num_stages):
         super().__init__(data_width, num_stages, params)
@@ -1736,26 +1736,48 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                             fcvt_widen_vs1.inp.valid.eq(uop.widen
                                                         | uop.widen2),
                             fcvt_widen_vs1.inp.bits.in1.eq(
-                                vs1_data_inv.bit_select(
-                                    w * (self.data_width // 2) + i * 32, 32)),
+                                self.nan_box(
+                                    vs1_data_inv.bit_select(
+                                        w * (self.data_width // 2) + i * 32,
+                                        32), self.type_tag.S)),
                             fcvt_widen_vs1.inp.bits.src_fmt.eq(FPFormat.S),
                             fcvt_widen_vs1.inp.bits.dst_fmt.eq(FPFormat.D),
                             fcvt_widen_vs2.inp.valid.eq(uop.widen),
                             fcvt_widen_vs2.inp.bits.in1.eq(
-                                vs2_data_inv.bit_select(
-                                    w * (self.data_width // 2) + i * 32, 32)),
+                                self.nan_box(
+                                    vs2_data_inv.bit_select(
+                                        w * (self.data_width // 2) + i * 32,
+                                        32), self.type_tag.S)),
                             fcvt_widen_vs2.inp.bits.src_fmt.eq(FPFormat.S),
                             fcvt_widen_vs2.inp.bits.dst_fmt.eq(FPFormat.D),
                         ]
 
+            fcvt_info1 = Record(FType.INFO_LAYOUT)
+            fcvt_info2 = Record(FType.INFO_LAYOUT)
+            m.d.comb += [
+                fcvt_info1.eq(FType.FP64.classify(
+                    fcvt_widen_vs1.out.bits.data)),
+                fcvt_info2.eq(FType.FP64.classify(
+                    fcvt_widen_vs2.out.bits.data)),
+            ]
+
+            fcvt_widen_data1 = Mux(
+                fcvt_info1.is_nan & fcvt_widen_vs1.out.bits.status[4],
+                Cat(~fcvt_widen_vs1.out.bits.data[:52],
+                    fcvt_widen_vs1.out.bits.data[52:]),
+                fcvt_widen_vs1.out.bits.data)
+            fcvt_widen_data2 = Mux(
+                fcvt_info2.is_nan & fcvt_widen_vs2.out.bits.status[4],
+                Cat(~fcvt_widen_vs2.out.bits.data[:52],
+                    fcvt_widen_vs2.out.bits.data[52:]),
+                fcvt_widen_vs2.out.bits.data)
+
             s1_vs2_data_bypass = Signal(64)
             m.d.sync += s1_vs2_data_bypass.eq(fcvt_widen_vs2.inp.bits.in1)
             m.d.comb += [
-                s1_vs1_data_widen.word_select(i,
-                                              64).eq(fcvt_widen_vs1.out.bits),
+                s1_vs1_data_widen.word_select(i, 64).eq(fcvt_widen_data1),
                 s1_vs2_data_widen.word_select(i, 64).eq(
-                    Mux(s1_cast_en, s1_vs2_data_bypass,
-                        fcvt_widen_vs2.out.bits)),
+                    Mux(s1_cast_en, s1_vs2_data_bypass, fcvt_widen_data2)),
             ]
 
         s1_vs1_data = Mux(s1_widen | s1_widen2, s1_vs1_data_widen,
