@@ -374,8 +374,24 @@ class PerLaneFunctionalUnit(FunctionalUnit):
                             self.req.bits.vs2_data.word_select(
                                 w + 2, self.lane_width // 2)))
 
-            m.d.comb += old_vd.eq(
-                self.req.bits.vs3_data.word_select(w, self.lane_width))
+            with m.If(uop.narrow):
+                m.d.comb += old_vd.eq(
+                    Cat(
+                        self.req.bits.vs3_data.word_select(i, 32)
+                        for i in range(w, self.vlen // 32, self.n_lanes)))
+            with m.Elif(uop.narrow_to_1):
+                with m.Switch(self.req.bits.uop.dest_eew()):
+                    for i in range(4):
+                        with m.Case(i):
+                            n = self.vlen_bytes // (1 << i)
+                            mask_width = n // self.n_lanes
+                            m.d.comb += old_vd.eq(
+                                self.req.bits.vs3_data.word_select(
+                                    self.req.bits.uop.expd_idx,
+                                    n).word_select(w, mask_width))
+            with m.Else():
+                m.d.comb += old_vd.eq(
+                    self.req.bits.vs3_data.word_select(w, self.lane_width))
 
             m.d.comb += [
                 lane_req.valid.eq(
@@ -1803,6 +1819,11 @@ class VFPULane(PipelinedLaneFunctionalUnit):
         byte_mask = Signal(self.data_width)
         get_byte_mask(m, tail_mask, out_tail, self.resp.bits.uop.dest_eew())
         get_byte_mask(m, byte_mask, out_mask, self.resp.bits.uop.dest_eew())
+        with m.If(self.resp.bits.uop.narrow_to_1):
+            m.d.comb += [
+                tail_mask.eq(out_tail),
+                byte_mask.eq(out_mask),
+            ]
 
         mask_gen = m.submodules.mask_gen = MaskDataGen(self.data_width,
                                                        self.params)
@@ -1847,8 +1868,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                         cast.out.valid, cast.out.bits.data,
                         Mux(frec.out.valid, frec.out.bits.data,
                             fma.out.bits.data)))
-                & mask_gen.mask_keep)
-            | mask_gen.mask_off)
+                & mask_gen.mask_keep
+                | mask_gen.mask_off))
 
         m.d.comb += self.resp.bits.fflags.valid.eq(self.resp.valid)
         with m.If(fcmp.out.valid):

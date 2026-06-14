@@ -602,8 +602,9 @@ class FPRegReadDecoder(HasFPUParams, Elaboratable):
                         OUT_TAG(self.type_tag.I),
                     ]
 
-                for op in ('FSGNJ', 'FMINMAX', 'FADD', 'FSUB', 'FMUL', 'FMADD',
-                           'FMSUB', 'FNMADD', 'FNMSUB', 'FDIV', 'FSQRT'):
+                for op in ('FSGNJ', 'CMPR', 'FCLASS', 'FMINMAX', 'FADD',
+                           'FSUB', 'FMUL', 'FMADD', 'FMSUB', 'FNMADD',
+                           'FNMSUB', 'FDIV', 'FSQRT'):
                     with m.Case(getattr(UOpCode, f'{op}_{typ}')):
                         m.d.comb += [
                             IN_TAG(getattr(self.type_tag, typ)),
