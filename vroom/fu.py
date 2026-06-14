@@ -1578,8 +1578,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.CMP),
-                    fma_op_mod.eq(uop.opcode == VOpCode.VMFLT),
-                    fp_rm.eq(RoundingMode.RNE),
+                    fma_op_mod.eq(uop.opcode == VOpCode.VMFGE),
+                    fp_rm.eq(RoundingMode.RTZ),
                     fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
@@ -1587,8 +1587,8 @@ class VFPULane(PipelinedLaneFunctionalUnit):
                 m.d.comb += [
                     cmp_en.eq(1),
                     fma_op.eq(FPUOperator.CMP),
-                    fma_op_mod.eq(uop.opcode == VOpCode.VMFLE),
-                    fp_rm.eq(RoundingMode.RTZ),
+                    fma_op_mod.eq(uop.opcode == VOpCode.VMFGT),
+                    fp_rm.eq(RoundingMode.RNE),
                     fmt_in.eq(Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 ]
 
