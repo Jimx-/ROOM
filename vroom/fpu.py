@@ -295,6 +295,8 @@ class VFPUCast(Elaboratable):
             in_pipe_out.eq(in_pipe.out.bits),
         ]
 
+        is_active = ~in_pipe_out.tail & in_pipe_out.mask
+
         resp_data_s = Signal(self.width)
         resp_status_s = []
         resp_data_d = Signal(self.width)
@@ -325,8 +327,9 @@ class VFPUCast(Elaboratable):
                     cast.inp.valid.eq(self.inp.valid),
                     resp_data_d.word_select(i // 2, 64).eq(cast.out.bits.data),
                 ]
-                resp_status_d.append(cast.out.bits.status)
-            resp_status_s.append(cast.out.bits.status)
+                resp_status_d.append(
+                    Mux(is_active[i // 2], cast.out.bits.status, 0))
+            resp_status_s.append(Mux(is_active[i], cast.out.bits.status, 0))
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
         with m.If(in_pipe_out.fn == FPUOperator.F2I):
