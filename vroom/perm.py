@@ -741,11 +741,12 @@ class PermutationCore(HasVectorParams, Elaboratable):
                                     vmask_vl.word_select(i, stride))
 
         byte_mask = Signal(self.vlen_bytes)
-        with m.Switch(uop.vsew):
-            for i in range(4):
-                with m.Case(i):
-                    m.d.comb += byte_mask.eq(
-                        Cat(x.replicate(1 << i) for x in vmask_uop))
+        with m.If(vs_rd_en):
+            with m.Switch(uop.vsew):
+                for i in range(4):
+                    with m.Case(i):
+                        m.d.comb += byte_mask.eq(
+                            Cat(x.replicate(1 << i) for x in vmask_uop))
 
         mask_one_count = PopCount(self.vlen_bytes)
         m.submodules += mask_one_count
@@ -754,6 +755,9 @@ class PermutationCore(HasVectorParams, Elaboratable):
         rd_ones_sum = Signal(range(self.vlen + 1))
         vcompress_update_vs_idx = Signal()
         vcompress_wb_valid = Signal()
+
+        ones_sum = Signal.like(rd_ones_sum)
+        m.d.comb += ones_sum.eq(rd_ones_sum + mask_one_count.out)
 
         vcompress_rd_wb = is_vcompress & (
             (rd_ones_sum + mask_one_count.out)
@@ -769,7 +773,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
         with m.If(vcompress_rd_done | vcompress_rd_old_vd):
             m.d.sync += rd_ones_sum.eq(0)
         with m.Elif(vcompress_update_vs_idx):
-            m.d.sync += rd_ones_sum.eq(rd_ones_sum + mask_one_count.out)
+            m.d.sync += rd_ones_sum.eq(ones_sum)
         m.d.sync += [
             vcompress_rd_old_vd_d1.eq(vcompress_rd_old_vd),
             vcompress_rd_old_vd_d2.eq(vcompress_rd_old_vd_d1),
@@ -782,7 +786,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
 
         vcompress_old_vd_idx = Signal(range(32))
         m.d.sync += vcompress_old_vd_idx.eq(
-            rd_ones_sum[log2_int(self.vlen_bytes):])
+            ones_sum[log2_int(self.vlen_bytes):])
         with m.If(vcompress_rd_old_vd):
             with m.If(vcompress_old_vd_idx == rd_vlmul):
                 m.d.sync += vcompress_old_vd_idx.eq(0)
@@ -933,7 +937,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
                                               | (old_vd_data_d1 & ~vd_mask))
 
         m.d.comb += [
-            self.wb_req.bits.eq(vd_masked_data),
+            self.wb_req.bits.eq(Mux(is_vcompress, vd_reg, vd_masked_data)),
             self.wb_req.valid.eq(Mux(is_vcompress, wb_valid_d4, wb_valid_d3)),
         ]
 
