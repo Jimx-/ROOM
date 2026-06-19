@@ -240,7 +240,7 @@ class VGatherUnit(HasVectorParams, Elaboratable):
             self.vd_reg.word_select(i, 8) for i in range(self.vlen_bytes))
 
         byte_sel = [
-            Signal(self.xlen, name=f'byte_sel{i}')
+            Signal(self.xlen + 3, name=f'byte_sel{i}')
             for i in range(self.vlen_bytes)
         ]
 
@@ -669,7 +669,7 @@ class PermutationCore(HasVectorParams, Elaboratable):
         #
 
         vrgather_rd_cnt_max = rd_vlmul + 2
-        vrgather_rd_cnt = Signal(range(4))
+        vrgather_rd_cnt = Signal(4)
         vrgather_rd_cnt_d1 = Signal.like(vrgather_rd_cnt)
         vrgather_update_vs_idx = Signal()
         vrgather_wb_valid = vrgather_update_vs_idx & (
