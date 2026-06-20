@@ -1073,7 +1073,7 @@ class VReductionUnit(PipelinedFunctionalUnit):
                                         2 * n, s0_opc[0]))
 
         vs1_masked_data = Signal(self.elen)
-        with m.Switch(s0_vsew):
+        with m.Switch(self.req.bits.uop.dest_eew()):
             for w in range(4):
                 with m.Case(w):
                     n = 1 << (3 + w)
@@ -1124,7 +1124,7 @@ class VReductionUnit(PipelinedFunctionalUnit):
             ]
 
         s2_vd_masked_data = Signal(self.elen)
-        with m.Switch(self.uops[1].vsew):
+        with m.Switch(self.uops[1].dest_eew()):
             for w in range(4):
                 with m.Case(w):
                     n = 1 << (3 + w)
@@ -1293,7 +1293,8 @@ class VReductionUnit(PipelinedFunctionalUnit):
             m.d.comb += vd_masked_data.eq((vd_reg & vd_mask)
                                           | (s3_old_vd & ~vd_mask))
 
-        m.d.comb += self.resp.bits.vd_data.eq(vd_masked_data)
+        m.d.comb += self.resp.bits.vd_data.eq(
+            Mux(self.uops[2].vl == 0, s3_old_vd, vd_masked_data))
 
         return m
 
