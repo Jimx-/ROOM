@@ -2168,12 +2168,9 @@ class VFReductionUnit(IterativeFunctionalUnit):
                             with m.If(is_redsum(req_opc)):
                                 m.d.comb += vs2_masked_data.word_select(
                                     i, n).eq(0)
-                            with m.Elif(req_opc == VOpCode.VFREDMIN):
+                            with m.Else():
                                 m.d.comb += vs2_masked_data.word_select(
-                                    i, n).eq(ftyp.greatest_finite(0))
-                            with m.Elif(req_opc == VOpCode.VFREDMAX):
-                                m.d.comb += vs2_masked_data.word_select(
-                                    i, n).eq(ftyp.greatest_finite(1))
+                                    i, n).eq(ftyp.default_nan())
 
                         with m.Else():
                             m.d.comb += vs2_masked_data.word_select(i, n).eq(
@@ -2225,6 +2222,8 @@ class VFReductionUnit(IterativeFunctionalUnit):
                             ]
 
         lane_out_valid = 1
+        red_status = Signal(5)
+        lane_out_status = [red_status]
         for i in range(self.n_lanes // 2):
             lane = VFPUReduce(self.lane_width, latency=self.num_red_stages)
             setattr(m.submodules, f'lane{i}', lane)
@@ -2240,9 +2239,12 @@ class VFReductionUnit(IterativeFunctionalUnit):
                     Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 lane.inp.bits.dst_fmt.eq(
                     Mux(uop.fp_single & ~uop.widen, FPFormat.S, FPFormat.D)),
+                lane.inp.bits.mask.eq(~0),
                 red_out_data.word_select(i, self.lane_width).eq(
                     lane.out.bits.data),
             ]
+
+            lane_out_status.append(lane.out.bits.status)
 
             with m.If(is_redsum(uop.opcode)):
                 m.d.comb += lane.inp.bits.fn.eq(FPUOperator.ADD)
@@ -2255,5 +2257,16 @@ class VFReductionUnit(IterativeFunctionalUnit):
                 ]
 
         m.d.comb += red_out_valid.eq(lane_out_valid)
+
+        with m.If(self.resp.fire):
+            m.d.sync += red_status.eq(0)
+        with m.Elif(lane_out_valid):
+            m.d.sync += red_status.eq(
+                functools.reduce(operator.or_, lane_out_status))
+
+        m.d.comb += [
+            self.resp.bits.fflags.valid.eq(self.resp.valid),
+            self.resp.bits.fflags.bits.eq(red_status),
+        ]
 
         return m
