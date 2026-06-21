@@ -3,7 +3,7 @@ from functools import reduce
 import operator
 
 from room.consts import RoundingMode
-from room.fpu import FPFormat, IntFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp, FPUDivSqrtMulti, FPUCastMulti, FPURec
+from room.fpu import FPFormat, FType, IntFormat, FPUOperator, FPUInput, FPUResult, FPUFMA, FPUComp, FPUDivSqrtMulti, FPUCastMulti, FPURec
 from room.utils import Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -463,10 +463,21 @@ class VFPUReduce(Elaboratable):
         m.d.comb += [
             fcvt_widen_in1.inp.valid.eq(self.inp.valid & (
                 self.inp.bits.src_fmt != self.inp.bits.dst_fmt)),
-            fcvt_widen_in1.inp.bits.in1.eq(self.inp.bits.in1),
+            fcvt_widen_in1.inp.bits.in1.eq(
+                Cat(self.inp.bits.in1[:32],
+                    Const(1, 1).replicate(32))),
             fcvt_widen_in1.inp.bits.src_fmt.eq(self.inp.bits.src_fmt),
             fcvt_widen_in1.inp.bits.dst_fmt.eq(self.inp.bits.dst_fmt),
         ]
+
+        fcvt_info1 = Record(FType.INFO_LAYOUT)
+        m.d.comb += fcvt_info1.eq(
+            FType.FP64.classify(fcvt_widen_in1.out.bits.data))
+        fcvt_widen_data1 = Mux(
+            fcvt_info1.is_nan & fcvt_widen_in1.out.bits.status[4],
+            Cat(~fcvt_widen_in1.out.bits.data[:52],
+                fcvt_widen_in1.out.bits.data[52:]),
+            fcvt_widen_in1.out.bits.data)
 
         fadd = m.submodules.fadd = VFPUFMA(self.width,
                                            latency=self.latency - 1)
@@ -475,7 +486,7 @@ class VFPUReduce(Elaboratable):
                               & (in_pipe_out.fn != FPUOperator.MINMAX)),
             fadd.inp.bits.eq(in_pipe_out),
             fadd.inp.bits.in1.eq(
-                Mux(fcvt_widen_in1.out.valid, fcvt_widen_in1.out.bits,
+                Mux(fcvt_widen_in1.out.valid, fcvt_widen_data1,
                     in_pipe_out.in1)),
             fadd.inp.bits.in3.eq(in_pipe_out.in2),
             fadd.inp.bits.src_fmt.eq(in_pipe_out.dst_fmt),

@@ -2167,7 +2167,7 @@ class VFReductionUnit(IterativeFunctionalUnit):
                                   | (i >= vl_rem)):
                             with m.If(is_redsum(req_opc)):
                                 m.d.comb += vs2_masked_data.word_select(
-                                    i, n).eq(0)
+                                    i, n).eq(ftyp.zero(1))
                             with m.Else():
                                 m.d.comb += vs2_masked_data.word_select(
                                     i, n).eq(ftyp.default_nan())
@@ -2235,6 +2235,7 @@ class VFReductionUnit(IterativeFunctionalUnit):
                     red_vs1_data.word_select(i, self.lane_width)),
                 lane.inp.bits.in2.eq(
                     red_vs2_data.word_select(i, self.lane_width)),
+                lane.inp.bits.rm.eq(uop.frm),
                 lane.inp.bits.src_fmt.eq(
                     Mux(uop.fp_single, FPFormat.S, FPFormat.D)),
                 lane.inp.bits.dst_fmt.eq(
