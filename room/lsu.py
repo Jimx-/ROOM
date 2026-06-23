@@ -1526,10 +1526,16 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                 ]
 
                 m.d.comb += [
-                    iresp.bits.uop.eq(ldq_e.uop),
-                    iresp.bits.data.eq(load_gen.data_out),
-                    iresp.valid.eq((ldq_e.uop.dst_rtype == RegisterType.FIX)
-                                   & data_valid & live),
+                    self.exec_iresps[w].bits.uop.eq(ldq_e.uop),
+                    self.exec_fresps[w].bits.uop.eq(ldq_e.uop),
+                    self.exec_iresps[w].bits.data.eq(load_gen.data_out),
+                    self.exec_fresps[w].bits.data.eq(load_gen.data_out),
+                    self.exec_iresps[w].valid.eq(
+                        (ldq_e.uop.dst_rtype == RegisterType.FIX)
+                        & data_valid & live),
+                    self.exec_fresps[w].valid.eq(
+                        (ldq_e.uop.dst_rtype == RegisterType.FLT)
+                        & data_valid & live),
                 ]
 
                 with m.If(data_valid & live):
