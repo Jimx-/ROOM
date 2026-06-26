@@ -385,6 +385,8 @@ class VFPURec(Elaboratable):
             in_pipe_out.eq(in_pipe.out.bits),
         ]
 
+        is_active = ~in_pipe_out.tail & in_pipe_out.mask
+
         drec_res = []
         drec_status = []
         if self.width >= 64:
@@ -401,7 +403,7 @@ class VFPURec(Elaboratable):
                 ]
 
                 drec_res.append(drec.out.bits.data)
-                drec_status.append(drec.out.bits.status)
+                drec_status.append(Mux(is_active[i], drec.out.bits.status, 0))
 
         srec_res = []
         srec_status = []
@@ -418,7 +420,7 @@ class VFPURec(Elaboratable):
             ]
 
             srec_res.append(srec.out.bits.data)
-            srec_status.append(srec.out.bits.status)
+            srec_status.append(Mux(is_active[i], srec.out.bits.status, 0))
 
         m.d.comb += self.out.valid.eq(in_pipe.out.valid)
         with m.Switch(in_pipe_out.dst_fmt):

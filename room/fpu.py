@@ -2060,7 +2060,7 @@ class FPURec(Elaboratable):
         #
 
         clz_pe = m.submodules.clz_pe = PriorityEncoder(self.ftyp.man)
-        m.d.comb += clz_pe.i.eq(s1_in1.man)
+        m.d.comb += clz_pe.i.eq(s1_in1.man[::-1])
 
         norm_exponent = Signal(self.ftyp.exp + 1)
         norm_mantissa = Signal(self.ftyp.man)
@@ -2116,7 +2116,8 @@ class FPURec(Elaboratable):
                                 s2_norm_exponent) >> 1),
                 s2_norm_out.sign.eq(s2_in1.sign),
                 s2_norm_out.exp.eq(s2_exponent),
-                s2_norm_out.man[-7:].eq(rsqrt_rd.data),
+                s2_norm_out.man.eq(
+                    Cat(Const(0, self.ftyp.man - 7), rsqrt_rd.data)),
             ]
 
         with m.Else():
@@ -2124,23 +2125,35 @@ class FPURec(Elaboratable):
                 s2_exponent.eq(2 * self.ftyp.bias() - 1 - s2_norm_exponent),
                 s2_norm_out.sign.eq(s2_in1.sign),
                 s2_norm_out.exp.eq(s2_exponent),
-                s2_norm_out.man[-7:].eq(rec_rd.data),
+                s2_norm_out.man.eq(
+                    Cat(Const(0, self.ftyp.man - 7), rec_rd.data)),
             ]
 
         result = Record(self.ftyp.record_layout())
+        status = FPException()
         with m.If(s2_is_rsqrt):
             with m.If(s2_in1.sign & (
                 (~s2_info1.is_nan & ~s2_info1.is_zero) | s2_info1.is_inf)):
                 # -inf <= x < -0.0, canonical NaN, NV
-                m.d.comb += result.eq(self.ftyp.default_nan())
+                m.d.comb += [
+                    result.eq(self.ftyp.default_nan()),
+                    status.nv.eq(1),
+                ]
             with m.Elif(s2_in1.sign & s2_info1.is_zero):
                 # -0.0, -inf, DZ
-                m.d.comb += result.eq(self.ftyp.inf(1))
+                m.d.comb += [
+                    result.eq(self.ftyp.inf(1)),
+                    status.dz.eq(1),
+                ]
             with m.Elif(~s2_in1.sign & s2_info1.is_zero):
                 # +0.0, +inf, DZ
-                m.d.comb += result.eq(self.ftyp.inf(0))
-            with m.Elif(~s2_in1.sign & (
-                (~s2_info1.is_nan & ~s2_info1.is_zero) | s2_info1.is_inf)):
+                m.d.comb += [
+                    result.eq(self.ftyp.inf(0)),
+                    status.dz.eq(1),
+                ]
+            with m.Elif(~s2_in1.sign
+                        & (~s2_info1.is_nan
+                           & ~s2_info1.is_zero & ~s2_info1.is_inf)):
                 # +0.0 < x < +inf, estimate
                 m.d.comb += result.eq(s2_norm_out)
             with m.Elif(~s2_in1.sign & s2_info1.is_inf):
@@ -2151,7 +2164,10 @@ class FPURec(Elaboratable):
                 m.d.comb += result.eq(self.ftyp.default_nan())
             with m.Elif(s2_info1.is_snan):
                 # sNaN, canonical NaN, NV
-                m.d.comb += result.eq(self.ftyp.default_nan())
+                m.d.comb += [
+                    result.eq(self.ftyp.default_nan()),
+                    status.nv.eq(1),
+                ]
 
         with m.Else():
             m.d.comb += result.eq(s2_norm_out)
@@ -2161,61 +2177,84 @@ class FPURec(Elaboratable):
             with m.Elif(s2_in1.exp[2:].all() & s2_in1.exp[1] & ~s2_in1.exp[0]):
                 # 2^B <= x < 2^(B+1) (normal), 2^-B > y >= 2^-(B+1) (subnormal, sig=01...)
                 m.d.comb += result.eq(
-                    Cat(s2_norm_out.man >> 2, Const(1, 2), s2_norm_out.exp,
-                        s2_norm_out.sign))
+                    Cat(s2_norm_out.man[2:], Const(1, 2),
+                        Const(0, self.ftyp.exp), s2_norm_out.sign))
             with m.Elif(s2_in1.exp[2:].all() & ~s2_in1.exp[1] & s2_in1.exp[0]):
                 # 2^(B-1) <= x < 2^B (normal), 2^-(B-1) > y >= 2^-B (subnormal, sig=1...)
                 m.d.comb += result.eq(
-                    Cat(s2_norm_out.man >> 1, Const(1, 1), s2_norm_out.exp,
-                        s2_norm_out.sign))
-            with m.If(s2_in1.sign & s2_info1.is_subnormal
-                      & ~s2_in1.man[-2:].any()
-                      & ((s2_rm == RoundingMode.RTZ)
-                         | (s2_rm == RoundingMode.RUP))):
+                    Cat(s2_norm_out.man[1:], Const(1, 1),
+                        Const(0, self.ftyp.exp), s2_norm_out.sign))
+            with m.Elif(s2_in1.sign & s2_info1.is_subnormal
+                        & ~s2_in1.man[-2:].any()
+                        & ((s2_rm == RoundingMode.RTZ)
+                           | (s2_rm == RoundingMode.RUP))):
                 # -2^-(B+1) < x < -0.0 (subnormal, sig=00...), {RUP, RTZ}, greatest-mag. negative finite value, {NX, OF}
-                m.d.comb += result.eq(self.ftyp.greatest_finite(1))
-            with m.If(s2_in1.sign & s2_info1.is_subnormal
-                      & ~s2_in1.man[-2:].any()
-                      & ((s2_rm == RoundingMode.RDN)
-                         | (s2_rm == RoundingMode.RNE)
-                         | (s2_rm == RoundingMode.RMM))):
+                m.d.comb += [
+                    result.eq(self.ftyp.greatest_finite(1)),
+                    status.nx.eq(1),
+                    status.of.eq(1),
+                ]
+            with m.Elif(s2_in1.sign & s2_info1.is_subnormal
+                        & ~s2_in1.man[-2:].any()
+                        & ((s2_rm == RoundingMode.RDN)
+                           | (s2_rm == RoundingMode.RNE)
+                           | (s2_rm == RoundingMode.RMM))):
                 # -2^-(B+1) < x < -0.0 (subnormal, sig=00...), {RDN, RNE, RMM}, -inf, {NX, OF}
-                m.d.comb += result.eq(self.ftyp.inf(1))
-            with m.If(~s2_in1.sign & s2_info1.is_subnormal
-                      & ~s2_in1.man[-2:].any()
-                      & ((s2_rm == RoundingMode.RTZ)
-                         | (s2_rm == RoundingMode.RUP))):
+                m.d.comb += [
+                    result.eq(self.ftyp.inf(1)),
+                    status.nx.eq(1),
+                    status.of.eq(1),
+                ]
+            with m.Elif(~s2_in1.sign & s2_info1.is_subnormal
+                        & ~s2_in1.man[-2:].any()
+                        & ((s2_rm == RoundingMode.RTZ)
+                           | (s2_rm == RoundingMode.RUP))):
                 # +0.0 < x < 2^-(B+1) (subnormal, sig=00...), {RUP, RTZ}, greatest finite value, {NX, OF}
-                m.d.comb += result.eq(self.ftyp.greatest_finite(0))
-            with m.If(~s2_in1.sign & s2_info1.is_subnormal
-                      & ~s2_in1.man[-2:].any()
-                      & ((s2_rm == RoundingMode.RDN)
-                         | (s2_rm == RoundingMode.RNE)
-                         | (s2_rm == RoundingMode.RMM))):
+                m.d.comb += [
+                    result.eq(self.ftyp.greatest_finite(0)),
+                    status.nx.eq(1),
+                    status.of.eq(1),
+                ]
+            with m.Elif(~s2_in1.sign & s2_info1.is_subnormal
+                        & ~s2_in1.man[-2:].any()
+                        & ((s2_rm == RoundingMode.RDN)
+                           | (s2_rm == RoundingMode.RNE)
+                           | (s2_rm == RoundingMode.RMM))):
                 # +0.0 < x < 2^-(B+1) (subnormal, sig=00...), {RDN, RNE, RMM}, +inf, {NX, OF}
-                m.d.comb += result.eq(self.ftyp.inf(0))
-            with m.If(s2_info1.is_zero):
+                m.d.comb += [
+                    result.eq(self.ftyp.inf(0)),
+                    status.nx.eq(1),
+                    status.of.eq(1),
+                ]
+            with m.Elif(s2_info1.is_zero):
                 # +-0.0, +-inf, DZ
-                m.d.comb += result.eq(self.ftyp.inf(s2_in1.sign))
-            with m.If(s2_info1.is_qnan):
+                m.d.comb += [
+                    result.eq(self.ftyp.inf(s2_in1.sign)),
+                    status.dz.eq(1),
+                ]
+            with m.Elif(s2_info1.is_qnan):
                 # qNaN, canonical NaN
                 m.d.comb += result.eq(self.ftyp.default_nan())
-            with m.If(s2_info1.is_snan):
+            with m.Elif(s2_info1.is_snan):
                 # sNaN, canonical NaN, NV
-                m.d.comb += result.eq(self.ftyp.default_nan())
+                m.d.comb += [
+                    result.eq(self.ftyp.default_nan()),
+                    status.nv.eq(1),
+                ]
 
         #
         # S3 - Output
         #
 
         out_pipe = m.submodules.out_pipe = Pipe(
-            width=len(result),
+            width=len(result) + len(status),
             depth=0 if self.latency == 1 else max(self.latency - 2, 1))
         m.d.comb += [
             out_pipe.in_valid.eq(s2_valid),
-            out_pipe.in_data.eq(result),
+            out_pipe.in_data.eq(Cat(result, status)),
             self.out.valid.eq(out_pipe.out.valid),
-            self.out.bits.data.eq(out_pipe.out.bits),
+            Cat(self.out.bits.data,
+                self.out.bits.status).eq(out_pipe.out.bits),
         ]
 
         return m
