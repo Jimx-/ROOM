@@ -705,16 +705,24 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
             with m.If(swap32):
                 m.d.comb += inp.bits.in3.eq(self.req.bits.rs2_data)
 
-        dfma = m.submodules.dfma = FPUFMA(self.width,
-                                          FPFormat.D,
-                                          latency=self.fma_latency)
+        try:
+            dfma = m.submodules.dfma = platform.get_fma(
+                width=self.width, format=FPFormat.D, latency=self.fma_latency)
+        except:
+            dfma = m.submodules.dfma = FPUFMA(self.width,
+                                              FPFormat.D,
+                                              latency=self.fma_latency)
         set_fu_input(dfma.inp)
         m.d.comb += dfma.inp.valid.eq(self.req.valid & fma_en
                                       & (fmt_out == FPFormat.D))
 
-        sfma = m.submodules.sfma = FPUFMA(32,
-                                          FPFormat.S,
-                                          latency=self.fma_latency)
+        try:
+            sfma = m.submodules.sfma = platform.get_fma(
+                width=32, format=FPFormat.S, latency=self.fma_latency)
+        except:
+            sfma = m.submodules.sfma = FPUFMA(32,
+                                              FPFormat.S,
+                                              latency=self.fma_latency)
         set_fu_input(sfma.inp)
         m.d.comb += sfma.inp.valid.eq(self.req.valid & fma_en
                                       & (fmt_out == FPFormat.S))
