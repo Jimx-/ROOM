@@ -314,7 +314,6 @@ class GroomWrapper(HasClusterParams, Elaboratable):
 
         self.sim_debug = sim_debug
 
-        self.reset_vector = Signal(32)
         self.busy = Signal()
 
         self.ctrl = GroomController(num_clusters=self.num_clusters)
@@ -407,7 +406,7 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                 core_debug.extend(cluster.core_debug)
 
             m.d.comb += [
-                cluster.reset_vector.eq(self.reset_vector),
+                cluster.reset_vector.eq(self.ctrl.reset_vector),
                 cluster.core_enable.eq(self.ctrl.core_enable),
                 cluster.cache_enable.eq(self.ctrl.cache_enable),
                 cluster.raster_enable.eq(self.ctrl.raster_enable[i]),

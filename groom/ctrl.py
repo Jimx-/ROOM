@@ -15,6 +15,8 @@ class GroomController(Peripheral, Elaboratable):
         self.cache_enable = Signal()
         self.raster_enable = Signal(num_clusters)
 
+        self.reset_vector = Signal(32)
+
         self.raster_tile_count = Signal(16)
         self.raster_tile_addr = Signal(32)
         self.raster_prim_addr = Signal(32)
@@ -22,6 +24,7 @@ class GroomController(Peripheral, Elaboratable):
 
         bank = self.csr_bank()
         self._enable = bank.csr(32, 'rw')
+        self._reset_vector = bank.csr(32, 'rw')
         self._scratch = bank.csr(32, 'rw')
         self._raster_tile_count = bank.csr(16, 'rw')
         self._raster_tile_addr = bank.csr(32, 'rw')
@@ -49,6 +52,11 @@ class GroomController(Peripheral, Elaboratable):
                 self.raster_enable.eq(self._enable.w_data[16:16 +
                                                           self.num_clusters]),
             ]
+
+        self.reset_vector.reset = 0x10000
+        m.d.comb += self._reset_vector.r_data.eq(self.reset_vector)
+        with m.If(self._reset_vector.w_stb):
+            m.d.sync += self.reset_vector.eq(self._reset_vector.w_data)
 
         self._scratch.r_data.reset = 0x12345678
         with m.If(self._scratch.w_stb):
