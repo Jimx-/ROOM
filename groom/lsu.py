@@ -25,6 +25,7 @@ class LSUDebug(HasCoreParams, ValueCastable):
 
         self.wid = Signal(range(self.n_warps), name=f'{name}__wid')
         self.uop_id = Signal(MicroOp.ID_WIDTH, name=f'{name}__uop_id')
+        self.tmask = Signal(self.n_threads, name=f'{name}__tmask')
         self.opcode = Signal(UOpCode, name=f'{name}__opcode')
 
         self.addr = [
@@ -44,8 +45,9 @@ class LSUDebug(HasCoreParams, ValueCastable):
 
     @ValueCastable.lowermethod
     def as_value(self):
-        return Cat(self.wid, self.uop_id, self.opcode, *self.addr, *self.data,
-                   self.data_valid, self.mem_size, self.lrs1, self.lrs2)
+        return Cat(self.wid, self.uop_id, self.tmask, self.opcode, *self.addr,
+                   *self.data, self.data_valid, self.mem_size, self.lrs1,
+                   self.lrs2)
 
     def shape(self):
         return self.as_value().shape()
@@ -407,8 +409,10 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         if self.sim_debug:
             m.d.comb += [
-                self.lsu_debug.valid.eq(self.exec_req.valid),
+                self.lsu_debug.valid.eq(self.exec_req.fire),
+                self.lsu_debug.bits.wid.eq(self.exec_req.bits.wid),
                 self.lsu_debug.bits.uop_id.eq(self.exec_req.bits.uop.uop_id),
+                self.lsu_debug.bits.tmask.eq(self.exec_req.bits.uop.tmask),
                 self.lsu_debug.bits.opcode.eq(self.exec_req.bits.uop.opcode),
                 self.lsu_debug.bits.data_valid.eq(
                     self.exec_req.bits.uop.is_std),

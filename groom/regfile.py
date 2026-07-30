@@ -21,6 +21,7 @@ class WritebackDebug(HasCoreParams, ValueCastable):
 
         self.wid = Signal(range(self.n_warps), name=f'{name}__wid')
         self.uop_id = Signal(MicroOp.ID_WIDTH, name=f'{name}__uop_id')
+        self.tmask = Signal(self.n_threads, name=f'{name}__tmask')
         self.ldst = Signal(range(32), name=f'{name}__pdst')
         self.data = [
             Signal(self.xlen, name=f'{name}__data{w}')
@@ -29,7 +30,7 @@ class WritebackDebug(HasCoreParams, ValueCastable):
 
     @ValueCastable.lowermethod
     def as_value(self):
-        return Cat(self.wid, self.uop_id, self.ldst, *self.data)
+        return Cat(self.wid, self.uop_id, self.tmask, self.ldst, *self.data)
 
     def shape(self):
         return self.as_value().shape()

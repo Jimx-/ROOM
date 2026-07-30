@@ -18,6 +18,7 @@ class IFDebug(HasCoreParams, Record):
         Record.__init__(self, [
             ('wid', range(self.n_warps)),
             ('uop_id', MicroOp.ID_WIDTH),
+            ('tmask', self.n_threads),
             ('pc', 32),
             ('inst', 32),
         ],
@@ -518,6 +519,8 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
                 self.if_debug.bits.wid.eq(s2_wid),
                 self.if_debug.bits.uop_id.eq(
                     self.fetch_packet.bits.uop.uop_id),
+                self.if_debug.bits.tmask.eq(
+                    self.fetch_packet.bits.uop.tmask),
                 self.if_debug.bits.pc.eq(self.fetch_packet.bits.uop.pc),
                 self.if_debug.bits.inst.eq(self.fetch_packet.bits.uop.inst),
             ]

@@ -204,6 +204,7 @@ class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
                 self.wb_debug.valid.eq(wb_req.valid),
                 self.wb_debug.bits.wid.eq(wb_req.bits.wid),
                 self.wb_debug.bits.uop_id.eq(wb_req.bits.uop.uop_id),
+                self.wb_debug.bits.tmask.eq(wb_req.bits.uop.tmask),
                 self.wb_debug.bits.ldst.eq(wb_req.bits.uop.ldst),
             ]
             for w in range(self.n_threads):

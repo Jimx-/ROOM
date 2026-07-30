@@ -1,0 +1,176 @@
+// -*- mode: verilog; -*-
+
+import "DPI-C" function void dpi_groom_trace_if(int core_id, int wid, int uop_id, int tmask, int pc, int insn);
+import "DPI-C" function void dpi_groom_trace_id(int core_id, int wid, int uop_id, int tmask);
+import "DPI-C" function void dpi_groom_trace_ex(int core_id, int wid, int uop_id, int tmask, int opcode, int lrs1,
+                                               bit [{{core.xlen * core.n_threads}}-1:0] rs1_data, int lrs2,
+    bit [{{core.xlen * core.n_threads}}-1:0] rs2_data, int lrs3,
+    bit [{{core.xlen * core.n_threads}}-1:0] rs3_data);
+import "DPI-C" function void dpi_groom_trace_mem(int core_id, int wid, int uop_id, int tmask, int opcode, int mem_size,
+                                                int lrs1, int lrs2,
+                                                bit [{{core.xlen * core.n_threads}}-1:0] addr,
+                                                bit [{{core.xlen * core.n_threads}}-1:0] data,
+                                                bit data_valid);
+import "DPI-C" function void dpi_groom_trace_wb(int core_id, int wid, int uop_id, int tmask, int ldst,
+                                               bit [{{core.xlen * core.n_threads}}-1:0] data);
+
+module groom_vl_trace_if
+  (
+   // {% for c in range(num_cores) %}
+    input wire                                     core{{c}}_if_valid,
+    input wire [$clog2({{core.n_warps}})-1:0]     core{{c}}_if_wid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              core{{c}}_if_uop_id,
+    input wire [{{core.n_threads}}-1:0]             core{{c}}_if_tmask,
+    input wire [31:0]                              core{{c}}_if_pc,
+    input wire [31:0]                              core{{c}}_if_inst,
+
+    input wire                                     core{{c}}_id_valid,
+    input wire [$clog2({{core.n_warps}})-1:0]     core{{c}}_id_wid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              core{{c}}_id_uop_id,
+    input wire [{{core.n_threads}}-1:0]            core{{c}}_id_tmask,
+
+   // {% for name in ['ex', 'fp_ex'] if name != 'fp_ex' or core.use_fpu %}
+    input wire                                     core{{c}}_{{name}}_valid,
+    input wire [$clog2({{core.n_warps}})-1:0]     core{{c}}_{{name}}_wid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              core{{c}}_{{name}}_uop_id,
+    input wire [{{core.n_threads}}-1:0]             core{{c}}_{{name}}_tmask,
+    input wire [15:0]                              core{{c}}_{{name}}_opcode,
+    input wire [4:0]                               core{{c}}_{{name}}_lrs1,
+   // {% for t in range(core.n_threads) %}
+    input wire [{{core.xlen}}-1:0]                 core{{c}}_{{name}}_rs1_data{{t}},
+   // {% endfor %}
+    input wire [4:0]                               core{{c}}_{{name}}_lrs2,
+   // {% for t in range(core.n_threads) %}
+    input wire [{{core.xlen}}-1:0]                 core{{c}}_{{name}}_rs2_data{{t}},
+    // {% endfor %}
+    input wire [4:0]                                core{{c}}_{{name}}_lrs3,
+    // {% for t in range(core.n_threads) %}
+    input wire [{{core.xlen}}-1:0]                  core{{c}}_{{name}}_rs3_data{{t}},
+    // {% endfor %}
+    // {% endfor %}
+
+    input wire                                     core{{c}}_mem_valid,
+    input wire [$clog2({{core.n_warps}})-1:0]     core{{c}}_mem_wid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              core{{c}}_mem_uop_id,
+    input wire [{{core.n_threads}}-1:0]             core{{c}}_mem_tmask,
+    input wire [15:0]                              core{{c}}_mem_opcode,
+    input wire [1:0]                               core{{c}}_mem_size,
+    input wire                                     core{{c}}_mem_data_valid,
+    input wire [4:0]                               core{{c}}_mem_lrs1,
+    input wire [4:0]                               core{{c}}_mem_lrs2,
+   // {% for t in range(core.n_threads) %}
+    input wire [{{core.xlen}}-1:0]                 core{{c}}_mem_addr{{t}},
+    input wire [{{core.xlen}}-1:0]                 core{{c}}_mem_data{{t}},
+   // {% endfor %}
+
+   // {% for name in ['wb', 'fp_wb'] if name != 'fp_wb' or core.use_fpu %}
+    input wire                                     core{{c}}_{{name}}_valid,
+    input wire [$clog2({{core.n_warps}})-1:0]     core{{c}}_{{name}}_wid,
+    input wire [{{UOP_ID_WIDTH}}-1:0]              core{{c}}_{{name}}_uop_id,
+    input wire [{{core.n_threads}}-1:0]             core{{c}}_{{name}}_tmask,
+    input wire [4:0]                               core{{c}}_{{name}}_ldst,
+   // {% for t in range(core.n_threads) %}
+    input wire [{{core.xlen}}-1:0]                 core{{c}}_{{name}}_data{{t}},
+   // {% endfor %}
+   // {% endfor %}
+   // {% endfor %}
+
+    input wire                                     clk,
+    input wire                                     rst
+   );
+
+   // {% for c in range(num_cores) %}
+   wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_ex_rs1_data = {
+      // {% for t in range(core.n_threads - 1, -1, -1) %}
+      core{{c}}_ex_rs1_data{{t}}{{ "," if not loop.last else "" }}
+      // {% endfor %}
+   };
+    wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_ex_rs2_data = {
+        // {% for t in range(core.n_threads - 1, -1, -1) %}
+        core{{c}}_ex_rs2_data{{t}}{{ "," if not loop.last else "" }}
+        // {% endfor %}
+    };
+    wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_ex_rs3_data = {
+        // {% for t in range(core.n_threads - 1, -1, -1) %}
+        core{{c}}_ex_rs3_data{{t}}{{ "," if not loop.last else "" }}
+        // {% endfor %}
+    };
+   // {% if core.use_fpu %}
+   wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_fp_ex_rs1_data = {
+      // {% for t in range(core.n_threads - 1, -1, -1) %}
+      core{{c}}_fp_ex_rs1_data{{t}}{{ "," if not loop.last else "" }}
+      // {% endfor %}
+   };
+    wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_fp_ex_rs2_data = {
+        // {% for t in range(core.n_threads - 1, -1, -1) %}
+        core{{c}}_fp_ex_rs2_data{{t}}{{ "," if not loop.last else "" }}
+        // {% endfor %}
+    };
+    wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_fp_ex_rs3_data = {
+        // {% for t in range(core.n_threads - 1, -1, -1) %}
+        core{{c}}_fp_ex_rs3_data{{t}}{{ "," if not loop.last else "" }}
+        // {% endfor %}
+    };
+   // {% endif %}
+   wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_mem_addr = {
+      // {% for t in range(core.n_threads - 1, -1, -1) %}
+      core{{c}}_mem_addr{{t}}{{ "," if not loop.last else "" }}
+      // {% endfor %}
+   };
+   wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_mem_data = {
+      // {% for t in range(core.n_threads - 1, -1, -1) %}
+      core{{c}}_mem_data{{t}}{{ "," if not loop.last else "" }}
+      // {% endfor %}
+   };
+   wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_wb_data = {
+      // {% for t in range(core.n_threads - 1, -1, -1) %}
+      core{{c}}_wb_data{{t}}{{ "," if not loop.last else "" }}
+      // {% endfor %}
+   };
+   // {% if core.use_fpu %}
+   wire [{{core.xlen * core.n_threads}}-1:0] core{{c}}_fp_wb_data = {
+      // {% for t in range(core.n_threads - 1, -1, -1) %}
+      core{{c}}_fp_wb_data{{t}}{{ "," if not loop.last else "" }}
+      // {% endfor %}
+   };
+   // {% endif %}
+   // {% endfor %}
+
+   always @(posedge clk or negedge rst) begin
+      if (~rst) begin
+         // {% for c in range(num_cores) %}
+         if (core{{c}}_if_valid)
+           dpi_groom_trace_if({{c}}, core{{c}}_if_wid, core{{c}}_if_uop_id,
+                              core{{c}}_if_tmask, core{{c}}_if_pc,
+                              core{{c}}_if_inst);
+         if (core{{c}}_id_valid)
+           dpi_groom_trace_id({{c}}, core{{c}}_id_wid, core{{c}}_id_uop_id,
+                              core{{c}}_id_tmask);
+         // {% for name in ['ex', 'fp_ex'] if name != 'fp_ex' or core.use_fpu %}
+         if (core{{c}}_{{name}}_valid)
+           dpi_groom_trace_ex({{c}}, core{{c}}_{{name}}_wid,
+                              core{{c}}_{{name}}_uop_id, core{{c}}_{{name}}_tmask,
+                core{{c}}_{{name}}_opcode,
+                core{{c}}_{{name}}_lrs1, core{{c}}_{{name}}_rs1_data,
+                core{{c}}_{{name}}_lrs2, core{{c}}_{{name}}_rs2_data,
+                core{{c}}_{{name}}_lrs3, core{{c}}_{{name}}_rs3_data);
+         // {% endfor %}
+         if (core{{c}}_mem_valid)
+           dpi_groom_trace_mem({{c}}, core{{c}}_mem_wid, core{{c}}_mem_uop_id,
+                               core{{c}}_mem_tmask, core{{c}}_mem_opcode,
+                               core{{c}}_mem_size,
+                               core{{c}}_mem_lrs1, core{{c}}_mem_lrs2,
+                               core{{c}}_mem_addr, core{{c}}_mem_data,
+                               core{{c}}_mem_data_valid);
+         // {% for name in ['wb', 'fp_wb'] if name != 'fp_wb' or core.use_fpu %}
+         if (core{{c}}_{{name}}_valid)
+           dpi_groom_trace_wb({{c}}, core{{c}}_{{name}}_wid,
+                              core{{c}}_{{name}}_uop_id, core{{c}}_{{name}}_tmask,
+                              core{{c}}_{{name}}_ldst,
+                              core{{c}}_{{name}}_data);
+         // {% endfor %}
+         // {% endfor %}
+      end
+   end
+
+endmodule

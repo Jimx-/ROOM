@@ -25,6 +25,7 @@ class ExecDebug(HasCoreParams, ValueCastable):
 
         self.wid = Signal(range(self.n_warps), name=f'{name}__wid')
         self.uop_id = Signal(MicroOp.ID_WIDTH, name=f'{name}__uop_id')
+        self.tmask = Signal(self.n_threads, name=f'{name}__tmask')
         self.opcode = Signal(UOpCode, name=f'{name}__opcode')
 
         self.lrs1 = Signal(range(32), name=f'{name}__lrs1')
@@ -38,11 +39,17 @@ class ExecDebug(HasCoreParams, ValueCastable):
             Signal(self.xlen, name=f'{name}__rs2_data{w}')
             for w in range(self.n_threads)
         ]
+        self.lrs3 = Signal(range(32), name=f'{name}__lrs3')
+        self.rs3_data = [
+            Signal(self.xlen, name=f'{name}__rs3_data{w}')
+            for w in range(self.n_threads)
+        ]
 
     @ValueCastable.lowermethod
     def as_value(self):
-        return Cat(self.wid, self.uop_id, self.opcode, self.lrs1,
-                   *self.rs1_data, self.lrs2, *self.rs2_data)
+        return Cat(self.wid, self.uop_id, self.tmask, self.opcode, self.lrs1,
+                   *self.rs1_data, self.lrs2, *self.rs2_data, self.lrs3,
+                   *self.rs3_data)
 
     def shape(self):
         return self.as_value().shape()
@@ -125,8 +132,10 @@ class ExecUnit(HasCoreParams, Elaboratable):
 
         if self.sim_debug:
             m.d.comb += [
-                self.exec_debug.valid.eq(self.req.valid),
+                self.exec_debug.valid.eq(self.req.fire),
+                self.exec_debug.bits.wid.eq(self.req.bits.wid),
                 self.exec_debug.bits.uop_id.eq(self.req.bits.uop.uop_id),
+                self.exec_debug.bits.tmask.eq(self.req.bits.uop.tmask),
                 self.exec_debug.bits.opcode.eq(self.req.bits.uop.opcode),
                 self.exec_debug.bits.lrs1.eq(self.req.bits.uop.lrs1),
                 self.exec_debug.bits.lrs2.eq(self.req.bits.uop.lrs2),
@@ -341,6 +350,13 @@ class FPUExecUnit(ExecUnit):
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
+
+        if self.sim_debug:
+            m.d.comb += self.exec_debug.bits.lrs3.eq(
+                self.req.bits.uop.lrs3)
+            for w in range(self.n_threads):
+                m.d.comb += self.exec_debug.bits.rs3_data[w].eq(
+                    self.req.bits.rs3_data[w])
 
         fu_units = []
 

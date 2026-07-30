@@ -351,10 +351,13 @@ class Core(HasCoreParams, Elaboratable):
                 self.core_debug.wb_debug.bits.wid.eq(wb_req.bits.wid),
                 self.core_debug.wb_debug.bits.uop_id.eq(
                     wb_req.bits.uop.uop_id),
+                self.core_debug.wb_debug.bits.tmask.eq(wb_req.bits.uop.tmask),
                 self.core_debug.wb_debug.bits.ldst.eq(wb_req.bits.uop.ldst),
             ]
             for w in range(self.n_threads):
                 m.d.comb += self.core_debug.wb_debug.bits.data[w].eq(
-                    wb_req.bits.data[w])
+                    Mux(wb_req.bits.uop.csr_cmd != CSRCommand.X,
+                        csr_port.r_data[w * self.xlen:(w + 1) * self.xlen],
+                        wb_req.bits.data[w]))
 
         return m
