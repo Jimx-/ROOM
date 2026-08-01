@@ -71,8 +71,6 @@ class CrcExtract(Elaboratable):
 
             with m.State("LAST"):
                 m.d.comb += [
-                    self.data_in.ready.eq(self.data_out.ready
-                                          & crc_queue.enq.ready),
                     self.data_out.bits.data.eq(prev_word.data),
                     self.data_out.bits.keep.eq(prev_word.keep),
                     self.data_out.bits.last.eq(1),
@@ -135,6 +133,9 @@ class CrcCalculate(Elaboratable):
 
         m.d.comb += [
             q_in.deq.connect(q_out.enq),
+            q_out.enq.valid.eq(q_in.deq.valid
+                               & (~q_in.deq.bits.last
+                                  | crc_queue.enq.ready)),
             q_in.deq.ready.eq(q_out.enq.ready
                               & (~q_in.deq.bits.last | crc_queue.enq.ready)),
         ]
@@ -263,7 +264,7 @@ class Crc(Elaboratable):
             rx_crc_calc.data_out.connect(self.rx_data_out),
         ]
 
-        with m.If(rx_crc_extract.crc.valid & rx_crc_extract.crc.valid):
+        with m.If(rx_crc_extract.crc.valid & rx_crc_calc.crc.valid):
             m.d.comb += [
                 rx_crc_extract.crc.ready.eq(1),
                 rx_crc_calc.crc.ready.eq(1),

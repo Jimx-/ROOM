@@ -156,17 +156,27 @@ class EthernetFramePadding(Elaboratable):
                                                & (done
                                                   | self.data_in.bits.last)),
                     self.data_out.valid.eq(self.data_in.valid | done),
-                    self.data_in.ready.eq(~done),
+                    self.data_in.ready.eq(self.data_out.ready & ~done),
                 ]
 
                 with m.If(self.data_in.fire & self.data_in.bits.last):
                     m.d.sync += done.eq(1)
 
-                with m.If(self.data_out.fire):
-                    with m.If(count < min_beats):
-                        m.d.sync += count.eq(count + 1)
+                # Padding is part of the presented AXI-stream beat and must not
+                # depend on ready/fire: it has to remain stable while valid is
+                # asserted and the downstream consumer is stalled.
+                with m.If(count < min_beats):
+                    for i in range(self.data_width // 8):
+                        with m.If(~self.data_in.bits.keep[i] | done):
+                            m.d.comb += [
+                                self.data_out.bits.data[i * 8:(i + 1) *
+                                                        8].eq(0),
+                                self.data_out.bits.keep[i].eq(1),
+                            ]
 
-                        for i in range(self.data_width // 8):
+                if leftover != 0:
+                    with m.If(count == min_beats):
+                        for i in range(leftover):
                             with m.If(~self.data_in.bits.keep[i] | done):
                                 m.d.comb += [
                                     self.data_out.bits.data[i * 8:(i + 1) *
@@ -174,15 +184,9 @@ class EthernetFramePadding(Elaboratable):
                                     self.data_out.bits.keep[i].eq(1),
                                 ]
 
-                    if leftover != 0:
-                        with m.If(count == min_beats):
-                            for i in range(leftover):
-                                with m.If(~self.data_in.bits.keep[i] | done):
-                                    m.d.comb += [
-                                        self.data_out.bits.data[i * 8:(i + 1) *
-                                                                8].eq(0),
-                                        self.data_out.bits.keep[i].eq(1),
-                                    ]
+                with m.If(self.data_out.fire):
+                    with m.If(count < min_beats):
+                        m.d.sync += count.eq(count + 1)
 
                     with m.If(last_padding):
                         with m.If(done | self.data_in.bits.last):

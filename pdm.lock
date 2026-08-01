@@ -2,10 +2,10 @@
 # It is not intended for manual editing.
 
 [metadata]
-groups = ["default", "dev", "distinctpy", "tinyrv"]
+groups = ["default", "dev"]
 strategy = []
 lock_version = "4.5.0"
-content_hash = "sha256:a4b5856b27760e0855cd96320359d90277c78fa039bc560c0fc35dc709ae3058"
+content_hash = "sha256:7f5a046e3089323dde00b1fd99d0d09d4217683073173120bce46a7f383600ea"
 
 [[metadata.targets]]
 requires_python = ">=3.11"
@@ -327,6 +327,16 @@ summary = "RISC-V Model"
 files = [
     {file = "riscv-model-0.6.6.tar.gz", hash = "sha256:dfff035b75ed36de33a99f95f1098697be308d4c7161a99407b82df22fd54d69"},
     {file = "riscv_model-0.6.6-py3-none-any.whl", hash = "sha256:94fb3c93ac74fd3fa8c82a600a4c0030fdef020a8c81423aa40e4666687349b6"},
+]
+
+[[package]]
+name = "scapy"
+version = "2.7.0"
+requires_python = "<4,>=3.7"
+summary = "Scapy: interactive packet manipulation tool"
+files = [
+    {file = "scapy-2.7.0-py3-none-any.whl", hash = "sha256:eb22786da92be6fd8e5c694ae5595e4f5b9ac1f4364c9c45986844f3e3063561"},
+    {file = "scapy-2.7.0.tar.gz", hash = "sha256:bfc1ef1b93280aea1ddee53be7f74232aa28ac3d891244d41ee85200d24aa446"},
 ]
 
 [[package]]

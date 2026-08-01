@@ -29,6 +29,7 @@ build-backend = "pdm.backend"
 dev = [
     "pytest",
     "rich",
+    "scapy>=2.6,<3",
     "tinyrv>=0.0.9",
     "distinctipy>=1.3.4",
 ]
