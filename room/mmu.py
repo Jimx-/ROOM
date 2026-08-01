@@ -189,7 +189,7 @@ class PageTableWalker(HasCoreParams, Elaboratable, AutoCSR):
             pte.eq(mem_resp_data),
             invalid_paddr.eq((pte.ppn >> self.ppn_bits) != 0),
             go_next_level.eq(pte.table() & ~invalid_paddr
-                             & (count != (self.pg_level_bits - 1))),
+                             & (count != (self.pg_levels - 1))),
         ]
 
         vpn = r_req.vpn

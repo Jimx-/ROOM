@@ -184,3 +184,16 @@ def test_page_table_walker_reports_reserved_leaf_pte():
     assert response["ae_ptw"] == 0
     assert response["ae_leaf"] == 0
     assert response["page_fault"] == 1
+
+
+def test_page_table_walker_stops_at_final_level():
+    memory = {
+        0x0000: make_pte(ppn=1),
+        0x1000: make_pte(ppn=2),
+        0x2000: make_pte(ppn=3),
+    }
+
+    requests, response = run_page_table_walk(0, memory)
+
+    assert requests == [0x0000, 0x1000, 0x2000]
+    assert response["level"] == 2
