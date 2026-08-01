@@ -1,4 +1,3 @@
-import argparse
 import pytest
 
 from amaranth import *
@@ -42,8 +41,10 @@ class AXIWriteRAM(Elaboratable):
                                 data_width=data_width,
                                 id_width=id_width,
                                 version=version)
-        self.monitor = Valid(Record, [("addr", addr_width, Direction.FANOUT),
-                                      ("data", data_width, Direction.FANOUT)])
+        self.monitor = Valid(Record,
+                             [("addr", addr_width, Direction.FANOUT),
+                              ("data", data_width, Direction.FANOUT),
+                              ("strb", data_width // 8, Direction.FANOUT)])
         self.aw_monitor = Valid(Record,
                                 [("addr", addr_width, Direction.FANOUT),
                                  ("len", 8, Direction.FANOUT),
@@ -58,7 +59,7 @@ class AXIWriteRAM(Elaboratable):
         mem = Memory(width=self.data_width,
                      depth=self.depth,
                      init=[0] * self.depth)
-        wport = m.submodules.wport = mem.write_port()
+        wport = m.submodules.wport = mem.write_port(granularity=8)
 
         aw_q = m.submodules.aw_q = Queue(self.aw_depth,
                                          Record, [("addr", self.addr_width),
@@ -99,15 +100,16 @@ class AXIWriteRAM(Elaboratable):
                 w_fire = self.bus.w.valid & self.bus.w.ready
                 m.d.comb += [
                     self.bus.w.ready.eq(1),
-                    wport.en.eq(w_fire),
+                    wport.en.eq(
+                        w_fire.replicate(self.data_width // 8)
+                        & self.bus.w.bits.strb),
                     self.monitor.valid.eq(w_fire),
                     self.monitor.bits.addr.eq((base_word + beat) << lg),
                     self.monitor.bits.data.eq(self.bus.w.bits.data),
+                    self.monitor.bits.strb.eq(self.bus.w.bits.strb),
                 ]
                 with m.If(w_fire):
-                    with m.If((self.bus.w.bits.last != (beat == total))
-                              | (self.bus.w.bits.strb !=
-                                 (1 << (self.data_width // 8)) - 1)):
+                    with m.If(self.bus.w.bits.last != (beat == total)):
                         m.d.sync += self.protocol_error.eq(1)
                     with m.If(beat == total):
                         m.d.sync += lat.eq(self.b_latency - 1)
@@ -173,24 +175,41 @@ def run_sim(top,
             cycles=1000,
             vcd=None,
             expected_errors=0,
-            expected_aw=None):
+            expected_aw=None,
+            expected_strb=None,
+            expected_writes=None):
     writer = top.writer
     ram = top.ram
     beat_bytes = top.data_width // 8
 
     expected = []
     data_beats = []
-    counter = 0
+    counter = 1
     for addr, length in commands:
-        valid = (length != 0 and addr % beat_bytes == 0
-                 and length % beat_bytes == 0)
-        nbeats = length // beat_bytes if valid else 0
+        narrow = (length == beat_bytes // 2 and addr % (beat_bytes // 2) == 0)
+        valid = narrow or (length != 0 and addr % beat_bytes == 0
+                           and length % beat_bytes == 0)
+        nbeats = 1 if narrow else length // beat_bytes if valid else 0
         for b in range(nbeats):
-            expected.append((addr + b * beat_bytes, counter))
-            data_beats.append(counter)
+            expected_addr = (addr & ~(beat_bytes - 1) if narrow else addr +
+                             b * beat_bytes)
+            if narrow:
+                upper = bool(addr & (beat_bytes // 2))
+                data = counter << (top.data_width // 2 if upper else 0)
+                strb = ((1 << (beat_bytes // 2)) - 1) << (beat_bytes //
+                                                          2 if upper else 0)
+            else:
+                data = counter
+                strb = (1 << beat_bytes) - 1
+            expected.append((expected_addr, data))
+            data_beats.append((data, strb))
             counter += 1
 
+    if expected_writes is not None:
+        expected = expected_writes
+
     received = []
+    strb_seen = []
     aw_seen = []
     done_count = 0
     error_count = 0
@@ -207,8 +226,9 @@ def run_sim(top,
             yield
 
     def data_process():
-        for v in data_beats:
-            yield writer.data.bits.data.eq(v)
+        for data, strb in data_beats:
+            yield writer.data.bits.data.eq(data)
+            yield writer.data.bits.strb.eq(strb)
             yield writer.data.valid.eq(1)
             yield
             while not (yield writer.data.ready):
@@ -237,6 +257,7 @@ def run_sim(top,
                 addr = (yield ram.monitor.bits.addr)
                 data = (yield ram.monitor.bits.data)
                 received.append((addr, data))
+                strb_seen.append((yield ram.monitor.bits.strb))
             yield
 
         assert received == expected
@@ -245,6 +266,8 @@ def run_sim(top,
         assert (yield ram.protocol_error) == 0
         if expected_aw is not None:
             assert aw_seen == expected_aw
+        if expected_strb is not None:
+            assert strb_seen == expected_strb
 
     sim = Simulator(top)
     sim.add_clock(1e-6)
@@ -281,6 +304,14 @@ def test_axi_dma_writer_data_last_done_and_4kb_split():
     run_sim(top, commands, expected_aw=expected_aw)
 
 
+def test_axi_dma_writer_half_width_transfer():
+    top = Top(data_width=64, ram_depth=1024)
+    run_sim(top, [(4, 4)],
+            expected_aw=[(4, 0, 2, int(AXIBurst.INCR))],
+            expected_strb=[0xf0],
+            expected_writes=[(0, 0x0000000100000000)])
+
+
 @pytest.mark.parametrize("command", [(0xffc, 8), (0x000, 15), (0x000, 0)])
 def test_axi_dma_writer_rejects_invalid_descriptor(command):
     top = Top(data_width=64, ram_depth=1024, max_burst_beats=16)
@@ -313,29 +344,3 @@ def test_axi3_dma_interfaces_elaborate():
     assert len(writer.bus.w.bits.id) == writer.id_width
     Fragment.get(reader, None)
     Fragment.get(writer, None)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description='AXIDMAWriter simulation test')
-    parser.add_argument('--vcd',
-                        type=str,
-                        default=None,
-                        help='write VCD trace')
-    args = parser.parse_args()
-
-    data_width = 64
-    beat_bytes = data_width // 8
-
-    commands = [
-        (0x000, 4 * beat_bytes),
-        (0x040, 16 * beat_bytes),
-        (0xfe0, 8 * beat_bytes),
-    ]
-
-    top = Top(data_width=data_width,
-              ram_depth=1024,
-              b_latency=3,
-              max_burst_beats=4,
-              max_outstanding=4)
-    run_sim(top, commands, vcd=args.vcd)

@@ -1,4 +1,3 @@
-import argparse
 import pytest
 
 from amaranth import *
@@ -56,11 +55,12 @@ class AXIReadRAM(Elaboratable):
 
         ar_q = m.submodules.ar_q = Queue(self.ar_depth,
                                          Record, [("addr", self.addr_width),
-                                                  ("len", 8)])
+                                                  ("len", 8), ("size", 3)])
         m.d.comb += [
             ar_q.enq.valid.eq(self.bus.ar.valid),
             ar_q.enq.bits.addr.eq(self.bus.ar.bits.addr),
             ar_q.enq.bits.len.eq(self.bus.ar.bits.len),
+            ar_q.enq.bits.size.eq(self.bus.ar.bits.size),
             self.bus.ar.ready.eq(ar_q.enq.ready),
             self.monitor.valid.eq(self.bus.ar.valid & self.bus.ar.ready),
             self.monitor.bits.addr.eq(self.bus.ar.bits.addr),
@@ -73,6 +73,8 @@ class AXIReadRAM(Elaboratable):
         lat = Signal(range(self.read_latency + 1))
         base_word = Signal(self.addr_width - lg)
         total = Signal(8)
+        transfer_size = Signal(3)
+        upper_lane = Signal()
 
         m.d.comb += rport.addr.eq(base_word + beat)
 
@@ -82,6 +84,8 @@ class AXIReadRAM(Elaboratable):
                     m.d.sync += [
                         base_word.eq(ar_q.deq.bits.addr >> lg),
                         total.eq(ar_q.deq.bits.len),
+                        transfer_size.eq(ar_q.deq.bits.size),
+                        upper_lane.eq(ar_q.deq.bits.addr[lg - 1]),
                         beat.eq(0),
                         lat.eq(self.read_latency - 1),
                     ]
@@ -91,9 +95,17 @@ class AXIReadRAM(Elaboratable):
                 with m.If(lat != 0):
                     m.d.sync += lat.eq(lat - 1)
                 with m.Else():
+                    narrow_data = Mux(
+                        upper_lane,
+                        Cat(Const(0, self.data_width // 2),
+                            rport.data[self.data_width // 2:]),
+                        Cat(rport.data[:self.data_width // 2],
+                            Const(0, self.data_width // 2)))
                     m.d.comb += [
                         self.bus.r.valid.eq(1),
-                        self.bus.r.bits.data.eq(rport.data),
+                        self.bus.r.bits.data.eq(
+                            Mux(transfer_size == lg - 1, narrow_data,
+                                rport.data)),
                         self.bus.r.bits.last.eq(beat == total),
                         self.bus.r.bits.resp.eq(self.r_resp),
                         self.bus.r.bits.id.eq(0),
@@ -151,18 +163,24 @@ def run_sim(top,
             cycles=1000,
             vcd=None,
             expected_errors=0,
-            expected_ar=None):
+            expected_ar=None,
+            expected_data=None):
     reader = top.reader
     beat_bytes = top.data_width // 8
 
     expected = []
     for addr, length in commands:
-        valid = (length != 0 and addr % beat_bytes == 0
-                 and length % beat_bytes == 0)
-        nbeats = length // beat_bytes if valid else 0
+        narrow = (length == beat_bytes // 2 and addr % (beat_bytes // 2) == 0)
+        valid = narrow or (length != 0 and addr % beat_bytes == 0
+                           and length % beat_bytes == 0)
+        nbeats = 1 if narrow else length // beat_bytes if valid else 0
         base = addr // beat_bytes
         for b in range(nbeats):
-            expected.append((top.init[base + b], 1 if b == nbeats - 1 else 0))
+            data = top.init[base + b]
+            expected.append((data, 1 if b == nbeats - 1 else 0))
+
+    if expected_data is not None:
+        expected = expected_data
 
     received = []
     ar_seen = []
@@ -250,6 +268,14 @@ def test_axi_dma_reader_data_last_and_4kb_split():
     run_sim(top, commands, expected_ar=expected_ar)
 
 
+def test_axi_dma_reader_half_width_transfer():
+    top = Top(data_width=64, ram_depth=1024)
+    top.init[0] = 0x1122334455667788
+    run_sim(top, [(4, 4)],
+            expected_ar=[(4, 0, 2, int(AXIBurst.INCR))],
+            expected_data=[(0x1122334400000000, 1)])
+
+
 @pytest.mark.parametrize("command", [(0xffc, 8), (0x000, 15), (0x000, 0)])
 def test_axi_dma_reader_rejects_invalid_descriptor(command):
     top = Top(data_width=64, ram_depth=1024, max_burst_beats=16)
@@ -259,29 +285,3 @@ def test_axi_dma_reader_rejects_invalid_descriptor(command):
 def test_axi_dma_reader_reports_rresp_error():
     top = Top(data_width=64, ram_depth=1024, max_burst_beats=4, r_resp=2)
     run_sim(top, [(0, 8)], expected_errors=1)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description='AXIDMAReader simulation test')
-    parser.add_argument('--vcd',
-                        type=str,
-                        default=None,
-                        help='write VCD trace')
-    args = parser.parse_args()
-
-    data_width = 64
-    beat_bytes = data_width // 8
-
-    commands = [
-        (0x000, 4 * beat_bytes),
-        (0x040, 16 * beat_bytes),
-        (0xfe0, 8 * beat_bytes),
-    ]
-
-    top = Top(data_width=data_width,
-              ram_depth=1024,
-              read_latency=3,
-              max_burst_beats=4,
-              max_outstanding=4)
-    run_sim(top, commands, vcd=args.vcd)

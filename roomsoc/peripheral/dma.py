@@ -270,15 +270,29 @@ class WishboneDMAWriter(Peripheral, Elaboratable):
 class AXIDMAReader(Elaboratable):
     """AXI read DMA master with multiple outstanding bursts.
 
-    Consumes a stream of command descriptors (byte address + length in bytes)
-    on ``sink`` and emits the fetched data on ``source``. Addresses and lengths
-    must be naturally aligned to the bus beat and lengths must be non-zero;
-    invalid commands pulse both ``done`` and ``error`` without issuing AXI.
-    AXI error responses also pulse ``error``. Each valid command is split
-    into legal AXI bursts (clipped to ``max_burst_beats`` and, for INCR, to the
-    4 KiB boundary) and up to ``max_outstanding`` bursts may be in flight at
-    once, hiding slave read latency. Responses are consumed strictly in order
-    (single AR ID); ``last`` on ``source`` marks the final beat of each command.
+    Interface contract:
+
+    * ``sink`` is a Decoupled descriptor stream. ``sink.addr`` is a byte
+      address and ``sink.len`` is a non-zero byte count. A full-width command
+      requires both fields to be aligned to ``data_width / 8``. The only
+      supported narrow command is exactly one half-width beat, aligned to
+      ``data_width / 16``. A descriptor transfers only when ``sink.valid`` and
+      ``sink.ready`` are both asserted.
+    * ``source`` is a Decoupled payload stream with one entry per AXI R beat.
+      ``source.data`` preserves AXI byte-lane placement; it is the unshifted
+      RDATA value. For example, a 32-bit transfer at address ``...4`` on a
+      64-bit bus occupies ``source.data[63:32]``. Unrequested lanes are not
+      meaningful. ``source.last`` marks the final beat of the descriptor, not
+      each AXI burst. Holding ``source.ready`` low applies backpressure to R.
+    * An invalid descriptor is consumed without issuing AXI and pulses both
+      ``done`` and ``error`` for one cycle. For a valid descriptor, ``done``
+      pulses when the final ``source`` beat is transferred. A non-OKAY RRESP
+      pulses ``error`` when that R beat is transferred.
+
+    Valid commands are split into legal AXI bursts, clipped to
+    ``max_burst_beats`` and, for INCR, to 4 KiB boundaries. Up to
+    ``max_outstanding`` bursts may be in flight. All requests use one AXI ID,
+    so responses must be returned in order.
     """
 
     def __init__(self,
@@ -323,6 +337,7 @@ class AXIDMAReader(Elaboratable):
         self.beat_bytes = self.data_width // 8
         self.lg_bytes = log2_int(self.beat_bytes)
 
+        # Public descriptor and payload streams; see the class contract above.
         self.sink = Decoupled(Record,
                               [("addr", self.addr_width, Direction.FANOUT),
                                ("len", 32, Direction.FANOUT)])
@@ -365,6 +380,7 @@ class AXIDMAReader(Elaboratable):
 
         cur_addr = Signal(self.addr_width)
         remaining = Signal(32)
+        transfer_lg = Signal(range(lg + 1), reset=lg)
         in_burst = Signal()
         invalid_cmd = Signal()
         m.d.sync += invalid_cmd.eq(0)
@@ -377,7 +393,7 @@ class AXIDMAReader(Elaboratable):
         else:
             burst_beats = b1
         if self.burst_type == 'INCR':
-            to_4kb = (0x1000 - (cur_addr & 0xfff)) >> lg
+            to_4kb = (0x1000 - (cur_addr & 0xfff)) >> transfer_lg
             burst_beats = Mux(b1 < to_4kb, b1, to_4kb)
 
         ar_valid = in_burst & has_room & meta_q.enq.ready
@@ -386,7 +402,7 @@ class AXIDMAReader(Elaboratable):
             bus.ar.valid.eq(ar_valid),
             bus.ar.bits.addr.eq(cur_addr),
             bus.ar.bits.len.eq(burst_beats - 1),
-            bus.ar.bits.size.eq(lg),
+            bus.ar.bits.size.eq(transfer_lg),
             bus.ar.bits.burst.eq(burst_enc),
             bus.ar.bits.lock.eq(0),
             bus.ar.bits.prot.eq(self.prot),
@@ -401,18 +417,24 @@ class AXIDMAReader(Elaboratable):
         with m.FSM():
             with m.State('IDLE'):
                 with m.If(cmd_q.deq.valid):
-                    beats = cmd_q.deq.bits.len[lg:]
+                    narrow = cmd_q.deq.bits.len == self.beat_bytes // 2
+                    narrow_valid = narrow
+                    if lg > 1:
+                        narrow_valid = narrow_valid & (
+                            cmd_q.deq.bits.addr[:lg - 1] == 0)
+                    beats = Mux(narrow_valid, 1, cmd_q.deq.bits.len[lg:])
                     invalid = cmd_q.deq.bits.len == 0
                     if lg:
-                        invalid = (invalid
-                                   | (cmd_q.deq.bits.addr[:lg] != 0)
-                                   | (cmd_q.deq.bits.len[:lg] != 0))
+                        full_invalid = ((cmd_q.deq.bits.addr[:lg] != 0)
+                                        | (cmd_q.deq.bits.len[:lg] != 0))
+                        invalid = invalid | (full_invalid & ~narrow_valid)
                     if self.burst_type == 'WRAP':
                         invalid = invalid | beats[0]
                     m.d.comb += cmd_q.deq.ready.eq(1)
                     m.d.sync += [
                         cur_addr.eq(cmd_q.deq.bits.addr),
                         remaining.eq(beats),
+                        transfer_lg.eq(Mux(narrow_valid, lg - 1, lg)),
                     ]
                     with m.If(~invalid):
                         m.d.sync += in_burst.eq(1)
@@ -427,7 +449,7 @@ class AXIDMAReader(Elaboratable):
                         meta_q.enq.bits.eq(remaining == burst_beats),
                     ]
                     m.d.sync += [
-                        cur_addr.eq(cur_addr + (burst_beats << lg)),
+                        cur_addr.eq(cur_addr + (burst_beats << transfer_lg)),
                         remaining.eq(remaining - burst_beats),
                     ]
                     with m.If(remaining == burst_beats):
@@ -461,18 +483,30 @@ class AXIDMAReader(Elaboratable):
 class AXIDMAWriter(Elaboratable):
     """AXI write DMA master with multiple outstanding bursts.
 
-    Mirror of :class:`AXIDMAReader` for the write direction. Consumes a stream
-    of command descriptors (byte address + length in bytes) on ``sink`` and
-    writes the payload supplied on ``data`` to memory. Addresses and lengths
-    must be naturally aligned to the bus beat and lengths must be non-zero;
-    invalid commands pulse both ``done`` and ``error`` without consuming data
-    or issuing AXI. AXI error responses also pulse ``error``. Each valid command
-    is split into legal AXI bursts (clipped to ``max_burst_beats`` and, for INCR,
-    to the 4 KiB boundary) and up to ``max_outstanding`` bursts may be in flight
-    at once, hiding slave write latency. Write data is streamed in order on the
-    W channel with ``W.last`` inserted at each burst boundary; write responses
-    are consumed strictly in order (single AW ID). ``done`` pulses for one cycle
-    when a command's final write response is received.
+    Interface contract:
+
+    * ``sink`` follows the same Decoupled descriptor rules as
+      :class:`AXIDMAReader`: byte address and non-zero byte length, either
+      naturally aligned full-width beats or exactly one naturally aligned
+      half-width beat.
+    * ``data`` is a Decoupled payload stream ordered to match accepted
+      descriptors. It supplies exactly ``sink.len / (data_width / 8)`` beats
+      for a full-width descriptor and one beat for a half-width descriptor.
+      ``data.data`` and ``data.strb`` must already use AXI byte-lane placement;
+      they are forwarded unchanged to WDATA and WSTRB. Thus a 32-bit transfer
+      at address ``...4`` on a 64-bit bus places its value in ``data[63:32]``
+      with ``strb=0xf0``; a full-width beat normally uses ``strb=0xff``.
+      There is no input ``last`` signal because the descriptor defines the
+      transfer length; the DMA generates WLAST at every AXI burst boundary.
+    * An invalid descriptor is consumed without consuming ``data`` or issuing
+      AXI, and pulses both ``done`` and ``error``. For a valid descriptor,
+      ``done`` pulses when its final B response is transferred. A non-OKAY
+      BRESP pulses ``error`` when that response is transferred.
+
+    Valid commands are split into legal AXI bursts, clipped to
+    ``max_burst_beats`` and, for INCR, to 4 KiB boundaries. Up to
+    ``max_outstanding`` bursts may be in flight. AW, W, and B ordering follows
+    accepted descriptor order and all requests use one AXI ID.
     """
 
     def __init__(self,
@@ -518,11 +552,13 @@ class AXIDMAWriter(Elaboratable):
         # Width needed to hold any per-burst beat count (1..max_burst_beats).
         self.beats_width = max(1, self.max_burst_beats.bit_length())
 
+        # Public descriptor and payload streams; see the class contract above.
         self.sink = Decoupled(Record,
                               [("addr", self.addr_width, Direction.FANOUT),
                                ("len", 32, Direction.FANOUT)])
-        self.data = Decoupled(Record,
-                              [("data", self.data_width, Direction.FANOUT)])
+        self.data = Decoupled(
+            Record, [("data", self.data_width, Direction.FANOUT),
+                     ("strb", self.data_width // 8, Direction.FANOUT)])
         self.done = Signal()
         self.error = Signal()
 
@@ -536,8 +572,6 @@ class AXIDMAWriter(Elaboratable):
             'INCR': AXIBurst.INCR,
             'WRAP': AXIBurst.WRAP,
         }[self.burst_type]
-
-        strb_full = (1 << (self.data_width // 8)) - 1
 
         cmd_q = m.submodules.cmd_q = Queue(
             self.cmd_fifo_depth, Record,
@@ -560,6 +594,7 @@ class AXIDMAWriter(Elaboratable):
 
         cur_addr = Signal(self.addr_width)
         remaining = Signal(32)
+        transfer_lg = Signal(range(lg + 1), reset=lg)
         in_burst = Signal()
         invalid_cmd = Signal()
         m.d.sync += invalid_cmd.eq(0)
@@ -572,7 +607,7 @@ class AXIDMAWriter(Elaboratable):
         else:
             burst_beats = b1
         if self.burst_type == 'INCR':
-            to_4kb = (0x1000 - (cur_addr & 0xfff)) >> lg
+            to_4kb = (0x1000 - (cur_addr & 0xfff)) >> transfer_lg
             burst_beats = Mux(b1 < to_4kb, b1, to_4kb)
 
         aw_valid = in_burst & has_room & wmeta_q.enq.ready & bmeta_q.enq.ready
@@ -581,7 +616,7 @@ class AXIDMAWriter(Elaboratable):
             bus.aw.valid.eq(aw_valid),
             bus.aw.bits.addr.eq(cur_addr),
             bus.aw.bits.len.eq(burst_beats - 1),
-            bus.aw.bits.size.eq(lg),
+            bus.aw.bits.size.eq(transfer_lg),
             bus.aw.bits.burst.eq(burst_enc),
             bus.aw.bits.lock.eq(0),
             bus.aw.bits.prot.eq(self.prot),
@@ -598,18 +633,24 @@ class AXIDMAWriter(Elaboratable):
         with m.FSM():
             with m.State('IDLE'):
                 with m.If(cmd_q.deq.valid):
-                    beats = cmd_q.deq.bits.len[lg:]
+                    narrow = cmd_q.deq.bits.len == self.beat_bytes // 2
+                    narrow_valid = narrow
+                    if lg > 1:
+                        narrow_valid = narrow_valid & (
+                            cmd_q.deq.bits.addr[:lg - 1] == 0)
+                    beats = Mux(narrow_valid, 1, cmd_q.deq.bits.len[lg:])
                     invalid = cmd_q.deq.bits.len == 0
                     if lg:
-                        invalid = (invalid
-                                   | (cmd_q.deq.bits.addr[:lg] != 0)
-                                   | (cmd_q.deq.bits.len[:lg] != 0))
+                        full_invalid = ((cmd_q.deq.bits.addr[:lg] != 0)
+                                        | (cmd_q.deq.bits.len[:lg] != 0))
+                        invalid = invalid | (full_invalid & ~narrow_valid)
                     if self.burst_type == 'WRAP':
                         invalid = invalid | beats[0]
                     m.d.comb += cmd_q.deq.ready.eq(1)
                     m.d.sync += [
                         cur_addr.eq(cmd_q.deq.bits.addr),
                         remaining.eq(beats),
+                        transfer_lg.eq(Mux(narrow_valid, lg - 1, lg)),
                     ]
                     with m.If(~invalid):
                         m.d.sync += in_burst.eq(1)
@@ -626,7 +667,7 @@ class AXIDMAWriter(Elaboratable):
                         bmeta_q.enq.bits.eq(remaining == burst_beats),
                     ]
                     m.d.sync += [
-                        cur_addr.eq(cur_addr + (burst_beats << lg)),
+                        cur_addr.eq(cur_addr + (burst_beats << transfer_lg)),
                         remaining.eq(remaining - burst_beats),
                     ]
                     with m.If(remaining == burst_beats):
@@ -644,7 +685,7 @@ class AXIDMAWriter(Elaboratable):
         # that many beats from ``data`` to the W channel, asserting W.last on
         # the final beat of every burst.
         wbeats = Signal(self.beats_width)
-        m.d.comb += bus.w.bits.strb.eq(strb_full)
+        m.d.comb += bus.w.bits.strb.eq(self.data.bits.strb)
 
         with m.FSM():
             with m.State('WIDLE'):
