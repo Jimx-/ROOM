@@ -4,7 +4,26 @@ from amaranth.utils import log2_int
 from amaranth.hdl.rec import Direction
 
 from .peripheral import Peripheral
-from roomsoc.interconnect.stream import Decoupled
+from roomsoc.interconnect.axi import AXIInterface
+from roomsoc.interconnect.axi.common import AXIBurst
+from roomsoc.interconnect.stream import Decoupled, Queue
+
+
+def _validate_axi_dma_config(version, burst_type, max_burst_beats,
+                             max_outstanding):
+    if version not in ('axi3', 'axi4'):
+        raise ValueError("version must be 'axi3' or 'axi4'")
+    if burst_type not in ('FIXED', 'INCR', 'WRAP'):
+        raise ValueError("invalid burst_type {}".format(burst_type))
+    beat_max = 256 if (version == 'axi4' and burst_type == 'INCR') else 16
+    if not (1 <= max_burst_beats <= beat_max):
+        raise ValueError(
+            "max_burst_beats {} out of range for {} {} (1..{})".format(
+                max_burst_beats, version, burst_type, beat_max))
+    if max_outstanding < 1:
+        raise ValueError("max_outstanding must be >= 1")
+    if burst_type == 'WRAP' and max_burst_beats not in (2, 4, 8, 16):
+        raise ValueError("WRAP max_burst_beats must be 2, 4, 8, or 16")
 
 
 class WishboneDMAReader(Peripheral, Elaboratable):
@@ -244,5 +263,416 @@ class WishboneDMAWriter(Peripheral, Elaboratable):
                                     m.d.sync += offset.eq(0)
                                 with m.Else():
                                     m.next = 'IDLE'
+
+        return m
+
+
+class AXIDMAReader(Elaboratable):
+    """AXI read DMA master with multiple outstanding bursts.
+
+    Consumes a stream of command descriptors (byte address + length in bytes)
+    on ``sink`` and emits the fetched data on ``source``. Addresses and lengths
+    must be naturally aligned to the bus beat and lengths must be non-zero;
+    invalid commands pulse both ``done`` and ``error`` without issuing AXI.
+    AXI error responses also pulse ``error``. Each valid command is split
+    into legal AXI bursts (clipped to ``max_burst_beats`` and, for INCR, to the
+    4 KiB boundary) and up to ``max_outstanding`` bursts may be in flight at
+    once, hiding slave read latency. Responses are consumed strictly in order
+    (single AR ID); ``last`` on ``source`` marks the final beat of each command.
+    """
+
+    def __init__(self,
+                 bus=None,
+                 *,
+                 addr_width=32,
+                 data_width=32,
+                 id_width=1,
+                 version='axi4',
+                 max_burst_beats=16,
+                 max_outstanding=8,
+                 cmd_fifo_depth=16,
+                 data_fifo_depth=32,
+                 burst_type='INCR',
+                 prot=0,
+                 cache=0b0011,
+                 qos=0):
+        _validate_axi_dma_config(version, burst_type, max_burst_beats,
+                                 max_outstanding)
+        if bus is None:
+            bus = AXIInterface(addr_width=addr_width,
+                               data_width=data_width,
+                               id_width=id_width,
+                               version=version)
+        self.bus = bus
+        self.addr_width = bus.addr_width
+        self.data_width = bus.data_width
+        self.id_width = bus.id_width
+        self.version = version
+        self.max_burst_beats = max_burst_beats
+        self.max_outstanding = max_outstanding
+        self.cmd_fifo_depth = cmd_fifo_depth
+        self.data_fifo_depth = data_fifo_depth
+        self.burst_type = burst_type
+        self.prot = prot
+        self.cache = cache
+        self.qos = qos
+
+        if hasattr(bus, 'version') and bus.version != version:
+            raise ValueError("bus version does not match DMA version")
+
+        self.beat_bytes = self.data_width // 8
+        self.lg_bytes = log2_int(self.beat_bytes)
+
+        self.sink = Decoupled(Record,
+                              [("addr", self.addr_width, Direction.FANOUT),
+                               ("len", 32, Direction.FANOUT)])
+        self.source = Decoupled(Record,
+                                [("data", self.data_width, Direction.FANOUT),
+                                 ("last", 1, Direction.FANOUT)])
+        self.done = Signal()
+        self.error = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+        bus = self.bus
+        lg = self.lg_bytes
+
+        burst_enc = {
+            'FIXED': AXIBurst.FIXED,
+            'INCR': AXIBurst.INCR,
+            'WRAP': AXIBurst.WRAP,
+        }[self.burst_type]
+
+        cmd_q = m.submodules.cmd_q = Queue(
+            self.cmd_fifo_depth, Record,
+            [("addr", self.addr_width, Direction.FANOUT),
+             ("len", 32, Direction.FANOUT)])
+        m.d.comb += self.sink.connect(cmd_q.enq)
+
+        data_q = m.submodules.data_q = Queue(
+            self.data_fifo_depth, Record,
+            [("data", self.data_width, Direction.FANOUT),
+             ("last", 1, Direction.FANOUT)])
+        m.d.comb += data_q.deq.connect(self.source)
+
+        # One entry per in-flight burst recording whether it completes a
+        # command; popped on the burst's last R beat to reconstruct per-command
+        # ``last`` on the source.
+        meta_q = m.submodules.meta_q = Queue(self.max_outstanding, Signal, 1)
+
+        outstanding = Signal(range(self.max_outstanding + 1))
+        has_room = outstanding < self.max_outstanding
+
+        cur_addr = Signal(self.addr_width)
+        remaining = Signal(32)
+        in_burst = Signal()
+        invalid_cmd = Signal()
+        m.d.sync += invalid_cmd.eq(0)
+
+        b1 = Mux(remaining < self.max_burst_beats, remaining,
+                 self.max_burst_beats)
+        if self.burst_type == 'WRAP':
+            burst_beats = Mux(b1 >= 16, 16, Mux(b1 >= 8, 8, Mux(b1 >= 4, 4,
+                                                                2)))
+        else:
+            burst_beats = b1
+        if self.burst_type == 'INCR':
+            to_4kb = (0x1000 - (cur_addr & 0xfff)) >> lg
+            burst_beats = Mux(b1 < to_4kb, b1, to_4kb)
+
+        ar_valid = in_burst & has_room & meta_q.enq.ready
+
+        m.d.comb += [
+            bus.ar.valid.eq(ar_valid),
+            bus.ar.bits.addr.eq(cur_addr),
+            bus.ar.bits.len.eq(burst_beats - 1),
+            bus.ar.bits.size.eq(lg),
+            bus.ar.bits.burst.eq(burst_enc),
+            bus.ar.bits.lock.eq(0),
+            bus.ar.bits.prot.eq(self.prot),
+            bus.ar.bits.cache.eq(self.cache),
+            bus.ar.bits.qos.eq(self.qos),
+            bus.ar.bits.region.eq(0),
+            bus.ar.bits.id.eq(0),
+        ]
+
+        ar_fire = ar_valid & bus.ar.ready
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(cmd_q.deq.valid):
+                    beats = cmd_q.deq.bits.len[lg:]
+                    invalid = cmd_q.deq.bits.len == 0
+                    if lg:
+                        invalid = (invalid
+                                   | (cmd_q.deq.bits.addr[:lg] != 0)
+                                   | (cmd_q.deq.bits.len[:lg] != 0))
+                    if self.burst_type == 'WRAP':
+                        invalid = invalid | beats[0]
+                    m.d.comb += cmd_q.deq.ready.eq(1)
+                    m.d.sync += [
+                        cur_addr.eq(cmd_q.deq.bits.addr),
+                        remaining.eq(beats),
+                    ]
+                    with m.If(~invalid):
+                        m.d.sync += in_burst.eq(1)
+                        m.next = 'BURST'
+                    with m.Else():
+                        m.d.sync += invalid_cmd.eq(1)
+
+            with m.State('BURST'):
+                with m.If(ar_fire):
+                    m.d.comb += [
+                        meta_q.enq.valid.eq(1),
+                        meta_q.enq.bits.eq(remaining == burst_beats),
+                    ]
+                    m.d.sync += [
+                        cur_addr.eq(cur_addr + (burst_beats << lg)),
+                        remaining.eq(remaining - burst_beats),
+                    ]
+                    with m.If(remaining == burst_beats):
+                        m.d.sync += in_burst.eq(0)
+                        m.next = 'IDLE'
+
+        r_last_fire = bus.r.valid & bus.r.ready & bus.r.bits.last
+
+        with m.If(ar_fire & ~r_last_fire):
+            m.d.sync += outstanding.eq(outstanding + 1)
+        with m.Elif(~ar_fire & r_last_fire):
+            m.d.sync += outstanding.eq(outstanding - 1)
+
+        m.d.comb += [
+            bus.r.ready.eq(data_q.enq.ready
+                           & (~bus.r.bits.last | meta_q.deq.valid)),
+            data_q.enq.valid.eq(bus.r.valid & bus.r.ready),
+            data_q.enq.bits.data.eq(bus.r.bits.data),
+            data_q.enq.bits.last.eq(bus.r.bits.last & meta_q.deq.bits),
+            meta_q.deq.ready.eq(bus.r.valid & bus.r.ready & bus.r.bits.last),
+            self.done.eq(invalid_cmd
+                         | (self.source.fire & self.source.bits.last)),
+            self.error.eq(invalid_cmd
+                          | (bus.r.valid & bus.r.ready
+                             & (bus.r.bits.resp != 0))),
+        ]
+
+        return m
+
+
+class AXIDMAWriter(Elaboratable):
+    """AXI write DMA master with multiple outstanding bursts.
+
+    Mirror of :class:`AXIDMAReader` for the write direction. Consumes a stream
+    of command descriptors (byte address + length in bytes) on ``sink`` and
+    writes the payload supplied on ``data`` to memory. Addresses and lengths
+    must be naturally aligned to the bus beat and lengths must be non-zero;
+    invalid commands pulse both ``done`` and ``error`` without consuming data
+    or issuing AXI. AXI error responses also pulse ``error``. Each valid command
+    is split into legal AXI bursts (clipped to ``max_burst_beats`` and, for INCR,
+    to the 4 KiB boundary) and up to ``max_outstanding`` bursts may be in flight
+    at once, hiding slave write latency. Write data is streamed in order on the
+    W channel with ``W.last`` inserted at each burst boundary; write responses
+    are consumed strictly in order (single AW ID). ``done`` pulses for one cycle
+    when a command's final write response is received.
+    """
+
+    def __init__(self,
+                 bus=None,
+                 *,
+                 addr_width=32,
+                 data_width=32,
+                 id_width=1,
+                 version='axi4',
+                 max_burst_beats=16,
+                 max_outstanding=8,
+                 cmd_fifo_depth=16,
+                 burst_type='INCR',
+                 prot=0,
+                 cache=0b0011,
+                 qos=0):
+        _validate_axi_dma_config(version, burst_type, max_burst_beats,
+                                 max_outstanding)
+        if bus is None:
+            bus = AXIInterface(addr_width=addr_width,
+                               data_width=data_width,
+                               id_width=id_width,
+                               version=version)
+        self.bus = bus
+        self.addr_width = bus.addr_width
+        self.data_width = bus.data_width
+        self.id_width = bus.id_width
+        self.version = version
+        self.max_burst_beats = max_burst_beats
+        self.max_outstanding = max_outstanding
+        self.cmd_fifo_depth = cmd_fifo_depth
+        self.burst_type = burst_type
+        self.prot = prot
+        self.cache = cache
+        self.qos = qos
+
+        if hasattr(bus, 'version') and bus.version != version:
+            raise ValueError("bus version does not match DMA version")
+
+        self.beat_bytes = self.data_width // 8
+        self.lg_bytes = log2_int(self.beat_bytes)
+
+        # Width needed to hold any per-burst beat count (1..max_burst_beats).
+        self.beats_width = max(1, self.max_burst_beats.bit_length())
+
+        self.sink = Decoupled(Record,
+                              [("addr", self.addr_width, Direction.FANOUT),
+                               ("len", 32, Direction.FANOUT)])
+        self.data = Decoupled(Record,
+                              [("data", self.data_width, Direction.FANOUT)])
+        self.done = Signal()
+        self.error = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+        bus = self.bus
+        lg = self.lg_bytes
+
+        burst_enc = {
+            'FIXED': AXIBurst.FIXED,
+            'INCR': AXIBurst.INCR,
+            'WRAP': AXIBurst.WRAP,
+        }[self.burst_type]
+
+        strb_full = (1 << (self.data_width // 8)) - 1
+
+        cmd_q = m.submodules.cmd_q = Queue(
+            self.cmd_fifo_depth, Record,
+            [("addr", self.addr_width, Direction.FANOUT),
+             ("len", 32, Direction.FANOUT)])
+        m.d.comb += self.sink.connect(cmd_q.enq)
+
+        # One entry per in-flight burst. ``wmeta_q`` carries the number of W
+        # beats to stream for that burst (popped on its last W beat so we know
+        # where to assert W.last); ``bmeta_q`` carries whether the burst
+        # completes a command (popped on its B response to reconstruct
+        # per-command completion on ``done``). Both are pushed together when AW
+        # fires, so their occupancy never exceeds ``outstanding``.
+        wmeta_q = m.submodules.wmeta_q = Queue(self.max_outstanding, Signal,
+                                               self.beats_width)
+        bmeta_q = m.submodules.bmeta_q = Queue(self.max_outstanding, Signal, 1)
+
+        outstanding = Signal(range(self.max_outstanding + 1))
+        has_room = outstanding < self.max_outstanding
+
+        cur_addr = Signal(self.addr_width)
+        remaining = Signal(32)
+        in_burst = Signal()
+        invalid_cmd = Signal()
+        m.d.sync += invalid_cmd.eq(0)
+
+        b1 = Mux(remaining < self.max_burst_beats, remaining,
+                 self.max_burst_beats)
+        if self.burst_type == 'WRAP':
+            burst_beats = Mux(b1 >= 16, 16, Mux(b1 >= 8, 8, Mux(b1 >= 4, 4,
+                                                                2)))
+        else:
+            burst_beats = b1
+        if self.burst_type == 'INCR':
+            to_4kb = (0x1000 - (cur_addr & 0xfff)) >> lg
+            burst_beats = Mux(b1 < to_4kb, b1, to_4kb)
+
+        aw_valid = in_burst & has_room & wmeta_q.enq.ready & bmeta_q.enq.ready
+
+        m.d.comb += [
+            bus.aw.valid.eq(aw_valid),
+            bus.aw.bits.addr.eq(cur_addr),
+            bus.aw.bits.len.eq(burst_beats - 1),
+            bus.aw.bits.size.eq(lg),
+            bus.aw.bits.burst.eq(burst_enc),
+            bus.aw.bits.lock.eq(0),
+            bus.aw.bits.prot.eq(self.prot),
+            bus.aw.bits.cache.eq(self.cache),
+            bus.aw.bits.qos.eq(self.qos),
+            bus.aw.bits.region.eq(0),
+            bus.aw.bits.id.eq(0),
+        ]
+        if self.version == 'axi3':
+            m.d.comb += bus.w.bits.id.eq(0)
+
+        aw_fire = aw_valid & bus.aw.ready
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(cmd_q.deq.valid):
+                    beats = cmd_q.deq.bits.len[lg:]
+                    invalid = cmd_q.deq.bits.len == 0
+                    if lg:
+                        invalid = (invalid
+                                   | (cmd_q.deq.bits.addr[:lg] != 0)
+                                   | (cmd_q.deq.bits.len[:lg] != 0))
+                    if self.burst_type == 'WRAP':
+                        invalid = invalid | beats[0]
+                    m.d.comb += cmd_q.deq.ready.eq(1)
+                    m.d.sync += [
+                        cur_addr.eq(cmd_q.deq.bits.addr),
+                        remaining.eq(beats),
+                    ]
+                    with m.If(~invalid):
+                        m.d.sync += in_burst.eq(1)
+                        m.next = 'BURST'
+                    with m.Else():
+                        m.d.sync += invalid_cmd.eq(1)
+
+            with m.State('BURST'):
+                with m.If(aw_fire):
+                    m.d.comb += [
+                        wmeta_q.enq.valid.eq(1),
+                        wmeta_q.enq.bits.eq(burst_beats),
+                        bmeta_q.enq.valid.eq(1),
+                        bmeta_q.enq.bits.eq(remaining == burst_beats),
+                    ]
+                    m.d.sync += [
+                        cur_addr.eq(cur_addr + (burst_beats << lg)),
+                        remaining.eq(remaining - burst_beats),
+                    ]
+                    with m.If(remaining == burst_beats):
+                        m.d.sync += in_burst.eq(0)
+                        m.next = 'IDLE'
+
+        b_fire = bus.b.valid & bus.b.ready
+
+        with m.If(aw_fire & ~b_fire):
+            m.d.sync += outstanding.eq(outstanding + 1)
+        with m.Elif(~aw_fire & b_fire):
+            m.d.sync += outstanding.eq(outstanding - 1)
+
+        # Write data path: for each burst recorded in ``wmeta_q`` stream exactly
+        # that many beats from ``data`` to the W channel, asserting W.last on
+        # the final beat of every burst.
+        wbeats = Signal(self.beats_width)
+        m.d.comb += bus.w.bits.strb.eq(strb_full)
+
+        with m.FSM():
+            with m.State('WIDLE'):
+                with m.If(wmeta_q.deq.valid):
+                    m.d.comb += wmeta_q.deq.ready.eq(1)
+                    m.d.sync += wbeats.eq(wmeta_q.deq.bits)
+                    m.next = 'WSTREAM'
+
+            with m.State('WSTREAM'):
+                w_fire = self.data.valid & bus.w.ready
+                m.d.comb += [
+                    bus.w.valid.eq(self.data.valid),
+                    bus.w.bits.data.eq(self.data.bits.data),
+                    bus.w.bits.last.eq(wbeats == 1),
+                    self.data.ready.eq(bus.w.ready),
+                ]
+                with m.If(w_fire):
+                    m.d.sync += wbeats.eq(wbeats - 1)
+                    with m.If(wbeats == 1):
+                        m.next = 'WIDLE'
+
+        # Write response path: accept B in order and pulse ``done`` on the
+        # final response of each command.
+        m.d.comb += [
+            bus.b.ready.eq(bmeta_q.deq.valid),
+            bmeta_q.deq.ready.eq(b_fire),
+            self.done.eq(invalid_cmd | (b_fire & bmeta_q.deq.bits)),
+            self.error.eq(invalid_cmd | (b_fire & (bus.b.bits.resp != 0))),
+        ]
 
         return m

@@ -114,16 +114,22 @@ class AXIInterface(Record):
                  data_width=32,
                  addr_width=32,
                  id_width=1,
+                 version='axi4',
                  name=None,
                  src_loc_at=1):
+        if version not in ('axi3', 'axi4'):
+            raise ValueError("version must be 'axi3' or 'axi4'")
+
         self.addr_width = addr_width
         self.data_width = data_width
         self.id_width = id_width
+        self.version = version
         self._map = None
 
         super().__init__(make_axi_layout(data_width=data_width,
                                          addr_width=addr_width,
-                                         id_width=id_width),
+                                         id_width=id_width,
+                                         version=version),
                          name=name,
                          src_loc_at=src_loc_at)
 
