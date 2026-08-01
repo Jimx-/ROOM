@@ -355,6 +355,194 @@ class AXILiteUpConverter(Elaboratable):
         return m
 
 
+class AXILiteDownConverter(Elaboratable):
+    """Split each wide AXI-Lite access into narrow AXI-Lite accesses."""
+
+    def __init__(self, master, slave):
+        if master.addr_width != slave.addr_width:
+            raise ValueError("AXI-Lite address widths must match")
+        if master.data_width <= slave.data_width:
+            raise ValueError("Master must be wider than slave")
+        if master.data_width % slave.data_width:
+            raise ValueError("AXI-Lite width ratio must be integral")
+        ratio = master.data_width // slave.data_width
+        if ratio & (ratio - 1):
+            raise ValueError("AXI-Lite width ratio must be a power of two")
+
+        self.master = master
+        self.slave = slave
+
+    def elaborate(self, platform):
+        m = Module()
+
+        master = self.master
+        slave = self.slave
+        dw_from = master.data_width
+        dw_to = slave.data_width
+        slave_bytes = dw_to // 8
+        ratio = dw_from // dw_to
+
+        # AXI-Lite has no transfer-size signal. As in LiteX, a wide access is
+        # defined as `ratio` consecutive narrow accesses starting at the exact
+        # address supplied by the wide master. Write lanes whose strobes are
+        # zero are skipped; reads always fetch and assemble every lane.
+
+        # Write conversion. Capture AW and W independently, since AXI-Lite does
+        # not require the two channels to arrive in the same cycle.
+        wr_aw_hold = Signal()
+        wr_addr = Signal(master.addr_width)
+        wr_prot = Signal(3)
+        wr_w_hold = Signal()
+        wr_data = Signal(dw_from)
+        wr_strb = Signal(dw_from // 8)
+        wr_lane = Signal(range(ratio))
+        wr_aw_sent = Signal()
+        wr_w_sent = Signal()
+        wr_resp = Signal(2)
+
+        wr_lane_data = Signal(dw_to)
+        wr_lane_strb = Signal(slave_bytes)
+        m.d.comb += [
+            wr_lane_data.eq(wr_data.word_select(wr_lane, dw_to)),
+            wr_lane_strb.eq(wr_strb.word_select(wr_lane, slave_bytes)),
+        ]
+
+        with m.FSM(name="axil_down_write"):
+            with m.State("IDLE"):
+                m.d.comb += [
+                    master.aw.ready.eq(~wr_aw_hold),
+                    master.w.ready.eq(~wr_w_hold),
+                ]
+                aw_fire = master.aw.valid & master.aw.ready
+                w_fire = master.w.valid & master.w.ready
+                with m.If(aw_fire):
+                    m.d.sync += [
+                        wr_aw_hold.eq(1),
+                        wr_addr.eq(master.aw.addr),
+                        wr_prot.eq(master.aw.prot),
+                    ]
+                with m.If(w_fire):
+                    m.d.sync += [
+                        wr_w_hold.eq(1),
+                        wr_data.eq(master.w.data),
+                        wr_strb.eq(master.w.strb),
+                    ]
+                with m.If((wr_aw_hold | aw_fire) & (wr_w_hold | w_fire)):
+                    m.d.sync += [
+                        wr_lane.eq(0),
+                        wr_aw_sent.eq(0),
+                        wr_w_sent.eq(0),
+                        wr_resp.eq(0),
+                    ]
+                    m.next = "CONVERT"
+
+            with m.State("CONVERT"):
+                with m.If(wr_lane_strb == 0):
+                    with m.If(wr_lane == ratio - 1):
+                        m.next = "RESPOND"
+                    with m.Else():
+                        m.d.sync += wr_lane.eq(wr_lane + 1)
+                with m.Else():
+                    m.d.comb += [
+                        slave.aw.valid.eq(~wr_aw_sent),
+                        slave.aw.addr.eq(wr_addr + wr_lane * slave_bytes),
+                        slave.aw.prot.eq(wr_prot),
+                        slave.w.valid.eq(~wr_w_sent),
+                        slave.w.data.eq(wr_lane_data),
+                        slave.w.strb.eq(wr_lane_strb),
+                    ]
+                    slave_aw_fire = slave.aw.valid & slave.aw.ready
+                    slave_w_fire = slave.w.valid & slave.w.ready
+                    with m.If(slave_aw_fire):
+                        m.d.sync += wr_aw_sent.eq(1)
+                    with m.If(slave_w_fire):
+                        m.d.sync += wr_w_sent.eq(1)
+                    with m.If((wr_aw_sent | slave_aw_fire)
+                              & (wr_w_sent | slave_w_fire)):
+                        m.next = "WAIT_RESP"
+
+            with m.State("WAIT_RESP"):
+                m.d.comb += slave.b.ready.eq(1)
+                with m.If(slave.b.valid):
+                    with m.If((wr_resp == 0) & (slave.b.resp != 0)):
+                        m.d.sync += wr_resp.eq(slave.b.resp)
+                    with m.If(wr_lane == ratio - 1):
+                        m.next = "RESPOND"
+                    with m.Else():
+                        m.d.sync += [
+                            wr_lane.eq(wr_lane + 1),
+                            wr_aw_sent.eq(0),
+                            wr_w_sent.eq(0),
+                        ]
+                        m.next = "CONVERT"
+
+            with m.State("RESPOND"):
+                m.d.comb += [
+                    master.b.valid.eq(1),
+                    master.b.resp.eq(wr_resp),
+                ]
+                with m.If(master.b.ready):
+                    m.d.sync += [
+                        wr_aw_hold.eq(0),
+                        wr_w_hold.eq(0),
+                    ]
+                    m.next = "IDLE"
+
+        # Read conversion. Each narrow response is placed in its corresponding
+        # wide data lane, and the first non-OKAY response is retained.
+        rd_addr = Signal(master.addr_width)
+        rd_prot = Signal(3)
+        rd_lane = Signal(range(ratio))
+        rd_data = Signal(dw_from)
+        rd_resp = Signal(2)
+
+        with m.FSM(name="axil_down_read"):
+            with m.State("IDLE"):
+                m.d.comb += master.ar.ready.eq(1)
+                with m.If(master.ar.valid):
+                    m.d.sync += [
+                        rd_addr.eq(master.ar.addr),
+                        rd_prot.eq(master.ar.prot),
+                        rd_lane.eq(0),
+                        rd_data.eq(0),
+                        rd_resp.eq(0),
+                    ]
+                    m.next = "CONVERT"
+
+            with m.State("CONVERT"):
+                m.d.comb += [
+                    slave.ar.valid.eq(1),
+                    slave.ar.addr.eq(rd_addr + rd_lane * slave_bytes),
+                    slave.ar.prot.eq(rd_prot),
+                ]
+                with m.If(slave.ar.ready):
+                    m.next = "WAIT_RESP"
+
+            with m.State("WAIT_RESP"):
+                m.d.comb += slave.r.ready.eq(1)
+                with m.If(slave.r.valid):
+                    m.d.sync += rd_data.word_select(rd_lane,
+                                                    dw_to).eq(slave.r.data)
+                    with m.If((rd_resp == 0) & (slave.r.resp != 0)):
+                        m.d.sync += rd_resp.eq(slave.r.resp)
+                    with m.If(rd_lane == ratio - 1):
+                        m.next = "RESPOND"
+                    with m.Else():
+                        m.d.sync += rd_lane.eq(rd_lane + 1)
+                        m.next = "CONVERT"
+
+            with m.State("RESPOND"):
+                m.d.comb += [
+                    master.r.valid.eq(1),
+                    master.r.data.eq(rd_data),
+                    master.r.resp.eq(rd_resp),
+                ]
+                with m.If(master.r.ready):
+                    m.next = "IDLE"
+
+        return m
+
+
 class AXILiteConverter(Elaboratable):
 
     def __init__(self, master, slave):
@@ -368,8 +556,8 @@ class AXILiteConverter(Elaboratable):
         dw_to = self.slave.data_width
 
         if dw_from > dw_to:
-            raise NotImplementedError(
-                "AXI-Lite down converter not implemented")
+            m.submodules.downconverter = AXILiteDownConverter(
+                self.master, self.slave)
         elif dw_from < dw_to:
             m.submodules.upconverter = AXILiteUpConverter(
                 self.master, self.slave)

@@ -162,7 +162,7 @@ class AXILite2AXI(Elaboratable):
                  axi,
                  write_id=0,
                  read_id=0,
-                 prot=0,
+                 prot=None,
                  burst_type='INCR'):
 
         self.write_id = write_id
@@ -185,6 +185,8 @@ class AXILite2AXI(Elaboratable):
             'INCR': 0b01,
             'WRAP': 0b10
         }[self.burst_type]
+        write_prot = axi_lite.aw.prot if self.prot is None else self.prot
+        read_prot = axi_lite.ar.prot if self.prot is None else self.prot
 
         m.d.comb += [
             # aw
@@ -195,7 +197,7 @@ class AXILite2AXI(Elaboratable):
             axi.aw.bits.len.eq(0),
             axi.aw.bits.size.eq(burst_size),
             axi.aw.bits.lock.eq(0),
-            axi.aw.bits.prot.eq(self.prot),
+            axi.aw.bits.prot.eq(write_prot),
             axi.aw.bits.cache.eq(0b0011),
             axi.aw.bits.qos.eq(0),
             axi.aw.bits.id.eq(self.write_id),
@@ -220,7 +222,7 @@ class AXILite2AXI(Elaboratable):
             axi.ar.bits.len.eq(0),
             axi.ar.bits.size.eq(burst_size),
             axi.ar.bits.lock.eq(0),
-            axi.ar.bits.prot.eq(self.prot),
+            axi.ar.bits.prot.eq(read_prot),
             axi.ar.bits.cache.eq(0b0011),
             axi.ar.bits.qos.eq(0),
             axi.ar.bits.id.eq(self.read_id),
@@ -513,6 +515,11 @@ class AXIFragmenter(Elaboratable):
 class AXI2AXILite(Elaboratable):
 
     def __init__(self, axi, axi_lite):
+        if axi.addr_width != axi_lite.addr_width:
+            raise ValueError("AXI and AXI-Lite address widths must match")
+        if axi.data_width != axi_lite.data_width:
+            raise ValueError("AXI and AXI-Lite data widths must match")
+
         self.axi = axi
         self.axi_lite = axi_lite
 
@@ -521,6 +528,7 @@ class AXI2AXILite(Elaboratable):
 
         axi = self.axi
         axil = self.axi_lite
+        bus_addr_mask = axi.data_width // 8 - 1
 
         ax_layout = make_ax_layout(addr_width=axi.addr_width,
                                    id_width=axi.id_width)
@@ -575,7 +583,12 @@ class AXI2AXILite(Elaboratable):
             with m.State('READ'):
                 m.d.comb += [
                     axil.ar.valid.eq(fragmenter.out.valid & ~cmd_done),
-                    axil.ar.addr.eq(fragmenter.out.bits.addr),
+                    # AXI-Lite has no transfer size, so represent a narrow AXI
+                    # access as a full-width, bus-aligned AXI-Lite access. The
+                    # AXI byte lanes retain the requested transfer placement.
+                    axil.ar.addr.eq(fragmenter.out.bits.addr
+                                    & ~bus_addr_mask),
+                    axil.ar.prot.eq(fragmenter.out.bits.prot),
                     fragmenter.out.ready.eq(axil.ar.ready & ~cmd_done),
                 ]
                 with m.If(fragmenter.out.valid & fragmenter.last):
@@ -586,7 +599,7 @@ class AXI2AXILite(Elaboratable):
                 m.d.comb += [
                     axi.r.valid.eq(axil.r.valid),
                     axi.r.bits.last.eq(cmd_done),
-                    axi.r.bits.resp.eq(0),
+                    axi.r.bits.resp.eq(axil.r.resp),
                     axi.r.bits.id.eq(fragmenter.out.bits.id),
                     axi.r.bits.data.eq(axil.r.data),
                     axil.r.ready.eq(axi.r.ready),
@@ -599,7 +612,9 @@ class AXI2AXILite(Elaboratable):
             with m.State('WRITE'):
                 m.d.comb += [
                     axil.aw.valid.eq(fragmenter.out.valid & ~cmd_done),
-                    axil.aw.addr.eq(fragmenter.out.bits.addr),
+                    axil.aw.addr.eq(fragmenter.out.bits.addr
+                                    & ~bus_addr_mask),
+                    axil.aw.prot.eq(fragmenter.out.bits.prot),
                     fragmenter.out.ready.eq(axil.aw.ready & ~cmd_done),
                 ]
                 with m.If(fragmenter.out.valid & fragmenter.last):
