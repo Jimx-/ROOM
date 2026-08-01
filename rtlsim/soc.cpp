@@ -5,6 +5,7 @@
 #include <list>
 #include <queue>
 #include <iomanip>
+#include <type_traits>
 
 #include <verilated.h>
 
@@ -35,7 +36,30 @@
 #define MEM_CYCLE_RATIO 0
 #endif
 
-#define MEM_BLOCK_BEATS 8
+static constexpr int MEM_LINE_WORDS = 8;
+static constexpr int MEM_AXI_BEATS = 1;
+
+template <typename Wide>
+static uint64_t get_wide_word(const Wide& value, int word)
+{
+    if constexpr (std::is_integral_v<Wide>) {
+        return word == 0 ? static_cast<uint64_t>(value) : 0;
+    } else {
+        return static_cast<uint64_t>(value[word * 2]) |
+               (static_cast<uint64_t>(value[word * 2 + 1]) << 32);
+    }
+}
+
+template <typename Wide>
+static void set_wide_word(Wide& value, int word, uint64_t data)
+{
+    if constexpr (std::is_integral_v<Wide>) {
+        if (word == 0) value = data;
+    } else {
+        value[word * 2] = static_cast<uint32_t>(data);
+        value[word * 2 + 1] = static_cast<uint32_t>(data >> 32);
+    }
+}
 #endif
 
 #ifndef TRACE_START_TIME
@@ -292,15 +316,14 @@ private:
 #ifdef RAMULATOR
     struct MemoryRequest {
         bool ready;
-        uint64_t data[MEM_BLOCK_BEATS];
-        uint8_t mask[MEM_BLOCK_BEATS];
+        uint64_t data[MEM_LINE_WORDS];
+        uint64_t mask;
         uint64_t addr;
         uint64_t tag;
         bool write;
-        int beat;
 
         MemoryRequest(uint64_t addr, uint64_t tag, bool write)
-            : addr(addr), tag(tag), write(write), ready(false), beat(0)
+            : ready(false), mask(0), addr(addr), tag(tag), write(write)
         {}
     };
 
@@ -312,6 +335,25 @@ private:
     bool dram_rd_rsp_ready_;
     bool dram_wr_rsp_active_;
     bool dram_wr_rsp_ready_;
+
+    auto find_ready_request(bool write)
+    {
+        for (auto it = mem_req_queue_.begin(); it != mem_req_queue_.end();
+             ++it) {
+            auto& req = **it;
+            if (!req.ready || req.write != write) continue;
+
+            bool older_same_id = false;
+            for (auto prev = mem_req_queue_.begin(); prev != it; ++prev) {
+                if ((*prev)->write == write && (*prev)->tag == req.tag) {
+                    older_same_id = true;
+                    break;
+                }
+            }
+            if (!older_same_id) return it;
+        }
+        return mem_req_queue_.end();
+    }
 #endif
 
     struct PhysMemoryRange {
@@ -609,20 +651,17 @@ private:
             dram_rd_rsp_active_ = false;
         }
         if (!dram_rd_rsp_active_) {
-            if (!mem_req_queue_.empty() && mem_req_queue_.front()->ready &&
-                !mem_req_queue_.front()->write) {
-                auto& mreq = mem_req_queue_.front();
+            auto ready = find_ready_request(false);
+            if (ready != mem_req_queue_.end()) {
+                auto& mreq = *ready;
                 dut_->ram_bus___05Fr___05Fvalid = 1;
                 dut_->ram_bus___05Fr___05Fbits___05Fid = mreq->tag;
                 dut_->ram_bus___05Fr___05Fbits___05Fresp = 0;
-                dut_->ram_bus___05Fr___05Fbits___05Flast =
-                    mreq->beat == MEM_BLOCK_BEATS - 1;
-                dut_->ram_bus___05Fr___05Fbits___05Fdata =
-                    mreq->data[mreq->beat++];
-
-                if (mreq->beat == MEM_BLOCK_BEATS) {
-                    mem_req_queue_.pop_front();
-                }
+                dut_->ram_bus___05Fr___05Fbits___05Flast = 1;
+                for (int i = 0; i < MEM_LINE_WORDS; ++i)
+                    set_wide_word(dut_->ram_bus___05Fr___05Fbits___05Fdata, i,
+                                  mreq->data[i]);
+                mem_req_queue_.erase(ready);
                 dram_rd_rsp_active_ = true;
             } else {
                 dut_->ram_bus___05Fr___05Fvalid = 0;
@@ -634,27 +673,28 @@ private:
             dram_wr_rsp_active_ = false;
         }
         if (!dram_wr_rsp_active_) {
-            if (!mem_req_queue_.empty() && mem_req_queue_.front()->ready &&
-                mem_req_queue_.front()->write) {
-                auto& mreq = mem_req_queue_.front();
+            auto ready = find_ready_request(true);
+            if (ready != mem_req_queue_.end()) {
+                auto& mreq = *ready;
                 dut_->ram_bus___05Fb___05Fvalid = 1;
                 dut_->ram_bus___05Fb___05Fbits___05Fid = mreq->tag;
                 dut_->ram_bus___05Fb___05Fbits___05Fresp = 0;
 
-                mem_req_queue_.pop_front();
+                mem_req_queue_.erase(ready);
                 dram_wr_rsp_active_ = true;
             } else {
                 dut_->ram_bus___05Fb___05Fvalid = 0;
             }
         }
 
-        if (dut_->ram_bus___05Faw___05Fvalid ||
-            dut_->ram_bus___05Far___05Fvalid) {
-            uint64_t req_addr = dut_->ram_bus___05Faw___05Fvalid
+        bool take_aw = dut_->ram_bus___05Faw___05Fvalid;
+        bool take_ar = dut_->ram_bus___05Far___05Fvalid && !take_aw;
+        if (take_aw || take_ar) {
+            uint64_t req_addr = take_aw
                                     ? dut_->ram_bus___05Faw___05Fbits___05Faddr
                                     : dut_->ram_bus___05Far___05Fbits___05Faddr;
 
-            if (dut_->ram_bus___05Faw___05Fvalid) {
+            if (take_aw) {
                 auto mem_req = std::make_unique<MemoryRequest>(
                     req_addr, dut_->ram_bus___05Faw___05Fbits___05Fid, true);
 
@@ -675,49 +715,42 @@ private:
             }
         }
 
-        dut_->ram_bus___05Fw___05Fready = 1;
+        dut_->ram_bus___05Fw___05Fready = !dram_write_queue_.empty();
 
-        if (dut_->ram_bus___05Fw___05Fvalid) {
-            if (!dram_write_queue_.empty()) {
-                auto& mreq = dram_write_queue_.front();
+        if (dut_->ram_bus___05Fw___05Fvalid &&
+            dut_->ram_bus___05Fw___05Fready) {
+            auto& mreq = dram_write_queue_.front();
 
-                mreq->data[mreq->beat] =
-                    dut_->ram_bus___05Fw___05Fbits___05Fdata;
-                mreq->mask[mreq->beat] =
-                    dut_->ram_bus___05Fw___05Fbits___05Fstrb;
-                mreq->beat++;
+            mreq->mask = dut_->ram_bus___05Fw___05Fbits___05Fstrb;
+            auto* mem =
+                reinterpret_cast<uint64_t*>(&ram_->phys_mem[mreq->addr]);
 
-                if (mreq->beat == MEM_BLOCK_BEATS) {
-                    auto* mem = reinterpret_cast<uint64_t*>(
-                        &ram_->phys_mem[mreq->addr]);
-
-                    for (int i = 0; i < MEM_BLOCK_BEATS; i++) {
-                        uint64_t wdata = 0;
-
-                        for (int j = 0; j < 8; j++) {
-                            if (mreq->mask[i] & (1 << j))
-                                wdata |= mreq->data[i] & (0xff << (j * 8));
-                            else
-                                wdata |= mem[i] & (0xff << (j * 8));
-                        }
-
-                        mem[i] = wdata;
-                    }
-
-                    mreq->ready = true;
-                    dram_queue_.emplace(mreq->addr,
-                                        ramulator::Request::Type::WRITE, 0);
-
-                    mem_req_queue_.emplace_back(
-                        std::move(dram_write_queue_.front()));
-                    dram_write_queue_.pop_front();
+            for (int i = 0; i < MEM_LINE_WORDS; ++i) {
+                mreq->data[i] =
+                    get_wide_word(dut_->ram_bus___05Fw___05Fbits___05Fdata, i);
+                uint64_t wdata = mem[i];
+                for (int j = 0; j < 8; ++j) {
+                    const uint64_t byte_mask = 0xffull << (j * 8);
+                    if (mreq->mask & (1ull << (i * 8 + j)))
+                        wdata =
+                            (wdata & ~byte_mask) | (mreq->data[i] & byte_mask);
                 }
-            } else {
-                dut_->ram_bus___05Fw___05Fready = 0;
+                mem[i] = wdata;
             }
+
+            // Ramulator models writes as posted requests and does not invoke
+            // their completion callback. The backing store has already been
+            // updated above, so the AXI write response can be made ready now,
+            // as in the original 64-bit adapter.
+            mreq->ready = true;
+            dram_queue_.emplace(mreq->addr,
+                                ramulator::Request::Type::WRITE, 0);
+
+            mem_req_queue_.emplace_back(std::move(dram_write_queue_.front()));
+            dram_write_queue_.pop_front();
         }
 
-        dut_->ram_bus___05Far___05Fready = 1;
+        dut_->ram_bus___05Far___05Fready = !take_aw;
         dut_->ram_bus___05Faw___05Fready = 1;
     }
 #endif

@@ -7,7 +7,7 @@ from amaranth_soc.memory import MemoryMap
 from room.consts import *
 from room import Core
 
-from roomsoc.soc import SoC
+from roomsoc.soc import SoC, SoCRegion
 from roomsoc.interconnect import axi, wishbone, tilelink as tl
 from roomsoc.interconnect.stream import Decoupled
 from roomsoc.peripheral import Peripheral
@@ -124,6 +124,10 @@ l2cache_params = dict(
     capacity_kb=64,
     n_ways=8,
     block_bytes=64,
+    inner_beat_bytes=8,
+    outer_beat_bytes=64,
+    write_bytes=8,
+    port_factor=4,
     in_bus=dict(
         source_id_width=7,
         sink_id_width=4,
@@ -387,7 +391,7 @@ class Top(Elaboratable):
                                            addr_width=32,
                                            id_width=4)
 
-        self.ram_bus = axi.AXIInterface(data_width=64,
+        self.ram_bus = axi.AXIInterface(data_width=512,
                                         addr_width=30,
                                         id_width=6)
 
@@ -457,7 +461,20 @@ class Top(Elaboratable):
             m.d.comb += debug_module.jtag.connect(self.jtag)
 
         soc.bus.add_master(name='axil_master', master=self.axil_master)
-        soc.bus.add_master(name='dm_master', master=debug_module.dbus)
+        # Debug SBA intentionally bypasses L2 and is attached to the RAM-only
+        # fabric below. It is therefore non-coherent with cached clients.
+        debug_axil32 = axi.AXILiteInterface(data_width=32, addr_width=32)
+        m.submodules.debug_wb_bridge = axi.Wishbone2AXILite(
+            debug_module.dbus, debug_axil32)
+        debug_axil512 = axi.AXILiteInterface(data_width=512, addr_width=32)
+        m.submodules.debug_width = axi.AXILiteConverter(debug_axil32,
+                                                       debug_axil512)
+        debug_axi = axi.AXIInterface(data_width=512,
+                                     addr_width=32,
+                                     id_width=1)
+        m.submodules.debug_axi_bridge = axi.AXILite2AXI(debug_axil512,
+                                                       debug_axi)
+        memory_masters = [debug_axi]
 
         soc.add_rom(name='rom',
                     origin=self.mem_map['rom'],
@@ -480,6 +497,11 @@ class Top(Elaboratable):
 
             l2cache = L2Cache(l2cache_params)
 
+            l2_axi = axi.TileLink2AXI.get_adapted_interface(l2cache.out_bus)
+            m.submodules.l2_axi_bridge = axi.TileLink2AXI(l2cache.out_bus,
+                                                         l2_axi)
+            memory_masters.insert(0, l2_axi)
+
             #
             # Cached & uncached core bus
             #
@@ -498,11 +520,14 @@ class Top(Elaboratable):
                                     sink_id_width=4,
                                     has_bce=True)
 
+            # The L2 outer port now terminates on a RAM-only fabric. Route
+            # exactly the DRAM window through it; reset ROM and every MMIO
+            # address remain on the 64-bit SoC fabric.
             mmio_valid = Signal()
-            for origin, size in core.io_regions.items():
-                with m.If((core.core_bus.a.bits.address >= origin)
-                          & (core.core_bus.a.bits.address < (origin + size))):
-                    m.d.comb += mmio_valid.eq(1)
+            m.d.comb += mmio_valid.eq(
+                (core.core_bus.a.bits.address < self.mem_map['sram']) |
+                (core.core_bus.a.bits.address >=
+                 self.mem_map['sram'] + 0x40000000))
 
             m.d.comb += [
                 core.core_bus.connect(mmio_bus),
@@ -563,7 +588,6 @@ class Top(Elaboratable):
             with m.Else():
                 m.d.comb += l2cache.in_bus.d.connect(core_l2c_bus.d)
 
-            soc.bus.add_master(name='l2c_dbus', master=l2cache.out_bus)
             soc.bus.add_master(name='cpu_mmio_bus', master=mmio_bus)
             soc.add_peripheral('l2cache', l2cache)
         elif core.core_bus is not None:
@@ -572,10 +596,22 @@ class Top(Elaboratable):
             soc.bus.add_master(name='cpu_ibus', master=core.ibus)
             soc.bus.add_master(name='cpu_dbus', master=core.dbus)
 
-        soc.add_bus(name='sram',
-                    bus=self.ram_bus,
-                    origin=self.mem_map['sram'],
-                    size=0x40000000)
+        # Keep the RAM region in the SoC map for PMA/cacheability reporting,
+        # but do not put a RAM slave on the 64-bit MMIO fabric. Uncached
+        # AXI-Lite accesses to this range consequently take the normal timeout
+        # error path.
+        ram_region = SoCRegion(origin=self.mem_map['sram'],
+                               size=0x40000000,
+                               mode='rw',
+                               cacheable=True)
+        soc.bus.add_region('sram', ram_region)
+
+        self.ram_bus.memory_map = MemoryMap(data_width=8, addr_width=30)
+        m.submodules.memory_fabric = axi.AXIInterconnectShared(
+            addr_width=32,
+            data_width=512,
+            masters=memory_masters,
+            slaves=[(ram_region, self.ram_bus)])
 
         soc.add_controller()
 
