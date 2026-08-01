@@ -2,7 +2,7 @@ import pytest
 
 from room.alu import ALU, ALUOperator
 from room.test import run_test
-from room.alu_test import mask_xlen, alu_unittest
+from tests.room.test_alu import mask_xlen, alu_unittest
 
 LOGIC_NEGATE_CASES = [
     (0xffffffffffffffff, 0x1),
