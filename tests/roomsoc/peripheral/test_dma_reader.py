@@ -130,7 +130,8 @@ class Top(Elaboratable):
                  read_latency=3,
                  max_burst_beats=4,
                  max_outstanding=4,
-                 r_resp=0):
+                 r_resp=0,
+                 burst_type='INCR'):
         self.addr_width = addr_width
         self.data_width = data_width
         self.ram_depth = ram_depth
@@ -141,7 +142,8 @@ class Top(Elaboratable):
                                    max_burst_beats=max_burst_beats,
                                    max_outstanding=max_outstanding,
                                    cmd_fifo_depth=4,
-                                   data_fifo_depth=8)
+                                   data_fifo_depth=8,
+                                   burst_type=burst_type)
         self.ram = AXIReadRAM(addr_width=addr_width,
                               data_width=data_width,
                               depth=ram_depth,
@@ -164,7 +166,8 @@ def run_sim(top,
             vcd=None,
             expected_errors=0,
             expected_ar=None,
-            expected_data=None):
+            expected_data=None,
+            min_peak_outstanding=None):
     reader = top.reader
     beat_bytes = top.data_width // 8
 
@@ -186,6 +189,7 @@ def run_sim(top,
     ar_seen = []
     done_count = 0
     error_count = 0
+    peak_outstanding = [0]
 
     def tx_process():
         # Feed commands as single-cycle valid pulses. Signal assignments are
@@ -210,14 +214,27 @@ def run_sim(top,
         # beat and moves to the next. No cross-cycle race.
         yield reader.source.ready.eq(1)
         yield
+        inflight = 0
         for _ in range(cycles):
+            # Mirror the reader's outstanding accounting to measure how many
+            # bursts were simultaneously in flight.
+            ar_fire = (yield reader.bus.ar.valid) and (yield reader.bus.ar.ready)
+            r_last_fire = ((yield reader.bus.r.valid)
+                           and (yield reader.bus.r.ready)
+                           and (yield reader.bus.r.bits.last))
+            if ar_fire and not r_last_fire:
+                inflight += 1
+            elif (not ar_fire) and r_last_fire:
+                inflight -= 1
+            if inflight > peak_outstanding[0]:
+                peak_outstanding[0] = inflight
             if (yield top.ram.monitor.valid):
                 ar_seen.append(
                     ((yield top.ram.monitor.bits.addr),
-                     (yield
-                      top.ram.monitor.bits.len), (yield
-                                                  top.ram.monitor.bits.size),
-                     (yield top.ram.monitor.bits.burst)))
+                      (yield
+                       top.ram.monitor.bits.len), (yield
+                                                   top.ram.monitor.bits.size),
+                      (yield top.ram.monitor.bits.burst)))
             if (yield reader.done):
                 done_count += 1
             if (yield reader.error):
@@ -233,6 +250,9 @@ def run_sim(top,
         assert error_count == expected_errors
         if expected_ar is not None:
             assert ar_seen == expected_ar
+        if min_peak_outstanding is not None:
+            assert peak_outstanding[0] >= min_peak_outstanding, \
+                peak_outstanding[0]
 
     sim = Simulator(top)
     sim.add_clock(1e-6)
@@ -285,3 +305,52 @@ def test_axi_dma_reader_rejects_invalid_descriptor(command):
 def test_axi_dma_reader_reports_rresp_error():
     top = Top(data_width=64, ram_depth=1024, max_burst_beats=4, r_resp=2)
     run_sim(top, [(0, 8)], expected_errors=1)
+
+
+def test_axi_dma_reader_half_width_lower_lane():
+    # The existing half-width test only covers the upper lane (addr 4); exercise
+    # the lower lane (addr 0), where source.data keeps the narrow payload in
+    # [31:0] and leaves [63:32] unused.
+    top = Top(data_width=64, ram_depth=1024)
+    top.init[0] = 0x1122334455667788
+    run_sim(top, [(0, 4)],
+            expected_ar=[(0, 0, 2, int(AXIBurst.INCR))],
+            expected_data=[(0x0000000055667788, 1)])
+
+
+def test_axi_dma_reader_narrow_at_4kb_boundary():
+    # A narrow transfer whose 4 bytes exactly fill the tail of a 4 KiB region
+    # (0xffc..0xfff) must issue a single correctly-sized beat and not be split.
+    top = Top(data_width=64, ram_depth=1024)
+    top.init[0xffc // 8] = 0xaabbccdd11223344
+    run_sim(top, [(0xffc, 4)],
+            expected_ar=[(0xffc, 0, 2, int(AXIBurst.INCR))],
+            expected_data=[(0xaabbccdd00000000, 1)])
+
+
+def test_axi_dma_reader_narrow_multiple_outstanding():
+    # Several narrow descriptors issued back to back must keep multiple bursts
+    # in flight and return each lane's data in command order.
+    top = Top(data_width=64,
+              ram_depth=1024,
+              read_latency=8,
+              max_outstanding=4)
+    top.init[0] = 0x1111222233334444
+    top.init[1] = 0x5555666677778888
+    incr = int(AXIBurst.INCR)
+    run_sim(top, [(0, 4), (4, 4), (8, 4)],
+            expected_ar=[(0, 0, 2, incr), (4, 0, 2, incr), (8, 0, 2, incr)],
+            expected_data=[(0x0000000033334444, 1),
+                           (0x1111222200000000, 1),
+                           (0x0000000077778888, 1)],
+            min_peak_outstanding=2)
+
+
+def test_axi_dma_reader_rejects_wrap_narrow():
+    # WRAP requires a power-of-two beat count > 1; a 1-beat narrow descriptor
+    # is therefore silently rejected as invalid (no AR issued).
+    top = Top(data_width=64,
+              ram_depth=1024,
+              max_burst_beats=4,
+              burst_type='WRAP')
+    run_sim(top, [(0, 4)], expected_errors=1, expected_ar=[], expected_data=[])

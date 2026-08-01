@@ -177,7 +177,9 @@ def run_sim(top,
             expected_errors=0,
             expected_aw=None,
             expected_strb=None,
-            expected_writes=None):
+            expected_writes=None,
+            min_peak_outstanding=None,
+            feed_data=True):
     writer = top.writer
     ram = top.ram
     beat_bytes = top.data_width // 8
@@ -213,6 +215,7 @@ def run_sim(top,
     aw_seen = []
     done_count = 0
     error_count = 0
+    peak_outstanding = [0]
 
     def cmd_process():
         for addr, length in commands:
@@ -226,29 +229,43 @@ def run_sim(top,
             yield
 
     def data_process():
-        for data, strb in data_beats:
-            yield writer.data.bits.data.eq(data)
-            yield writer.data.bits.strb.eq(strb)
-            yield writer.data.valid.eq(1)
-            yield
-            while not (yield writer.data.ready):
+        # Rejected descriptors consume no W beats; skip feeding to avoid
+        # deadlocking on data.ready when no burst will ever stream.
+        if feed_data:
+            for data, strb in data_beats:
+                yield writer.data.bits.data.eq(data)
+                yield writer.data.bits.strb.eq(strb)
+                yield writer.data.valid.eq(1)
                 yield
-            yield writer.data.valid.eq(0)
-            yield
+                while not (yield writer.data.ready):
+                    yield
+                yield writer.data.valid.eq(0)
+                yield
         for _ in range(cycles):
             yield
 
     def collect_process():
         nonlocal done_count, error_count
+        inflight = 0
         for _ in range(cycles):
+            # Mirror the writer's outstanding accounting (AW vs B) to measure
+            # how many bursts were simultaneously in flight.
+            aw_fire = (yield writer.bus.aw.valid) and (yield writer.bus.aw.ready)
+            b_fire = (yield writer.bus.b.valid) and (yield writer.bus.b.ready)
+            if aw_fire and not b_fire:
+                inflight += 1
+            elif (not aw_fire) and b_fire:
+                inflight -= 1
+            if inflight > peak_outstanding[0]:
+                peak_outstanding[0] = inflight
             if (yield ram.aw_monitor.valid):
                 aw_seen.append(
                     ((yield
-                      ram.aw_monitor.bits.addr), (yield
-                                                  ram.aw_monitor.bits.len),
-                     (yield
-                      ram.aw_monitor.bits.size), (yield
-                                                  ram.aw_monitor.bits.burst)))
+                       ram.aw_monitor.bits.addr), (yield
+                                                   ram.aw_monitor.bits.len),
+                      (yield
+                       ram.aw_monitor.bits.size), (yield
+                                                   ram.aw_monitor.bits.burst)))
             if (yield writer.done):
                 done_count += 1
             if (yield writer.error):
@@ -268,6 +285,9 @@ def run_sim(top,
             assert aw_seen == expected_aw
         if expected_strb is not None:
             assert strb_seen == expected_strb
+        if min_peak_outstanding is not None:
+            assert peak_outstanding[0] >= min_peak_outstanding, \
+                peak_outstanding[0]
 
     sim = Simulator(top)
     sim.add_clock(1e-6)
@@ -344,3 +364,45 @@ def test_axi3_dma_interfaces_elaborate():
     assert len(writer.bus.w.bits.id) == writer.id_width
     Fragment.get(reader, None)
     Fragment.get(writer, None)
+
+
+def test_axi_dma_writer_half_width_lower_lane():
+    # The existing half-width test only covers the upper lane (addr 4); exercise
+    # the lower lane (addr 0), where the W payload and strobe occupy [31:0].
+    top = Top(data_width=64, ram_depth=1024)
+    run_sim(top, [(0, 4)],
+            expected_aw=[(0, 0, 2, int(AXIBurst.INCR))],
+            expected_strb=[0x0f],
+            expected_writes=[(0, 0x0000000000000001)])
+
+
+def test_axi_dma_writer_narrow_multiple_outstanding():
+    # Several narrow descriptors issued back to back must keep multiple bursts
+    # outstanding (AW ahead of B) and commit each lane in command order.
+    top = Top(data_width=64,
+              ram_depth=1024,
+              b_latency=8,
+              max_outstanding=4)
+    incr = int(AXIBurst.INCR)
+    run_sim(top, [(0, 4), (4, 4), (8, 4)],
+            expected_aw=[(0, 0, 2, incr), (4, 0, 2, incr), (8, 0, 2, incr)],
+            expected_strb=[0x0f, 0xf0, 0x0f],
+            expected_writes=[(0, 0x0000000000000001),
+                             (0, 0x0000000200000000),
+                             (8, 0x0000000000000003)],
+            min_peak_outstanding=2)
+
+
+def test_axi_dma_writer_rejects_wrap_narrow():
+    # WRAP requires a power-of-two beat count > 1; a 1-beat narrow descriptor
+    # is therefore silently rejected as invalid (no AW issued). feed_data=False
+    # because a rejected descriptor never consumes a W beat.
+    top = Top(data_width=64,
+              ram_depth=1024,
+              max_burst_beats=4,
+              burst_type='WRAP')
+    run_sim(top, [(0, 4)],
+            expected_errors=1,
+            expected_aw=[],
+            expected_writes=[],
+            feed_data=False)
