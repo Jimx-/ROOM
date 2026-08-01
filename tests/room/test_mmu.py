@@ -1,7 +1,8 @@
 from amaranth.sim import Simulator
 
-from room.consts import IssueQueueType
+from room.consts import IssueQueueType, MemoryCommand, PrivilegeMode
 from room.mmu import PageTableWalker
+from room.tlb import TLB
 
 CORE_PARAMS = dict(
     xlen=64,
@@ -148,7 +149,7 @@ def test_page_table_walker_translates_superpage_mapping():
         0x3000: make_pte(ppn=0x80000, read=True, accessed=True),
     }
 
-    requests, response = run_page_table_walk(0x80000000, memory)
+    requests, response = run_page_table_walk(0x80123000, memory)
 
     assert requests == [0x0010, 0x3000]
     assert response["level"] == 1
@@ -156,6 +157,69 @@ def test_page_table_walker_translates_superpage_mapping():
     assert response["ae_ptw"] == 0
     assert response["ae_leaf"] == 0
     assert response["page_fault"] == 0
+
+
+def test_tlb_merges_low_vpn_bits_into_superpage_ppn():
+    params = {**CORE_PARAMS, "n_pmps": 0}
+    dut = TLB(req_width=1,
+              params=params,
+              log_max_size=3,
+              n_sets=4,
+              n_ways=2,
+              n_banks=2,
+              n_superpage_entries=2)
+
+    def process():
+        req = dut.req[0]
+        resp = dut.resp[0]
+
+        yield dut.prv.eq(PrivilegeMode.S)
+        yield dut.ptbr.mode.eq(8)
+        yield dut.ptw_req.ready.eq(1)
+        yield
+
+        vaddr = 0x80123ABC
+        yield req.bits.vaddr.eq(vaddr)
+        yield req.bits.cmd.eq(MemoryCommand.READ)
+        yield req.bits.size.eq(3)
+        yield req.valid.eq(1)
+        yield
+        yield req.valid.eq(0)
+        yield
+
+        assert (yield resp.valid)
+        assert (yield resp.bits.miss)
+        assert (yield dut.ptw_req.valid)
+        assert (yield dut.ptw_req.bits.vpn) == vaddr >> 12
+        yield
+
+        yield dut.ptw_resp.bits.level.eq(1)
+        yield dut.ptw_resp.bits.pte.v.eq(1)
+        yield dut.ptw_resp.bits.pte.r.eq(1)
+        yield dut.ptw_resp.bits.pte.a.eq(1)
+        superpage_ppn = 0x40000
+        yield dut.ptw_resp.bits.pte.ppn.eq(superpage_ppn)
+        yield dut.ptw_resp.valid.eq(1)
+        yield
+        yield dut.ptw_resp.valid.eq(0)
+        yield
+
+        yield req.bits.vaddr.eq(vaddr)
+        yield req.valid.eq(1)
+        yield
+        yield req.valid.eq(0)
+        yield
+
+        assert (yield resp.valid)
+        assert not (yield resp.bits.miss)
+        superpage_offset = vaddr & ((1 << 21) - 1)
+        expected_paddr = (superpage_ppn << 12) | superpage_offset
+        assert (yield resp.bits.paddr) == expected_paddr
+
+    sim = Simulator(dut)
+    sim.add_clock(1e-6)
+    sim.add_sync_process(process)
+    sim.run()
 
 
 def test_page_table_walker_reports_invalid_table_address():
