@@ -451,7 +451,7 @@ class _DownConverter(Elaboratable):
         m.d.comb += [
             self.source.valid.eq(self.sink.valid),
             self.source.bits.last.eq(self.sink.bits.last
-                                     & (self == (self.ratio - 1))),
+                                     & (sel == (self.ratio - 1))),
         ]
 
         with m.Switch(sel):
@@ -501,7 +501,13 @@ class _UpConverter(Elaboratable):
             m.d.sync += self.source.valid.eq(0)
 
         with m.If(self.sink.fire):
-            with m.If((sel == (self.ratio - 1)) | self.sink.last):
+            # A partial final word must not retain lane-valid bits from the
+            # preceding output word (or packet). The lane assignment below
+            # overrides the cleared slice for the accepted input beat.
+            with m.If(sel == 0):
+                m.d.sync += self.source.bits.keep.eq(0)
+
+            with m.If((sel == (self.ratio - 1)) | self.sink.bits.last):
                 m.d.sync += [
                     self.source.valid.eq(1),
                     sel.eq(0),
@@ -511,9 +517,9 @@ class _UpConverter(Elaboratable):
 
         with m.If(self.source.fire):
             with m.If(self.sink.fire):
-                m.d.sync += self.source.bits.last(self.sink.bits.last)
+                m.d.sync += self.source.bits.last.eq(self.sink.bits.last)
             with m.Else():
-                m.d.sync += self.source.bits.last(0)
+                m.d.sync += self.source.bits.last.eq(0)
         with m.If(self.sink.fire):
             m.d.sync += self.source.bits.last.eq(self.source.bits.last
                                                  | self.sink.bits.last)
