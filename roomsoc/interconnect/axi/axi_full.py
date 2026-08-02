@@ -877,6 +877,16 @@ class AXIDecoder(Elaboratable):
                     "decoder data width {} (required for dense address translation)"
                     .format(sub_bus.data_width, self.data_width))
 
+        # Address forwarding truncates the initiator address to the subordinate
+        # bus width. This is equivalent to subtracting the window base only
+        # when the base is aligned to the subordinate aperture size.
+        if isinstance(addr, int) and addr >= 0:
+            aperture_size = 1 << sub_bus.memory_map.addr_width
+            if addr % aperture_size != 0:
+                raise ValueError(
+                    "Window address {:#x} must be aligned to its {:#x}-byte "
+                    "aperture".format(addr, aperture_size))
+
         self._subs[sub_bus.memory_map] = sub_bus
         return self._map.add_window(sub_bus.memory_map,
                                     addr=addr,
