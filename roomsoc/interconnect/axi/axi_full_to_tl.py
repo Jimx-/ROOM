@@ -13,6 +13,9 @@ from roomsoc.interconnect.stream import SkidBuffer, Decoupled
 class TileLink2AXI(Elaboratable):
 
     def __init__(self, tl, axi, max_flights=4, prot=0, burst_type='INCR'):
+        if not isinstance(max_flights, int) or max_flights <= 0:
+            raise ValueError("max_flights must be a positive integer")
+
         self.prot = prot
         self.burst_type = burst_type
         self.max_flights = max_flights
@@ -214,17 +217,23 @@ class TileLink2AXI(Elaboratable):
 class AXI2Tilelink(Elaboratable):
 
     def __init__(self, axi, tl, max_flights=1):
+        if not isinstance(max_flights, int) or max_flights <= 0:
+            raise ValueError("max_flights must be a positive integer")
+
         self.max_flights = max_flights
 
         self.axi = axi
         self.tl = tl
 
-        if len(tl.a.bits.source) < len(
-                axi.ar.bits.id) + bits_for(max_flights - 1) + 1:
+        # See ``elaborate`` for why ``(max_flights - 1).bit_length()`` is used
+        # instead of ``bits_for(max_flights - 1)`` (the latter miscounts the
+        # count bits as 1 for the single-outstanding case).
+        added_bits = (max_flights - 1).bit_length() + 1
+        if len(tl.a.bits.source) < len(axi.ar.bits.id) + added_bits:
             raise ValueError(
                 "TileLink bus has source ID width {}, which is smaller than required width {}"
                 .format(len(tl.a.bits.source),
-                        len(axi.ar.bits.id) + bits_for(max_flights - 1) + 1))
+                        len(axi.ar.bits.id) + added_bits))
 
     @staticmethod
     def get_adapted_interface(axi, max_flights=1, src_loc_at=0):
@@ -232,7 +241,7 @@ class AXI2Tilelink(Elaboratable):
                                   addr_width=axi.addr_width,
                                   size_width=4,
                                   source_id_width=axi.id_width +
-                                  bits_for(max_flights - 1) + 1,
+                                  (max_flights - 1).bit_length() + 1,
                                   src_loc_at=src_loc_at + 1)
 
     def elaborate(self, platform):
@@ -242,7 +251,12 @@ class AXI2Tilelink(Elaboratable):
         tl = self.tl
 
         max_bytes = 2**len(axi.ar.bits.len) * 2**len(axi.ar.bits.size)
-        log_flights = bits_for(self.max_flights - 1)
+        # ``bits_for(max_flights - 1)`` returns 1 for max_flights == 1 (since
+        # bits_for(0) == 1), which would desync the source-ID encode (id<<1)
+        # from the decode (source>>added_bits). Use ``bit_length()`` instead so
+        # a single-outstanding bridge needs zero count bits and added_bits == 1.
+        # For max_flights >= 2 this is identical to bits_for(max_flights - 1).
+        log_flights = (self.max_flights - 1).bit_length()
         txn_count_bits = bits_for(self.max_flights)
         added_bits = log_flights + 1
 
