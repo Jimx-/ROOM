@@ -362,7 +362,8 @@ class AXIFragmenter(Elaboratable):
 
         self.out_bus = AXIInterface(addr_width=in_bus.addr_width,
                                     data_width=in_bus.data_width,
-                                    id_width=in_bus.id_width)
+                                    id_width=in_bus.id_width,
+                                    version=in_bus.version)
 
         if max_size * 8 < in_bus.data_width:
             raise ValueError(
