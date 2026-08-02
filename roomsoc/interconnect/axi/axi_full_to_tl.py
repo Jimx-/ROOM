@@ -63,10 +63,9 @@ class TileLink2AXI(Elaboratable):
         aw_ready = Signal()
 
         out_ax = Decoupled(Record, ax_layout)
-        ax_buffer = m.submodules.ax_buffer = SkidBuffer(Record, ax_layout)
+        ax_buffer = m.submodules.ax_buffer = SkidBuffer(out_ax)
         out_w = Decoupled(Record, axi.w.bits.layout)
-        w_buffer = m.submodules.w_buffer = SkidBuffer(Record,
-                                                      axi.w.bits.layout)
+        w_buffer = m.submodules.w_buffer = SkidBuffer(out_w)
         m.d.comb += [
             out_ax.connect(ax_buffer.enq),
             out_w.connect(w_buffer.enq),
@@ -368,8 +367,7 @@ class AXI2Tilelink(Elaboratable):
             ok_r.bits.last.eq(d_last),
         ]
 
-        r_buffer = m.submodules.r_buffer = SkidBuffer(Record,
-                                                      axi.r.bits.layout)
+        r_buffer = m.submodules.r_buffer = SkidBuffer(ok_r)
         m.d.comb += [
             r_buffer.enq.bits.connect(ok_r.bits),
             r_buffer.enq.valid.eq(ok_r.valid),
@@ -384,8 +382,7 @@ class AXI2Tilelink(Elaboratable):
             ok_b.bits.resp.eq(d_resp),
         ]
 
-        b_buffer = m.submodules.b_buffer = SkidBuffer(Record,
-                                                      axi.b.bits.layout)
+        b_buffer = m.submodules.b_buffer = SkidBuffer(ok_b)
         m.d.comb += [
             b_buffer.enq.bits.connect(ok_b.bits),
             b_buffer.enq.valid.eq(ok_b.valid),

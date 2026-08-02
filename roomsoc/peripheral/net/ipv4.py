@@ -261,9 +261,8 @@ class Ipv4Dropper(Elaboratable):
 
         header_beats = 480 // self.data_width
 
-        q_in = m.submodules.q_in = Queue(header_beats + 2, Record,
-                                         make_data_layout(self.data_width))
-        m.d.comb += stream2queue(self.data_in, q_in)
+        q_in = m.submodules.q_in = Queue(header_beats + 2, self.data_in)
+        m.d.comb += self.data_in.connect(q_in.enq)
 
         with m.FSM():
             with m.State("IDLE"):
@@ -280,7 +279,7 @@ class Ipv4Dropper(Elaboratable):
                         m.next = "DROP"
 
             with m.State("FORWARD"):
-                m.d.comb += queue2stream(q_in, self.data_out)
+                m.d.comb += q_in.deq.connect(self.data_out)
 
                 with m.If(self.data_out.fire & self.data_out.bits.last):
                     m.next = "IDLE"
@@ -322,13 +321,12 @@ class Ipv4Dispatcher(Elaboratable):
 
         header_beats = 160 // self.data_width
 
-        q_in = m.submodules.q_in = Queue(header_beats + 2, Record,
-                                         make_data_layout(self.data_width))
-        m.d.comb += stream2queue(self.data_in, q_in)
+        q_in = m.submodules.q_in = Queue(header_beats + 2, self.data_in)
+        m.d.comb += self.data_in.connect(q_in.enq)
 
         m.d.comb += [
             self.data_in.connect(header_extract.data_in),
-            stream2queue(header_extract.data_out, q_in),
+            header_extract.data_out.connect(q_in.enq),
         ]
 
         protocol = Signal(16)
@@ -342,9 +340,9 @@ class Ipv4Dispatcher(Elaboratable):
             with m.State("FORWARD"):
                 with m.Switch(protocol):
                     with m.Case(IpProtocol.TCP):
-                        m.d.comb += queue2stream(q_in, self.tcp_data_out)
+                        m.d.comb += q_in.deq.connect(self.tcp_data_out)
                     with m.Case(IpProtocol.UDP):
-                        m.d.comb += queue2stream(q_in, self.udp_data_out)
+                        m.d.comb += q_in.deq.connect(self.udp_data_out)
                     with m.Default():
                         m.d.comb += q_in.deq.ready.eq(1)
 
@@ -386,12 +384,10 @@ class Ipv4Handler(Elaboratable):
         dispatcher = m.submodules.dispatcher = Ipv4Dispatcher(
             data_width=self.data_width)
 
-        udp_queue = m.submodules.udp_queue = Queue(
-            2, Record, make_data_layout(self.data_width))
-        m.d.comb += queue2stream(udp_queue, self.udp_data_out)
-        roce_queue = m.submodules.roce_queue = Queue(
-            2, Record, make_data_layout(self.data_width))
-        m.d.comb += queue2stream(roce_queue, self.roce_data_out)
+        udp_queue = m.submodules.udp_queue = Queue(2, self.udp_data_out)
+        m.d.comb += udp_queue.deq.connect(self.udp_data_out)
+        roce_queue = m.submodules.roce_queue = Queue(2, self.roce_data_out)
+        m.d.comb += roce_queue.deq.connect(self.roce_data_out)
 
         m.d.comb += [
             addr_check.my_ip_addr.eq(self.my_ip_addr),
@@ -400,8 +396,8 @@ class Ipv4Handler(Elaboratable):
             checksum.data_out.connect(dropper.data_in),
             dropper.data_out.connect(dispatcher.data_in),
             dispatcher.tcp_data_out.connect(self.tcp_data_out),
-            stream2queue(dispatcher.udp_data_out, udp_queue),
-            stream2queue(dispatcher.udp_data_out, roce_queue),
+            dispatcher.udp_data_out.connect(udp_queue.enq),
+            dispatcher.udp_data_out.connect(roce_queue.enq),
             dispatcher.udp_data_out.ready.eq(udp_queue.enq.ready
                                              & roce_queue.enq.ready),
             udp_queue.enq.valid.eq(dispatcher.udp_data_out.valid

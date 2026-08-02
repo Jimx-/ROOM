@@ -42,9 +42,23 @@ class Decoupled:
         if name is None:
             name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
 
+        self._payload_cls = cls
+        self._payload_args = args
+        self._payload_kwargs = kwargs.copy()
+
         self.bits = cls(name=f'{name}_bits', *args, **kwargs)
         self.valid = Signal(name=f'{name}_valid')
         self.ready = Signal(name=f'{name}_ready')
+
+    def clone(self, *, name=None):
+        if type(self) is not Decoupled:
+            raise NotImplementedError(
+                f'{type(self).__name__} must implement clone()')
+
+        return Decoupled(self._payload_cls,
+                         *self._payload_args,
+                         name=name,
+                         **self._payload_kwargs)
 
     @property
     def fire(self):
@@ -64,6 +78,33 @@ class Decoupled:
         return stmts
 
 
+def _buffer_interfaces(interface_or_cls, *args, **kwargs):
+    if isinstance(interface_or_cls, Decoupled):
+        if args or kwargs:
+            raise TypeError(
+                'A Decoupled prototype cannot be combined with payload '
+                'arguments')
+
+        return (interface_or_cls.clone(name='enq'),
+                interface_or_cls.clone(name='deq'))
+
+    if (isinstance(interface_or_cls, type)
+            and issubclass(interface_or_cls, Decoupled)):
+        if 'name' in kwargs:
+            return (interface_or_cls(*args, **kwargs),
+                    interface_or_cls(*args, **kwargs))
+
+        return (interface_or_cls(*args, name='enq', **kwargs),
+                interface_or_cls(*args, name='deq', **kwargs))
+
+    if 'name' in kwargs:
+        return (Decoupled(interface_or_cls, *args, **kwargs),
+                Decoupled(interface_or_cls, *args, **kwargs))
+
+    return (Decoupled(interface_or_cls, *args, name='enq', **kwargs),
+            Decoupled(interface_or_cls, *args, name='deq', **kwargs))
+
+
 def _wrap_incr(signal, modulo):
     if modulo == 2**len(signal):
         return (signal + 1)[:len(signal)]
@@ -72,22 +113,43 @@ def _wrap_incr(signal, modulo):
 
 
 class SkidBuffer(Elaboratable):
+    """A ready/valid skid buffer with structurally identical endpoints.
+
+    ``enq`` is the input (the producer drives ``valid`` and ``bits``), and
+    ``deq`` is the output (the consumer drives ``ready``). A transfer occurs
+    on either endpoint when its ``valid`` and ``ready`` are both asserted.
+
+    The payload/interface argument has three supported forms:
+
+    * Passing a payload constructor and its arguments, for example
+      ``SkidBuffer(Record, layout)``, wraps that payload in a new
+      :class:`Decoupled` for each endpoint. The constructor must accept a
+      ``name=`` keyword argument.
+    * Passing a :class:`Decoupled` subclass and its constructor arguments, for
+      example ``SkidBuffer(AXIStreamInterface, data_width=64)``, constructs
+      that interface type directly for each endpoint instead of nesting it in
+      another :class:`Decoupled`.
+    * Passing an existing :class:`Decoupled` interface, for example
+      ``SkidBuffer(stream)``, calls ``stream.clone()`` for each endpoint.
+      The clone must be an independent, structurally compatible interface;
+      additional payload arguments are not allowed in this form.
+
+    With ``pipe=False`` the output is registered. With ``pipe=True`` an
+    unstalled input falls through combinationally, while one stalled beat is
+    retained in the skid storage. Payload bits must remain stable while the
+    producer asserts ``valid`` without observing ``ready``.
+    """
 
     def __init__(self, cls, *args, pipe=False, **kwargs):
-        self.cls = cls
-        self.args = args
-        self.kwargs = kwargs
         self.pipe = pipe
 
-        self.enq = Decoupled(cls, *args, **kwargs)
-
-        self.deq = Decoupled(cls, *args, **kwargs)
+        self.enq, self.deq = _buffer_interfaces(cls, *args, **kwargs)
 
     def elaborate(self, platform):
         m = Module()
 
         valid = Signal()
-        data = self.cls(*self.args, **self.kwargs)
+        data = Signal(len(Value.cast(self.enq.bits)), reset_less=True)
 
         with m.If(self.enq.fire & (self.deq.valid & ~self.deq.ready)):
             m.d.sync += valid.eq(1)
@@ -119,6 +181,37 @@ class SkidBuffer(Elaboratable):
 
 
 class Queue(Elaboratable):
+    """A finite ready/valid FIFO with structurally identical endpoints.
+
+    ``enq`` is the input (the producer drives ``valid`` and ``bits``), and
+    ``deq`` is the output (the consumer drives ``ready``). A transfer occurs
+    on either endpoint when its ``valid`` and ``ready`` are both asserted.
+
+    The payload/interface argument has three supported forms:
+
+    * Passing a payload constructor and its arguments, for example
+      ``Queue(4, Record, layout)``, wraps that payload in a new
+      :class:`Decoupled` for each endpoint. The constructor must accept a
+      ``name=`` keyword argument.
+    * Passing a :class:`Decoupled` subclass and its constructor arguments, for
+      example ``Queue(4, AXIStreamInterface, data_width=64)``, constructs that
+      interface type directly for each endpoint instead of nesting it in
+      another :class:`Decoupled`.
+    * Passing an existing :class:`Decoupled` interface, for example
+      ``Queue(4, stream)``, calls ``stream.clone()`` for each endpoint. The
+      clone must be an independent, structurally compatible interface;
+      additional payload arguments are not allowed in this form.
+
+    ``depth`` is the number of stored entries. ``count`` reports the number
+    of stored entries and does not count a combinational flow-through beat.
+    When ``flow=True``, an enqueue may flow directly to ``deq`` while the FIFO
+    is empty. When ``pipe=True``, a dequeue from a full FIFO may make room for
+    an enqueue in the same cycle. If ``has_flush=True``, the ``flush`` input
+    synchronously discards all stored entries.
+
+    As with any ready/valid channel, a producer must keep ``valid`` and
+    ``bits`` stable until the enqueue transfer completes.
+    """
 
     def __init__(self,
                  depth,
@@ -133,9 +226,7 @@ class Queue(Elaboratable):
         self.pipe = pipe
         self.has_flush = has_flush
 
-        self.enq = Decoupled(cls, *args, **kwargs)
-
-        self.deq = Decoupled(cls, *args, **kwargs)
+        self.enq, self.deq = _buffer_interfaces(cls, *args, **kwargs)
 
         self.count = Signal(range(depth + 1))
 

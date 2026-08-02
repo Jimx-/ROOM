@@ -805,7 +805,7 @@ class ExtendedPacketizer(Elaboratable):
         m.d.comb += aeth_packetizer.header.eq(aeth)
 
         empty_payload_q = m.submodules.empty_payload_q = Queue(
-            4, Record, make_data_layout(data_width=self.data_width))
+            4, aeth_packetizer.sink)
         m.d.comb += [
             empty_payload_q.enq.bits.keep.eq(0),
             empty_payload_q.enq.bits.last.eq(1),
@@ -857,8 +857,8 @@ class ExtendedPacketizer(Elaboratable):
             with m.State('FORWARD_AETH'):
                 with m.If(~aeth_seen_last):
                     with m.If(_opcode_no_data(meta.opcode)):
-                        m.d.comb += queue2stream(empty_payload_q,
-                                                 aeth_packetizer.sink)
+                        m.d.comb += empty_payload_q.deq.connect(
+                            aeth_packetizer.sink)
                     with m.Else():
                         m.d.comb += self.mem_read_data.connect(
                             aeth_packetizer.sink)

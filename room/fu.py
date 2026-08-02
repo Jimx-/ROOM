@@ -1,5 +1,6 @@
 from amaranth import *
 from amaranth import tracer
+from amaranth.hdl.ast import ValueCastable
 from amaranth.utils import log2_int
 
 from room.consts import *
@@ -33,7 +34,7 @@ class ExecReq:
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
-class ExecResp(HasCoreParams):
+class ExecResp(HasCoreParams, ValueCastable):
 
     def __init__(self, data_width, params, name=None, src_loc_at=0):
         super().__init__(params)
@@ -51,9 +52,19 @@ class ExecResp(HasCoreParams):
 
         self.fflags = Valid(Signal, 5, name=f'{name}_fflags')
 
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.uop, self.addr, self.data, self.mem_exc, self.sfence,
+                   self.fflags)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
     def eq(self, rhs):
-        attrs = ['uop', 'addr', 'data', 'mem_exc', 'sfence', 'fflags']
-        return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
+        return Value.cast(self).eq(Value.cast(rhs))
 
 
 class FunctionalUnit(HasCoreParams, Elaboratable):

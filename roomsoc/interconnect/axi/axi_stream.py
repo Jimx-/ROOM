@@ -16,7 +16,7 @@ class _AXIStreamLayout(Record):
                  name=None,
                  src_loc_at=0):
         if layout is not None:
-            payload_layout = layout
+            payload_layout = list(layout)
         else:
             payload_layout = [
                 ('data', max(1, data_width), Direction.FANOUT),
@@ -48,6 +48,7 @@ class AXIStreamInterface(Decoupled):
         self.id_width = id_width
         self.dest_width = dest_width
         self.user_width = user_width
+        self._layout = None if layout is None else list(layout)
 
         super().__init__(_AXIStreamLayout,
                          self.data_width,
@@ -58,6 +59,15 @@ class AXIStreamInterface(Decoupled):
                          layout,
                          name=name,
                          src_loc_at=1)
+
+    def clone(self, *, name=None):
+        return AXIStreamInterface(data_width=self.data_width,
+                                  keep_width=self.keep_width,
+                                  id_width=self.id_width,
+                                  dest_width=self.dest_width,
+                                  user_width=self.user_width,
+                                  layout=self._layout,
+                                  name=name)
 
 
 class AXIStreamPacketizer(Elaboratable):

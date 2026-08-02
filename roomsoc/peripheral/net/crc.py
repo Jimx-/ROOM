@@ -113,20 +113,11 @@ class CrcCalculate(Elaboratable):
 
         crc = Signal(32, reset=0xffffffff)
 
-        q_in = m.submodules.q_in = Queue(2,
-                                         Record,
-                                         make_data_layout(
-                                             self.data_width, self.user_width),
-                                         flow=False)
-        m.d.comb += stream2queue(self.data_in, q_in)
+        q_in = m.submodules.q_in = Queue(2, self.data_in, flow=False)
+        m.d.comb += self.data_in.connect(q_in.enq)
 
-        q_out = m.submodules.q_out = Queue(2,
-                                           Record,
-                                           make_data_layout(
-                                               self.data_width,
-                                               self.user_width),
-                                           flow=False)
-        m.d.comb += queue2stream(q_out, self.data_out)
+        q_out = m.submodules.q_out = Queue(2, self.data_out, flow=False)
+        m.d.comb += q_out.deq.connect(self.data_out)
 
         crc_queue = m.submodules.crc_queue = Queue(2, Signal, 32)
         m.d.comb += crc_queue.deq.connect(self.crc)
