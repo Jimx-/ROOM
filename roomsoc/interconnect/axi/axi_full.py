@@ -538,12 +538,14 @@ class AXI2AXILite(Elaboratable):
 
         cmd_done = Signal()
         last_ar = Signal()
-
-        m.d.comb += axil.b.ready.eq(1)
+        write_resp = Signal(2)
 
         with m.FSM():
             with m.State('IDLE'):
-                m.d.sync += cmd_done.eq(0)
+                m.d.sync += [
+                    cmd_done.eq(0),
+                    write_resp.eq(0),
+                ]
 
                 with m.If(axi.ar.valid & axi.aw.valid):
                     with m.If(last_ar):
@@ -627,18 +629,29 @@ class AXI2AXILite(Elaboratable):
                     axil.w.data.eq(axi.w.bits.data),
                     axil.w.strb.eq(axi.w.bits.strb),
                     axi.w.ready.eq(axil.w.ready),
+                    axil.b.ready.eq(1),
                 ]
 
+                with m.If(axil.b.valid & (axil.b.resp != 0)):
+                    m.d.sync += write_resp.eq(axil.b.resp)
+
                 with m.If(axi.w.valid & axi.w.ready & axi.w.bits.last):
+                    m.next = 'WRITE_RESP'
+
+            with m.State('WRITE_RESP'):
+                m.d.comb += axil.b.ready.eq(1)
+                with m.If(axil.b.valid):
+                    with m.If(axil.b.resp != 0):
+                        m.d.sync += write_resp.eq(axil.b.resp)
                     m.next = 'RESP'
 
             with m.State('RESP'):
                 m.d.comb += [
                     axi.b.valid.eq(1),
-                    axi.b.bits.resp.eq(0),
+                    axi.b.bits.resp.eq(write_resp),
                     axi.b.bits.id.eq(fragmenter.out.bits.id),
                 ]
-                with m.If(axi.b.ready):
+                with m.If(axi.b.valid & axi.b.ready):
                     m.d.comb += fragmenter.out.ready.eq(1)
                     m.next = 'IDLE'
 
