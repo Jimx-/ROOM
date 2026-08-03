@@ -608,9 +608,11 @@ class Arbiter(Elaboratable):
         else:
             beats_left = Signal()
 
+        stalled = Signal()
         bus_busy = beats_left != 0
+        bus_locked = bus_busy | stalled
 
-        with m.If(~bus_busy):
+        with m.If(~bus_locked):
             self.policy(m, requests, grant, early_grant)
 
             with m.Switch(early_grant):
@@ -622,6 +624,21 @@ class Arbiter(Elaboratable):
                                 beats_left.eq(
                                     Interface.num_beats0(self._intrs[i].bits)),
                             ]
+                        with m.Elif(requests[i] & ~self.bus.ready):
+                            # Once valid is presented, Decoupled requires the
+                            # selected payload to remain stable until ready.
+                            m.d.sync += [
+                                grant.eq(i),
+                                stalled.eq(1),
+                            ]
+
+        with m.If(stalled & self.bus.fire):
+            m.d.sync += stalled.eq(0)
+            with m.Switch(grant):
+                for i in range(len(requests)):
+                    with m.Case(i):
+                        m.d.sync += beats_left.eq(
+                            Interface.num_beats0(self._intrs[i].bits))
 
         with m.If(bus_busy):
             m.d.sync += beats_left.eq(beats_left - self.bus.fire)
