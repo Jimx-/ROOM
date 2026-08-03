@@ -201,6 +201,7 @@ class Interface:
         self.sink_id_width = sink_id_width
         self.size_width = size_width
         self.has_bce = has_bce
+        self._map = None
 
         self.a = Decoupled(ChannelA,
                            addr_width=addr_width,
@@ -299,9 +300,10 @@ class Interface:
         beat_bytes = data_width // 8
 
         beats = Interface.num_beats0(bits)
-        counter = Signal(range(4**len(bits.size) //
-                               beat_bytes) if hasattr(bits, 'size') else 1,
-                         name=f'{prefix}counter')
+        counter_width = (max(1, (1 << len(bits.size)) -
+                             log2_int(beat_bytes))
+                         if hasattr(bits, 'size') else 1)
+        counter = Signal(counter_width, name=f'{prefix}counter')
         counter_next = counter - 1
         first = Signal(name=f'{prefix}first')
         last = Signal(name=f'{prefix}last')
@@ -937,5 +939,128 @@ class Serializer(Elaboratable):
                 in_bus.c.connect(out_bus.c),
                 in_bus.e.connect(out_bus.e),
             ]
+
+        return m
+
+
+class SRAM(Elaboratable):
+    """TileLink-UL SRAM slave (channels A + D).
+
+    The TileLink analogue of :class:`roomsoc.interconnect.wishbone.SRAM`:
+    handles ``Get`` (-> ``AccessAckData``) and ``PutFull``/``PutPartial``
+    (-> ``AccessAck``) of any size, single- or multi-beat, one transaction
+    outstanding. Reads use a combinational read port; writes commit through an
+    8-bit-granularity write port gated by the per-byte ``mask``.
+
+    Parameters
+    ----------
+    mem_or_size : amaranth.Memory or int
+        A pre-built ``Memory`` (which may carry its own ``init``), or a size in
+        **bytes**; the word depth is ``size // (data_width // 8)``.
+    read_only : bool
+        Reject writes (deny them) instead of committing.
+    bus : Interface, optional
+        Existing bus to attach; one is created if omitted.
+    error : Signal, optional
+        Transaction error input, sampled on the first A beat. When asserted the
+        response carries ``denied`` (and ``corrupt`` on reads) and writes do not
+        commit. Use this to wire a protection/permission check into the slave,
+        or to let a testbench inject error responses.
+    """
+
+    def __init__(self, mem_or_size, *, read_only=False, bus=None, error=None):
+        self.read_only = read_only
+        self.error = error if error is not None else Const(0)
+        if bus is None:
+            bus = Interface(addr_width=32, data_width=32)
+        self.bus = bus
+        if isinstance(mem_or_size, Memory):
+            self.mem = mem_or_size
+        else:
+            depth = mem_or_size // (bus.data_width // 8)
+            self.mem = Memory(width=bus.data_width, depth=depth)
+
+    def elaborate(self, platform):
+        m = Module()
+        bus = self.bus
+        beat_bytes = bus.data_width // 8
+        lg = log2_int(beat_bytes)
+
+        rport = m.submodules.rport = self.mem.read_port(domain="comb")
+        wport = m.submodules.wport = self.mem.write_port(granularity=8)
+
+        a_first, a_last, _, _ = Interface.count(m, bus.a.bits, bus.a.fire)
+        _, d_last, _, _ = Interface.count(m, bus.d.bits, bus.d.fire)
+        a_write = Interface.has_data(bus.a.bits)
+
+        r_addr = Signal(bus.addr_width)
+        r_size = Signal.like(bus.a.bits.size)
+        r_source = Signal.like(bus.a.bits.source)
+        r_is_read = Signal()
+        r_denied = Signal()
+        wbeat = Signal(8)
+        rbeat = Signal(8)
+        resp = Signal()
+
+        # Accept A only while not producing a response (one outstanding txn).
+        m.d.comb += bus.a.ready.eq(~resp)
+
+        # A write is denied outright in read-only mode; ``error`` denies any
+        # transaction. Denied is latched at the first A beat.
+        write_denied = a_write if self.read_only else Const(0)
+        cur_denied = self.error | write_denied
+
+        with m.If(bus.a.fire & a_first):
+            m.d.sync += [
+                r_addr.eq(bus.a.bits.address),
+                r_size.eq(bus.a.bits.size),
+                r_source.eq(bus.a.bits.source),
+                r_is_read.eq(~a_write),
+                r_denied.eq(cur_denied),
+            ]
+
+        # Write commit: every non-denied write A beat goes to the byte port.
+        denied_during_txn = Mux(a_first, cur_denied, r_denied)
+        m.d.comb += [
+            wport.addr.eq(bus.a.bits.address[lg:] + wbeat),
+            wport.data.eq(bus.a.bits.data),
+            wport.en.eq((bus.a.fire & a_write & ~denied_during_txn).replicate(
+                beat_bytes) & bus.a.bits.mask),
+        ]
+        with m.If(bus.a.fire & a_write & ~a_last):
+            m.d.sync += wbeat.eq(wbeat + 1)
+
+        # Arm the response once the last A beat has fired.
+        with m.If(bus.a.fire & a_last):
+            m.d.sync += [
+                resp.eq(1),
+                wbeat.eq(0),
+                rbeat.eq(0),
+            ]
+
+        # Read port addressing for the (possibly multi-beat) D response.
+        m.d.comb += rport.addr.eq(r_addr[lg:] + rbeat)
+
+        m.d.comb += [
+            bus.d.valid.eq(resp),
+            bus.d.bits.opcode.eq(
+                Mux(r_is_read, ChannelDOpcode.AccessAckData,
+                    ChannelDOpcode.AccessAck)),
+            bus.d.bits.param.eq(0),
+            bus.d.bits.size.eq(r_size),
+            bus.d.bits.source.eq(r_source),
+            bus.d.bits.sink.eq(0),
+            bus.d.bits.denied.eq(r_denied),
+            bus.d.bits.corrupt.eq(r_denied & r_is_read),
+            bus.d.bits.data.eq(rport.data),
+        ]
+
+        with m.If(bus.d.fire):
+            m.d.sync += rbeat.eq(rbeat + 1)
+            with m.If(d_last):
+                m.d.sync += [
+                    resp.eq(0),
+                    rbeat.eq(0),
+                ]
 
         return m

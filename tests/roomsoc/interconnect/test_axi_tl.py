@@ -19,9 +19,9 @@ previously had only script-only or zero coverage (see
   * Round-trip AXI->TL->AXI against an AXI SRAM slave
 
 The AXI far-end uses the shared ``axi_helpers`` kit (``AXIResponder`` and the
-master drivers); the TL far-end uses a small ``TLSRAM`` subordinate and
-``tl_get``/``tl_put`` master drivers defined here, since Phase 0 did not lift
-any TileLink testbench kit.
+master drivers); the TL far-end uses the shared ``tl_helpers`` kit
+(``TLSRAM`` subordinate and ``tl_get``/``tl_put`` master drivers), whose
+synthesizable RAM core is ``roomsoc.interconnect.tilelink.SRAM``.
 """
 
 import pytest
@@ -33,9 +33,9 @@ from amaranth.utils import log2_int
 from roomsoc.interconnect import tilelink
 from roomsoc.interconnect.axi import AXIInterface, AXI2Tilelink, TileLink2AXI
 from roomsoc.interconnect.axi.common import AXIBurst, AXIResp
-from roomsoc.interconnect.stream import Valid
 
 from axi_helpers import AXIResponder, run_sim, axi_read
+from tl_helpers import TLSRAM, tl_get, tl_put
 
 
 def axi_write_together(bus, addr, data, strb, *, size, txn_id=0):
@@ -76,227 +76,6 @@ def axi_write_together(bus, addr, data, strb, *, size, txn_id=0):
 def _init(depth, base=0x100):
     """Predictable memory image: word i holds ``base + i``."""
     return [base + i for i in range(depth)]
-
-
-# ---------------------------------------------------------------------------
-# TileLink-UL SRAM subordinate (A+D, Get/PutFull/PutPartial, single + multi-beat)
-# ---------------------------------------------------------------------------
-class TLSRAM(Elaboratable):
-    """Minimal TileLink-UL SRAM slave for round-trip / bridge tests.
-
-    Handles Get (-> AccessAckData) and PutFull/PutPartial (-> AccessAck) of any
-    size, single- or multi-beat, one transaction outstanding. ``denied_addr``
-    forces ``denied`` (and ``corrupt`` on reads) so the SLVERR path of
-    ``AXI2Tilelink`` can be exercised.
-
-    A monitor tap ``a_monitor`` latches ``(address, opcode, size, source)`` on
-    the first A beat of each transaction so tests can assert on the TL request
-    that reached the slave.
-    """
-
-    def __init__(self,
-                 *,
-                 addr_width=32,
-                 data_width=32,
-                 size_width=4,
-                 source_id_width=4,
-                 depth=256,
-                 init=None,
-                 denied_addr=None):
-        self.bus = tilelink.Interface(addr_width=addr_width,
-                                      data_width=data_width,
-                                      size_width=size_width,
-                                      source_id_width=source_id_width)
-        self.depth = depth
-        self.init = ([0] * depth) if init is None else list(init)
-        self.denied_addr = denied_addr
-        self.a_monitor = Valid(
-            Record, [("address", addr_width, Direction.FANOUT),
-                     ("opcode", tilelink.ChannelAOpcode, Direction.FANOUT),
-                     ("size", size_width, Direction.FANOUT),
-                     ("source", source_id_width, Direction.FANOUT)])
-
-    def elaborate(self, platform):
-        m = Module()
-        bus = self.bus
-        beat_bytes = bus.data_width // 8
-        lg = log2_int(beat_bytes)
-
-        mem = Memory(width=bus.data_width, depth=self.depth, init=self.init)
-        rport = m.submodules.rport = mem.read_port(domain="comb")
-        wport = m.submodules.wport = mem.write_port(granularity=8)
-
-        a_first, a_last, _, _ = tilelink.Interface.count(m,
-                                                         bus.a.bits,
-                                                         bus.a.fire)
-        _, d_last, _, _ = tilelink.Interface.count(m,
-                                                   bus.d.bits,
-                                                   bus.d.fire)
-        a_write = tilelink.Interface.has_data(bus.a.bits)
-
-        # Latched transaction metadata (sampled on the first A beat).
-        r_addr = Signal(bus.addr_width)
-        r_size = Signal.like(bus.a.bits.size)
-        r_source = Signal.like(bus.a.bits.source)
-        r_is_read = Signal()
-        r_denied = Signal()
-        wbeat = Signal(8)
-        rbeat = Signal(8)
-        resp = Signal()
-
-        # Accept A only while not producing a response.
-        m.d.comb += bus.a.ready.eq(~resp)
-
-        m.d.comb += [
-            self.a_monitor.valid.eq(bus.a.fire & a_first),
-            self.a_monitor.bits.address.eq(bus.a.bits.address),
-            self.a_monitor.bits.opcode.eq(bus.a.bits.opcode),
-            self.a_monitor.bits.size.eq(bus.a.bits.size),
-            self.a_monitor.bits.source.eq(bus.a.bits.source),
-        ]
-
-        with m.If(bus.a.fire & a_first):
-            m.d.sync += [
-                r_addr.eq(bus.a.bits.address),
-                r_size.eq(bus.a.bits.size),
-                r_source.eq(bus.a.bits.source),
-                r_is_read.eq(~a_write),
-            ]
-            if self.denied_addr is not None:
-                m.d.sync += r_denied.eq(bus.a.bits.address == self.denied_addr)
-
-        # Write commit: every write A beat goes straight to the byte port.
-        m.d.comb += [
-            wport.addr.eq(bus.a.bits.address[lg:] + wbeat),
-            wport.data.eq(bus.a.bits.data),
-            wport.en.eq(
-                (bus.a.fire & a_write).replicate(beat_bytes) & bus.a.bits.mask),
-        ]
-        with m.If(bus.a.fire & a_write & ~a_last):
-            m.d.sync += wbeat.eq(wbeat + 1)
-
-        # Arm the response once the last A beat has fired.
-        with m.If(bus.a.fire & a_last):
-            m.d.sync += [
-                resp.eq(1),
-                wbeat.eq(0),
-                rbeat.eq(0),
-            ]
-
-        # Read port addressing for the (possibly multi-beat) D response.
-        m.d.comb += rport.addr.eq(r_addr[lg:] + rbeat)
-
-        m.d.comb += [
-            bus.d.valid.eq(resp),
-            bus.d.bits.opcode.eq(
-                Mux(r_is_read, tilelink.ChannelDOpcode.AccessAckData,
-                    tilelink.ChannelDOpcode.AccessAck)),
-            bus.d.bits.param.eq(0),
-            bus.d.bits.size.eq(r_size),
-            bus.d.bits.source.eq(r_source),
-            bus.d.bits.sink.eq(0),
-            bus.d.bits.denied.eq(r_denied),
-            bus.d.bits.corrupt.eq(r_denied & r_is_read),
-            bus.d.bits.data.eq(rport.data),
-        ]
-
-        with m.If(bus.d.fire):
-            m.d.sync += rbeat.eq(rbeat + 1)
-            with m.If(d_last):
-                m.d.sync += [
-                    resp.eq(0),
-                    rbeat.eq(0),
-                ]
-
-        return m
-
-
-# ---------------------------------------------------------------------------
-# TileLink master drivers (amaranth pysim sync coroutines)
-#
-# Only a naked ``yield`` advances the clock; all reads/writes between two naked
-# yields are coherent within one cycle. The receiver drives ``ready``.
-# ---------------------------------------------------------------------------
-def tl_get(bus, address, *, size, source=0):
-    """Issue a TL Get (single A beat) and collect the D response.
-
-    Returns ``(data, denied, corrupt)`` where ``data`` is the little-endian
-    concatenation of all D beats (``(1 << size) // beat_bytes`` of them).
-    """
-    beat_bytes = bus.data_width // 8
-    nbeats = max(1, (1 << size) // beat_bytes)
-
-    yield bus.a.bits.opcode.eq(tilelink.ChannelAOpcode.Get)
-    yield bus.a.bits.param.eq(0)
-    yield bus.a.bits.size.eq(size)
-    yield bus.a.bits.source.eq(source)
-    yield bus.a.bits.address.eq(address)
-    yield bus.a.bits.mask.eq((1 << beat_bytes) - 1)
-    yield bus.a.bits.data.eq(0)
-    yield bus.a.bits.corrupt.eq(0)
-    yield bus.a.valid.eq(1)
-    yield
-    while not (yield bus.a.ready):
-        yield
-    yield bus.a.valid.eq(0)
-
-    yield bus.d.ready.eq(1)
-    data = 0
-    denied = 0
-    corrupt = 0
-    for i in range(nbeats):
-        while not (yield bus.d.valid):
-            yield
-        denied |= (yield bus.d.bits.denied)
-        corrupt |= (yield bus.d.bits.corrupt)
-        data |= (yield bus.d.bits.data) << (i * bus.data_width)
-        yield
-    yield bus.d.ready.eq(0)
-    return data, denied, corrupt
-
-
-def tl_put(bus, address, data, mask, *, size, source=0, full=True):
-    """Issue a TL PutFull/PutPartial and collect the single AccessAck.
-
-    ``nbeats = (1 << size) // beat_bytes`` A beats are driven. ``mask`` is the
-    per-byte mask for the whole transaction (each beat uses its own lane
-    slice). Returns ``denied``.
-    """
-    beat_bytes = bus.data_width // 8
-    nbeats = max(1, (1 << size) // beat_bytes)
-    opcode = (tilelink.ChannelAOpcode.PutFullData
-              if full else tilelink.ChannelAOpcode.PutPartialData)
-
-    yield bus.a.bits.opcode.eq(opcode)
-    yield bus.a.bits.param.eq(0)
-    yield bus.a.bits.size.eq(size)
-    yield bus.a.bits.source.eq(source)
-    yield bus.a.bits.address.eq(address)
-    yield bus.a.bits.corrupt.eq(0)
-    yield bus.a.valid.eq(1)
-
-    for i in range(nbeats):
-        beat_data = (data >> (i * bus.data_width)) & ((1 << bus.data_width) -
-                                                      1)
-        if full:
-            beat_mask = (1 << beat_bytes) - 1
-        else:
-            beat_mask = (mask >> (i * beat_bytes)) & ((1 << beat_bytes) - 1)
-        yield bus.a.bits.data.eq(beat_data)
-        yield bus.a.bits.mask.eq(beat_mask)
-        yield
-        while not (yield bus.a.ready):
-            yield
-
-    yield bus.a.valid.eq(0)
-
-    yield bus.d.ready.eq(1)
-    while not (yield bus.d.valid):
-        yield
-    denied = (yield bus.d.bits.denied)
-    yield
-    yield bus.d.ready.eq(0)
-    return denied
 
 
 # ===========================================================================
