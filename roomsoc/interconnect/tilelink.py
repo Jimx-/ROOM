@@ -750,7 +750,7 @@ class Fragmenter(Elaboratable):
             old_gennum = Mux(a_first, a_orig_mask >> log2_int(beat_bytes),
                              gennum - 1)[:counter_bits]
             new_gennum = ~(~old_gennum | (a_mask >> log2_int(beat_bytes)))
-            a_fragnum = Signal(counter_bits)
+            a_fragnum = Signal(log2_int(self.max_size // self.min_size))
             m.d.comb += a_fragnum.eq(
                 ~(~(old_gennum >> log2_int(self.min_size // beat_bytes)))
                 | (a_frag_mask >> log2_int(self.min_size)))

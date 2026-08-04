@@ -258,3 +258,122 @@ class TLRamModel:
             if mask & (1 << i):
                 self.mem[address + i] = (data >> (i * 8)) & 0xFF
         return bytes(self.mem[address:address + self.beat_bytes])
+
+
+# ---------------------------------------------------------------------------
+# TileLink-C master drivers (coherent BCE operations)
+#
+# Used by CacheCork (Phase 4) and L2 cache (Phase 8) tests. Each driver issues
+# a single coherent transaction on the BCE channels and collects the D response.
+# ---------------------------------------------------------------------------
+def tl_acquire(bus,
+               address,
+               *,
+               size,
+               source,
+               grow_param=tilelink.GrowParam.NtoB,
+               opcode=tilelink.ChannelAOpcode.AcquireBlock):
+    """Issue a TL-C AcquireBlock or AcquirePerm and collect Grant/GrantData.
+
+    Acquires carry no A-channel data, so a single A beat is driven. The D
+    response beat count depends on whether the eventual responder returns data:
+    AcquireBlock(NtoB/NtoT) -> GrantData (``size``-dependent beats);
+    AcquirePerm or AcquireBlock(BtoT) -> Grant (one beat, no data).
+
+    Returns ``(opcode, param, source, sink, data, denied, corrupt)`` where
+    ``opcode`` is the :class:`ChannelDOpcode` value actually received.
+    """
+    beat_bytes = bus.data_width // 8
+    expect_data = (opcode == tilelink.ChannelAOpcode.AcquireBlock
+                   and grow_param != tilelink.GrowParam.BtoT)
+    d_beats = max(1, (1 << size) // beat_bytes) if expect_data else 1
+
+    yield bus.a.bits.opcode.eq(opcode)
+    yield bus.a.bits.param.eq(grow_param)
+    yield bus.a.bits.size.eq(size)
+    yield bus.a.bits.source.eq(source)
+    yield bus.a.bits.address.eq(address)
+    yield bus.a.bits.mask.eq((1 << beat_bytes) - 1)
+    yield bus.a.bits.data.eq(0)
+    yield bus.a.bits.corrupt.eq(0)
+    yield bus.a.valid.eq(1)
+    yield
+    while not (yield bus.a.ready):
+        yield
+    yield bus.a.valid.eq(0)
+
+    yield bus.d.ready.eq(1)
+    data = 0
+    d_opcode = d_param = d_source = d_sink = d_denied = d_corrupt = 0
+    for i in range(d_beats):
+        while not (yield bus.d.valid):
+            yield
+        if i == 0:
+            d_opcode = (yield bus.d.bits.opcode)
+            d_param = (yield bus.d.bits.param)
+            d_source = (yield bus.d.bits.source)
+            d_sink = (yield bus.d.bits.sink)
+            d_denied = (yield bus.d.bits.denied)
+            d_corrupt = (yield bus.d.bits.corrupt)
+        data |= (yield bus.d.bits.data) << (i * bus.data_width)
+        yield
+    yield bus.d.ready.eq(0)
+    return d_opcode, d_param, d_source, d_sink, data, d_denied, d_corrupt
+
+
+def tl_release(bus,
+               address,
+               *,
+               size,
+               source,
+               param=tilelink.ShrinkReportParam.TtoB,
+               data=None):
+    """Issue a TL-C Release or ReleaseData and collect ReleaseAck on D.
+
+    When ``data`` is not None, drives ReleaseData (``size``-dependent C beats);
+    otherwise drives Release (single beat, no data). Returns
+    ``(opcode, source, denied)`` from the ReleaseAck.
+    """
+    beat_bytes = bus.data_width // 8
+    has_data = data is not None
+    opcode = (tilelink.ChannelCOpcode.ReleaseData if has_data
+              else tilelink.ChannelCOpcode.Release)
+    c_beats = max(1, (1 << size) // beat_bytes) if has_data else 1
+
+    yield bus.c.bits.opcode.eq(opcode)
+    yield bus.c.bits.param.eq(param)
+    yield bus.c.bits.size.eq(size)
+    yield bus.c.bits.source.eq(source)
+    yield bus.c.bits.address.eq(address)
+    yield bus.c.bits.corrupt.eq(0)
+    yield bus.c.valid.eq(1)
+
+    for i in range(c_beats):
+        if has_data:
+            beat = (data >> (i * bus.data_width)) & ((1 << bus.data_width) - 1)
+            yield bus.c.bits.data.eq(beat)
+        yield
+        while not (yield bus.c.ready):
+            yield
+
+    yield bus.c.valid.eq(0)
+
+    yield bus.d.ready.eq(1)
+    while not (yield bus.d.valid):
+        yield
+    d_opcode = (yield bus.d.bits.opcode)
+    d_source = (yield bus.d.bits.source)
+    d_denied = (yield bus.d.bits.denied)
+    yield
+    yield bus.d.ready.eq(0)
+    return d_opcode, d_source, d_denied
+
+
+def tl_grantack(bus, *, sink):
+    """Issue a single GrantAck (E channel) beat and wait for acceptance."""
+    yield bus.e.bits.sink.eq(sink)
+    yield bus.e.valid.eq(1)
+    yield
+    while not (yield bus.e.ready):
+        yield
+    yield bus.e.valid.eq(0)
