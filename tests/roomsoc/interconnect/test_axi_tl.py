@@ -34,8 +34,8 @@ from roomsoc.interconnect import tilelink
 from roomsoc.interconnect.axi import AXIInterface, AXI2Tilelink, TileLink2AXI
 from roomsoc.interconnect.axi.common import AXIBurst, AXIResp
 
-from axi_helpers import AXIResponder, run_sim, axi_read
-from tl_helpers import TLSRAM, tl_get, tl_put
+from axi_helpers import AXIResponder, run_sim, axi_read, axi_read_burst
+from tl_helpers import TLSRAM, tl_get, tl_put, tl_acquire, tl_release
 
 
 def axi_write_together(bus, addr, data, strb, *, size, txn_id=0):
@@ -590,6 +590,38 @@ def test_axi2tl_max_flights_count_source_tagging():
     assert r_ids == [1, 1, 1, 1, 1]
 
 
+def test_axi2tl_max_flights_write_source_tagging():
+    # Exercise the independent write counter and the B-channel ordering gate.
+    # For id=1, added_bits=3 and the write discriminator is bit 0, giving
+    # sources 9, 11, 13, 15 before the two-bit transaction count wraps.
+    top = Axi2TlTop(id_width=4, max_flights=4)
+    src_caps = []
+    b_ids = []
+
+    def driver():
+        for i in range(5):
+            resp, bid = yield from axi_write_together(top.axi,
+                                                       i * 4,
+                                                       0xA000 + i,
+                                                       0xf,
+                                                       size=2,
+                                                       txn_id=1)
+            assert resp == AXIResp.OKAY
+            b_ids.append(bid)
+
+    def monitor():
+        for _ in range(600):
+            if (yield top.sram.a_monitor.valid):
+                assert ((yield top.sram.a_monitor.bits.opcode) ==
+                        tilelink.ChannelAOpcode.PutPartialData.value)
+                src_caps.append((yield top.sram.a_monitor.bits.source))
+            yield
+
+    run_sim(top, driver, monitor)
+    assert src_caps == [9, 11, 13, 15, 9]
+    assert b_ids == [1, 1, 1, 1, 1]
+
+
 def test_axi2tl_propagates_slverr_from_denied():
     # A TL ``denied`` response must become AXI SLVERR on both R (read) and B
     # (write); a subsequent normal access must still return OKAY.
@@ -724,3 +756,382 @@ def test_roundtrip_axi_tl_axi():
         assert (data, resp, rid) == (0xcafef00d, AXIResp.OKAY, 1)
 
     run_sim(top, driver)
+
+
+# ===========================================================================
+# Phase 7 -- Gap-fill: TL-C through CacheCork, burst edges, max_flights,
+#            atomic opcodes
+# ===========================================================================
+def _axi_write_burst_together(bus, addr, beats, *, size, txn_id=0):
+    """Drive a multi-beat AXI write with AW held valid across all W beats.
+
+    ``AXI2Tilelink`` gates ``aw.ready`` on ``w.valid & w.last``, so AW must
+    remain asserted until the final W beat.  Each entry in *beats* is a
+    ``(data, strb)`` tuple.  Returns ``(resp, id)``.
+    """
+    yield bus.aw.bits.addr.eq(addr)
+    yield bus.aw.bits.size.eq(size)
+    yield bus.aw.bits.len.eq(len(beats) - 1)
+    yield bus.aw.bits.burst.eq(AXIBurst.INCR)
+    yield bus.aw.bits.id.eq(txn_id)
+    yield bus.aw.valid.eq(1)
+    for index, (data, strb) in enumerate(beats):
+        yield bus.w.bits.data.eq(data)
+        yield bus.w.bits.strb.eq(strb)
+        yield bus.w.bits.last.eq(index == len(beats) - 1)
+        yield bus.w.valid.eq(1)
+        yield
+        while not (yield bus.w.ready):
+            yield
+    yield bus.aw.valid.eq(0)
+    yield bus.w.valid.eq(0)
+
+    yield bus.b.ready.eq(1)
+    while not (yield bus.b.valid):
+        yield
+    result = ((yield bus.b.bits.resp), (yield bus.b.bits.id))
+    yield
+    yield bus.b.ready.eq(0)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# TL-C through TileLink2AXI + CacheCork
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("grow_param", [tilelink.GrowParam.NtoB,
+                                         tilelink.GrowParam.NtoT])
+def test_tl2axi_cachecork_acquire_block(grow_param):
+    # AcquireBlock must surface on the AXI side as a Get (AR) whose id
+    # carries the cork-shifted source, and return as GrantData.
+    top = Tl2AxiTop(source_id_width=3, id_width=4, has_bce=True)
+    lg = log2_int(top.data_width // 8)
+    ar_ids = []
+
+    def driver():
+        d_op, d_param, d_source, _sink, data, d_denied, d_corrupt = \
+            yield from tl_acquire(top.tl,
+                                  0,
+                                  size=lg,
+                                  source=2,
+                                  grow_param=grow_param)
+        assert d_op == tilelink.ChannelDOpcode.GrantData.value
+        assert d_param == tilelink.CapParam.toT.value
+        assert d_source == 2
+        assert data == 0x100
+        assert (d_denied, d_corrupt) == (0, 0)
+
+    def monitor():
+        for _ in range(300):
+            if (yield top.ram.ar_monitor.valid):
+                ar_ids.append((yield top.ram.bus.ar.bits.id))
+            yield
+        assert ar_ids == [(2 << 1) | 1]
+
+    run_sim(top, driver, monitor)
+
+
+def test_tl2axi_cachecork_acquire_perm_no_downstream():
+    # AcquirePerm(BtoT) returns a Grant immediately via the CacheCork; no AXI
+    # traffic (AR/AW) must be generated.
+    top = Tl2AxiTop(source_id_width=3, id_width=4, has_bce=True)
+    lg = log2_int(top.data_width // 8)
+    axi_traffic = []
+
+    def driver():
+        d_op, _param, d_source, _sink, data, _, _ = \
+            yield from tl_acquire(top.tl,
+                                  0,
+                                  size=lg,
+                                  source=3,
+                                  opcode=tilelink.ChannelAOpcode.AcquirePerm,
+                                  grow_param=tilelink.GrowParam.BtoT)
+        assert d_op == tilelink.ChannelDOpcode.Grant.value
+        assert d_source == 3
+        assert data == 0
+
+    def monitor():
+        for _ in range(300):
+            if (yield top.ram.ar_monitor.valid):
+                axi_traffic.append('AR')
+            if (yield top.ram.aw_monitor.valid):
+                axi_traffic.append('AW')
+            yield
+        assert axi_traffic == []
+
+    run_sim(top, driver, monitor)
+
+
+def test_tl2axi_cachecork_release_data_writes_and_acks():
+    # ReleaseData must become a downstream PutFull (AXI AW+W), the AXI B
+    # response must surface as a ReleaseAck, and the data must persist.
+    top = Tl2AxiTop(source_id_width=3, id_width=4, has_bce=True)
+    lg = log2_int(top.data_width // 8)
+    aw_caps = []
+    w_caps = []
+
+    def driver():
+        d_op, d_source, d_denied = yield from tl_release(
+            top.tl, 0, size=lg, source=4, data=0xDEADBEEF)
+        assert d_op == tilelink.ChannelDOpcode.ReleaseAck.value
+        assert d_source == 4
+        assert d_denied == 0
+        # Read back via a plain Get through the same cork+bridge path.
+        data, _, _ = yield from tl_get(top.tl, 0, size=lg, source=0)
+        assert data == 0xDEADBEEF
+
+    def monitor():
+        for _ in range(400):
+            if (yield top.ram.aw_monitor.valid):
+                aw_caps.append(((yield top.ram.aw_monitor.bits.addr),
+                                (yield top.ram.aw_monitor.bits.len),
+                                (yield top.ram.aw_monitor.bits.size),
+                                (yield top.ram.bus.aw.bits.id)))
+            if (yield top.ram.w_monitor.valid):
+                w_caps.append(((yield top.ram.w_monitor.bits.data),
+                               (yield top.ram.w_monitor.bits.strb)))
+            yield
+
+    run_sim(top, driver, monitor)
+    assert aw_caps == [(0, 0, lg, 4 << 1)]
+    assert w_caps == [(0xDEADBEEF, 0xf)]
+
+
+# ---------------------------------------------------------------------------
+# AXI2Tilelink burst-length edge cases
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("length", [1, 3, 15])
+def test_axi2tl_multibeat_read_incr(length):
+    top = Axi2TlTop(id_width=4, max_flights=1)
+    lg = log2_int(top.data_width // 8)
+
+    def driver():
+        beats = yield from axi_read_burst(top.axi,
+                                          0,
+                                          size=lg,
+                                          length=length,
+                                          txn_id=1)
+        assert len(beats) == length + 1
+        for i, (data, resp, last, _rid) in enumerate(beats):
+            assert data == 0x100 + i
+            assert resp == AXIResp.OKAY
+            assert last == (i == length)
+
+    run_sim(top, driver)
+
+
+@pytest.mark.parametrize("nbeats", [2, 4, 16])
+def test_axi2tl_multibeat_write_incr(nbeats):
+    top = Axi2TlTop(id_width=4, max_flights=1)
+    lg = log2_int(top.data_width // 8)
+    pattern = [0x11110000 + i for i in range(nbeats)]
+    beats = [(v, 0xf) for v in pattern]
+
+    def driver():
+        resp, bid = yield from _axi_write_burst_together(top.axi,
+                                                         0,
+                                                         beats,
+                                                         size=lg,
+                                                         txn_id=2)
+        assert (resp, bid) == (AXIResp.OKAY, 2)
+        read_beats = yield from axi_read_burst(top.axi,
+                                               0,
+                                               size=lg,
+                                               length=nbeats - 1,
+                                               txn_id=3)
+        assert len(read_beats) == nbeats
+        for i, (data, resp, last, rid) in enumerate(read_beats):
+            assert (data, resp, last, rid) == (
+                pattern[i], AXIResp.OKAY, i == nbeats - 1, 3)
+
+    run_sim(top, driver)
+
+
+def test_axi2tl_wrap4_aligned_read():
+    # A WRAP4 burst at a boundary-aligned address is equivalent to INCR for
+    # data-ordering purposes.  The bridge must handle the burst type without
+    # error and return beats in linear order.
+    top = Axi2TlTop(id_width=4, max_flights=1)
+    lg = log2_int(top.data_width // 8)
+
+    def driver():
+        yield top.axi.ar.bits.addr.eq(0)
+        yield top.axi.ar.bits.size.eq(lg)
+        yield top.axi.ar.bits.len.eq(3)
+        yield top.axi.ar.bits.burst.eq(AXIBurst.WRAP)
+        yield top.axi.ar.bits.id.eq(1)
+        yield top.axi.ar.valid.eq(1)
+        yield
+        while not (yield top.axi.ar.ready):
+            yield
+        yield top.axi.ar.valid.eq(0)
+
+        yield top.axi.r.ready.eq(1)
+        got = []
+        for _ in range(4):
+            while not (yield top.axi.r.valid):
+                yield
+            got.append((yield top.axi.r.bits.data))
+            assert (yield top.axi.r.bits.resp) == AXIResp.OKAY
+            yield
+        yield top.axi.r.ready.eq(0)
+        assert got == [0x100, 0x101, 0x102, 0x103]
+
+    run_sim(top, driver)
+
+
+@pytest.mark.parametrize("axi_size,tl_size", [(0, 0), (1, 1), (2, 2)])
+def test_axi2tl_axi_size_maps_to_tl_size(axi_size, tl_size):
+    top = Axi2TlTop(id_width=4, max_flights=1)
+    caps = []
+
+    def driver():
+        yield from axi_read(top.axi, 0, size=axi_size, txn_id=1)
+
+    def monitor():
+        for _ in range(300):
+            if (yield top.sram.a_monitor.valid):
+                caps.append((yield top.sram.a_monitor.bits.size))
+            yield
+
+    run_sim(top, driver, monitor)
+    assert caps[0] == tl_size
+
+
+# ---------------------------------------------------------------------------
+# max_flights: saturate, stall, then release
+# ---------------------------------------------------------------------------
+def test_tl2axi_max_flights_stall_then_release():
+    top = Tl2AxiMaxFlightsTop(max_flights=2)
+    lg = log2_int(32 // 8)
+    counts = {'a': 0, 'ar': 0}
+
+    def driver():
+        bus = top.tl
+        beat_bytes = bus.data_width // 8
+        yield bus.d.ready.eq(0)
+
+        # Offer Gets continuously until backpressure is sustained. A single
+        # quiet monitor cycle is not sufficient evidence of saturation: skid
+        # buffers can naturally insert bubbles before all slots are occupied.
+        yield bus.a.bits.opcode.eq(tilelink.ChannelAOpcode.Get)
+        yield bus.a.bits.param.eq(0)
+        yield bus.a.bits.size.eq(lg)
+        yield bus.a.bits.source.eq(0)
+        yield bus.a.bits.address.eq(0)
+        yield bus.a.bits.mask.eq((1 << beat_bytes) - 1)
+        yield bus.a.bits.data.eq(0)
+        yield bus.a.bits.corrupt.eq(0)
+        yield bus.a.valid.eq(1)
+
+        stalled_cycles = 0
+        for _ in range(100):
+            yield
+            if (yield bus.a.ready):
+                stalled_cycles = 0
+            else:
+                stalled_cycles += 1
+            if stalled_cycles == 8:
+                break
+        else:
+            raise AssertionError("size queue never reached sustained stall")
+        saturated = counts['a']
+        saturated_ar = counts['ar']
+        assert top.max_flights <= saturated <= top.max_flights + 2
+
+        # Retire exactly one D beat, then block D again. Exactly one additional
+        # A request must be admitted before the queue returns to saturation.
+        for _ in range(100):
+            if (yield bus.d.valid):
+                break
+            yield
+        else:
+            raise AssertionError("no D response available at saturation")
+        yield bus.d.ready.eq(1)
+        yield
+        yield bus.d.ready.eq(0)
+
+        stalled_cycles = 0
+        for _ in range(100):
+            yield
+            if (yield bus.a.ready):
+                stalled_cycles = 0
+            else:
+                stalled_cycles += 1
+            if stalled_cycles == 8:
+                break
+        else:
+            raise AssertionError("queue did not stall again after one retire")
+        yield bus.a.valid.eq(0)
+        assert counts['a'] == saturated + 1
+        assert counts['ar'] == saturated_ar + 1
+
+    def monitor():
+        for _ in range(300):
+            if (yield top.tl.a.fire):
+                counts['a'] += 1
+            if (yield top.ram.ar_monitor.valid):
+                counts['ar'] += 1
+            yield
+
+    run_sim(top, driver, monitor)
+
+
+# ---------------------------------------------------------------------------
+# Atomic opcodes: treated as reads (unsupported -- documented)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("opcode", [tilelink.ChannelAOpcode.ArithmeticData,
+                                     tilelink.ChannelAOpcode.LogicalData])
+def test_tl2axi_atomic_opcode_treated_as_read(opcode):
+    # ArithmeticData / LogicalData are not recognised by ``Interface.has_data``
+    # (only PutFull/PutPartial qualify), so the bridge routes them through the
+    # read path (AR) and ignores the operand data on the W channel.  This test
+    # documents that behaviour: the opcode surfaces as an AXI AR, no AW/W is
+    # generated, and the response carries plain read data.
+    top = Tl2AxiTop(source_id_width=4, id_width=4)
+    lg = log2_int(top.data_width // 8)
+    ar_fired = []
+    aw_fired = []
+
+    def driver():
+        bus = top.tl
+        beat_bytes = bus.data_width // 8
+        yield bus.a.bits.opcode.eq(opcode)
+        yield bus.a.bits.param.eq(0)
+        yield bus.a.bits.size.eq(lg)
+        yield bus.a.bits.source.eq(1)
+        yield bus.a.bits.address.eq(0)
+        yield bus.a.bits.mask.eq((1 << beat_bytes) - 1)
+        yield bus.a.bits.data.eq(0x42)
+        yield bus.a.bits.corrupt.eq(0)
+        yield bus.a.valid.eq(1)
+        yield
+        while not (yield bus.a.ready):
+            yield
+        yield bus.a.valid.eq(0)
+
+        yield bus.d.ready.eq(1)
+        while not (yield bus.d.valid):
+            yield
+        data = (yield bus.d.bits.data)
+        d_opcode = (yield bus.d.bits.opcode)
+        d_source = (yield bus.d.bits.source)
+        denied = (yield bus.d.bits.denied)
+        corrupt = (yield bus.d.bits.corrupt)
+        yield
+        yield bus.d.ready.eq(0)
+        assert data == 0x100
+        assert d_opcode == tilelink.ChannelDOpcode.AccessAckData.value
+        assert d_source == 1
+        assert (denied, corrupt) == (0, 0)
+
+    def monitor():
+        for _ in range(300):
+            if (yield top.ram.ar_monitor.valid):
+                ar_fired.append(True)
+            if (yield top.ram.aw_monitor.valid):
+                aw_fired.append(True)
+            yield
+
+    run_sim(top, driver, monitor)
+    assert len(ar_fired) == 1
+    assert len(aw_fired) == 0
