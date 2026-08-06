@@ -2169,6 +2169,7 @@ class MSHR(HasL2CacheParams, Elaboratable):
                 Mux(request.prio[1] & ~meta.hit, request.tag, meta.tag)),
             self.schedule.bits.c.bits.set.eq(request.set),
             self.schedule.bits.c.bits.way.eq(meta.way),
+            self.schedule.bits.c.bits.source.eq(request.source),
             self.schedule.bits.c.bits.dirty.eq(
                 Mux(meta.hit | ~request.prio[1], meta.dirty, 0)),
             # Channel D
@@ -2529,8 +2530,6 @@ class Scheduler(HasL2CacheParams, Elaboratable):
 
         m.d.comb += [
             schedule.a.bits.source.eq(mshr_grant),
-            schedule.c.bits.source.eq(
-                Mux(schedule.c.bits.opcode[1], mshr_grant, 0)),
             schedule.d.bits.sink.eq(mshr_grant),
         ]
 
@@ -2541,6 +2540,12 @@ class Scheduler(HasL2CacheParams, Elaboratable):
             source_b.req.bits.eq(schedule.b.bits),
             source_c.req.valid.eq(schedule.c.valid),
             source_c.req.bits.eq(schedule.c.bits),
+            # Releases use the allocated MSHR as their C source. ProbeAck and
+            # ProbeAckData instead have to echo the source of the outer Probe,
+            # which the BC MSHR retained in schedule.c.bits.source.
+            source_c.req.bits.source.eq(
+                Mux(schedule.c.bits.opcode[1], mshr_grant,
+                    schedule.c.bits.source)),
             source_d.req.valid.eq(schedule.d.valid),
             source_d.req.bits.eq(schedule.d.bits),
             source_e.req.valid.eq(schedule.e.valid),

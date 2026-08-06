@@ -23,6 +23,15 @@ Phase 5 — ``Serializer`` (``tilelink.py:911``)
     new transaction from a *different* source is stalled; the same source is
     allowed through.  B/C/E pass through unchanged in coherent mode.
 
+tl_c_responder self-tests
+    Direct validation of the coherent subordinate responder gadget in isolation
+    from any cache. Acquire grants (capability reflection + block data), the
+    BtoT no-data grant, ReleaseData writeback into the model, a bare Release,
+    and a multi-beat grant. The responder is driven entirely from the master
+    side by the kit's own ``tl_acquire`` / ``tl_release`` / ``tl_grantack``
+    drivers against a ``TLRamModel`` -- the same gadgets the L2 tests use on the
+    inner side.
+
 All tests use the two-process Decoupled pattern with the pysim clock model from
 AGENTS.md (only a naked ``yield`` advances the cycle; reads/writes between naked
 yields are coherent within one cycle).
@@ -35,8 +44,8 @@ from amaranth.utils import log2_int
 
 from roomsoc.interconnect import tilelink
 
-from tl_helpers import (TLSRAM, tl_get, tl_put, tl_acquire, tl_release,
-                        tl_grantack, run_sim)
+from tl_helpers import (TLSRAM, TLRamModel, tl_get, tl_put, tl_acquire,
+                        tl_release, tl_grantack, tl_c_responder, run_sim)
 
 
 def _init(depth, base=0x100):
@@ -1460,3 +1469,184 @@ def test_fragmenter_has_bce_absorbs_c_and_e():
         assert (yield top.in_bus.e.ready) == 1
 
     run_sim(top, proc)
+
+
+# ===========================================================================
+# tl_c_responder self-tests
+# ===========================================================================
+class _ResponderBusTop(Elaboratable):
+    """A bare coherent interface anchored in a module so pysim tracks it."""
+
+    def __init__(self):
+        self.bus = tilelink.Interface(addr_width=32,
+                                      data_width=64,
+                                      size_width=4,
+                                      source_id_width=2,
+                                      sink_id_width=2,
+                                      has_bce=True)
+
+    def elaborate(self, platform):
+        m = Module()
+        # A dummy sync register so the simulation has a 'sync' domain to clock.
+        _anchor = Signal()
+        m.d.sync += _anchor.eq(0)
+        return m
+
+
+def _responder_rd(model, addr, nbytes):
+    return int.from_bytes(model.get(addr, log2_int(nbytes)), "little")
+
+
+def _new_responder_model(depth=256):
+    return TLRamModel(data_width=64,
+                      depth=depth,
+                      init=[0xC000 + i for i in range(depth)])
+
+
+def _run_responder(model, driver_fn):
+    """Run ``driver_fn(top, model)`` against a responder-backed coherent bus.
+
+    ``driver_fn`` is a generator function taking ``(top, model)``. A watchdog
+    turns a responder deadlock into a hard failure instead of a hang.
+    """
+    top = _ResponderBusTop()
+    done = [False]
+
+    def responder():
+        yield from tl_c_responder(top.bus, model=model, done=done)
+
+    def watchdog(limit=200000):
+        for _ in range(limit):
+            if done[0]:
+                return
+            yield
+        raise AssertionError("responder test deadlocked")
+
+    def drv():
+        yield from driver_fn(top, model)
+        done[0] = True
+
+    run_sim(top, responder, watchdog, drv)
+
+
+# ---------------------------------------------------------------------------
+# Acquire -> Grant / GrantData
+# ---------------------------------------------------------------------------
+def test_responder_acquire_ntob_grants_data_toB():
+    model = _new_responder_model()
+
+    def driver(top, model):
+        d_op, d_param, d_src, d_sink, data, denied, corrupt = \
+            yield from tl_acquire(top.bus,
+                                  0x10,
+                                  size=3,
+                                  source=1,
+                                  grow_param=tilelink.GrowParam.NtoB)
+        assert d_op == tilelink.ChannelDOpcode.GrantData.value
+        assert d_param == tilelink.CapParam.toB.value
+        assert d_src == 1
+        assert (denied, corrupt) == (0, 0)
+        assert data == _responder_rd(model, 0x10, 8)
+        yield from tl_grantack(top.bus, sink=d_sink)
+
+    _run_responder(model, driver)
+
+
+def test_responder_acquire_ntot_grants_data_toT():
+    model = _new_responder_model()
+
+    def driver(top, model):
+        d_op, d_param, _src, d_sink, data, _, _ = \
+            yield from tl_acquire(top.bus,
+                                  0x20,
+                                  size=3,
+                                  source=2,
+                                  grow_param=tilelink.GrowParam.NtoT)
+        assert d_op == tilelink.ChannelDOpcode.GrantData.value
+        assert d_param == tilelink.CapParam.toT.value
+        assert data == _responder_rd(model, 0x20, 8)
+        yield from tl_grantack(top.bus, sink=d_sink)
+
+    _run_responder(model, driver)
+
+
+def test_responder_acquire_btot_grants_no_data():
+    model = _new_responder_model()
+
+    def driver(top, model):
+        d_op, d_param, _src, d_sink, data, _, _ = \
+            yield from tl_acquire(top.bus,
+                                  0x30,
+                                  size=3,
+                                  source=3,
+                                  grow_param=tilelink.GrowParam.BtoT)
+        assert d_op == tilelink.ChannelDOpcode.Grant.value
+        assert d_param == tilelink.CapParam.toT.value
+        assert data == 0, "BtoT upgrade must not carry data"
+        yield from tl_grantack(top.bus, sink=d_sink)
+
+    _run_responder(model, driver)
+
+
+# ---------------------------------------------------------------------------
+# Release / ReleaseData
+# ---------------------------------------------------------------------------
+def test_responder_release_data_writeback_and_ack():
+    model = _new_responder_model()
+    addr = 0x40
+    value = 0x0BADF00DDEADBEEF
+
+    def driver(top, model):
+        d_op, d_src, d_denied = yield from tl_release(
+            top.bus,
+            addr,
+            size=3,
+            source=1,
+            param=tilelink.ShrinkReportParam.TtoN,
+            data=value)
+        assert d_op == tilelink.ChannelDOpcode.ReleaseAck.value
+        assert d_src == 1
+        assert d_denied == 0
+        assert _responder_rd(model, addr, 8) == value, \
+            "ReleaseData must commit to model"
+
+    _run_responder(model, driver)
+
+
+def test_responder_release_emits_ack_without_write():
+    model = _new_responder_model()
+    before = _responder_rd(model, 0x50, 8)
+
+    def driver(top, model):
+        d_op, d_src, _ = yield from tl_release(top.bus,
+                                               0x50,
+                                               size=3,
+                                               source=2)
+        assert d_op == tilelink.ChannelDOpcode.ReleaseAck.value
+        assert d_src == 2
+        assert _responder_rd(model, 0x50, 8) == before, \
+            "bare Release must not write"
+
+    _run_responder(model, driver)
+
+
+# ---------------------------------------------------------------------------
+# Multi-beat grant
+# ---------------------------------------------------------------------------
+def test_responder_multibeat_grant_data():
+    model = _new_responder_model()
+
+    def driver(top, model):
+        size = log2_int(16)  # 16-byte line -> two 8-byte beats
+        d_op, _param, _src, d_sink, data, denied, corrupt = \
+            yield from tl_acquire(top.bus,
+                                  0x60,
+                                  size=size,
+                                  source=0,
+                                  grow_param=tilelink.GrowParam.NtoB)
+        assert d_op == tilelink.ChannelDOpcode.GrantData.value
+        assert (denied, corrupt) == (0, 0)
+        assert data == _responder_rd(model, 0x60, 16)
+        yield from tl_grantack(top.bus, sink=d_sink)
+
+    _run_responder(model, driver)

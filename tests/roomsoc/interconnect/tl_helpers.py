@@ -4,14 +4,19 @@ Single source of truth for the TL slave responder and master drivers that
 TileLink tests previously reinvented per file. Mirrors ``axi_helpers.py`` and
 the ``wishbone.SRAM`` API.
 
-  * ``TLSRAM``     -- test slave = ``tilelink.SRAM`` + ``denied_addr`` error
-                      injection + ``a_monitor`` tap. Lifted from the inline
-                      test slave in ``test_axi_tl.py``.
-  * ``tl_get``     -- TL-UL Get master driver.
-  * ``tl_put``     -- TL-UL PutFull/PutPartial master driver.
-  * ``collect_d``  -- D-channel collector enforcing the valid-stable invariant.
-  * ``TLRamModel`` -- byte-addressable golden model for randomized tests.
-  * ``run_sim``    -- re-exported from ``axi_helpers``.
+  * ``TLSRAM``        -- test slave = ``tilelink.SRAM`` + ``denied_addr`` error
+                         injection + ``a_monitor`` tap. Lifted from the inline
+                         test slave in ``test_axi_tl.py``.
+  * ``tl_get``        -- TL-UL Get master driver.
+  * ``tl_put``        -- TL-UL PutFull/PutPartial master driver.
+  * ``collect_d``     -- D-channel collector enforcing the valid-stable invariant.
+  * ``TLRamModel``    -- byte-addressable golden model for randomized tests.
+  * ``tl_acquire``/``tl_release``/``tl_grantack`` -- TL-C coherent master drivers.
+  * ``drive_d``       -- D-channel emitter (responder side), complement of
+                         ``collect_d``.
+  * ``tl_c_responder`` -- coherent TL-C memory subordinate (the "outer" memory
+                         behind a coherent manager such as an L2/L3 cache).
+  * ``run_sim``       -- re-exported from ``axi_helpers``.
 
 The synthesizable RAM slave itself lives in
 ``roomsoc.interconnect.tilelink.SRAM``; this module adds only simulation
@@ -28,7 +33,12 @@ from amaranth.hdl.rec import Direction
 from roomsoc.interconnect import tilelink
 from roomsoc.interconnect.stream import Valid
 
-from axi_helpers import run_sim
+try:
+    from .axi_helpers import run_sim
+except ImportError:
+    # Interconnect tests historically import this module directly after pytest
+    # adds this directory to sys.path.
+    from axi_helpers import run_sim
 
 
 class TLSRAM(Elaboratable):
@@ -377,3 +387,211 @@ def tl_grantack(bus, *, sink):
     while not (yield bus.e.ready):
         yield
     yield bus.e.valid.eq(0)
+
+
+# ---------------------------------------------------------------------------
+# TileLink-C coherent subordinate (responder)
+#
+# The coherent-memory far-end for a TL-C manager such as an L2/L3 cache's
+# out_bus, or any coherent master. Backed by the golden TLRamModel store, and
+# the enabling "TLCResponder" piece the TL_TEST_PLAN deferred to Phase 8.
+# ---------------------------------------------------------------------------
+def drive_d(bus, *, opcode, param, source, sink, size, beats, data_fn):
+    """Drive ``beats`` D beats on ``bus`` as the D-side master (responder).
+
+    The complement of :func:`collect_d`: each beat is held valid (payload
+    stable) until accepted, honouring the Decoupled valid-stable invariant.
+    ``data_fn(i)`` returns beat ``i``'s data payload, or ``None`` for a
+    no-data Grant/ReleaseAck (the data field is driven 0).
+    """
+    yield bus.d.bits.opcode.eq(opcode)
+    yield bus.d.bits.param.eq(param)
+    yield bus.d.bits.size.eq(size)
+    yield bus.d.bits.source.eq(source)
+    yield bus.d.bits.sink.eq(sink)
+    yield bus.d.bits.denied.eq(0)
+    yield bus.d.bits.corrupt.eq(0)
+    for i in range(beats):
+        yield bus.d.bits.data.eq(data_fn(i) if data_fn else 0)
+        yield bus.d.valid.eq(1)
+        yield
+        while not (yield bus.d.ready):
+            yield
+    yield bus.d.valid.eq(0)
+    yield
+
+
+def _serve_acquire(bus, model, beat_bytes):
+    """Accept one AcquireBlock on A and answer with Grant/GrantData on D.
+
+    Grant beat counts come from the request's ``size`` field (a coherent
+    manager sets it to log2 of its line size), so any line geometry is served.
+    """
+    param = (yield bus.a.bits.param)
+    source = (yield bus.a.bits.source)
+    address = (yield bus.a.bits.address)
+    size = (yield bus.a.bits.size)
+
+    yield bus.a.ready.eq(1)
+    yield  # A beat fires at this edge
+    yield bus.a.ready.eq(0)
+
+    if param == tilelink.GrowParam.BtoT.value:
+        # Permission upgrade: the manager already holds the line's data.
+        yield from drive_d(bus,
+                           opcode=tilelink.ChannelDOpcode.Grant,
+                           param=tilelink.CapParam.toT,
+                           source=source,
+                           sink=0,
+                           size=size,
+                           beats=1,
+                           data_fn=None)
+        return
+
+    gparam = (tilelink.CapParam.toT
+              if param == tilelink.GrowParam.NtoT.value
+              else tilelink.CapParam.toB)
+    beats = max(1, (1 << size) // beat_bytes)
+    block = model.get(address, size)  # bytes, little-endian, length 1<<size
+
+    def read_beat(i, block=block, beat_bytes=beat_bytes):
+        return int.from_bytes(block[i * beat_bytes:(i + 1) * beat_bytes],
+                              "little")
+
+    yield from drive_d(bus,
+                       opcode=tilelink.ChannelDOpcode.GrantData,
+                       param=gparam,
+                       source=source,
+                       sink=0,
+                       size=size,
+                       beats=beats,
+                       data_fn=read_beat)
+
+
+def _serve_release(bus, model, beat_bytes):
+    """Accept one Release/ReleaseData on C and answer with ReleaseAck on D.
+
+    ReleaseData beats are committed to ``model`` (dirty writeback); a bare
+    Release carries no data.
+    """
+    opcode = (yield bus.c.bits.opcode)
+    source = (yield bus.c.bits.source)
+    address = (yield bus.c.bits.address)
+    size = (yield bus.c.bits.size)
+    has_data = opcode == tilelink.ChannelCOpcode.ReleaseData.value
+    beats = max(1, (1 << size) // beat_bytes) if has_data else 1
+
+    yield bus.c.ready.eq(1)
+    yield
+    got = 0
+    for _ in range(beats * 64 + 32):
+        if (yield bus.c.fire):
+            if has_data:
+                beat = (yield bus.c.bits.data)
+                model.put(address + got * beat_bytes, beat,
+                          (1 << beat_bytes) - 1)
+            got += 1
+            if got == beats:
+                break
+        yield
+    yield bus.c.ready.eq(0)
+
+    yield from drive_d(bus,
+                       opcode=tilelink.ChannelDOpcode.ReleaseAck,
+                       param=0,
+                       source=source,
+                       sink=0,
+                       size=size,
+                       beats=1,
+                       data_fn=None)
+
+
+def _issue_probe(bus, request, responses, beat_bytes):
+    """Issue one outer Probe and collect the cache's ProbeAck response."""
+    address, size, param, source = request
+    yield bus.b.bits.opcode.eq(tilelink.ChannelBOpcode.Probe)
+    yield bus.b.bits.param.eq(param)
+    yield bus.b.bits.size.eq(size)
+    yield bus.b.bits.source.eq(source)
+    yield bus.b.bits.address.eq(address)
+    yield bus.b.bits.mask.eq((1 << beat_bytes) - 1)
+    yield bus.b.valid.eq(1)
+    yield
+    while not (yield bus.b.ready):
+        yield
+    yield bus.b.valid.eq(0)
+
+    yield bus.c.ready.eq(1)
+    while not (yield bus.c.valid):
+        yield
+    opcode = (yield bus.c.bits.opcode)
+    report = (yield bus.c.bits.param)
+    response_source = (yield bus.c.bits.source)
+    has_data = opcode == tilelink.ChannelCOpcode.ProbeAckData.value
+    beats = max(1, (1 << size) // beat_bytes) if has_data else 1
+    data = 0
+    for beat in range(beats):
+        while not (yield bus.c.valid):
+            yield
+        data |= (yield bus.c.bits.data) << (beat * bus.data_width)
+        yield
+    yield bus.c.ready.eq(0)
+    responses.append((opcode, report, response_source, data))
+
+
+def tl_c_responder(bus, *, model, done, probes=None, probe_responses=None):
+    """Coherent TileLink-C memory subordinate (the "outer" memory).
+
+    Models the coherent memory behind a TL-C manager such as an L2/L3 cache's
+    ``out_bus``. It is the D-side master and the A/C/E/B slave:
+
+      * ``AcquireBlock`` on A -> ``GrantData`` (NtoB->toB, NtoT->toT); a BtoT
+        permission upgrade returns a no-data ``Grant`` (toT).
+      * ``Release``/``ReleaseData`` on C -> ``ReleaseAck``; ``ReleaseData``
+        beats are committed to ``model`` (dirty writeback).
+      * ``GrantAck`` on E is always accepted.
+      * ``Probe`` on B is never issued -- an outer memory does not probe down
+        into the cache.
+
+    ``model`` is a :class:`TLRamModel` (built with ``data_width=bus.data_width``)
+    backing the address space, or any object exposing
+    ``get(address, size) -> bytes`` and ``put(address, data, mask)``. Grant beat
+    counts are derived from each request's ``size`` field, so any line size is
+    handled. ``done`` is a one-element list ``[False]`` the driving coroutine
+    flips to ``[True]`` once its stimulus is complete, so the responder stops
+    and ``run_sim`` can return; pair it with a watchdog coroutine to turn a
+    DUT deadlock into a hard test failure instead of a hang.
+
+    The loop services one outer transaction at a time, which suffices for
+    sequential single-manager traffic; a pipelined manager simply sees
+    backpressure on the channels it cannot yet service. Multi-outstanding stress
+    traffic would need a synthesizable responder instead. If ``probes`` and
+    ``probe_responses`` lists are supplied, the driver may append
+    ``(address, size, CapParam, source)`` requests; the responder issues each
+    on B and appends ``(opcode, report, source, data)`` from the C response.
+    """
+    beat_bytes = bus.data_width // 8
+
+    yield bus.b.valid.eq(0)
+    yield bus.e.ready.eq(1)
+    yield bus.a.ready.eq(0)
+    yield bus.c.ready.eq(0)
+    yield bus.d.valid.eq(0)
+    yield
+
+    while not done[0]:
+        if probes:
+            request = probes.pop(0)
+            yield from _issue_probe(bus, request, probe_responses, beat_bytes)
+            continue
+        if (yield bus.a.valid) and not (yield bus.d.valid):
+            yield from _serve_acquire(bus, model, beat_bytes)
+            continue
+        if (yield bus.c.valid) and not (yield bus.d.valid):
+            yield from _serve_release(bus, model, beat_bytes)
+            continue
+        yield
+
+    yield bus.d.valid.eq(0)
+    yield bus.a.ready.eq(0)
+    yield bus.c.ready.eq(0)
