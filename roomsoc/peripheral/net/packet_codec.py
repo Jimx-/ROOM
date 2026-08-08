@@ -114,6 +114,7 @@ class RDMAConnectionSetup(Packet):
         LEIntField("remote_qpn", 2),
         StrFixedLenField("remote_ip", b"\x00" * 16, length=16),
         LEShortField("remote_port", 8000),
+        LEIntField("initial_rx_psn", 0),
     ]
 
 

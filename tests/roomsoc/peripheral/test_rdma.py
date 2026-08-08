@@ -67,13 +67,15 @@ def build_test_packets():
             local_qpn=2,
             remote_qpn=2,
             remote_ip=source_ip,
-            remote_port=8000),
+            remote_port=8000,
+            initial_rx_psn=1),
         _build_roce_packet(
             src_mac=alternate_driver_mac,
             opcode=BthOpcode.RC_RDMA_WRITE_ONLY,
             vaddr=0x1230,
             dmalen=16,
             payload=bytes(range(16)),
+            psn=1,
             **roce_common),
         _build_roce_packet(
             src_mac=driver_mac,
@@ -81,24 +83,28 @@ def build_test_packets():
             vaddr=0x1234,
             dmalen=4,
             payload=bytes.fromhex("abcdefff"),
+            psn=2,
             **roce_common),
         _build_roce_packet(
             src_mac=alternate_driver_mac,
             opcode=BthOpcode.RC_RDMA_READ_REQUEST,
             vaddr=0x1230,
             dmalen=16,
+            psn=3,
             **roce_common),
         _build_roce_packet(
             src_mac=driver_mac,
             opcode=BthOpcode.RC_RDMA_READ_REQUEST,
             vaddr=0x1230,
             dmalen=4,
+            psn=4,
             **roce_common),
         _build_roce_packet(
             src_mac=driver_mac,
             opcode=BthOpcode.RC_RDMA_READ_REQUEST,
             vaddr=0x1234,
             dmalen=4,
+            psn=5,
             **roce_common),
     ]
 
@@ -217,20 +223,26 @@ def _connection_setup(src_mac=DRIVER_MAC,
                       local_qpn=2,
                       remote_qpn=2,
                       remote_ip=SOURCE_IP,
-                      remote_port=8000):
+                      remote_port=8000,
+                      initial_rx_psn=0):
     """UDP connection-setup frame that populates the QP connection table."""
     setup = RDMAConnectionSetup(
         local_qpn=local_qpn,
         remote_qpn=remote_qpn,
         remote_ip=socket.inet_aton(remote_ip) + b"\x00" * 12,
-        remote_port=remote_port)
+        remote_port=remote_port,
+        initial_rx_psn=initial_rx_psn)
     return bytes(
         Ether(dst=_mac(DEVICE_MAC), src=_mac(src_mac))
         / IP(src=SOURCE_IP, dst=DEVICE_IP, id=1)
         / UDP(sport=500, dport=8000) / setup)
 
 
-def _roce_write(vaddr, payload, src_mac=DRIVER_MAC, dest_qp=2):
+def _roce_write(vaddr,
+                payload,
+                src_mac=DRIVER_MAC,
+                dest_qp=2,
+                psn=0):
     """RC RDMA_WRITE_ONLY frame carrying *payload* at *vaddr*."""
     return _build_roce_packet(src_mac=src_mac,
                               opcode=BthOpcode.RC_RDMA_WRITE_ONLY,
@@ -238,27 +250,43 @@ def _roce_write(vaddr, payload, src_mac=DRIVER_MAC, dest_qp=2):
                               dmalen=len(payload),
                               payload=payload,
                               dest_qp=dest_qp,
+                              psn=psn,
                               **_ROCE_COMMON)
 
 
-def _roce_read_request(vaddr, dmalen, src_mac=DRIVER_MAC, dest_qp=2):
+def _roce_read_request(vaddr,
+                       dmalen,
+                       src_mac=DRIVER_MAC,
+                       dest_qp=2,
+                       psn=0):
     """RC RDMA_READ_REQUEST frame for *dmalen* bytes at *vaddr*."""
     return _build_roce_packet(src_mac=src_mac,
                               opcode=BthOpcode.RC_RDMA_READ_REQUEST,
                               vaddr=vaddr,
                               dmalen=dmalen,
                               dest_qp=dest_qp,
+                              psn=psn,
                               **_ROCE_COMMON)
 
 
-def _link_established(*ops):
+def _link_established(*ops, initial_rx_psn=1):
     """Prepend ARP + connection-setup so the RDMA op frames in *ops* get ACKed.
 
     The ARP request seeds the ARP table with the peer's MAC (without it the UDP
     ACKs cannot be addressed and the TX path stalls) and the connection-setup
     frame populates the QP connection table the RoCE TX path looks up.
     """
-    return [_arp_request(HOST_MAC, SOURCE_IP), _connection_setup(), *ops]
+    return [
+        _arp_request(HOST_MAC, SOURCE_IP),
+        _connection_setup(initial_rx_psn=initial_rx_psn),
+        *ops,
+    ]
+
+
+def test_connection_setup_psn_is_little_endian_32_bit():
+    encoded = bytes(RDMAConnectionSetup(initial_rx_psn=0x123456))
+    assert encoded[-4:] == b"\x56\x34\x12\x00"
+    assert RDMAConnectionSetup(encoded).initial_rx_psn == 0x123456
 
 
 class RDMAConnectionServer(Elaboratable):
@@ -279,11 +307,14 @@ class RDMAConnectionServer(Elaboratable):
             ('remote_qpn', 32, Direction.FANOUT),
             ('remote_ip', 128, Direction.FANOUT),
             ('remote_port', 16, Direction.FANOUT),
+            ('initial_rx_psn', 32, Direction.FANOUT),
         ]
         meta_q = m.submodules.meta_q = Queue(2, UdpIpMetadata, flow=False)
         depacketizer = m.submodules.depacketizer = AXIStreamDepacketizer(
             Record, payload_layout, data_width=self.data_width)
         m.d.comb += self.rx_meta_in.connect(meta_q.enq)
+
+        setup_valid = Signal()
 
         with m.FSM():
             with m.State("IDLE"):
@@ -294,6 +325,10 @@ class RDMAConnectionServer(Elaboratable):
                 m.d.comb += self.rx_data_in.connect(depacketizer.sink)
                 with m.If(depacketizer.source.valid):
                     m.d.sync += [
+                        setup_valid.eq(
+                            (depacketizer.header.local_qpn[24:] == 0)
+                            & (depacketizer.header.remote_qpn[24:] == 0)
+                            & (depacketizer.header.initial_rx_psn[24:] == 0)),
                         self.conn_req.bits.local_qpn.eq(
                             depacketizer.header.local_qpn),
                         self.conn_req.bits.remote_qpn.eq(
@@ -302,6 +337,8 @@ class RDMAConnectionServer(Elaboratable):
                             depacketizer.header.remote_ip),
                         self.conn_req.bits.remote_port.eq(
                             depacketizer.header.remote_port),
+                        self.conn_req.bits.initial_rx_psn.eq(
+                            depacketizer.header.initial_rx_psn[:24]),
                     ]
                     m.next = "DRAIN"
 
@@ -309,7 +346,14 @@ class RDMAConnectionServer(Elaboratable):
                 m.d.comb += depacketizer.source.ready.eq(1)
                 with m.If(depacketizer.source.fire
                           & depacketizer.source.bits.last):
-                    m.next = "WRITE"
+                    with m.If(setup_valid):
+                        m.next = "WRITE"
+                    with m.Else():
+                        m.next = "REJECT"
+
+            with m.State("REJECT"):
+                m.d.comb += meta_q.deq.ready.eq(1)
+                m.next = "IDLE"
 
             with m.State("WRITE"):
                 m.d.comb += self.conn_req.valid.eq(1)
@@ -783,8 +827,8 @@ def test_rdma_write_then_read_roundtrip(vaddr, payload):
     # 256-word SRAM -- since both WRITE and READ apply the identical
     # address->word mapping, so the payload must round-trip in every case.
     requests = _link_established(
-        _roce_write(vaddr, payload),
-        _roce_read_request(vaddr, len(payload)),
+        _roce_write(vaddr, payload, psn=1),
+        _roce_read_request(vaddr, len(payload), psn=2),
     )
     responses, _ = run_rdma(requests)
 
@@ -805,8 +849,8 @@ def test_rdma_write_on_each_qpn_is_acked(qpn):
     # built by hand rather than via _link_established, which always seeds QP 2.)
     requests = [
         _arp_request(HOST_MAC, SOURCE_IP),
-        _connection_setup(local_qpn=qpn, remote_qpn=qpn),
-        _roce_write(0x1230, bytes(range(8)), dest_qp=qpn),
+        _connection_setup(local_qpn=qpn, remote_qpn=qpn, initial_rx_psn=1),
+        _roce_write(0x1230, bytes(range(8)), dest_qp=qpn, psn=1),
     ]
     responses, _ = run_rdma(requests)
 
@@ -814,6 +858,53 @@ def test_rdma_write_on_each_qpn_is_acked(qpn):
     ack = Ether(responses[2])
     assert ack[BTH].opcode == BthOpcode.RC_ACKNOWLEDGE
     assert ack[BTH].dest_qp == qpn
+
+
+def test_connection_setup_programs_nonzero_responder_psn():
+    initial_psn = 0x123456
+    accepted_addr = 0x1230
+    rejected_addr = 0x1240
+    accepted_word = (accepted_addr // 8) % Top.SRAM_DEPTH
+    rejected_word = (rejected_addr // 8) % Top.SRAM_DEPTH
+    payload = bytes.fromhex("0123456789abcdef")
+
+    requests = _link_established(
+        _roce_write(accepted_addr, payload, psn=initial_psn),
+        _roce_write(rejected_addr, bytes(range(8)), psn=0),
+        initial_rx_psn=initial_psn,
+    )
+    responses, sram = run_rdma(
+        requests, sram_addresses=(accepted_word, rejected_word))
+
+    # ARP + setup ACK + ACK for the matching request. The PSN-0 request is
+    # rejected, proving the programmed value did not come from reset state.
+    assert len(responses) == 3
+    ack = Ether(responses[2])
+    assert ack[BTH].opcode == BthOpcode.RC_ACKNOWLEDGE
+    assert ack[BTH].psn == initial_psn
+    assert sram == {
+        accepted_word: int.from_bytes(payload, "little"),
+        rejected_word: rejected_word,
+    }
+
+
+@pytest.mark.parametrize("invalid_field", [
+    "local_qpn",
+    "remote_qpn",
+    "initial_rx_psn",
+])
+def test_connection_setup_rejects_values_wider_than_wire_protocol(
+        invalid_field):
+    setup_args = {invalid_field: 0x1000000}
+    requests = [
+        _arp_request(HOST_MAC, SOURCE_IP),
+        _connection_setup(**setup_args),
+    ]
+    responses, _ = run_rdma(requests)
+
+    # Invalid setup is drained without a connection-table write or setup ACK.
+    assert len(responses) == 1
+    assert ARP in Ether(responses[0])
 
 
 def test_arp_table_resolves_multiple_peers():
@@ -826,10 +917,10 @@ def test_arp_table_resolves_multiple_peers():
     requests = [
         _arp_request(HOST_MAC, SOURCE_IP),
         _arp_request(peer_b_mac, peer_b_ip),
-        _connection_setup(local_qpn=2, remote_ip=SOURCE_IP),
-        _connection_setup(local_qpn=5, remote_ip=peer_b_ip),
-        _roce_write(0x1230, bytes(range(8)), dest_qp=2),
-        _roce_write(0x1240, bytes(range(8)), dest_qp=5),
+        _connection_setup(local_qpn=2, remote_ip=SOURCE_IP, initial_rx_psn=1),
+        _connection_setup(local_qpn=5, remote_ip=peer_b_ip, initial_rx_psn=1),
+        _roce_write(0x1230, bytes(range(8)), dest_qp=2, psn=1),
+        _roce_write(0x1240, bytes(range(8)), dest_qp=5, psn=1),
     ]
     responses, _ = run_rdma(requests)
 
@@ -852,19 +943,15 @@ def _roce_with_opcode(frame, opcode):
     return roce_codec.finalize_roce(packet)
 
 
-def test_rdma_write_without_connection_is_unroutable():
-    # A WRITE arriving before any connection setup still executes its DMA (the
-    # dropper / state-table path is independent of the connection table), but
-    # its ACK cannot be routed: the connection-table miss yields a zero peer IP
-    # with no ARP entry, so mac_ip_encoder drops the ACK. No TX frame emerges,
-    # yet SRAM is written -- pinning the current (debatable) behaviour that
-    # unroutable ops still DMA.
+def test_rdma_write_without_connection_is_dropped():
+    # A WRITE arriving before any connection setup is rejected by the state
+    # table (valid bit is clear), so there is no DMA side effect and no ACK.
     word = (0x1234 // 8) % Top.SRAM_DEPTH
     requests = [_roce_write(0x1234, bytes.fromhex("abcdefff"))]
     responses, sram = run_rdma(requests, sram_addresses=(word, ))
 
     assert responses == []
-    assert sram == {word: 0xffefcdab00000046}
+    assert sram == {word: word}
 
 
 def test_unrelated_udp_port_is_filtered():
@@ -896,11 +983,58 @@ def test_roce_unsupported_opcode_is_dropped():
     assert sram == {word: word}
 
 
+def test_incoming_ack_does_not_advance_responder_psn():
+    incoming_ack = _build_roce_packet(
+        src_mac=DRIVER_MAC,
+        opcode=BthOpcode.RC_ACKNOWLEDGE,
+        psn=1,
+        **_ROCE_COMMON,
+    )
+    requests = _link_established(
+        incoming_ack,
+        _roce_write(0x1230, bytes(range(8)), psn=1),
+    )
+    word = (0x1230 // 8) % Top.SRAM_DEPTH
+    responses, sram = run_rdma(requests, sram_addresses=(word, ))
+
+    # The endpoint has no requester state, so the incoming ACK is discarded.
+    # The following responder request must still be accepted at PSN 1.
+    assert len(responses) == 3, sram
+    ack = Ether(responses[2])
+    assert ack[BTH].opcode == BthOpcode.RC_ACKNOWLEDGE
+    assert ack[BTH].psn == 1
+
+
+def test_unsupported_write_fragment_does_not_advance_or_execute():
+    rejected_addr = 0x1230
+    accepted_addr = 0x1240
+    rejected_word = (rejected_addr // 8) % Top.SRAM_DEPTH
+    accepted_word = (accepted_addr // 8) % Top.SRAM_DEPTH
+    rejected = _roce_with_opcode(
+        _roce_write(rejected_addr, bytes.fromhex("deadbeefcafef00d"), psn=1),
+        0x06,  # RC_RDMA_WRITE_FIRST; outside packet_codec's supported enum.
+    )
+    accepted_payload = bytes(range(8))
+    requests = _link_established(
+        rejected,
+        _roce_write(accepted_addr, accepted_payload, psn=1),
+    )
+    responses, sram = run_rdma(
+        requests, sram_addresses=(rejected_word, accepted_word))
+
+    assert len(responses) == 3
+    assert Ether(responses[2])[BTH].psn == 1
+    assert sram == {
+        rejected_word: rejected_word,
+        accepted_word: int.from_bytes(accepted_payload, "little"),
+    }
+
+
 def _backpressure_scenario():
     return _link_established(
-        _roce_write(0x1230, bytes(range(8))),
-        _roce_write(0x1234, bytes.fromhex("abcdefff")),
-        _roce_read_request(0x1230, 16),
+        _roce_write(0x1230, bytes(range(8)), psn=1),
+        _roce_write(0x1234, bytes.fromhex("abcdefff"), psn=2),
+        _roce_read_request(0x1230, 16, psn=3),
     )
 
 
@@ -977,6 +1111,7 @@ def _random_trace(rng, count):
     operations = []
     expected = []
     hot_vaddr = 0x1230
+    psn = 1
     for index, kind in enumerate(kinds):
         size = rng.choice((4, 8, 16, 24, 32))
         if index % 3 == 0:
@@ -990,13 +1125,14 @@ def _random_trace(rng, count):
 
         if kind == "write":
             payload = bytes(rng.randrange(256) for _ in range(size))
-            operations.append(_roce_write(vaddr, payload))
+            operations.append(_roce_write(vaddr, payload, psn=psn))
             _model_write(memory, vaddr, payload)
-            expected.append((BthOpcode.RC_ACKNOWLEDGE, b""))
+            expected.append((BthOpcode.RC_ACKNOWLEDGE, b"", psn))
         else:
-            operations.append(_roce_read_request(vaddr, size))
+            operations.append(_roce_read_request(vaddr, size, psn=psn))
             expected.append((BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
-                             _model_read(memory, vaddr, size)))
+                             _model_read(memory, vaddr, size), psn))
+        psn += 1
 
     return operations, expected
 
@@ -1021,7 +1157,7 @@ def test_rdma_randomized_trace_roundtrips_and_survives_backpressure(seed):
 
     assert len(reference) == 2 + len(operations)  # ARP + conn ack + each op
     operation_responses = [Ether(frame) for frame in reference[2:]]
-    assert [(packet[BTH].opcode, _roce_payload(packet))
+    assert [(packet[BTH].opcode, _roce_payload(packet), packet[BTH].psn)
             for packet in operation_responses] == expected
 
     ready = lambda cycle, s=seed: ((cycle * 1103515245 + 12345 + s) >> 8) % 10 >= 3
@@ -1030,3 +1166,122 @@ def test_rdma_randomized_trace_roundtrips_and_survives_backpressure(seed):
                            tx_ready_fn=ready,
                            rx_gap=operation_gap)
     assert stressed == reference
+
+
+def test_replay_of_old_psn_is_rejected():
+    # Two in-order writes are accepted; replaying the first PSN is rejected
+    # without a second DMA side effect or ACK.
+    word_a = (0x1230 // 8) % Top.SRAM_DEPTH
+    word_b = (0x1260 // 8) % Top.SRAM_DEPTH
+    payload_a = bytes(range(8))
+    payload_b = bytes(range(8, 16))
+    replay_payload = bytes.fromhex("deadbeefcafef00d")
+    requests = _link_established(
+        _roce_write(0x1230, payload_a, psn=1),
+        _roce_write(0x1260, payload_b, psn=2),
+        _roce_write(0x1230, replay_payload, psn=1),
+    )
+    responses, sram = run_rdma(requests, sram_addresses=(word_a, word_b))
+
+    assert len(responses) == 4  # ARP + conn ack + 2 write ACKs (replay dropped)
+    acks = [Ether(f) for f in responses[2:]]
+    assert [a[BTH].psn for a in acks] == [1, 2]
+    assert sram == {
+        word_a: int.from_bytes(payload_a, "little"),
+        word_b: int.from_bytes(payload_b, "little"),
+    }
+
+
+def test_future_psn_does_not_advance_state():
+    # A future PSN is rejected without advancing resp_epsn; the expected PSN
+    # that follows is still accepted.
+    future_addr = 0x1230
+    expected_addr = 0x1240
+    future_word = (future_addr // 8) % Top.SRAM_DEPTH
+    expected_word = (expected_addr // 8) % Top.SRAM_DEPTH
+    future_payload = bytes.fromhex("deadbeefcafef00d")
+    expected_payload = bytes(range(8))
+    requests = _link_established(
+        _roce_write(future_addr, future_payload, psn=100),
+        _roce_write(expected_addr, expected_payload, psn=1),
+    )
+    responses, sram = run_rdma(
+        requests, sram_addresses=(future_word, expected_word))
+
+    assert len(responses) == 3  # ARP + conn ack + 1 ACK (future dropped)
+    ack = Ether(responses[2])
+    assert ack[BTH].psn == 1
+    assert sram == {
+        future_word: future_word,
+        expected_word: int.from_bytes(expected_payload, "little"),
+    }
+
+
+def test_psn_wrap_across_boundary():
+    # Three writes whose PSNs cross the 24-bit wrap are all accepted.
+    addrs = [0x1230, 0x1238, 0x1240]
+    words = [(a // 8) % Top.SRAM_DEPTH for a in addrs]
+    payloads = [bytes(range(8)), bytes(range(8, 16)), bytes(range(16, 24))]
+    requests = _link_established(
+        _roce_write(addrs[0], payloads[0], psn=0xfffffe),
+        _roce_write(addrs[1], payloads[1], psn=0xffffff),
+        _roce_write(addrs[2], payloads[2], psn=0),
+        initial_rx_psn=0xfffffe,
+    )
+    responses, sram = run_rdma(requests, sram_addresses=tuple(words))
+
+    assert len(responses) == 5  # ARP + conn ack + 3 write ACKs
+    acks = [Ether(f) for f in responses[2:]]
+    assert [a[BTH].psn for a in acks] == [0xfffffe, 0xffffff, 0]
+    assert sram == {
+        words[i]: int.from_bytes(payloads[i], "little") for i in range(3)
+    }
+
+
+def test_two_qps_with_different_starting_psns_are_isolated():
+    # Two QPs configured with different starting PSNs each accept their own
+    # first request; neither QP's state interferes with the other.
+    addrs = (0x1230, 0x1240, 0x1250, 0x1260, 0x1270)
+    words = tuple((addr // 8) % Top.SRAM_DEPTH for addr in addrs)
+    requests = [
+        _arp_request(HOST_MAC, SOURCE_IP),
+        _connection_setup(local_qpn=2, remote_qpn=2, initial_rx_psn=0x100),
+        _connection_setup(local_qpn=5, remote_qpn=5, initial_rx_psn=0x200),
+        _roce_write(addrs[0], bytes(range(8)), dest_qp=2, psn=0x100),
+        _roce_write(addrs[1], bytes(range(8, 16)), dest_qp=5, psn=0x200),
+        # A future QP-2 PSN must not affect QP 5 or advance QP 2.
+        _roce_write(addrs[2], bytes(range(16, 24)), dest_qp=2, psn=0x102),
+        _roce_write(addrs[3], bytes(range(24, 32)), dest_qp=5, psn=0x201),
+        _roce_write(addrs[4], bytes(range(32, 40)), dest_qp=2, psn=0x101),
+    ]
+    responses, sram = run_rdma(requests, sram_addresses=words)
+
+    assert len(responses) == 7  # ARP + 2 setup ACKs + 4 accepted writes
+    acks = [Ether(f) for f in responses[3:]]
+    assert [(ack[BTH].dest_qp, ack[BTH].psn) for ack in acks] == [
+        (2, 0x100),
+        (5, 0x200),
+        (5, 0x201),
+        (2, 0x101),
+    ]
+    assert sram == {
+        words[0]: int.from_bytes(bytes(range(8)), "little"),
+        words[1]: int.from_bytes(bytes(range(8, 16)), "little"),
+        words[2]: words[2],
+        words[3]: int.from_bytes(bytes(range(24, 32)), "little"),
+        words[4]: int.from_bytes(bytes(range(32, 40)), "little"),
+    }
+
+
+@pytest.mark.parametrize("qpn", [64, 65, 0xffffff])
+def test_out_of_range_qpn_is_dropped(qpn):
+    # A write to a QPN >= max_qps is rejected by the state table range
+    # check without DMA or ACK.
+    word = (0x1230 // 8) % Top.SRAM_DEPTH
+    requests = _link_established(
+        _roce_write(0x1230, bytes(range(8)), dest_qp=qpn, psn=1),
+    )
+    responses, sram = run_rdma(requests, sram_addresses=(word, ))
+
+    assert len(responses) == 2  # ARP + conn ack only
+    assert sram == {word: word}

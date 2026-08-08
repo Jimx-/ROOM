@@ -2,8 +2,6 @@ from enum import IntEnum
 from amaranth import *
 from amaranth.hdl.rec import Direction
 
-from room.utils import Arbiter
-
 from roomsoc.interconnect.axi import AXIStreamInterface, AXIStreamDepacketizer, AXIStreamPacketizer
 from roomsoc.interconnect.stream import Decoupled, Valid, Queue
 
@@ -132,6 +130,11 @@ def _opcode_no_data(opcode):
         opcode == BthOpcode.RC_ACKNOWLEDGE)
 
 
+def _opcode_is_supported_responder_request(opcode):
+    return (opcode == BthOpcode.RC_RDMA_WRITE_ONLY) | (
+        opcode == BthOpcode.RC_RDMA_READ_REQUEST)
+
+
 IB_BTH_LAYOUT = [
     ("opcode", 8, Direction.FANOUT),
     ("version", 4, Direction.FANOUT),
@@ -247,14 +250,18 @@ class InfiniBandDepacketizer(Elaboratable):
         with m.FSM():
             with m.State('IDLE'):
                 with m.If(bth_depacketizer.source.valid):
-                    m.d.comb += meta_q.enq.valid.eq(1)
-
-                    with m.If(meta_q.enq.fire):
-                        with m.If(_opcode_is_reth(bth_header.opcode)):
+                    with m.If(_opcode_is_supported_responder_request(
+                            bth_header.opcode)):
+                        m.d.comb += meta_q.enq.valid.eq(1)
+                        with m.If(meta_q.enq.fire):
                             m.next = 'RETH_HEADER'
-                        with m.Elif(_opcode_is_aeth(bth_header.opcode)):
-                            m.next = 'AETH_HEADER'
-                        with m.Else():
+                    with m.Else():
+                        # This endpoint is responder-only. Consume unsupported
+                        # request fragments and all response/ACK packets before
+                        # they allocate metadata or touch responder PSN state.
+                        m.d.comb += bth_depacketizer.source.ready.eq(1)
+                        with m.If(bth_depacketizer.source.fire
+                                  & ~bth_depacketizer.source.bits.last):
                             m.next = 'DROP'
 
             with m.State('RETH_HEADER'):
@@ -293,7 +300,10 @@ class InfiniBandDepacketizer(Elaboratable):
                     m.next = 'AETH_DATA'
 
             with m.State('AETH_DATA'):
-                m.d.comb += aeth_depacketizer.source.ready.eq(1)
+                m.d.comb += [
+                    bth_depacketizer.source.connect(aeth_depacketizer.sink),
+                    aeth_depacketizer.source.ready.eq(1),
+                ]
 
                 with m.If(aeth_depacketizer.source.fire
                           & aeth_depacketizer.source.bits.last):
@@ -341,42 +351,122 @@ class StateTable(Elaboratable):
 
         def __init__(self, name=None, src_loc_at=0):
             super().__init__([
-                ('epsn', 24, Direction.FANOUT),
+                ('valid', 1, Direction.FANOUT),
+                ('resp_epsn', 24, Direction.FANOUT),
+            ],
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
+
+    class LookupReq(Record):
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__([
+                ('qpn', 24, Direction.FANOUT),
+            ],
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
+
+    class CommitReq(Record):
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__([
+                ('qpn', 24, Direction.FANOUT),
+                ('valid', 1, Direction.FANOUT),
+                ('resp_epsn', 24, Direction.FANOUT),
+            ],
+                             name=name,
+                             src_loc_at=1 + src_loc_at)
+
+    class InitReq(Record):
+
+        def __init__(self, name=None, src_loc_at=0):
+            super().__init__([
+                ('qpn', 24, Direction.FANOUT),
+                ('resp_epsn', 24, Direction.FANOUT),
             ],
                              name=name,
                              src_loc_at=1 + src_loc_at)
 
     def __init__(self, max_qps):
+        if max_qps <= 0:
+            raise ValueError("max_qps must be positive")
         self.max_qps = max_qps
+        self.index_width = max(1, (max_qps - 1).bit_length())
 
-        self.read = [Decoupled(Signal, 16, name=f'read{i}') for i in range(1)]
-        self.resp = [
-            Valid(StateTable.Entry, name=f'resp{i}') for i in range(1)
-        ]
+        self.read = Decoupled(StateTable.LookupReq)
+        self.resp = Valid(StateTable.Entry)
+
+        self.commit = Decoupled(StateTable.CommitReq)
+        self.init = Decoupled(StateTable.InitReq)
 
     def elaborate(self, platform):
         m = Module()
 
-        mem = Memory(width=len(self.resp[0].bits), depth=self.max_qps)
+        mem = Memory(width=len(self.resp.bits), depth=self.max_qps)
         mem_rport = m.submodules.mem_rport = mem.read_port(transparent=False)
+        mem_wport = m.submodules.mem_wport = mem.write_port()
 
-        read_arbiter = m.submodules.read_arbiter = Arbiter(
-            len(self.read), Signal, 16)
-        for r, rr in zip(self.read, read_arbiter.inp):
-            m.d.comb += r.connect(rr)
+        # One-entry transaction lock: an RX read-modify-write owns the table
+        # from lookup fire until commit fire, so a connection-init write cannot
+        # land between the lookup and the commit of the same QP.
+        busy = Signal()
+        owner_qpn = Signal(24)
+
+        iw = self.index_width
+
+        in_range = Signal()
+        m.d.comb += in_range.eq(self.read.bits.qpn < self.max_qps)
+
+        in_range_r = Signal()
+        with m.If(self.read.fire):
+            m.d.sync += in_range_r.eq(in_range)
+
+        read_entry = StateTable.Entry()
+        m.d.comb += read_entry.eq(mem_rport.data)
 
         m.d.comb += [
-            mem_rport.addr.eq(read_arbiter.out.bits),
-            read_arbiter.out.ready.eq(1),
+            mem_rport.addr.eq(self.read.bits.qpn[:iw]),
+            self.read.ready.eq(~busy),
+            self.resp.bits.valid.eq(read_entry.valid & in_range_r),
+            self.resp.bits.resp_epsn.eq(read_entry.resp_epsn),
         ]
 
-        for r in self.resp:
-            m.d.comb += r.bits.eq(mem_rport.data)
-            m.d.sync += r.valid.eq(0)
+        m.d.sync += self.resp.valid.eq(0)
+        with m.If(self.read.fire):
+            m.d.sync += [
+                self.resp.valid.eq(1),
+                busy.eq(1),
+                owner_qpn.eq(self.read.bits.qpn),
+            ]
 
-        for r, rs in zip(self.read, self.resp):
-            with m.If(r.fire):
-                m.d.sync += rs.valid.eq(1)
+        commit_in_range = Signal()
+        init_in_range = Signal()
+        m.d.comb += [
+            commit_in_range.eq(self.commit.bits.qpn < self.max_qps),
+            init_in_range.eq(self.init.bits.qpn < self.max_qps),
+        ]
+
+        commit_matches = Signal()
+        m.d.comb += commit_matches.eq(busy
+                                      & (self.commit.bits.qpn == owner_qpn))
+
+        with m.If(self.commit.valid & commit_matches):
+            m.d.comb += [
+                mem_wport.addr.eq(self.commit.bits.qpn[:iw]),
+                mem_wport.data.eq(Cat(self.commit.bits.valid,
+                                      self.commit.bits.resp_epsn)),
+                mem_wport.en.eq(self.commit.fire & commit_in_range),
+                self.commit.ready.eq(1),
+            ]
+            with m.If(self.commit.fire):
+                m.d.sync += busy.eq(0)
+        with m.Elif(self.init.valid & ~busy & ~self.read.valid):
+            m.d.comb += [
+                mem_wport.addr.eq(self.init.bits.qpn[:iw]),
+                mem_wport.data.eq(Cat(Const(1, 1), self.init.bits.resp_epsn)),
+                mem_wport.en.eq(self.init.fire & init_in_range),
+                self.init.ready.eq(1),
+            ]
 
         return m
 
@@ -401,12 +491,17 @@ class ConnectionTable(Elaboratable):
         def __init__(self, name=None, src_loc_at=0):
             super().__init__([
                 ('local_qpn', 24, Direction.FANOUT),
-            ] + ConnectionTable.Entry._layout,
+            ] + ConnectionTable.Entry._layout + [
+                ('initial_rx_psn', 24, Direction.FANOUT),
+            ],
                              name=name,
                              src_loc_at=1 + src_loc_at)
 
     def __init__(self, max_qps):
+        if max_qps <= 0:
+            raise ValueError("max_qps must be positive")
         self.max_qps = max_qps
+        self.index_width = max(1, (max_qps - 1).bit_length())
 
         self.read = Decoupled(Signal, 24)
         self.resp = Valid(ConnectionTable.Entry)
@@ -419,10 +514,17 @@ class ConnectionTable(Elaboratable):
         mem = Memory(width=len(self.resp.bits), depth=self.max_qps)
         mem_rport = m.submodules.mem_rport = mem.read_port(transparent=False)
 
+        iw = self.index_width
+        read_in_range = Signal()
+        read_in_range_r = Signal()
+        m.d.comb += read_in_range.eq(self.read.bits < self.max_qps)
+        with m.If(self.read.fire):
+            m.d.sync += read_in_range_r.eq(read_in_range)
+
         m.d.comb += [
-            mem_rport.addr.eq(self.read.bits),
+            mem_rport.addr.eq(self.read.bits[:iw]),
             self.read.ready.eq(1),
-            self.resp.bits.eq(mem_rport.data),
+            self.resp.bits.eq(Mux(read_in_range_r, mem_rport.data, 0)),
         ]
 
         m.d.sync += self.resp.valid.eq(0)
@@ -431,14 +533,55 @@ class ConnectionTable(Elaboratable):
 
         mem_wport = m.submodules.mem_wport = mem.write_port()
         write_entry = ConnectionTable.Entry()
+        write_in_range = Signal()
         m.d.comb += [
+            write_in_range.eq(self.write.bits.local_qpn < self.max_qps),
             write_entry.remote_qpn.eq(self.write.bits.remote_qpn),
             write_entry.remote_ip.eq(self.write.bits.remote_ip),
             write_entry.remote_port.eq(self.write.bits.remote_port),
-            mem_wport.addr.eq(self.write.bits.local_qpn),
+            mem_wport.addr.eq(self.write.bits.local_qpn[:iw]),
             mem_wport.data.eq(write_entry),
-            mem_wport.en.eq(self.write.valid),
+            mem_wport.en.eq(self.write.fire & write_in_range),
             self.write.ready.eq(1),
+        ]
+
+        return m
+
+
+class _ConnectionInitializer(Elaboratable):
+    """Atomically fork connection setup into routing and responder state.
+
+    Invalid local QPNs are consumed without updating either table. This keeps
+    the connection producer live while preventing an out-of-range QPN from
+    aliasing a low routing-table entry.
+    """
+
+    def __init__(self, max_qps):
+        self.max_qps = max_qps
+        self.req = Decoupled(ConnectionTable.WriteRequest)
+        self.conn_write = Decoupled(ConnectionTable.WriteRequest)
+        self.state_init = Decoupled(StateTable.InitReq)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        in_range = Signal()
+        m.d.comb += [
+            in_range.eq(self.req.bits.local_qpn < self.max_qps),
+
+            self.conn_write.bits.eq(self.req.bits),
+            self.conn_write.valid.eq(
+                self.req.valid & in_range & self.state_init.ready),
+
+            self.state_init.bits.qpn.eq(self.req.bits.local_qpn),
+            self.state_init.bits.resp_epsn.eq(
+                self.req.bits.initial_rx_psn),
+            self.state_init.valid.eq(
+                self.req.valid & in_range & self.conn_write.ready),
+
+            self.req.ready.eq(
+                ~in_range
+                | (self.conn_write.ready & self.state_init.ready)),
         ]
 
         return m
@@ -457,8 +600,9 @@ class InfiniBandDropper(Elaboratable):
         self.aeth_out = Decoupled(Record, IB_AETH_LAYOUT)
         self.reth_out = Decoupled(Record, IB_RETH_LAYOUT)
 
-        self.state_read = Decoupled(Signal, 16)
+        self.state_read = Decoupled(StateTable.LookupReq)
         self.state_resp = Valid(StateTable.Entry)
+        self.state_commit = Decoupled(StateTable.CommitReq)
 
         self.data_in = AXIStreamInterface(data_width=data_width)
         self.data_out = AXIStreamInterface(data_width=data_width)
@@ -467,6 +611,8 @@ class InfiniBandDropper(Elaboratable):
         m = Module()
 
         meta = InfiniBandMetadata()
+        state_entry = StateTable.Entry()
+        state_match = Signal()
 
         meta_q = m.submodules.meta_q = Queue(4, InfiniBandMetadata)
         m.d.comb += [
@@ -490,24 +636,70 @@ class InfiniBandDropper(Elaboratable):
                                & self.aeth_in.valid)
                               | (_opcode_is_reth(self.meta_in.bits.opcode)
                                  & self.reth_in.valid)):
-                        m.d.comb += [
-                            self.state_read.bits.eq(self.meta_in.bits.dest_qp),
-                            self.state_read.valid.eq(1),
-                        ]
+                        with m.If(_opcode_is_supported_responder_request(
+                                self.meta_in.bits.opcode)):
+                            m.d.comb += [
+                                self.state_read.bits.qpn.eq(
+                                    self.meta_in.bits.dest_qp),
+                                self.state_read.valid.eq(1),
+                            ]
 
-                        with m.If(self.state_read.fire):
+                            with m.If(self.state_read.fire):
+                                m.d.comb += self.meta_in.ready.eq(1)
+                                m.d.sync += [
+                                    meta.eq(self.meta_in.bits),
+                                    is_aeth.eq(
+                                        _opcode_is_aeth(
+                                            self.meta_in.bits.opcode)),
+                                ]
+
+                                m.next = 'CHECK'
+                        with m.Else():
+                            # This endpoint has no requester state. Drain
+                            # recognized ACK/read-response and unsupported
+                            # request-fragment opcodes without looking up or
+                            # advancing responder PSN state.
                             m.d.comb += self.meta_in.ready.eq(1)
                             m.d.sync += [
                                 meta.eq(self.meta_in.bits),
                                 is_aeth.eq(
                                     _opcode_is_aeth(self.meta_in.bits.opcode)),
                             ]
-
-                            m.next = 'CHECK'
+                            with m.If(_opcode_no_data(
+                                    self.meta_in.bits.opcode)):
+                                # Let RxHandler consume header-only ACKs; its
+                                # default opcode path discards them. This also
+                                # preserves depacketizer stream alignment.
+                                m.next = 'FORWARD_META'
+                            with m.Else():
+                                m.next = 'DROP_META'
 
             with m.State('CHECK'):
                 with m.If(self.state_resp.valid):
-                    with m.If(self.state_resp.bits.epsn == meta.psn):
+                    m.d.sync += [
+                        state_entry.eq(self.state_resp.bits),
+                        state_match.eq(
+                            self.state_resp.bits.valid
+                            & (self.state_resp.bits.resp_epsn
+                               == meta.psn)),
+                    ]
+                    m.next = 'COMMIT'
+
+            # Close the StateTable transaction: on accept advance
+            # resp_epsn by one (24-bit wrap); on reject write the entry
+            # back unchanged.
+            with m.State('COMMIT'):
+                m.d.comb += [
+                    self.state_commit.bits.qpn.eq(meta.dest_qp),
+                    self.state_commit.bits.valid.eq(state_entry.valid),
+                    self.state_commit.bits.resp_epsn.eq(
+                        Mux(state_match,
+                            (state_entry.resp_epsn + 1)[:24],
+                            state_entry.resp_epsn)),
+                    self.state_commit.valid.eq(1),
+                ]
+                with m.If(self.state_commit.fire):
+                    with m.If(state_match):
                         m.next = 'FORWARD_META'
                     with m.Else():
                         m.next = 'DROP_META'
@@ -695,6 +887,7 @@ class ReadFragmenter(Elaboratable):
             event_q.enq.bits.qpn.eq(self.req.bits.qpn),
             event_q.enq.bits.addr.eq(self.req.bits.vaddr),
             event_q.enq.bits.len.eq(self.req.bits.dmalen),
+            event_q.enq.bits.psn.eq(self.req.bits.psn),
             event_q.enq.valid.eq(self.req.valid & cmd_q.enq.ready),
             self.req.ready.eq(cmd_q.enq.ready & event_q.enq.ready),
         ]
@@ -1034,7 +1227,13 @@ class InfiniBandTransportProtocol(Elaboratable):
 
         conn_table = m.submodules.conn_table = ConnectionTable(
             max_qps=self.max_qps)
-        m.d.comb += self.conn_req.connect(conn_table.write)
+        conn_initializer = m.submodules.conn_initializer = (
+            _ConnectionInitializer(max_qps=self.max_qps))
+        m.d.comb += [
+            self.conn_req.connect(conn_initializer.req),
+            conn_initializer.conn_write.connect(conn_table.write),
+            conn_initializer.state_init.connect(state_table.init),
+        ]
 
         depacketizer = m.submodules.depacketizer = InfiniBandDepacketizer(
             data_width=self.data_width)
@@ -1047,8 +1246,9 @@ class InfiniBandTransportProtocol(Elaboratable):
             depacketizer.reth.connect(dropper.reth_in),
             depacketizer.aeth.connect(dropper.aeth_in),
             depacketizer.data_out.connect(dropper.data_in),
-            dropper.state_read.connect(state_table.read[0]),
-            dropper.state_resp.eq(state_table.resp[0]),
+            dropper.state_read.connect(state_table.read),
+            dropper.state_resp.eq(state_table.resp),
+            dropper.state_commit.connect(state_table.commit),
         ]
 
         rx_handler = m.submodules.rx_handler = RxHandler(
