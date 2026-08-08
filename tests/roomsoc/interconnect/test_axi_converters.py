@@ -3,10 +3,12 @@ import pytest
 from amaranth import *
 from amaranth.sim import Simulator
 
-from roomsoc.interconnect.axi import (AXI2AXILite, AXIInterface,
+from roomsoc.interconnect.axi import (AXI2AXILite, AXIBurst2Beat,
+                                      AXIConverter, AXIInterface,
                                       AXILiteConverter, AXILiteInterface)
+from roomsoc.interconnect.axi.common import AXIBurst, AXIResp
 
-from axi_helpers import (AXILiteResponder, axi_read, axi_read_burst,
+from axi_helpers import (AXILiteResponder, AXIResponder, axi_read, axi_read_burst,
                          axi_write, axi_write_burst, axilite_write_split, run_sim)
 
 
@@ -74,6 +76,83 @@ class AXIToNarrowAXILiteTop(Elaboratable):
             wide_axil, self.slave.bus)
         m.submodules.slave = self.slave
         return m
+
+
+class AXIConverterTop(Elaboratable):
+
+    def __init__(self,
+                 master_dw,
+                 slave_dw,
+                 *,
+                 init=None,
+                 r_resp=AXIResp.OKAY,
+                 b_resp=AXIResp.OKAY):
+        self.master = AXIInterface(addr_width=16,
+                                   data_width=master_dw,
+                                   id_width=3)
+        self.slave = AXIResponder(addr_width=16,
+                                  data_width=slave_dw,
+                                  id_width=3,
+                                  depth=64,
+                                  init=init,
+                                  r_resp=r_resp,
+                                  b_resp=b_resp)
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.converter = AXIConverter(self.master, self.slave.bus)
+        m.submodules.slave = self.slave
+        return m
+
+
+@pytest.mark.parametrize(('burst', 'expected'), [
+    (AXIBurst.FIXED, [0x08, 0x08, 0x08, 0x08]),
+    (AXIBurst.INCR, [0x08, 0x0c, 0x10, 0x14]),
+    (AXIBurst.WRAP, [0x08, 0x0c, 0x00, 0x04]),
+])
+def test_axi_burst2beat_addresses_and_backpressure(burst, expected):
+    bus = AXIInterface(addr_width=8, data_width=32, id_width=3)
+    dut = AXIBurst2Beat(bus.aw)
+
+    def driver():
+        yield bus.aw.bits.addr.eq(0x08)
+        yield bus.aw.bits.len.eq(3)
+        yield bus.aw.bits.size.eq(2)
+        yield bus.aw.bits.burst.eq(burst)
+        yield bus.aw.bits.id.eq(5)
+        yield bus.aw.valid.eq(1)
+        yield dut.out.ready.eq(1)
+        yield
+
+        beats = []
+        stalled = None
+        for cycle in range(20):
+            valid = (yield dut.out.valid)
+            beat = ((yield dut.out.bits.addr),
+                    (yield dut.out.bits.id),
+                    (yield dut.out.bits.first),
+                    (yield dut.out.bits.last))
+            ready = (yield dut.out.ready)
+
+            if stalled is not None:
+                assert valid
+                assert beat == stalled
+            if valid and ready:
+                beats.append(beat)
+                if beat[3]:
+                    yield bus.aw.valid.eq(0)
+            stalled = beat if valid and not ready else None
+            yield dut.out.ready.eq(cycle not in (1, 2, 6))
+            yield
+            if len(beats) == 4:
+                break
+
+        assert [beat[0] for beat in beats] == expected
+        assert [beat[1] for beat in beats] == [5] * 4
+        assert [beat[2] for beat in beats] == [1, 0, 0, 0]
+        assert [beat[3] for beat in beats] == [0, 0, 0, 1]
+
+    run_sim(dut, driver)
 
 
 def test_axi2axilite_protocol_conversion():
@@ -507,3 +586,288 @@ def test_axi_to_narrow_axilite_preserves_narrow_byte_lanes():
     sim.add_sync_process(driver)
     sim.add_sync_process(monitor)
     sim.run()
+
+
+@pytest.mark.filterwarnings("ignore::amaranth.hdl.ir.UnusedElaboratable")
+def test_axi_converter_rejects_fractional_width_ratios():
+    import gc
+
+    with pytest.raises(ValueError, match="down-converter ratio"):
+        Simulator(AXIConverter(AXIInterface(data_width=48),
+                               AXIInterface(data_width=32)))
+    with pytest.raises(ValueError, match="up-converter ratio"):
+        Simulator(AXIConverter(AXIInterface(data_width=32),
+                               AXIInterface(data_width=48)))
+
+    gc.collect()
+
+
+def test_axi_converter_equal_width_passthrough():
+    top = AXIConverterTop(32, 32, init=[0x12345678])
+    reads = []
+    writes = []
+
+    def driver():
+        assert (yield from axi_read(top.master, 0, size=2,
+                                    txn_id=5)) == (0x12345678, 0, 1, 5)
+        assert (yield from axi_write(top.master,
+                                     4,
+                                     0xdeadbeef,
+                                     0x5,
+                                     size=2,
+                                     txn_id=6)) == (0, 6)
+
+    def monitor():
+        for _ in range(100):
+            if (yield top.slave.ar_monitor.valid):
+                reads.append(((yield top.slave.ar_monitor.bits.addr),
+                              (yield top.slave.ar_monitor.bits.len),
+                              (yield top.slave.ar_monitor.bits.size)))
+            if (yield top.slave.w_monitor.valid):
+                writes.append(((yield top.slave.w_monitor.bits.addr),
+                               (yield top.slave.w_monitor.bits.data),
+                               (yield top.slave.w_monitor.bits.strb)))
+            yield
+
+        assert reads == [(0, 0, 2)]
+        assert writes == [(4, 0xdeadbeef, 0x5)]
+
+    run_sim(top, driver, monitor)
+
+
+def test_axi_downconverter_burst_data_strobes_and_responses():
+    top = AXIConverterTop(64,
+                          32,
+                          init=[0x89abcdef, 0x01234567,
+                                0x76543210, 0xfedcba98],
+                          r_resp=AXIResp.SLVERR,
+                          b_resp=AXIResp.SLVERR)
+    ars = []
+    aws = []
+    writes = []
+
+    def driver():
+        assert (yield from axi_read_burst(top.master,
+                                          0,
+                                          size=3,
+                                          length=1,
+                                          txn_id=3)) == [
+                                              (0x0123456789abcdef, 2, 0, 3),
+                                              (0xfedcba9876543210, 2, 1, 3),
+                                          ]
+        assert (yield from axi_write_burst(
+            top.master,
+            0x10,
+            [(0xaaaabbbbccccdddd, 0x0f),
+             (0x1111222233334444, 0xf0)],
+            size=3,
+            txn_id=7)) == (2, 7)
+
+    def monitor():
+        for _ in range(200):
+            if (yield top.slave.ar_monitor.valid):
+                ars.append(((yield top.slave.ar_monitor.bits.addr),
+                            (yield top.slave.ar_monitor.bits.len),
+                            (yield top.slave.ar_monitor.bits.size),
+                            (yield top.slave.ar_monitor.bits.burst)))
+            if (yield top.slave.aw_monitor.valid):
+                aws.append(((yield top.slave.aw_monitor.bits.addr),
+                            (yield top.slave.aw_monitor.bits.len),
+                            (yield top.slave.aw_monitor.bits.size),
+                            (yield top.slave.aw_monitor.bits.burst)))
+            if (yield top.slave.w_monitor.valid):
+                writes.append(((yield top.slave.w_monitor.bits.addr),
+                               (yield top.slave.w_monitor.bits.data),
+                               (yield top.slave.w_monitor.bits.strb)))
+            yield
+
+        assert ars == [(0, 3, 2, AXIBurst.INCR)]
+        assert aws == [(0x10, 3, 2, AXIBurst.INCR)]
+        assert writes == [(0x10, 0xccccdddd, 0xf),
+                          (0x14, 0xaaaabbbb, 0x0),
+                          (0x18, 0x33334444, 0x0),
+                          (0x1c, 0x11112222, 0xf)]
+        assert not (yield top.slave.protocol_error)
+
+    run_sim(top, driver, monitor)
+
+
+def test_axi_downconverter_narrow_access_selects_addressed_lane():
+    top = AXIConverterTop(64, 32, init=[0x11111111, 0x89abcdef])
+    reads = []
+    writes = []
+
+    def driver():
+        assert (yield from axi_read(top.master, 4, size=2,
+                                    txn_id=1)) == (0x89abcdef00000000, 0, 1, 1)
+        assert (yield from axi_write(top.master,
+                                     4,
+                                     0xdeadbeef00000000,
+                                     0xf0,
+                                     size=2,
+                                     txn_id=2)) == (0, 2)
+
+    def monitor():
+        for _ in range(100):
+            if (yield top.slave.ar_monitor.valid):
+                reads.append(((yield top.slave.ar_monitor.bits.addr),
+                              (yield top.slave.ar_monitor.bits.len),
+                              (yield top.slave.ar_monitor.bits.size)))
+            if (yield top.slave.w_monitor.valid):
+                writes.append(((yield top.slave.w_monitor.bits.addr),
+                               (yield top.slave.w_monitor.bits.data),
+                               (yield top.slave.w_monitor.bits.strb)))
+            yield
+
+        assert reads == [(4, 0, 2)]
+        assert writes == [(4, 0xdeadbeef, 0xf)]
+
+    run_sim(top, driver, monitor)
+
+
+def test_axi_downconverter_fixed_burst_uses_slow_path():
+    top = AXIConverterTop(64,
+                          32,
+                          init=[0x89abcdef, 0x01234567],
+                          r_resp=AXIResp.SLVERR,
+                          b_resp=AXIResp.SLVERR)
+    ars = []
+    aws = []
+    writes = []
+
+    def driver():
+        bus = top.master
+        yield bus.ar.bits.addr.eq(0)
+        yield bus.ar.bits.size.eq(3)
+        yield bus.ar.bits.len.eq(1)
+        yield bus.ar.bits.burst.eq(AXIBurst.FIXED)
+        yield bus.ar.bits.id.eq(3)
+        yield bus.ar.valid.eq(1)
+        yield
+        while not (yield bus.ar.ready):
+            yield
+        yield bus.ar.valid.eq(0)
+        yield bus.r.ready.eq(1)
+        read_beats = []
+        while len(read_beats) < 2:
+            if (yield bus.r.valid):
+                read_beats.append(((yield bus.r.bits.data),
+                                   (yield bus.r.bits.resp),
+                                   (yield bus.r.bits.last),
+                                   (yield bus.r.bits.id)))
+            yield
+        yield bus.r.ready.eq(0)
+        assert read_beats == [(0x0123456789abcdef, 2, 0, 3),
+                              (0x0123456789abcdef, 2, 1, 3)]
+
+        yield bus.aw.bits.addr.eq(0x10)
+        yield bus.aw.bits.size.eq(3)
+        yield bus.aw.bits.len.eq(1)
+        yield bus.aw.bits.burst.eq(AXIBurst.FIXED)
+        yield bus.aw.bits.id.eq(5)
+        yield bus.aw.valid.eq(1)
+        yield
+        while not (yield bus.aw.ready):
+            yield
+        yield bus.aw.valid.eq(0)
+        for index, data in enumerate((0xaaaabbbbccccdddd,
+                                      0x1111222233334444)):
+            yield bus.w.bits.data.eq(data)
+            yield bus.w.bits.strb.eq(0xff)
+            yield bus.w.bits.last.eq(index == 1)
+            yield bus.w.valid.eq(1)
+            yield
+            while not (yield bus.w.ready):
+                yield
+            yield bus.w.valid.eq(0)
+        yield bus.b.ready.eq(1)
+        while not (yield bus.b.valid):
+            yield
+        assert ((yield bus.b.bits.resp),
+                (yield bus.b.bits.id)) == (AXIResp.SLVERR, 5)
+        yield
+        yield bus.b.ready.eq(0)
+
+    def monitor():
+        for _ in range(300):
+            if (yield top.slave.ar_monitor.valid):
+                ars.append(((yield top.slave.ar_monitor.bits.addr),
+                            (yield top.slave.ar_monitor.bits.len),
+                            (yield top.slave.ar_monitor.bits.size),
+                            (yield top.slave.ar_monitor.bits.burst)))
+            if (yield top.slave.aw_monitor.valid):
+                aws.append(((yield top.slave.aw_monitor.bits.addr),
+                            (yield top.slave.aw_monitor.bits.len),
+                            (yield top.slave.aw_monitor.bits.size),
+                            (yield top.slave.aw_monitor.bits.burst)))
+            if (yield top.slave.w_monitor.valid):
+                writes.append(((yield top.slave.w_monitor.bits.addr),
+                               (yield top.slave.w_monitor.bits.data),
+                               (yield top.slave.w_monitor.bits.strb)))
+            yield
+
+        narrow_burst = (1, 2, AXIBurst.INCR)
+        assert ars == [(0, *narrow_burst), (0, *narrow_burst)]
+        assert aws == [(0x10, *narrow_burst), (0x10, *narrow_burst)]
+        assert writes == [(0x10, 0xccccdddd, 0xf),
+                          (0x14, 0xaaaabbbb, 0xf),
+                          (0x10, 0x33334444, 0xf),
+                          (0x14, 0x11112222, 0xf)]
+        assert not (yield top.slave.protocol_error)
+
+    run_sim(top, driver, monitor)
+
+
+def test_axi_upconverter_ratio_four_bursts_and_lane_steering():
+    top = AXIConverterTop(16,
+                          64,
+                          init=[0x0706050403020100],
+                          r_resp=AXIResp.SLVERR,
+                          b_resp=AXIResp.SLVERR)
+    ars = []
+    aws = []
+    writes = []
+
+    def driver():
+        assert (yield from axi_read_burst(top.master,
+                                          0,
+                                          size=1,
+                                          length=3,
+                                          txn_id=4)) == [
+                                              (0x0100, 2, 0, 4),
+                                              (0x0302, 2, 0, 4),
+                                              (0x0504, 2, 0, 4),
+                                              (0x0706, 2, 1, 4),
+                                          ]
+        assert (yield from axi_write_burst(
+            top.master,
+            0,
+            [(0x1122, 0x3), (0x3344, 0x1),
+             (0x5566, 0x2), (0x7788, 0x3)],
+            size=1,
+            txn_id=6)) == (2, 6)
+
+    def monitor():
+        for _ in range(300):
+            if (yield top.slave.ar_monitor.valid):
+                ars.append(((yield top.slave.ar_monitor.bits.addr),
+                            (yield top.slave.ar_monitor.bits.len),
+                            (yield top.slave.ar_monitor.bits.size)))
+            if (yield top.slave.aw_monitor.valid):
+                aws.append(((yield top.slave.aw_monitor.bits.addr),
+                            (yield top.slave.aw_monitor.bits.len),
+                            (yield top.slave.aw_monitor.bits.size)))
+            if (yield top.slave.w_monitor.valid):
+                writes.append(((yield top.slave.w_monitor.bits.data),
+                               (yield top.slave.w_monitor.bits.strb)))
+            yield
+
+        assert ars == [(0, 0, 1), (2, 0, 1), (4, 0, 1), (6, 0, 1)]
+        assert aws == [(0, 0, 1), (2, 0, 1), (4, 0, 1), (6, 0, 1)]
+        assert writes == [(0x0000000000001122, 0x03),
+                          (0x0000000033440000, 0x04),
+                          (0x0000556600000000, 0x20),
+                          (0x7788000000000000, 0xc0)]
+        assert not (yield top.slave.protocol_error)
+
+    run_sim(top, driver, monitor)

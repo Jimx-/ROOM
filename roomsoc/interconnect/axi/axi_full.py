@@ -1073,3 +1073,923 @@ class AXIInterconnectShared(Elaboratable):
         m.d.comb += shared.connect(decoder.bus)
 
         return m
+
+
+# AXI Bursts to Beats ------------------------------------------------------------------------------
+
+class AXIBurst2Beat(Elaboratable):
+    """Expand an AXI address-burst channel into one beat per transfer.
+
+    The input ``ax_burst`` is an AXI AW/AR channel (a ``Record`` carrying ``.bits``,
+    ``.valid`` and ``.ready``). The output :pyattr:`out` is a :class:`Decoupled` stream of
+    single beats carrying ``addr``, ``id``, ``first`` and ``last``. FIXED bursts hold the
+    address, INCR/WRAP bursts advance it by ``2**size`` per beat (WRAP wraps within the
+    burst window). Mirrors LiteX ``AXIBurst2Beat``.
+    """
+
+    def __init__(self, ax_burst):
+        self.ax_burst = ax_burst
+        addr_w = len(ax_burst.bits.addr)
+        id_w = len(ax_burst.bits.id)
+        self.out = Decoupled(Record, [
+            ('addr',  addr_w),
+            ('id',    id_w),
+            ('first', 1),
+            ('last',  1),
+        ])
+
+    def elaborate(self, platform):
+        m = Module()
+
+        ax_burst = self.ax_burst
+        ax_beat = self.out
+
+        addr_w = len(ax_burst.bits.addr)
+        beat_count  = Signal(8)
+        beat_size   = Signal(addr_w + 1)
+        beat_offset = Signal(signed(addr_w + 1))
+        beat_wrap   = Signal(addr_w)
+
+        m.d.comb += [
+            beat_size.eq(1 << ax_burst.bits.size),
+            beat_wrap.eq((ax_burst.bits.len << ax_burst.bits.size)[:addr_w]),
+
+            ax_beat.valid.eq(ax_burst.valid | ~ax_beat.bits.first),
+            ax_beat.bits.first.eq(beat_count == 0),
+            ax_beat.bits.last.eq(beat_count == ax_burst.bits.len),
+            ax_beat.bits.addr.eq(
+                (ax_burst.bits.addr + beat_offset)[:addr_w]),
+            ax_beat.bits.id.eq(ax_burst.bits.id),
+        ]
+        with m.If(ax_beat.ready):
+            with m.If(ax_beat.bits.last):
+                m.d.comb += ax_burst.ready.eq(1)
+
+        with m.If(ax_beat.valid & ax_beat.ready):
+            with m.If(ax_beat.bits.last):
+                m.d.sync += [
+                    beat_count.eq(0),
+                    beat_offset.eq(0),
+                ]
+            with m.Else():
+                m.d.sync += beat_count.eq(beat_count + 1)
+                with m.If((ax_burst.bits.burst == AXIBurst.INCR) |
+                          (ax_burst.bits.burst == AXIBurst.WRAP)):
+                    m.d.sync += beat_offset.eq(beat_offset + beat_size)
+            with m.If(ax_burst.bits.burst == AXIBurst.WRAP):
+                with m.If((ax_beat.bits.addr & beat_wrap) == beat_wrap):
+                    # ``beat_wrap`` is the byte offset of the final beat in
+                    # the wrap window.  Move from that beat to the window's
+                    # first beat, rather than merely undoing the normal
+                    # one-beat increment above.
+                    m.d.sync += beat_offset.eq(beat_offset - beat_wrap)
+
+        return m
+
+
+# AXI Stream Width Converters (used internally by the data-width converter) ------------------------
+
+class _StrideDown(Elaboratable):
+    """Split each wide (data + strb) beat into ``ratio`` narrow beats."""
+
+    def __init__(self, dw_wide, dw_narrow):
+        self.dw_wide = dw_wide
+        self.dw_narrow = dw_narrow
+        self.ratio = dw_wide // dw_narrow
+        self.sink = Decoupled(Record, [
+            ('data', dw_wide),
+            ('strb', dw_wide // 8),
+            ('last', 1),
+        ])
+        self.source = Decoupled(Record, [
+            ('data', dw_narrow),
+            ('strb', dw_narrow // 8),
+            ('last', 1),
+        ])
+
+    def elaborate(self, platform):
+        m = Module()
+
+        ratio = self.ratio
+        nb = self.dw_narrow // 8
+        sel = Signal(range(ratio))
+
+        m.d.comb += [
+            self.source.valid.eq(self.sink.valid),
+            self.source.bits.last.eq(self.sink.bits.last & (sel == ratio - 1)),
+        ]
+        with m.Switch(sel):
+            for i in range(ratio):
+                with m.Case(i):
+                    m.d.comb += [
+                        self.source.bits.data.eq(
+                            self.sink.bits.data[i * self.dw_narrow:(i + 1) * self.dw_narrow]),
+                        self.source.bits.strb.eq(
+                            self.sink.bits.strb[i * nb:(i + 1) * nb]),
+                    ]
+
+        with m.If(self.source.fire):
+            m.d.sync += sel.eq(sel + 1)
+            with m.If(sel == ratio - 1):
+                m.d.comb += self.sink.ready.eq(1)
+                m.d.sync += sel.eq(0)
+
+        return m
+
+
+class _StrideUp(Elaboratable):
+    """Merge ``ratio`` narrow data beats into one wide beat."""
+
+    def __init__(self, dw_narrow, dw_wide):
+        self.dw_narrow = dw_narrow
+        self.dw_wide = dw_wide
+        self.ratio = dw_wide // dw_narrow
+        self.sink = Decoupled(Record, [
+            ('data', dw_narrow),
+            ('last', 1),
+        ])
+        self.source = Decoupled(Record, [
+            ('data', dw_wide),
+            ('last', 1),
+        ])
+
+    def elaborate(self, platform):
+        m = Module()
+
+        ratio = self.ratio
+        sel = Signal(range(ratio))
+
+        m.d.comb += self.sink.ready.eq(~self.source.valid | self.source.ready)
+
+        with m.If(self.source.ready):
+            m.d.sync += self.source.valid.eq(0)
+
+        with m.If(self.sink.fire):
+            with m.If(sel == 0):
+                m.d.sync += self.source.bits.data.eq(0)
+            with m.Switch(sel):
+                for i in range(ratio):
+                    with m.Case(i):
+                        m.d.sync += self.source.bits.data[
+                            i * self.dw_narrow:(i + 1) * self.dw_narrow].eq(
+                                self.sink.bits.data)
+            with m.If((sel == ratio - 1) | self.sink.bits.last):
+                m.d.sync += [
+                    self.source.valid.eq(1),
+                    self.source.bits.last.eq(self.sink.bits.last),
+                    sel.eq(0),
+                ]
+            with m.Else():
+                m.d.sync += sel.eq(sel + 1)
+
+        return m
+
+
+# AXI Data-Width Up Converter ---------------------------------------------------------------------
+
+class AXIUpConverter(Elaboratable):
+    """AXI4 data-width up-converter (``dw_from < dw_to``, integer ratio).
+
+    Each narrow beat is turned into a single-beat wide transfer, placing the narrow
+    data/strobe into the address-selected wide lane. Bursts of any type are supported:
+    an :class:`AXIBurst2Beat` expands the address burst into per-beat commands so every
+    narrow beat becomes its own wide single-beat access. Mirrors LiteX
+    ``AXIUpConverter``.
+    """
+
+    def __init__(self, axi_from, axi_to):
+        self.axi_from = axi_from
+        self.axi_to = axi_to
+        dw_from = axi_from.data_width
+        dw_to = axi_to.data_width
+        ratio = dw_to // dw_from
+        if dw_from * ratio != dw_to:
+            raise ValueError("AXI up-converter ratio must be an integer")
+        self.ratio = ratio
+        self.lane_bits = log2_int(ratio)
+        self.lane_lsb = log2_int(dw_from // 8)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        axi_from = self.axi_from
+        axi_to = self.axi_to
+        ratio = self.ratio
+        lane_bits = self.lane_bits
+        lane_lsb = self.lane_lsb
+        dw_from = axi_from.data_width
+
+        has_user = len(axi_from.aw.bits.user) > 0
+        is_axi3 = axi_from.version == 'axi3'
+        lane_field = max(1, lane_bits)
+
+        def ax_cmd_layout():
+            layout = [
+                ('addr',   len(axi_to.aw.bits.addr)),
+                ('size',   len(axi_to.aw.bits.size)),
+                ('lock',   len(axi_to.aw.bits.lock)),
+                ('prot',   len(axi_to.aw.bits.prot)),
+                ('cache',  len(axi_to.aw.bits.cache)),
+                ('qos',    len(axi_to.aw.bits.qos)),
+                ('region', len(axi_to.aw.bits.region)),
+                ('id',     len(axi_to.aw.bits.id)),
+                ('lane',   lane_field),
+                ('last',   1),
+            ]
+            if has_user:
+                layout.append(('user', len(axi_to.aw.bits.user)))
+            return layout
+
+        # -- Write address path ---------------------------------------------------------------
+        aw_b2b = m.submodules.aw_b2b = AXIBurst2Beat(axi_from.aw)
+        aw = aw_b2b.out
+
+        aw_cmd = m.submodules.aw_cmd = Queue(16, Record, ax_cmd_layout(), flow=False)
+        aw_data = m.submodules.aw_data = Queue(16, Record, [('lane', lane_field)], flow=False)
+        b_info = m.submodules.b_info = Queue(
+            16, Record, [('id', len(axi_to.b.bits.id)), ('last', 1)], flow=False)
+
+        aw_fifos_ready = Signal()
+        m.d.comb += [
+            aw_fifos_ready.eq(aw_cmd.enq.ready & aw_data.enq.ready),
+            aw.ready.eq(aw_fifos_ready),
+
+            aw_cmd.enq.valid.eq(aw.valid & aw_data.enq.ready),
+            aw_cmd.enq.bits.addr.eq(aw.bits.addr),
+            aw_cmd.enq.bits.size.eq(axi_from.aw.bits.size),
+            aw_cmd.enq.bits.lock.eq(axi_from.aw.bits.lock),
+            aw_cmd.enq.bits.prot.eq(axi_from.aw.bits.prot),
+            aw_cmd.enq.bits.cache.eq(axi_from.aw.bits.cache),
+            aw_cmd.enq.bits.qos.eq(axi_from.aw.bits.qos),
+            aw_cmd.enq.bits.region.eq(axi_from.aw.bits.region),
+            aw_cmd.enq.bits.id.eq(aw.bits.id),
+            aw_cmd.enq.bits.lane.eq(aw.bits.addr[lane_lsb:lane_lsb + lane_bits]),
+            aw_cmd.enq.bits.last.eq(aw.bits.last),
+
+            aw_data.enq.valid.eq(aw.valid & aw_cmd.enq.ready),
+            aw_data.enq.bits.lane.eq(aw.bits.addr[lane_lsb:lane_lsb + lane_bits]),
+
+            axi_to.aw.valid.eq(aw_cmd.deq.valid & b_info.enq.ready),
+            axi_to.aw.bits.addr.eq(aw_cmd.deq.bits.addr),
+            axi_to.aw.bits.burst.eq(AXIBurst.INCR),
+            axi_to.aw.bits.len.eq(0),
+            axi_to.aw.bits.size.eq(aw_cmd.deq.bits.size),
+            axi_to.aw.bits.lock.eq(aw_cmd.deq.bits.lock),
+            axi_to.aw.bits.prot.eq(aw_cmd.deq.bits.prot),
+            axi_to.aw.bits.cache.eq(aw_cmd.deq.bits.cache),
+            axi_to.aw.bits.qos.eq(aw_cmd.deq.bits.qos),
+            axi_to.aw.bits.region.eq(aw_cmd.deq.bits.region),
+            axi_to.aw.bits.id.eq(aw_cmd.deq.bits.id),
+            aw_cmd.deq.ready.eq(axi_to.aw.ready & b_info.enq.ready),
+
+            b_info.enq.valid.eq(aw_cmd.deq.valid & axi_to.aw.ready),
+            b_info.enq.bits.id.eq(aw_cmd.deq.bits.id),
+            b_info.enq.bits.last.eq(aw_cmd.deq.bits.last),
+        ]
+        if has_user:
+            m.d.comb += [
+                aw_cmd.enq.bits.user.eq(axi_from.aw.bits.user),
+                axi_to.aw.bits.user.eq(aw_cmd.deq.bits.user),
+            ]
+
+        # -- Write data path ------------------------------------------------------------------
+        m.d.comb += [
+            axi_to.w.valid.eq(axi_from.w.valid & aw_data.deq.valid),
+            axi_from.w.ready.eq(axi_to.w.ready & aw_data.deq.valid),
+            aw_data.deq.ready.eq(axi_from.w.valid & axi_to.w.ready),
+
+            axi_to.w.bits.data.eq(0),
+            axi_to.w.bits.strb.eq(0),
+            axi_to.w.bits.last.eq(1),
+        ]
+        if is_axi3:
+            m.d.comb += axi_to.w.bits.id.eq(axi_from.w.bits.id)
+        if has_user:
+            m.d.comb += axi_to.w.bits.user.eq(axi_from.w.bits.user)
+        for i in range(ratio):
+            with m.If(aw_data.deq.bits.lane == i):
+                m.d.comb += [
+                    axi_to.w.bits.data[i * dw_from:(i + 1) * dw_from].eq(axi_from.w.bits.data),
+                    axi_to.w.bits.strb[i * (dw_from // 8):(i + 1) * (dw_from // 8)].eq(
+                        axi_from.w.bits.strb),
+                ]
+
+        # -- Write response path --------------------------------------------------------------
+        b_resp = Signal(2, reset=AXIResp.OKAY)
+        m.d.comb += [
+            axi_from.b.valid.eq(axi_to.b.valid & b_info.deq.valid & b_info.deq.bits.last),
+            axi_from.b.bits.resp.eq(
+                Mux(axi_to.b.bits.resp != AXIResp.OKAY, axi_to.b.bits.resp, b_resp)),
+            axi_from.b.bits.id.eq(axi_to.b.bits.id),
+            axi_to.b.ready.eq(b_info.deq.valid &
+                              (~b_info.deq.bits.last | axi_from.b.ready)),
+            b_info.deq.ready.eq(axi_to.b.valid & axi_to.b.ready),
+        ]
+        if has_user:
+            m.d.comb += axi_from.b.bits.user.eq(axi_to.b.bits.user)
+        with m.If(axi_to.b.valid & axi_to.b.ready):
+            with m.If(b_info.deq.bits.last):
+                m.d.sync += b_resp.eq(AXIResp.OKAY)
+            with m.Elif(axi_to.b.bits.resp != AXIResp.OKAY):
+                m.d.sync += b_resp.eq(axi_to.b.bits.resp)
+
+        # -- Read address path ----------------------------------------------------------------
+        ar_b2b = m.submodules.ar_b2b = AXIBurst2Beat(axi_from.ar)
+        ar = ar_b2b.out
+
+        ar_cmd = m.submodules.ar_cmd = Queue(16, Record, ax_cmd_layout(), flow=False)
+        r_info = m.submodules.r_info = Queue(
+            16, Record, [('lane', lane_field), ('last', 1)], flow=False)
+        r_fifo = m.submodules.r_fifo = Queue(
+            16, Record, [
+                ('data', dw_from),
+                ('resp', len(axi_from.r.bits.resp)),
+                ('id', len(axi_from.r.bits.id)),
+                ('last', 1),
+            ], flow=False)
+
+        m.d.comb += [
+            ar_cmd.enq.valid.eq(ar.valid),
+            ar.ready.eq(ar_cmd.enq.ready),
+            ar_cmd.enq.bits.addr.eq(ar.bits.addr),
+            ar_cmd.enq.bits.size.eq(axi_from.ar.bits.size),
+            ar_cmd.enq.bits.lock.eq(axi_from.ar.bits.lock),
+            ar_cmd.enq.bits.prot.eq(axi_from.ar.bits.prot),
+            ar_cmd.enq.bits.cache.eq(axi_from.ar.bits.cache),
+            ar_cmd.enq.bits.qos.eq(axi_from.ar.bits.qos),
+            ar_cmd.enq.bits.region.eq(axi_from.ar.bits.region),
+            ar_cmd.enq.bits.id.eq(ar.bits.id),
+            ar_cmd.enq.bits.lane.eq(ar.bits.addr[lane_lsb:lane_lsb + lane_bits]),
+            ar_cmd.enq.bits.last.eq(ar.bits.last),
+
+            axi_to.ar.valid.eq(ar_cmd.deq.valid & r_info.enq.ready),
+            axi_to.ar.bits.addr.eq(ar_cmd.deq.bits.addr),
+            axi_to.ar.bits.burst.eq(AXIBurst.INCR),
+            axi_to.ar.bits.len.eq(0),
+            axi_to.ar.bits.size.eq(ar_cmd.deq.bits.size),
+            axi_to.ar.bits.lock.eq(ar_cmd.deq.bits.lock),
+            axi_to.ar.bits.prot.eq(ar_cmd.deq.bits.prot),
+            axi_to.ar.bits.cache.eq(ar_cmd.deq.bits.cache),
+            axi_to.ar.bits.qos.eq(ar_cmd.deq.bits.qos),
+            axi_to.ar.bits.region.eq(ar_cmd.deq.bits.region),
+            axi_to.ar.bits.id.eq(ar_cmd.deq.bits.id),
+            ar_cmd.deq.ready.eq(axi_to.ar.ready & r_info.enq.ready),
+
+            r_info.enq.valid.eq(ar_cmd.deq.valid & axi_to.ar.ready),
+            r_info.enq.bits.lane.eq(ar_cmd.deq.bits.lane),
+            r_info.enq.bits.last.eq(ar_cmd.deq.bits.last),
+        ]
+        if has_user:
+            m.d.comb += [
+                ar_cmd.enq.bits.user.eq(axi_from.ar.bits.user),
+                axi_to.ar.bits.user.eq(ar_cmd.deq.bits.user),
+            ]
+
+        # -- Read data path -------------------------------------------------------------------
+        r_data = Signal(dw_from)
+        for i in range(ratio):
+            with m.If(r_info.deq.bits.lane == i):
+                m.d.comb += r_data.eq(axi_to.r.bits.data[i * dw_from:(i + 1) * dw_from])
+
+        m.d.comb += [
+            r_fifo.enq.valid.eq(axi_to.r.valid & r_info.deq.valid),
+            r_fifo.enq.bits.data.eq(r_data),
+            r_fifo.enq.bits.resp.eq(axi_to.r.bits.resp),
+            r_fifo.enq.bits.id.eq(axi_to.r.bits.id),
+            r_fifo.enq.bits.last.eq(r_info.deq.bits.last),
+            axi_to.r.ready.eq(r_info.deq.valid & r_fifo.enq.ready),
+            r_info.deq.ready.eq(axi_to.r.valid & axi_to.r.ready),
+
+            axi_from.r.valid.eq(r_fifo.deq.valid),
+            axi_from.r.bits.data.eq(r_fifo.deq.bits.data),
+            axi_from.r.bits.resp.eq(r_fifo.deq.bits.resp),
+            axi_from.r.bits.last.eq(r_fifo.deq.bits.last),
+            axi_from.r.bits.id.eq(r_fifo.deq.bits.id),
+            r_fifo.deq.ready.eq(axi_from.r.ready),
+        ]
+        if has_user:
+            m.d.comb += axi_from.r.bits.user.eq(axi_to.r.bits.user)
+
+        return m
+
+
+# AXI Data-Width Down Converter -------------------------------------------------------------------
+
+class AXIDownConverter(Elaboratable):
+    """AXI4 data-width down-converter (``dw_from > dw_to``, integer ratio).
+
+    INCR/WRAP/FIXED-1 bursts take a combinational fast path: one wide AW/AR becomes one
+    narrow AW/AR with a ratio-multiplied length, and the W/R streams are split/merged by
+    ratio. FIXED bursts longer than one beat (and bursts too long to fit a narrow burst)
+    cannot be expressed as a single narrow burst and take a slower FSM path that issues
+    ``ratio``-beat narrow INCR bursts back-to-back, coalescing the B responses and
+    re-timing the W/R ``last`` signals. Mirrors LiteX ``AXIDownConverter``.
+    """
+
+    def __init__(self, axi_from, axi_to):
+        self.axi_from = axi_from
+        self.axi_to = axi_to
+        dw_from = axi_from.data_width
+        dw_to = axi_to.data_width
+        ratio = dw_from // dw_to
+        if dw_from != dw_to * ratio:
+            raise ValueError("AXI down-converter ratio must be an integer")
+        self.ratio = ratio
+        self.wide_size_log2 = log2_int(dw_from // 8)
+        self.narrow_size_log2 = log2_int(dw_to // 8)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        axi_from = self.axi_from
+        axi_to = self.axi_to
+        ratio = self.ratio
+        wide_size_log2 = self.wide_size_log2
+        narrow_size_log2 = self.narrow_size_log2
+        dw_from = axi_from.data_width
+        dw_to = axi_to.data_width
+        ratio_log2 = log2_int(ratio)
+
+        has_user = len(axi_from.aw.bits.user) > 0
+        is_axi3 = axi_from.version == 'axi3'
+        wide_mask = C((1 << wide_size_log2) - 1, len(axi_to.aw.bits.addr))
+        max_fast_len = (256 >> ratio_log2) - 1
+
+        def burst_remap():
+            with m.Switch(axi_from.aw.bits.burst):
+                with m.Case(AXIBurst.FIXED):
+                    m.d.comb += axi_to.aw.bits.burst.eq(AXIBurst.INCR)
+                with m.Case(AXIBurst.INCR):
+                    m.d.comb += axi_to.aw.bits.burst.eq(AXIBurst.INCR)
+                with m.Case(AXIBurst.WRAP):
+                    m.d.comb += axi_to.aw.bits.burst.eq(AXIBurst.WRAP)
+                with m.Case(AXIBurst.RESERVED):
+                    m.d.comb += axi_to.aw.bits.burst.eq(AXIBurst.RESERVED)
+
+        # ============================ Write path: AW / W / B ============================
+
+        cap_aw_addr = Signal.like(axi_from.aw.bits.addr)
+        cap_aw_len = Signal.like(axi_from.aw.bits.len)
+        cap_aw_size = Signal.like(axi_from.aw.bits.size)
+        cap_aw_id = Signal.like(axi_from.aw.bits.id)
+        cap_aw_lock = Signal.like(axi_from.aw.bits.lock)
+        cap_aw_prot = Signal.like(axi_from.aw.bits.prot)
+        cap_aw_cache = Signal.like(axi_from.aw.bits.cache)
+        cap_aw_qos = Signal.like(axi_from.aw.bits.qos)
+        cap_aw_region = Signal.like(axi_from.aw.bits.region)
+        cap_aw_lane = Signal(range(max(ratio, 2)))
+
+        aw_emit_count = Signal.like(axi_from.aw.bits.len)
+        b_collected_resp = Signal(2)
+        w_subbeat_count = Signal(range(max(ratio, 2)))
+
+        cap_aw_incr = Signal()
+        fixed_aw_active = Signal()
+        narrow_aw_active = Signal()
+        aw_narrow_pending = Signal()
+
+        is_aw_narrow = (axi_from.aw.bits.len == 0) & (axi_from.aw.bits.size <= narrow_size_log2)
+        is_aw_slow = (
+            (axi_from.aw.bits.burst == AXIBurst.FIXED) & (axi_from.aw.bits.len != 0)
+        ) | (axi_from.aw.bits.len > max_fast_len)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(narrow_aw_active):
+                    m.d.comb += axi_from.aw.ready.eq(0)
+                with m.Elif(is_aw_narrow):
+                    m.d.comb += [
+                        aw_narrow_pending.eq(axi_from.aw.valid),
+                        axi_to.aw.valid.eq(axi_from.aw.valid),
+                        axi_to.aw.bits.addr.eq(axi_from.aw.bits.addr),
+                        axi_to.aw.bits.len.eq(0),
+                        axi_to.aw.bits.size.eq(axi_from.aw.bits.size),
+                        axi_to.aw.bits.burst.eq(AXIBurst.INCR),
+                        axi_to.aw.bits.id.eq(axi_from.aw.bits.id),
+                        axi_to.aw.bits.lock.eq(axi_from.aw.bits.lock),
+                        axi_to.aw.bits.prot.eq(axi_from.aw.bits.prot),
+                        axi_to.aw.bits.cache.eq(axi_from.aw.bits.cache),
+                        axi_to.aw.bits.qos.eq(axi_from.aw.bits.qos),
+                        axi_to.aw.bits.region.eq(axi_from.aw.bits.region),
+                        axi_from.aw.ready.eq(axi_to.aw.ready),
+                    ]
+                    if has_user:
+                        m.d.comb += axi_to.aw.bits.user.eq(axi_from.aw.bits.user)
+                    with m.If(axi_from.aw.valid & axi_to.aw.ready):
+                        m.d.sync += [
+                            cap_aw_lane.eq(
+                                axi_from.aw.bits.addr[narrow_size_log2:wide_size_log2]),
+                            narrow_aw_active.eq(1),
+                        ]
+                with m.Elif(~is_aw_slow):
+                    m.d.comb += [
+                        axi_to.aw.valid.eq(axi_from.aw.valid),
+                        axi_to.aw.bits.addr.eq(axi_from.aw.bits.addr & ~wide_mask),
+                        axi_to.aw.bits.len.eq(
+                            ((axi_from.aw.bits.len + 1) << ratio_log2) - 1),
+                        axi_to.aw.bits.size.eq(narrow_size_log2),
+                        axi_to.aw.bits.id.eq(axi_from.aw.bits.id),
+                        axi_to.aw.bits.lock.eq(axi_from.aw.bits.lock),
+                        axi_to.aw.bits.prot.eq(axi_from.aw.bits.prot),
+                        axi_to.aw.bits.cache.eq(axi_from.aw.bits.cache),
+                        axi_to.aw.bits.qos.eq(axi_from.aw.bits.qos),
+                        axi_to.aw.bits.region.eq(axi_from.aw.bits.region),
+                        axi_from.aw.ready.eq(axi_to.aw.ready),
+                    ]
+                    burst_remap()
+                    if has_user:
+                        m.d.comb += axi_to.aw.bits.user.eq(axi_from.aw.bits.user)
+                with m.Else():
+                    m.d.comb += axi_from.aw.ready.eq(1)
+                    with m.If(axi_from.aw.valid):
+                        m.d.sync += [
+                            cap_aw_addr.eq(axi_from.aw.bits.addr),
+                            cap_aw_len.eq(axi_from.aw.bits.len),
+                            cap_aw_size.eq(axi_from.aw.bits.size),
+                            cap_aw_id.eq(axi_from.aw.bits.id),
+                            cap_aw_lock.eq(axi_from.aw.bits.lock),
+                            cap_aw_prot.eq(axi_from.aw.bits.prot),
+                            cap_aw_cache.eq(axi_from.aw.bits.cache),
+                            cap_aw_qos.eq(axi_from.aw.bits.qos),
+                            cap_aw_region.eq(axi_from.aw.bits.region),
+                            cap_aw_incr.eq(axi_from.aw.bits.burst == AXIBurst.INCR),
+                            aw_emit_count.eq(0),
+                            b_collected_resp.eq(AXIResp.OKAY),
+                        ]
+                        m.next = 'FIXED-EMIT-AW'
+
+            with m.State('FIXED-EMIT-AW'):
+                m.d.comb += [
+                    fixed_aw_active.eq(1),
+                    axi_to.aw.valid.eq(1),
+                    axi_to.aw.bits.addr.eq(
+                        (cap_aw_addr + Mux(cap_aw_incr, aw_emit_count << wide_size_log2, 0))
+                        & ~wide_mask),
+                    axi_to.aw.bits.len.eq(ratio - 1),
+                    axi_to.aw.bits.burst.eq(AXIBurst.INCR),
+                    axi_to.aw.bits.size.eq(narrow_size_log2),
+                    axi_to.aw.bits.id.eq(cap_aw_id),
+                    axi_to.aw.bits.lock.eq(cap_aw_lock),
+                    axi_to.aw.bits.prot.eq(cap_aw_prot),
+                    axi_to.aw.bits.cache.eq(cap_aw_cache),
+                    axi_to.aw.bits.qos.eq(cap_aw_qos),
+                    axi_to.aw.bits.region.eq(cap_aw_region),
+                ]
+                with m.If(axi_to.aw.ready):
+                    m.next = 'FIXED-WAIT-B'
+
+            with m.State('FIXED-WAIT-B'):
+                m.d.comb += [
+                    fixed_aw_active.eq(1),
+                    axi_to.b.ready.eq(1),
+                ]
+                with m.If(axi_to.b.valid):
+                    with m.If(axi_to.b.bits.resp > b_collected_resp):
+                        m.d.sync += b_collected_resp.eq(axi_to.b.bits.resp)
+                    with m.If(aw_emit_count == cap_aw_len):
+                        m.next = 'FIXED-EMIT-B'
+                    with m.Else():
+                        m.d.sync += aw_emit_count.eq(aw_emit_count + 1)
+                        m.next = 'FIXED-EMIT-AW'
+
+            with m.State('FIXED-EMIT-B'):
+                m.d.comb += [
+                    fixed_aw_active.eq(1),
+                    axi_from.b.valid.eq(1),
+                    axi_from.b.bits.id.eq(cap_aw_id),
+                    axi_from.b.bits.resp.eq(b_collected_resp),
+                ]
+                with m.If(axi_from.b.ready):
+                    m.next = 'IDLE'
+
+        # W channel.
+        w_conv = m.submodules.w_conv = _StrideDown(dw_from, dw_to)
+
+        narrow_w_data = Signal(dw_to)
+        narrow_w_strb = Signal(dw_to // 8)
+        m.d.comb += [
+            narrow_w_data.eq(0),
+            narrow_w_strb.eq(0),
+        ]
+        with m.Switch(cap_aw_lane):
+            for i in range(ratio):
+                with m.Case(i):
+                    m.d.comb += [
+                        narrow_w_data.eq(axi_from.w.bits.data[i * dw_to:(i + 1) * dw_to]),
+                        narrow_w_strb.eq(
+                            axi_from.w.bits.strb[i * (dw_to // 8):(i + 1) * (dw_to // 8)]),
+                    ]
+
+        m.d.comb += [
+            w_conv.sink.valid.eq(
+                axi_from.w.valid & ~narrow_aw_active & ~aw_narrow_pending),
+            w_conv.sink.bits.data.eq(axi_from.w.bits.data),
+            w_conv.sink.bits.strb.eq(axi_from.w.bits.strb),
+            w_conv.sink.bits.last.eq(axi_from.w.bits.last),
+        ]
+        with m.If(narrow_aw_active):
+            m.d.comb += [
+                axi_to.w.valid.eq(axi_from.w.valid),
+                axi_to.w.bits.data.eq(narrow_w_data),
+                axi_to.w.bits.strb.eq(narrow_w_strb),
+                axi_to.w.bits.last.eq(axi_from.w.bits.last),
+                axi_from.w.ready.eq(axi_to.w.ready),
+                w_conv.source.ready.eq(0),
+            ]
+            if is_axi3:
+                m.d.comb += axi_to.w.bits.id.eq(axi_from.w.bits.id)
+            if has_user:
+                m.d.comb += axi_to.w.bits.user.eq(axi_from.w.bits.user)
+        with m.Else():
+            m.d.comb += [
+                axi_to.w.valid.eq(w_conv.source.valid),
+                axi_to.w.bits.data.eq(w_conv.source.bits.data),
+                axi_to.w.bits.strb.eq(w_conv.source.bits.strb),
+                w_conv.source.ready.eq(axi_to.w.ready),
+                axi_from.w.ready.eq(Mux(aw_narrow_pending, 0, w_conv.sink.ready)),
+            ]
+            if is_axi3:
+                m.d.comb += axi_to.w.bits.id.eq(axi_from.w.bits.id)
+            if has_user:
+                m.d.comb += axi_to.w.bits.user.eq(axi_from.w.bits.user)
+            with m.If(fixed_aw_active):
+                m.d.comb += axi_to.w.bits.last.eq(w_subbeat_count == ratio - 1)
+            with m.Else():
+                m.d.comb += axi_to.w.bits.last.eq(w_conv.source.bits.last)
+
+        with m.If(axi_to.w.valid & axi_to.w.ready & ~narrow_aw_active):
+            with m.If(w_subbeat_count == ratio - 1):
+                m.d.sync += w_subbeat_count.eq(0)
+            with m.Else():
+                m.d.sync += w_subbeat_count.eq(w_subbeat_count + 1)
+
+        # B channel: pass-through except the FIXED FSM drives it directly.
+        with m.If(narrow_aw_active):
+            m.d.comb += [
+                axi_from.b.valid.eq(axi_to.b.valid),
+                axi_to.b.ready.eq(axi_from.b.ready),
+                axi_from.b.bits.id.eq(axi_to.b.bits.id),
+                axi_from.b.bits.resp.eq(axi_to.b.bits.resp),
+            ]
+            if has_user:
+                m.d.comb += axi_from.b.bits.user.eq(axi_to.b.bits.user)
+        with m.Elif(~fixed_aw_active):
+            m.d.comb += [
+                axi_from.b.valid.eq(axi_to.b.valid),
+                axi_to.b.ready.eq(axi_from.b.ready),
+                axi_from.b.bits.id.eq(axi_to.b.bits.id),
+                axi_from.b.bits.resp.eq(axi_to.b.bits.resp),
+            ]
+            if has_user:
+                m.d.comb += axi_from.b.bits.user.eq(axi_to.b.bits.user)
+        with m.If(narrow_aw_active & axi_to.b.valid & axi_from.b.ready):
+            m.d.sync += narrow_aw_active.eq(0)
+
+        # ============================= Read path: AR / R ===============================
+
+        cap_ar_addr = Signal.like(axi_from.ar.bits.addr)
+        cap_ar_len = Signal.like(axi_from.ar.bits.len)
+        cap_ar_size = Signal.like(axi_from.ar.bits.size)
+        cap_ar_id = Signal.like(axi_from.ar.bits.id)
+        cap_ar_lock = Signal.like(axi_from.ar.bits.lock)
+        cap_ar_prot = Signal.like(axi_from.ar.bits.prot)
+        cap_ar_cache = Signal.like(axi_from.ar.bits.cache)
+        cap_ar_qos = Signal.like(axi_from.ar.bits.qos)
+        cap_ar_region = Signal.like(axi_from.ar.bits.region)
+        cap_ar_lane = Signal(range(max(ratio, 2)))
+
+        ar_emit_count = Signal.like(axi_from.ar.bits.len)
+        r_wide_count = Signal.like(axi_from.ar.bits.len)
+
+        cap_ar_incr = Signal()
+        fixed_ar_active = Signal()
+        narrow_ar_active = Signal()
+        narrow_r_valid = Signal()
+        narrow_r_data = Signal(dw_to)
+        narrow_r_resp = Signal.like(axi_from.r.bits.resp)
+        narrow_r_id = Signal.like(axi_from.r.bits.id)
+
+        is_ar_narrow = (axi_from.ar.bits.len == 0) & (axi_from.ar.bits.size <= narrow_size_log2)
+        is_ar_slow = (
+            (axi_from.ar.bits.burst == AXIBurst.FIXED) & (axi_from.ar.bits.len != 0)
+        ) | (axi_from.ar.bits.len > max_fast_len)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                with m.If(narrow_ar_active):
+                    m.d.comb += axi_from.ar.ready.eq(0)
+                with m.Elif(is_ar_narrow):
+                    m.d.comb += [
+                        axi_to.ar.valid.eq(axi_from.ar.valid),
+                        axi_to.ar.bits.addr.eq(axi_from.ar.bits.addr),
+                        axi_to.ar.bits.len.eq(0),
+                        axi_to.ar.bits.size.eq(axi_from.ar.bits.size),
+                        axi_to.ar.bits.burst.eq(AXIBurst.INCR),
+                        axi_to.ar.bits.id.eq(axi_from.ar.bits.id),
+                        axi_to.ar.bits.lock.eq(axi_from.ar.bits.lock),
+                        axi_to.ar.bits.prot.eq(axi_from.ar.bits.prot),
+                        axi_to.ar.bits.cache.eq(axi_from.ar.bits.cache),
+                        axi_to.ar.bits.qos.eq(axi_from.ar.bits.qos),
+                        axi_to.ar.bits.region.eq(axi_from.ar.bits.region),
+                        axi_from.ar.ready.eq(axi_to.ar.ready),
+                    ]
+                    if has_user:
+                        m.d.comb += axi_to.ar.bits.user.eq(axi_from.ar.bits.user)
+                    with m.If(axi_from.ar.valid & axi_to.ar.ready):
+                        m.d.sync += [
+                            cap_ar_lane.eq(
+                                axi_from.ar.bits.addr[narrow_size_log2:wide_size_log2]),
+                            narrow_ar_active.eq(1),
+                        ]
+                with m.Elif(~is_ar_slow):
+                    m.d.comb += [
+                        axi_to.ar.valid.eq(axi_from.ar.valid),
+                        axi_to.ar.bits.addr.eq(axi_from.ar.bits.addr & ~wide_mask),
+                        axi_to.ar.bits.len.eq(
+                            ((axi_from.ar.bits.len + 1) << ratio_log2) - 1),
+                        axi_to.ar.bits.size.eq(narrow_size_log2),
+                        axi_to.ar.bits.id.eq(axi_from.ar.bits.id),
+                        axi_to.ar.bits.lock.eq(axi_from.ar.bits.lock),
+                        axi_to.ar.bits.prot.eq(axi_from.ar.bits.prot),
+                        axi_to.ar.bits.cache.eq(axi_from.ar.bits.cache),
+                        axi_to.ar.bits.qos.eq(axi_from.ar.bits.qos),
+                        axi_to.ar.bits.region.eq(axi_from.ar.bits.region),
+                        axi_from.ar.ready.eq(axi_to.ar.ready),
+                    ]
+                    with m.Switch(axi_from.ar.bits.burst):
+                        with m.Case(AXIBurst.FIXED):
+                            m.d.comb += axi_to.ar.bits.burst.eq(AXIBurst.INCR)
+                        with m.Case(AXIBurst.INCR):
+                            m.d.comb += axi_to.ar.bits.burst.eq(AXIBurst.INCR)
+                        with m.Case(AXIBurst.WRAP):
+                            m.d.comb += axi_to.ar.bits.burst.eq(AXIBurst.WRAP)
+                        with m.Case(AXIBurst.RESERVED):
+                            m.d.comb += axi_to.ar.bits.burst.eq(AXIBurst.RESERVED)
+                    if has_user:
+                        m.d.comb += axi_to.ar.bits.user.eq(axi_from.ar.bits.user)
+                with m.Else():
+                    m.d.comb += axi_from.ar.ready.eq(1)
+                    with m.If(axi_from.ar.valid):
+                        m.d.sync += [
+                            cap_ar_addr.eq(axi_from.ar.bits.addr),
+                            cap_ar_len.eq(axi_from.ar.bits.len),
+                            cap_ar_size.eq(axi_from.ar.bits.size),
+                            cap_ar_id.eq(axi_from.ar.bits.id),
+                            cap_ar_lock.eq(axi_from.ar.bits.lock),
+                            cap_ar_prot.eq(axi_from.ar.bits.prot),
+                            cap_ar_cache.eq(axi_from.ar.bits.cache),
+                            cap_ar_qos.eq(axi_from.ar.bits.qos),
+                            cap_ar_region.eq(axi_from.ar.bits.region),
+                            cap_ar_incr.eq(axi_from.ar.bits.burst == AXIBurst.INCR),
+                            ar_emit_count.eq(0),
+                            r_wide_count.eq(0),
+                        ]
+                        m.next = 'FIXED-EMIT-AR'
+
+            with m.State('FIXED-EMIT-AR'):
+                m.d.comb += [
+                    fixed_ar_active.eq(1),
+                    axi_to.ar.valid.eq(1),
+                    axi_to.ar.bits.addr.eq(
+                        (cap_ar_addr + Mux(cap_ar_incr, ar_emit_count << wide_size_log2, 0))
+                        & ~wide_mask),
+                    axi_to.ar.bits.len.eq(ratio - 1),
+                    axi_to.ar.bits.burst.eq(AXIBurst.INCR),
+                    axi_to.ar.bits.size.eq(narrow_size_log2),
+                    axi_to.ar.bits.id.eq(cap_ar_id),
+                    axi_to.ar.bits.lock.eq(cap_ar_lock),
+                    axi_to.ar.bits.prot.eq(cap_ar_prot),
+                    axi_to.ar.bits.cache.eq(cap_ar_cache),
+                    axi_to.ar.bits.qos.eq(cap_ar_qos),
+                    axi_to.ar.bits.region.eq(cap_ar_region),
+                ]
+                with m.If(axi_to.ar.ready):
+                    m.next = 'FIXED-DRAIN-R'
+
+            with m.State('FIXED-DRAIN-R'):
+                m.d.comb += fixed_ar_active.eq(1)
+                with m.If(axi_from.r.valid & axi_from.r.ready):
+                    with m.If(ar_emit_count == cap_ar_len):
+                        m.next = 'IDLE'
+                    with m.Else():
+                        m.d.sync += ar_emit_count.eq(ar_emit_count + 1)
+                        m.next = 'FIXED-EMIT-AR'
+
+        # R channel.
+        r_conv = m.submodules.r_conv = _StrideUp(dw_to, dw_from)
+
+        full_r_resp = Signal.like(axi_from.r.bits.resp)
+        full_r_id = Signal.like(axi_from.r.bits.id)
+
+        narrow_r_wide_data = Signal(dw_from)
+        m.d.comb += narrow_r_wide_data.eq(0)
+        with m.Switch(cap_ar_lane):
+            for i in range(ratio):
+                with m.Case(i):
+                    m.d.comb += narrow_r_wide_data[i * dw_to:(i + 1) * dw_to].eq(narrow_r_data)
+
+        m.d.comb += [
+            r_conv.sink.valid.eq(axi_to.r.valid & ~narrow_ar_active),
+            r_conv.sink.bits.data.eq(axi_to.r.bits.data),
+            r_conv.sink.bits.last.eq(axi_to.r.bits.last),
+        ]
+        with m.If(narrow_ar_active):
+            m.d.comb += [
+                axi_to.r.ready.eq(~narrow_r_valid),
+                r_conv.source.ready.eq(0),
+            ]
+        with m.Else():
+            m.d.comb += [
+                axi_to.r.ready.eq(r_conv.sink.ready),
+                r_conv.source.ready.eq(axi_from.r.ready),
+            ]
+
+        with m.If(narrow_r_valid):
+            m.d.comb += [
+                axi_from.r.valid.eq(1),
+                axi_from.r.bits.data.eq(narrow_r_wide_data),
+                axi_from.r.bits.resp.eq(narrow_r_resp),
+                axi_from.r.bits.last.eq(1),
+                axi_from.r.bits.id.eq(narrow_r_id),
+            ]
+        with m.Else():
+            m.d.comb += [
+                axi_from.r.valid.eq(r_conv.source.valid),
+                axi_from.r.bits.data.eq(r_conv.source.bits.data),
+                axi_from.r.bits.resp.eq(full_r_resp),
+                axi_from.r.bits.id.eq(full_r_id),
+            ]
+            with m.If(fixed_ar_active):
+                m.d.comb += axi_from.r.bits.last.eq(r_wide_count == cap_ar_len)
+            with m.Else():
+                m.d.comb += axi_from.r.bits.last.eq(r_conv.source.bits.last)
+        if has_user:
+            with m.If(narrow_r_valid):
+                m.d.comb += axi_from.r.bits.user.eq(0)
+            with m.Else():
+                m.d.comb += axi_from.r.bits.user.eq(axi_to.r.bits.user)
+
+        # Sub-beat tracking and id/resp accumulation.
+        r_sub_count = Signal(range(max(ratio, 2)))
+        with m.If(narrow_ar_active & axi_to.r.valid & axi_to.r.ready):
+            m.d.sync += [
+                narrow_r_valid.eq(1),
+                narrow_r_data.eq(axi_to.r.bits.data),
+                narrow_r_resp.eq(axi_to.r.bits.resp),
+                narrow_r_id.eq(axi_to.r.bits.id),
+            ]
+        with m.If(narrow_r_valid & axi_from.r.ready):
+            m.d.sync += [
+                narrow_r_valid.eq(0),
+                narrow_ar_active.eq(0),
+            ]
+        with m.If(axi_to.r.valid & axi_to.r.ready & ~narrow_ar_active):
+            with m.If(r_sub_count == 0):
+                m.d.sync += [
+                    full_r_id.eq(axi_to.r.bits.id),
+                    full_r_resp.eq(axi_to.r.bits.resp),
+                ]
+            with m.Elif(axi_to.r.bits.resp > full_r_resp):
+                m.d.sync += full_r_resp.eq(axi_to.r.bits.resp)
+            with m.If(r_sub_count == ratio - 1):
+                m.d.sync += r_sub_count.eq(0)
+            with m.Else():
+                m.d.sync += r_sub_count.eq(r_sub_count + 1)
+
+        with m.If(axi_from.r.valid & axi_from.r.ready):
+            with m.If(fixed_ar_active):
+                with m.If(r_wide_count == cap_ar_len):
+                    m.d.sync += r_wide_count.eq(0)
+                with m.Else():
+                    m.d.sync += r_wide_count.eq(r_wide_count + 1)
+
+        return m
+
+
+# AXI Data-Width Converter ------------------------------------------------------------------------
+
+class AXIConverter(Elaboratable):
+    """AXI data-width converter.
+
+    Connects ``master`` to ``slave``, transparently up- or down-converting the data
+    width (which must differ by an integer ratio). Equal widths are wired directly.
+    """
+
+    def __init__(self, master, slave):
+        self.master = master
+        self.slave = slave
+
+    def elaborate(self, platform):
+        m = Module()
+
+        dw_from = self.master.data_width
+        dw_to = self.slave.data_width
+
+        if dw_from > dw_to:
+            m.submodules.conv = AXIDownConverter(self.master, self.slave)
+        elif dw_from < dw_to:
+            m.submodules.conv = AXIUpConverter(self.master, self.slave)
+        else:
+            m.d.comb += self.master.connect(self.slave)
+
+        return m
