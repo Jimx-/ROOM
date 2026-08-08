@@ -390,7 +390,7 @@ class AXILiteDownConverter(Elaboratable):
         # Write conversion. Capture AW and W independently, since AXI-Lite does
         # not require the two channels to arrive in the same cycle.
         wr_aw_hold = Signal()
-        wr_addr = Signal(master.addr_width)
+        wr_addr_cur = Signal(master.addr_width)
         wr_prot = Signal(3)
         wr_w_hold = Signal()
         wr_data = Signal(dw_from)
@@ -418,7 +418,7 @@ class AXILiteDownConverter(Elaboratable):
                 with m.If(aw_fire):
                     m.d.sync += [
                         wr_aw_hold.eq(1),
-                        wr_addr.eq(master.aw.addr),
+                        wr_addr_cur.eq(master.aw.addr),
                         wr_prot.eq(master.aw.prot),
                     ]
                 with m.If(w_fire):
@@ -441,11 +441,14 @@ class AXILiteDownConverter(Elaboratable):
                     with m.If(wr_lane == ratio - 1):
                         m.next = "RESPOND"
                     with m.Else():
-                        m.d.sync += wr_lane.eq(wr_lane + 1)
+                        m.d.sync += [
+                            wr_lane.eq(wr_lane + 1),
+                            wr_addr_cur.eq(wr_addr_cur + slave_bytes),
+                        ]
                 with m.Else():
                     m.d.comb += [
                         slave.aw.valid.eq(~wr_aw_sent),
-                        slave.aw.addr.eq(wr_addr + wr_lane * slave_bytes),
+                        slave.aw.addr.eq(wr_addr_cur),
                         slave.aw.prot.eq(wr_prot),
                         slave.w.valid.eq(~wr_w_sent),
                         slave.w.data.eq(wr_lane_data),
@@ -471,6 +474,7 @@ class AXILiteDownConverter(Elaboratable):
                     with m.Else():
                         m.d.sync += [
                             wr_lane.eq(wr_lane + 1),
+                            wr_addr_cur.eq(wr_addr_cur + slave_bytes),
                             wr_aw_sent.eq(0),
                             wr_w_sent.eq(0),
                         ]
@@ -490,7 +494,7 @@ class AXILiteDownConverter(Elaboratable):
 
         # Read conversion. Each narrow response is placed in its corresponding
         # wide data lane, and the first non-OKAY response is retained.
-        rd_addr = Signal(master.addr_width)
+        rd_addr_cur = Signal(master.addr_width)
         rd_prot = Signal(3)
         rd_lane = Signal(range(ratio))
         rd_data = Signal(dw_from)
@@ -501,7 +505,7 @@ class AXILiteDownConverter(Elaboratable):
                 m.d.comb += master.ar.ready.eq(1)
                 with m.If(master.ar.valid):
                     m.d.sync += [
-                        rd_addr.eq(master.ar.addr),
+                        rd_addr_cur.eq(master.ar.addr),
                         rd_prot.eq(master.ar.prot),
                         rd_lane.eq(0),
                         rd_data.eq(0),
@@ -512,7 +516,7 @@ class AXILiteDownConverter(Elaboratable):
             with m.State("CONVERT"):
                 m.d.comb += [
                     slave.ar.valid.eq(1),
-                    slave.ar.addr.eq(rd_addr + rd_lane * slave_bytes),
+                    slave.ar.addr.eq(rd_addr_cur),
                     slave.ar.prot.eq(rd_prot),
                 ]
                 with m.If(slave.ar.ready):
@@ -528,7 +532,10 @@ class AXILiteDownConverter(Elaboratable):
                     with m.If(rd_lane == ratio - 1):
                         m.next = "RESPOND"
                     with m.Else():
-                        m.d.sync += rd_lane.eq(rd_lane + 1)
+                        m.d.sync += [
+                            rd_lane.eq(rd_lane + 1),
+                            rd_addr_cur.eq(rd_addr_cur + slave_bytes),
+                        ]
                         m.next = "CONVERT"
 
             with m.State("RESPOND"):
