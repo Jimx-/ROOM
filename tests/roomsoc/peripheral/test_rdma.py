@@ -28,6 +28,8 @@ from roomsoc.peripheral.net import packet_codec as roce_codec
 from roomsoc.peripheral.net.packet_codec import (AETH, BTH, RETH, BthOpcode,
                                                  RDMAConnectionSetup)
 from roomsoc.peripheral.net.udp import UdpIpMetadata
+from tests.roomsoc.peripheral.net_helpers import (assert_valid_ipv4_checksum,
+                                                  is_ipv4_frame)
 
 
 def build_test_packets():
@@ -742,6 +744,10 @@ def run_rdma(requests,
     if sram_addresses:
         simulator.add_sync_process(inspect_sram)
     simulator.run()
+
+    for response in responses:
+        if is_ipv4_frame(response):
+            assert_valid_ipv4_checksum(response)
     return responses, sram_image
 
 

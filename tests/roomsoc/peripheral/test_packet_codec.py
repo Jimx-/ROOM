@@ -10,6 +10,7 @@ from scapy.packet import Raw
 from roomsoc.peripheral.net import packet_codec as codec
 from roomsoc.peripheral.net.packet_codec import (AETH, BTH, RETH, BthOpcode,
                                                  RDMAConnectionSetup)
+from tests.roomsoc.peripheral.net_helpers import assert_valid_ipv4_checksum
 
 DST_MAC = "12:34:56:78:9a:bc"
 SRC_MAC = "70:66:55:5a:92:41"
@@ -99,6 +100,7 @@ def test_real_icrc_matches_driver_capture():
         "00000000000012300000000000000010"
         "000102030405060708090a0b0c0d0e0f"
         "ca47470e")
+    assert_valid_ipv4_checksum(captured)
     assert codec.icrc_matches(captured)
     assert captured[-4:] == codec.compute_icrc(captured[14:-4])
 
@@ -111,6 +113,8 @@ def test_rtl_icrc_matches_hardware_captures():
         "1100ffff0000000200000000"
         "00000000"
         "392aa6c7")
+    assert_valid_ipv4_checksum(ack)
+    assert Ether(ack)[UDP].chksum == 0
     assert codec.icrc_matches(ack, mode="rtl")
     assert ack[-4:] == codec.compute_rtl_icrc(ack[14:-4])
 
@@ -177,6 +181,7 @@ def test_scapy_roundtrip_and_padding(opcode, payload):
                         vaddr=0x1230,
                         dmalen=len(payload),
                         payload=payload)
+    assert_valid_ipv4_checksum(packet)
     parsed = Ether(packet)
     assert parsed[BTH].opcode == opcode
     assert parsed[BTH].dest_qp == 2
@@ -196,6 +201,8 @@ def test_icrc_detects_corruption():
                    dmalen=4,
                    payload=b"\xab\xcd\xef\xff"))
     packet[20] ^= 0xFF
+    with pytest.raises(AssertionError, match="invalid IPv4 header checksum"):
+        assert_valid_ipv4_checksum(packet)
     assert not codec.icrc_matches(packet)
 
 
@@ -209,13 +216,14 @@ def test_connection_setup_layer_matches_record_and_golden_packet():
         Ether(dst=DST_MAC, src=SRC_MAC)
         / IP(src=SRC_IP, dst=DST_IP, id=1)
         / UDP(sport=500, dport=8000) / setup)
+    assert_valid_ipv4_checksum(packet)
     assert packet == bytes.fromhex(
         "123456789abc7066555a92410800"
-        "45000036000100004011f562c0a80201c0a80202"
-        "01f41f4000225259"
+        "4500003a000100004011f55ec0a80201c0a80202"
+        "01f41f4000265251"
         "0200000002000000"
         "c0a80201000000000000000000000000"
-        "401f")
+        "401f00000000")
     parsed = Ether(packet)[RDMAConnectionSetup]
     assert parsed.local_qpn == 2
     assert parsed.remote_qpn == 2

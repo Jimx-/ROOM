@@ -8,6 +8,18 @@ from .common import *
 __all__ = ("Crc", )
 
 
+def _crc_table(width, polynomial):
+    """Build a byte lookup table for a reflected CRC."""
+    mask = (1 << width) - 1
+    table = []
+    for n in range(256):
+        c = n
+        for _ in range(8):
+            c = (c >> 1) ^ polynomial if (c & 1) else (c >> 1)
+        table.append(c & mask)
+    return table
+
+
 class CrcExtract(Elaboratable):
 
     def __init__(self, data_width):
@@ -97,21 +109,44 @@ class CrcExtract(Elaboratable):
 
 class CrcCalculate(Elaboratable):
 
-    def __init__(self, data_width, user_width=1):
+    def __init__(self,
+                 data_width,
+                 user_width=1,
+                 *,
+                 crc_width=32,
+                 polynomial=0xedb88320,
+                 initial_value=0xffffffff,
+                 final_xor=0xffffffff):
+        if data_width <= 0 or data_width % 8:
+            raise ValueError("data_width must be a positive multiple of 8")
+        if crc_width < 8:
+            raise ValueError("crc_width must be at least 8")
+
+        crc_mask = (1 << crc_width) - 1
+        for name, value in (("polynomial", polynomial),
+                            ("initial_value", initial_value),
+                            ("final_xor", final_xor)):
+            if not 0 <= value <= crc_mask:
+                raise ValueError(f"{name} must fit in crc_width bits")
+
         self.data_width = data_width
         self.user_width = user_width
+        self.crc_width = crc_width
+        self.polynomial = polynomial
+        self.initial_value = initial_value
+        self.final_xor = final_xor
 
         self.data_in = AXIStreamInterface(data_width=data_width,
                                           user_width=user_width)
         self.data_out = AXIStreamInterface(data_width=data_width,
                                            user_width=user_width)
 
-        self.crc = Decoupled(Signal, 32)
+        self.crc = Decoupled(Signal, crc_width)
 
     def elaborate(self, platform):
         m = Module()
 
-        crc = Signal(32, reset=0xffffffff)
+        crc = Signal(self.crc_width, reset=self.initial_value)
 
         q_in = m.submodules.q_in = Queue(2, self.data_in, flow=False)
         m.d.comb += self.data_in.connect(q_in.enq)
@@ -119,7 +154,7 @@ class CrcCalculate(Elaboratable):
         q_out = m.submodules.q_out = Queue(2, self.data_out, flow=False)
         m.d.comb += q_out.deq.connect(self.data_out)
 
-        crc_queue = m.submodules.crc_queue = Queue(2, Signal, 32)
+        crc_queue = m.submodules.crc_queue = Queue(2, Signal, self.crc_width)
         m.d.comb += crc_queue.deq.connect(self.crc)
 
         m.d.comb += [
@@ -132,29 +167,35 @@ class CrcCalculate(Elaboratable):
         ]
 
         crc_next = Signal.like(crc)
-        m.d.comb += crc_queue.enq.bits.eq(crc_next ^ 0xffffffff)
+        m.d.comb += crc_queue.enq.bits.eq(crc_next ^ self.final_xor)
+
+        # Each byte advances the reflected CRC by one asynchronous table
+        # lookup instead of eight serial bit shifts.
+        crc_mem = Memory(width=self.crc_width,
+                         depth=256,
+                         init=_crc_table(self.crc_width, self.polynomial))
 
         crc_bytes = [
-            Signal(32, name=f'crc_byte{i}')
+            Signal(self.crc_width, name=f'crc_byte{i}')
             for i in range(self.data_width // 8 + 1)
         ]
         m.d.comb += crc_bytes[0].eq(crc)
 
-        polynomial = Const(0xedb88320, 32)
+        crc_ports = [
+            crc_mem.read_port(domain="comb")
+            for _ in range(self.data_width // 8)
+        ]
+        for i, port in enumerate(crc_ports):
+            setattr(m.submodules, f"crc_port{i}", port)
+            m.d.comb += port.addr.eq(
+                crc_bytes[i][:8]
+                ^ q_in.deq.bits.data[i * 8:(i + 1) * 8])
 
         with m.If(q_in.deq.fire):
-            for i in range(self.data_width // 8):
-                m.d.comb += crc_bytes[i + 1].eq(crc_bytes[i])
-
-                with m.If(q_in.deq.bits.keep[i]):
-                    acc = crc_bytes[i] ^ q_in.deq.bits.data[i * 8:(i + 1) * 8]
-
-                    for _ in range(8):
-                        mask = Signal(32)
-                        m.d.comb += mask.eq(-(acc & 1))
-                        acc = (acc >> 1) ^ (polynomial & mask)
-
-                    m.d.comb += crc_bytes[i + 1].eq(acc)
+            for i, port in enumerate(crc_ports):
+                updated = port.data ^ (crc_bytes[i] >> 8)
+                m.d.comb += crc_bytes[i + 1].eq(
+                    Mux(q_in.deq.bits.keep[i], updated, crc_bytes[i]))
 
             m.d.comb += [
                 crc_next.eq(crc_bytes[-1]),
