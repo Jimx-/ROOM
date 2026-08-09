@@ -287,7 +287,10 @@ class Core(HasCoreParams, Elaboratable):
         #
         lsu = m.submodules.lsu = LoadStoreUnit(self.params,
                                                sim_debug=self.sim_debug)
-        m.d.comb += exec_unit.lsu_req.connect(lsu.exec_req)
+        m.d.comb += [
+            exec_unit.lsu_req.connect(lsu.exec_req),
+            if_stage.warp_memory.eq(lsu.warp_memory),
+        ]
 
         for dcache_req, lsu_dcache_req in zip(self.dcache_req, lsu.dcache_req):
             m.d.comb += lsu_dcache_req.connect(dcache_req)

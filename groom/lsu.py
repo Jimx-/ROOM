@@ -4,7 +4,6 @@ from amaranth.utils import log2_int
 from amaranth.hdl.ast import ValueCastable
 
 from groom.fu import ExecResp
-
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.dcache import DCacheReq, DCacheResp
@@ -343,6 +342,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             for i in range(self.n_threads)
         ]
 
+        self.warp_memory = Signal(self.n_warps)
+
         if sim_debug:
             self.lsu_debug = Valid(LSUDebug, params)
 
@@ -354,6 +355,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         lsq = Array(
             LSQEntry(self.params, name=f'lsq{i}') for i in range(self.n_warps))
+
+        # Include requests allocating an LSQ entry on this edge so that an
+        # idle-barrier bypass cannot race an older memory instruction.
+        m.d.comb += self.warp_memory.eq(
+            Cat(lsq[w].valid
+                | (self.exec_req.fire & (self.exec_req.bits.wid == w))
+                | (self.fp_std.fire & (self.fp_std.bits.wid == w))
+                for w in range(self.n_warps)))
 
         s0_tlb_uncacheable = Signal(self.n_threads)
         for w in range(self.n_threads):

@@ -173,6 +173,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         self.stall_req = Valid(WarpStallReq, params)
         self.br_res = Valid(BranchResolution, params)
         self.warp_ctrl = Valid(WarpControlReq, params)
+        self.warp_memory = Signal(self.n_warps)
         self.join_req = Valid(Signal, range(self.n_warps))
 
         self.tmask = BankedCSR(CSR, gpucsrnames.tmask,
@@ -199,6 +200,49 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         barrier_masks = Array(
             Signal(self.n_warps, name=f'barrier_mask{i}')
             for i in range(self.n_barriers))
+        barrier_waiting = Signal(self.n_warps)
+        barrier_ids = Array(
+            Signal(range(self.n_barriers), name=f'barrier_id{i}')
+            for i in range(self.n_warps))
+        barrier_counts = Array(
+            Signal(range(self.n_warps), name=f'barrier_count{i}')
+            for i in range(self.n_warps))
+
+        barrier_ready_wid = Signal(range(self.n_warps))
+        barrier_ready = Signal()
+        for i in reversed(range(self.n_warps)):
+            with m.If(barrier_waiting[i] & ~self.warp_memory[i]):
+                m.d.comb += [
+                    barrier_ready_wid.eq(i),
+                    barrier_ready.eq(1),
+                ]
+
+        incoming_barrier = (self.warp_ctrl.valid
+                            & self.warp_ctrl.bits.barrier.valid)
+        barrier_bypass = Signal()
+        m.d.comb += barrier_bypass.eq(
+            incoming_barrier & ~barrier_ready
+            & ~self.warp_memory.bit_select(self.warp_ctrl.bits.wid, 1))
+
+        barrier_arrival_valid = Signal()
+        barrier_arrival_wid = Signal(range(self.n_warps))
+        barrier_arrival_id = Signal(range(self.n_barriers))
+        barrier_arrival_count = Signal(range(self.n_warps))
+        with m.If(barrier_ready):
+            m.d.comb += [
+                barrier_arrival_valid.eq(1),
+                barrier_arrival_wid.eq(barrier_ready_wid),
+                barrier_arrival_id.eq(barrier_ids[barrier_ready_wid]),
+                barrier_arrival_count.eq(barrier_counts[barrier_ready_wid]),
+            ]
+        with m.Elif(barrier_bypass):
+            m.d.comb += [
+                barrier_arrival_valid.eq(1),
+                barrier_arrival_wid.eq(self.warp_ctrl.bits.wid),
+                barrier_arrival_id.eq(self.warp_ctrl.bits.barrier.id),
+                barrier_arrival_count.eq(
+                    self.warp_ctrl.bits.barrier.count),
+            ]
 
         with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
             m.d.sync += active_warps.eq(self.warp_ctrl.bits.wspawn.mask)
@@ -269,23 +313,41 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                             stalled_warps[i].eq(0),
                         ]
 
-        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.barrier.valid):
-            active_barrier_count = 0
-            for b in barrier_masks[self.warp_ctrl.bits.barrier.id]:
-                active_barrier_count += b
-
+        # A busy incoming warp waits for its LSU to drain. If a queued warp is
+        # admitted this cycle, preserve the incoming request for a later cycle
+        # so that only one barrier mask update occurs at a time.
+        with m.If(incoming_barrier & ~barrier_bypass):
             with m.Switch(self.warp_ctrl.bits.wid):
                 for i in range(self.n_warps):
                     with m.Case(i):
-                        m.d.sync += stalled_warps[i].eq(0)
+                        m.d.sync += [
+                            barrier_waiting[i].eq(1),
+                            barrier_ids[i].eq(
+                                self.warp_ctrl.bits.barrier.id),
+                            barrier_counts[i].eq(
+                                self.warp_ctrl.bits.barrier.count),
+                        ]
+
+        with m.If(barrier_arrival_valid):
+            active_barrier_count = 0
+            for arrived in barrier_masks[barrier_arrival_id]:
+                active_barrier_count += arrived
+
+            with m.Switch(barrier_arrival_wid):
+                for i in range(self.n_warps):
+                    with m.Case(i):
+                        m.d.sync += [
+                            barrier_waiting[i].eq(0),
+                            stalled_warps[i].eq(0),
+                        ]
 
                         with m.If(active_barrier_count ==
-                                  self.warp_ctrl.bits.barrier.count):
+                                  barrier_arrival_count):
                             m.d.sync += barrier_masks[
-                                self.warp_ctrl.bits.barrier.id].eq(0)
+                                barrier_arrival_id].eq(0)
                         with m.Else():
                             m.d.sync += barrier_masks[
-                                self.warp_ctrl.bits.barrier.id][i].eq(1)
+                                barrier_arrival_id][i].eq(1)
 
         with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.split.valid):
             with m.Switch(self.warp_ctrl.bits.wid):
@@ -403,6 +465,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
         self.stall_req = Valid(WarpStallReq, params)
         self.br_res = Valid(BranchResolution, params)
         self.warp_ctrl = Valid(WarpControlReq, params)
+        self.warp_memory = Signal(self.n_warps)
         self.join_req = Valid(Signal, range(self.n_warps))
 
         self._warp_sched = WarpScheduler(self.params)
@@ -423,6 +486,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
             warp_sched.stall_req.eq(self.stall_req),
             warp_sched.br_res.eq(self.br_res),
             warp_sched.warp_ctrl.eq(self.warp_ctrl),
+            warp_sched.warp_memory.eq(self.warp_memory),
             warp_sched.join_req.eq(self.join_req),
             self.busy.eq(warp_sched.busy),
         ]
