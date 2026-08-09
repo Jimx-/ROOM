@@ -199,13 +199,15 @@ def _collect_get_responses(bus, expected, *, ready_fn=lambda cycle: 1,
     raise AssertionError(f"timed out waiting for sources {sorted(remaining)}")
 
 
-def _probe_responder(bus, clients, probes, done):
+def _probe_responder(bus, clients, probes, done, *, beat_gap=0):
     """Respond to inner B-channel probes using per-client cache state.
 
     ``clients`` is keyed by the first source ID assigned to each client. Each
     present entry contains ``cap`` (``CapParam.toB`` or ``toT``), ``data``, and
     ``dirty``. Dirty clients return ProbeAckData; clean clients return
     ProbeAck. Every observed probe is appended to ``probes`` for assertions.
+    ``beat_gap`` inserts invalid C cycles between data beats, which is legal
+    TileLink traffic and useful for exercising BankedStore reservations.
     """
     beat_bytes = bus.data_width // 8
     yield bus.b.ready.eq(1)
@@ -260,6 +262,11 @@ def _probe_responder(bus, clients, probes, done):
             yield
             while not (yield bus.c.ready):
                 yield
+            if beat != beats - 1 and beat_gap:
+                yield bus.c.valid.eq(0)
+                for _ in range(beat_gap):
+                    yield
+                yield bus.c.valid.eq(1)
 
         yield bus.c.valid.eq(0)
         if target == tilelink.CapParam.toN.value:
@@ -898,4 +905,77 @@ def test_l2_multibeat_dirty_probe_then_writeback():
     run_sim(top,
             *_common(top, model, done),
             _proc(_probe_responder, top.in_bus, clients, probes, done),
+            driver)
+
+
+def test_l2_wide_outer_eviction_preserves_gapped_probeack_data():
+    """A 512-bit eviction must not cut into a gapped 64-bit ProbeAckData.
+
+    The conflict miss evicts a dirty client-owned line. SourceC is allowed to
+    start once the first probe response beat arrives, so SinkC's noop bank
+    reservations must keep the one-beat outer read stalled across each legal
+    gap until all eight inner beats have updated the BankedStore.
+    """
+    params = _l2_params(block_bytes=64,
+                        outer_beat_bytes=64,
+                        port_factor=4,
+                        n_mshrs=4)
+    top = L2Top(params)
+    model = _model(top)
+    done = [False]
+    clients = {}
+    probes = []
+    address = 0x40
+    size = log2_int(64)
+    set_stride = 0x200
+    dirty_beats = [
+        0x1111111111111111,
+        0x2222222222222222,
+        0x3333333333333333,
+        0x4444444444444444,
+        0x5555555555555555,
+        0x6666666666666666,
+        0x7777777777777777,
+        0x0001003C00000000,
+    ]
+    dirty_value = sum(beat << (64 * i)
+                      for i, beat in enumerate(dirty_beats))
+
+    def driver():
+        yield from _acquire(top.in_bus,
+                            address,
+                            size=size,
+                            source=0,
+                            grow_param=tilelink.GrowParam.NtoT)
+        clients[0] = dict(cap=tilelink.CapParam.toT,
+                          data=dirty_value,
+                          dirty=True)
+
+        # Fill the other way, then replace the client-owned dirty victim.
+        yield from tl_get(top.in_bus,
+                          address + set_stride,
+                          size=size,
+                          source=1)
+        yield from tl_get(top.in_bus,
+                          address + 2 * set_stride,
+                          size=size,
+                          source=1)
+
+        assert probes == [
+            (0, address, tilelink.CapParam.toN.value, True)
+        ]
+        actual = _rd(model, address, 64)
+        assert actual == dirty_value, (
+            f"dirty victim mismatch:\nactual   {actual:0128x}\n"
+            f"expected {dirty_value:0128x}")
+        done[0] = True
+
+    run_sim(top,
+            *_common(top, model, done),
+            _proc(_probe_responder,
+                  top.in_bus,
+                  clients,
+                  probes,
+                  done,
+                  beat_gap=1),
             driver)

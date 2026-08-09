@@ -262,7 +262,12 @@ class BankedStore(HasL2CacheParams, Elaboratable):
                 bank = word % num_banks
                 row = word // num_banks
                 for i in range(num_banks):
-                    with m.If((bank == i) & port.valid & ~port.bits.noop):
+                    # A noop still reserves its banks for arbitration. SinkC
+                    # emits these requests in gaps between ProbeAckData beats
+                    # so a wider, lower-priority SourceC read cannot cut into
+                    # the middle of the writeback stream. Only bank_en below
+                    # suppresses the actual SRAM access for a noop.
+                    with m.If((bank == i) & port.valid):
                         m.d.comb += [
                             out.bank_sel[i].eq(1),
                             out.index[i * row_bits:(i + 1) * row_bits].eq(row),
@@ -281,7 +286,7 @@ class BankedStore(HasL2CacheParams, Elaboratable):
 
             conflict = (out.bank_sel & out.bank_sum).any()
             m.d.comb += [
-                port.ready.eq(port.bits.noop | ~conflict),
+                port.ready.eq(~conflict),
                 out.bank_en.eq(Repl(port.valid & ~port.bits.noop & ~conflict,
                                     num_banks) & out.bank_sel),
             ]
