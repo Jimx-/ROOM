@@ -28,10 +28,19 @@ if __name__ == '__main__':
 
         f.write(f'#define USE_SMEM {int(core_params.use_smem)}\n')
         if core_params.use_smem:
-            f.write(
-                f'#define SMEM_BASE {hex(core_params.smem_base+core_params.smem_size)}\n'
-            )
-            f.write(f'#define SMEM_SIZE {hex(core_params.smem_size)}\n')
-        f.write('\n')
+            f.write('\n')
+            f.write(f'#define SMEM_START {hex(core_params.smem_base)}\n')
+            f.write(f'#define SMEM_SIZE  {hex(core_params.smem_size)}\n')
+
+        f.write('''
+#define USE_SMEM_STACK 0
+
+#if USE_SMEM_STACK
+#define GROOM_STACK_TOP (SMEM_START + SMEM_SIZE)
+#else
+#define GROOM_STACK_TOP 0x90000000
+#endif
+
+''')
 
         f.write('#endif\n')
