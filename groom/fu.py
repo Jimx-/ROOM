@@ -583,7 +583,7 @@ class DivUnit(IterativeFunctionalUnit):
                 div.req.bits.dw.eq(self.req.bits.uop.alu_dw),
                 div.req.bits.in1.eq(self.req.bits.rs1_data[w]),
                 div.req.bits.in2.eq(self.req.bits.rs2_data[w]),
-                div.req.valid.eq(self.req.valid & self.req.bits.uop.tmask[w]),
+                div.req.valid.eq(self.req.fire & self.req.bits.uop.tmask[w]),
                 self.resp.bits.data[w].eq(div.resp.bits),
                 div_resp_valid[w].eq(div.resp.valid),
                 div.resp.ready.eq(~tmask_valid | self.resp.fire),
