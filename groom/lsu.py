@@ -104,6 +104,10 @@ class SharedMemory(HasCoreParams, Elaboratable):
             DCacheReq(self.params, name=f's0_req{i}')
             for i in range(self.n_threads)
         ]
+        s0_write_masks = [
+            Signal(word_bytes, name=f's0_write_mask{i}')
+            for i in range(self.n_threads)
+        ]
         s0_banks = [
             Signal(bank_bits, name=f's0_bank{i}')
             for i in range(self.n_threads)
@@ -129,6 +133,7 @@ class SharedMemory(HasCoreParams, Elaboratable):
             m.d.comb += [
                 s0_req[w].eq(self.req[w].bits),
                 s0_req[w].data.eq(store_gen.data_out),
+                s0_write_masks[w].eq(store_gen.mask),
                 s0_banks[w].eq(
                     (self.req[w].bits.addr >> bank_off_bits)[:bank_bits]),
                 s0_idxs[w].eq(
@@ -240,17 +245,36 @@ class SharedMemory(HasCoreParams, Elaboratable):
 
             m.d.sync += s2_bank_reads[b].eq(mem_read.data)
 
-            mem_write = mem.write_port()
+            mem_write = mem.write_port(granularity=8)
             setattr(m.submodules, f'mem_write{b}', mem_write)
 
             for i in range(self.n_threads):
                 with m.If(s0_bank_gnts[b][i]):
-                    m.d.comb += [
-                        mem_write.addr.eq(s0_idxs[i]),
-                        mem_write.data.eq(s0_req[i].data),
-                        mem_write.en.eq(
-                            MemoryCommand.is_write(s0_req[i].uop.mem_cmd)),
-                    ]
+                    m.d.comb += mem_write.addr.eq(s0_idxs[i])
+
+                    for byte in range(word_bytes):
+                        byte_data = s0_req[i].data.word_select(byte, 8)
+                        byte_en = (MemoryCommand.is_write(
+                            s0_req[i].uop.mem_cmd) & s0_write_masks[i][byte])
+
+                        for j in range(i + 1, self.n_threads):
+                            coalesced_write = (
+                                s0_valids[j] & (s0_banks[j] == b)
+                                & (s0_idxs[j] == s0_idxs[i])
+                                & MemoryCommand.is_write(
+                                    s0_req[j].uop.mem_cmd)
+                                & s0_write_masks[j][byte])
+                            byte_data = Mux(
+                                coalesced_write,
+                                s0_req[j].data.word_select(byte, 8),
+                                byte_data)
+                            byte_en |= coalesced_write
+
+                        m.d.comb += [
+                            mem_write.data.word_select(byte,
+                                                       8).eq(byte_data),
+                            mem_write.en[byte].eq(byte_en),
+                        ]
 
         for w in range(self.n_threads):
             load_gen = LoadGen(max_size=self.xlen // 8)
