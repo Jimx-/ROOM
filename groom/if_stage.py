@@ -122,11 +122,14 @@ class IPDomStack(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        mem = Memory(depth=self.n_threads, width=2 * len(self.r_data))
-        r_ptr = Signal(range(self.n_threads + 1))
-        w_ptr = Signal(range(self.n_threads + 1))
+        mem = Memory(depth=self.ipdom_stack_depth,
+                     width=2 * len(self.r_data))
+        r_ptr = Signal(range(self.ipdom_stack_depth + 1))
+        w_ptr = Signal(range(self.ipdom_stack_depth + 1))
 
-        index = Array(Signal(name=f'index{i}') for i in range(self.n_threads))
+        index = Array(
+            Signal(name=f'index{i}')
+            for i in range(self.ipdom_stack_depth))
 
         with m.If(self.w_en):
             m.d.sync += [

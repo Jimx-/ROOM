@@ -148,6 +148,7 @@ class HasCoreParams:
             self.n_warps = params['n_warps']
             self.n_threads = params['n_threads']
             self.n_barriers = params['n_barriers']
+            self.ipdom_stack_depth = params.get('ipdom_stack_depth', 32)
 
             self.mem_width = self.n_threads
             self.max_br_count = 0
