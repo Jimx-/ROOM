@@ -122,14 +122,12 @@ class IPDomStack(HasCoreParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        mem = Memory(depth=self.ipdom_stack_depth,
-                     width=2 * len(self.r_data))
+        mem = Memory(depth=self.ipdom_stack_depth, width=2 * len(self.r_data))
         r_ptr = Signal(range(self.ipdom_stack_depth + 1))
         w_ptr = Signal(range(self.ipdom_stack_depth + 1))
 
         index = Array(
-            Signal(name=f'index{i}')
-            for i in range(self.ipdom_stack_depth))
+            Signal(name=f'index{i}') for i in range(self.ipdom_stack_depth))
 
         with m.If(self.w_en):
             m.d.sync += [
@@ -243,8 +241,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 barrier_arrival_valid.eq(1),
                 barrier_arrival_wid.eq(self.warp_ctrl.bits.wid),
                 barrier_arrival_id.eq(self.warp_ctrl.bits.barrier.id),
-                barrier_arrival_count.eq(
-                    self.warp_ctrl.bits.barrier.count),
+                barrier_arrival_count.eq(self.warp_ctrl.bits.barrier.count),
             ]
 
         with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
@@ -325,8 +322,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                     with m.Case(i):
                         m.d.sync += [
                             barrier_waiting[i].eq(1),
-                            barrier_ids[i].eq(
-                                self.warp_ctrl.bits.barrier.id),
+                            barrier_ids[i].eq(self.warp_ctrl.bits.barrier.id),
                             barrier_counts[i].eq(
                                 self.warp_ctrl.bits.barrier.count),
                         ]
@@ -344,13 +340,12 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                             stalled_warps[i].eq(0),
                         ]
 
-                        with m.If(active_barrier_count ==
-                                  barrier_arrival_count):
-                            m.d.sync += barrier_masks[
-                                barrier_arrival_id].eq(0)
+                        with m.If(
+                                active_barrier_count == barrier_arrival_count):
+                            m.d.sync += barrier_masks[barrier_arrival_id].eq(0)
                         with m.Else():
-                            m.d.sync += barrier_masks[
-                                barrier_arrival_id][i].eq(1)
+                            m.d.sync += barrier_masks[barrier_arrival_id][
+                                i].eq(1)
 
         with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.split.valid):
             with m.Switch(self.warp_ctrl.bits.wid):
@@ -428,7 +423,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                             Mux(wspawn_valid[i], 1, thread_masks[i])),
                     ]
 
-        m.d.comb += self.busy.eq(active_warps.any())
+        m.d.comb += self.busy.eq(active_warps.any() | self.warp_memory.any())
 
         return m
 
@@ -586,8 +581,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
                 self.if_debug.bits.wid.eq(s2_wid),
                 self.if_debug.bits.uop_id.eq(
                     self.fetch_packet.bits.uop.uop_id),
-                self.if_debug.bits.tmask.eq(
-                    self.fetch_packet.bits.uop.tmask),
+                self.if_debug.bits.tmask.eq(self.fetch_packet.bits.uop.tmask),
                 self.if_debug.bits.pc.eq(self.fetch_packet.bits.uop.pc),
                 self.if_debug.bits.inst.eq(self.fetch_packet.bits.uop.inst),
             ]
