@@ -398,6 +398,7 @@ class DMAHandler(Elaboratable):
         self.read_data = AXIStreamInterface(data_width=data_width)
         self.write_cmd = Decoupled(Rocev2Stack.MemoryCommand)
         self.write_data = AXIStreamInterface(data_width=data_width)
+        self.write_done = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -469,6 +470,8 @@ class DMAHandler(Elaboratable):
                     (1 << (self.data_width // 8)) - 1)),
             self.write_data.ready.eq(write_active & writer.data.ready),
         ]
+        m.d.comb += self.write_done.eq(write_active & writer.done)
+
         with m.If(write_active & writer.done):
             m.d.sync += write_active.eq(0)
 
@@ -547,6 +550,7 @@ class Top(Elaboratable):
             roce_stack.mem_write_cmd.connect(dma_handler.write_cmd),
             roce_stack.mem_write_data.connect(dma_handler.write_data),
             dma_handler.read_data.connect(roce_stack.mem_read_data),
+            roce_stack.mem_write_done.eq(dma_handler.write_done),
         ]
 
         dma_sram_bus = wb.Interface(addr_width=29,

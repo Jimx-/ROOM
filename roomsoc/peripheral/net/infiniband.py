@@ -188,6 +188,17 @@ class _EventMetadata(Record):
                          src_loc_at=1 + src_loc_at)
 
 
+class _PendingWrite(Record):
+
+    def __init__(self, name=None, src_loc_at=0):
+        super().__init__([
+            ('qpn', 24, Direction.FANOUT),
+            ('psn', 24, Direction.FANOUT),
+        ],
+                         name=name,
+                         src_loc_at=1 + src_loc_at)
+
+
 class InfiniBandMetadata(Record):
 
     def __init__(self, name=None, src_loc_at=0):
@@ -784,6 +795,7 @@ class RxHandler(Elaboratable):
 
         self.write_cmd = Decoupled(InfiniBandTransportProtocol.MemoryCommand)
         self.ack_event = Decoupled(_EventMetadata)
+        self.mem_write_done = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -794,6 +806,24 @@ class RxHandler(Elaboratable):
 
         ack_q = m.submodules.ack_q = Queue(4, _EventMetadata)
         m.d.comb += ack_q.deq.connect(self.ack_event)
+
+        pending_q = m.submodules.pending_q = Queue(16, _PendingWrite)
+
+        completions = Signal(range(17))
+        ack_ready = (completions != 0) & pending_q.deq.valid
+        ack_fire = ack_ready & ack_q.enq.ready
+        m.d.comb += [
+            ack_q.enq.bits.opcode.eq(BthOpcode.RC_ACKNOWLEDGE),
+            ack_q.enq.bits.qpn.eq(pending_q.deq.bits.qpn),
+            ack_q.enq.bits.psn.eq(pending_q.deq.bits.psn),
+            ack_q.enq.valid.eq(ack_ready),
+            pending_q.deq.ready.eq(ack_fire),
+        ]
+
+        with m.If(self.mem_write_done & ~ack_fire):
+            m.d.sync += completions.eq(completions + 1)
+        with m.Elif(~self.mem_write_done & ack_fire):
+            m.d.sync += completions.eq(completions - 1)
 
         meta = InfiniBandMetadata()
         aeth = Record(IB_AETH_LAYOUT)
@@ -837,14 +867,13 @@ class RxHandler(Elaboratable):
                         m.d.comb += [
                             write_cmd_q.enq.bits.addr.eq(reth.vaddr),
                             write_cmd_q.enq.bits.len.eq(reth.dmalen),
-                            write_cmd_q.enq.valid.eq(ack_q.enq.ready),
-                            ack_q.enq.bits.opcode.eq(BthOpcode.RC_ACKNOWLEDGE),
-                            ack_q.enq.bits.qpn.eq(meta.dest_qp),
-                            ack_q.enq.bits.psn.eq(meta.psn),
-                            ack_q.enq.valid.eq(write_cmd_q.enq.ready),
+                            write_cmd_q.enq.valid.eq(pending_q.enq.ready),
+                            pending_q.enq.bits.qpn.eq(meta.dest_qp),
+                            pending_q.enq.bits.psn.eq(meta.psn),
+                            pending_q.enq.valid.eq(write_cmd_q.enq.ready),
                         ]
 
-                        with m.If(write_cmd_q.enq.fire & ack_q.enq.fire):
+                        with m.If(write_cmd_q.enq.fire & pending_q.enq.fire):
                             m.next = 'FORWARD'
 
                     with m.Default():
@@ -1213,6 +1242,7 @@ class InfiniBandTransportProtocol(Elaboratable):
         self.mem_write_cmd = Decoupled(
             InfiniBandTransportProtocol.MemoryCommand)
         self.mem_write_data = AXIStreamInterface(data_width=data_width)
+        self.mem_write_done = Signal()
 
         self.rx_data_in = AXIStreamInterface(data_width=data_width)
 
@@ -1260,6 +1290,7 @@ class InfiniBandTransportProtocol(Elaboratable):
             dropper.data_out.connect(rx_handler.data_in),
             rx_handler.write_cmd.connect(self.mem_write_cmd),
             rx_handler.data_out.connect(self.mem_write_data),
+            rx_handler.mem_write_done.eq(self.mem_write_done),
         ]
 
         read_fragmenter = m.submodules.read_fragmenter = ReadFragmenter(
