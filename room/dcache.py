@@ -2841,27 +2841,18 @@ class DCache(HasDCacheParams, Elaboratable):
 
             m.d.comb += s2_data_word[w].eq(s2_data_word_prebypass[w])
 
-        for i in reversed(range(self.mem_width)):
-            s3_bypass = Cat(s3_valid[i]
-                            & (s2_req[w].addr[self.word_off_bits:] ==
-                               s3_req[i].addr[self.word_off_bits:])
-                            for w in range(self.mem_width))
-            s4_bypass = Cat(s4_valid[i]
-                            & (s2_req[w].addr[self.word_off_bits:] ==
-                               s4_req[i].addr[self.word_off_bits:])
-                            for w in range(self.mem_width))
-            s5_bypass = Cat(s5_valid[i]
-                            & (s2_req[w].addr[self.word_off_bits:] ==
-                               s5_req[i].addr[self.word_off_bits:])
-                            for w in range(self.mem_width))
+        for reqs, valid in ((s5_req, s5_valid),
+                            (s4_req, s4_valid),
+                            (s3_req, s3_valid)):
+            for i in reversed(range(self.mem_width)):
+                bypass = Cat(valid[i]
+                             & (s2_req[w].addr[self.word_off_bits:] ==
+                                reqs[i].addr[self.word_off_bits:])
+                             for w in range(self.mem_width))
 
-            for w in range(self.mem_width):
-                with m.If(s3_bypass[w]):
-                    m.d.comb += s2_data_word[w].eq(s3_req[i].data)
-                with m.Elif(s4_bypass[w]):
-                    m.d.comb += s2_data_word[w].eq(s4_req[i].data)
-                with m.Elif(s5_bypass[w]):
-                    m.d.comb += s2_data_word[w].eq(s5_req[i].data)
+                for w in range(self.mem_width):
+                    with m.If(bypass[w]):
+                        m.d.comb += s2_data_word[w].eq(reqs[i].data)
 
         return m
 
