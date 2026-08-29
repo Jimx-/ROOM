@@ -76,6 +76,10 @@ class WarpControlReq(HasCoreParams, Record):
                 ('else_mask', self.n_threads, DIR_FANOUT),
                 ('pc', 32, DIR_FANOUT),
             ]),
+            ('join', [
+                ('valid', 1, DIR_FANOUT),
+                ('stack_ptr', range(self.ipdom_stack_depth + 1), DIR_FANOUT),
+            ]),
             ('barrier', [
                 ('valid', 1, DIR_FANOUT),
                 ('id', range(self.n_barriers), DIR_FANOUT),
@@ -112,37 +116,40 @@ class IPDomStack(HasCoreParams, Elaboratable):
 
         self.w_data1 = Record(self.layout)
         self.w_data2 = Record(self.layout)
-        self.w_index = Signal()
         self.w_en = Signal()
+        self.w_ptr = Signal(range(self.ipdom_stack_depth + 1))
 
         self.r_data = Record(self.layout)
         self.r_index = Signal()
         self.r_en = Signal()
+        self.join_ptr = Signal(range(self.ipdom_stack_depth + 1))
+        self.join_active = Signal()
 
     def elaborate(self, platform):
         m = Module()
 
         mem = Memory(depth=self.ipdom_stack_depth, width=2 * len(self.r_data))
         r_ptr = Signal(range(self.ipdom_stack_depth + 1))
-        w_ptr = Signal(range(self.ipdom_stack_depth + 1))
-
         index = Array(
             Signal(name=f'index{i}') for i in range(self.ipdom_stack_depth))
 
         with m.If(self.w_en):
             m.d.sync += [
-                index[w_ptr].eq(self.w_index),
-                r_ptr.eq(w_ptr),
-                w_ptr.eq(w_ptr + 1),
+                index[self.w_ptr].eq(0),
+                r_ptr.eq(self.w_ptr),
+                self.w_ptr.eq(self.w_ptr + 1),
             ]
-        with m.Elif(self.r_en):
+        with m.Elif(self.r_en & self.join_active):
             m.d.sync += [
                 index[r_ptr].eq(1),
-                w_ptr.eq(w_ptr - index[r_ptr]),
+                self.w_ptr.eq(self.w_ptr - index[r_ptr]),
                 r_ptr.eq(r_ptr - index[r_ptr]),
             ]
 
-        m.d.comb += self.r_index.eq(index[r_ptr])
+        m.d.comb += [
+            self.r_index.eq(index[r_ptr]),
+            self.join_active.eq(self.join_ptr != self.w_ptr),
+        ]
 
         rport = m.submodules.rport = mem.read_port(domain='comb')
         m.d.comb += [
@@ -154,7 +161,7 @@ class IPDomStack(HasCoreParams, Elaboratable):
 
         wport = m.submodules.wport = mem.write_port()
         m.d.comb += [
-            wport.addr.eq(w_ptr),
+            wport.addr.eq(self.w_ptr),
             wport.data.eq(Cat(self.w_data1, self.w_data2)),
             wport.en.eq(self.w_en),
         ]
@@ -175,7 +182,10 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         self.br_res = Valid(BranchResolution, params)
         self.warp_ctrl = Valid(WarpControlReq, params)
         self.warp_memory = Signal(self.n_warps)
-        self.join_req = Valid(Signal, range(self.n_warps))
+        self.stack_ptrs = [
+            Signal(range(self.ipdom_stack_depth + 1), name=f'stack_ptr{i}')
+            for i in range(self.n_warps)
+        ]
 
         self.tmask = BankedCSR(CSR, gpucsrnames.tmask,
                                [('value', self.n_threads, CSRAccess.RO)],
@@ -390,19 +400,28 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
             m.d.comb += [
                 stack.w_en.eq(self.warp_ctrl.valid
                               & self.warp_ctrl.bits.split.valid
+                              & self.warp_ctrl.bits.split.diverged
                               & (self.warp_ctrl.bits.wid == w)),
                 stack.w_data1.pc.eq(self.warp_ctrl.bits.split.pc),
                 stack.w_data1.mask.eq(self.warp_ctrl.bits.split.else_mask),
                 stack.w_data2.mask.eq(thread_masks[w]),
-                stack.w_index.eq(~self.warp_ctrl.bits.split.diverged),
+                self.stack_ptrs[w].eq(stack.w_ptr),
             ]
 
-            with m.If(self.join_req.valid & (self.join_req.bits == w)):
-                m.d.comb += stack.r_en.eq(1)
-                m.d.sync += thread_masks[w].eq(stack.r_data.mask)
+            join = (self.warp_ctrl.valid
+                    & self.warp_ctrl.bits.join.valid
+                    & (self.warp_ctrl.bits.wid == w))
+            m.d.comb += [
+                stack.r_en.eq(join),
+                stack.join_ptr.eq(self.warp_ctrl.bits.join.stack_ptr),
+            ]
+            with m.If(join):
+                m.d.sync += stalled_warps[w].eq(0)
+                with m.If(stack.join_active):
+                    m.d.sync += thread_masks[w].eq(stack.r_data.mask)
 
-                with m.If(~stack.r_index):
-                    m.d.sync += warp_pcs[w].eq(stack.r_data.pc)
+                    with m.If(~stack.r_index):
+                        m.d.sync += warp_pcs[w].eq(stack.r_data.pc)
 
         #
         # Output
@@ -464,7 +483,10 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
         self.br_res = Valid(BranchResolution, params)
         self.warp_ctrl = Valid(WarpControlReq, params)
         self.warp_memory = Signal(self.n_warps)
-        self.join_req = Valid(Signal, range(self.n_warps))
+        self.stack_ptrs = [
+            Signal(range(self.ipdom_stack_depth + 1), name=f'stack_ptr{i}')
+            for i in range(self.n_warps)
+        ]
 
         self._warp_sched = WarpScheduler(self.params)
 
@@ -485,9 +507,11 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
             warp_sched.br_res.eq(self.br_res),
             warp_sched.warp_ctrl.eq(self.warp_ctrl),
             warp_sched.warp_memory.eq(self.warp_memory),
-            warp_sched.join_req.eq(self.join_req),
             self.busy.eq(warp_sched.busy),
         ]
+        for stack_ptr, sched_stack_ptr in zip(self.stack_ptrs,
+                                              warp_sched.stack_ptrs):
+            m.d.comb += stack_ptr.eq(sched_stack_ptr)
 
         #
         # F0 - Next PC select

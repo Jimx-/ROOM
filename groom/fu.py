@@ -422,6 +422,10 @@ class GPUControlUnit(PipelinedFunctionalUnit):
 
     def __init__(self, params):
         super().__init__(1, params['xlen'], params, is_gpu=True)
+        self.stack_ptrs = [
+            Signal(range(self.ipdom_stack_depth + 1), name=f'stack_ptr{i}')
+            for i in range(self.n_warps)
+        ]
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
@@ -488,6 +492,17 @@ class GPUControlUnit(PipelinedFunctionalUnit):
                         warp_ctrl.bits.split.pc.eq(uop.pc + 4),
                     ]
 
+                with m.Case(UOpCode.GPU_JOIN):
+                    m.d.comb += [
+                        warp_ctrl.valid.eq(1),
+                        warp_ctrl.bits.join.valid.eq(1),
+                    ]
+
+                    for w in reversed(range(self.n_threads)):
+                        with m.If(uop.tmask[w]):
+                            m.d.comb += warp_ctrl.bits.join.stack_ptr.eq(
+                                self.req.bits.rs1_data[w])
+
                 with m.Case(UOpCode.GPU_BARRIER):
                     m.d.comb += [
                         warp_ctrl.valid.eq(1),
@@ -506,6 +521,13 @@ class GPUControlUnit(PipelinedFunctionalUnit):
         #
         # Output
         #
+
+        stack_ptr = Signal(range(self.ipdom_stack_depth + 1))
+        m.d.sync += stack_ptr.eq(
+            Array(self.stack_ptrs)[self.req.bits.wid])
+        with m.If(self.resp.bits.uop.opcode == UOpCode.GPU_SPLIT):
+            for w in range(self.n_threads):
+                m.d.comb += self.resp.bits.data[w].eq(stack_ptr)
 
         warp_ctrl_pipe = m.submodules.warp_ctrl_pipe = Pipe(
             len(warp_ctrl.bits), depth=self.num_stages)

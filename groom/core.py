@@ -151,7 +151,6 @@ class Core(HasCoreParams, Elaboratable):
         m.d.comb += [
             if_stage.fetch_packet.connect(dec_stage.fetch_packet),
             if_stage.stall_req.eq(dec_stage.stall_req),
-            if_stage.join_req.eq(dec_stage.join_req),
         ]
 
         if self.sim_debug:
@@ -257,6 +256,9 @@ class Core(HasCoreParams, Elaboratable):
             if_stage.br_res.eq(exec_unit.br_res),
             if_stage.warp_ctrl.eq(exec_unit.warp_ctrl),
         ]
+        for stack_ptr, if_stack_ptr in zip(exec_unit.stack_ptrs,
+                                           if_stage.stack_ptrs):
+            m.d.comb += stack_ptr.eq(if_stack_ptr)
 
         if self.sim_debug:
             m.d.comb += self.core_debug.ex_debug.eq(exec_unit.exec_debug)

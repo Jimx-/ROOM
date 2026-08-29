@@ -173,6 +173,11 @@ class ALUExecUnit(ExecUnit, AutoCSR):
         if has_raster:
             self._raster = RasterUnit(self.data_width, params)
 
+        self.stack_ptrs = [
+            Signal(range(self.ipdom_stack_depth + 1), name=f'stack_ptr{i}')
+            for i in range(self.n_warps)
+        ]
+
     def elaborate(self, platform):
         m = super().elaborate(platform)
 
@@ -199,6 +204,9 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                              & (self.req.bits.uop.opcode != UOpCode.GPU_RAST)),
             self.warp_ctrl.eq(gpu.warp_ctrl),
         ]
+        for gpu_stack_ptr, stack_ptr in zip(gpu.stack_ptrs,
+                                            self.stack_ptrs):
+            m.d.comb += gpu_stack_ptr.eq(stack_ptr)
 
         imul = m.submodules.imul = MultiplierUnit(self.data_width, 3,
                                                   self.params)

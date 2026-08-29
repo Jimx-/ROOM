@@ -102,6 +102,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             uop.opcode.eq(UOpCode.GPU_SPLIT),
                             uop.iq_type.eq(IssueQueueType.INT),
                             uop.fu_type.eq(FUType.GPU),
+                            uop.dst_rtype.eq(RegisterType.FIX),
                             uop.lrs2_rtype.eq(RegisterType.FIX),
                             uop.imm_sel.eq(ImmSel.S),
                             STALL,
@@ -112,6 +113,8 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                             uop.opcode.eq(UOpCode.GPU_JOIN),
                             uop.iq_type.eq(IssueQueueType.INT),
                             uop.fu_type.eq(FUType.GPU),
+                            uop.lrs1_rtype.eq(RegisterType.FIX),
+                            STALL,
                         ]
 
                     with m.Case(0x4):  # gpu_barrier
@@ -179,7 +182,6 @@ class DecodeStage(HasCoreParams, Elaboratable):
         self.ready = Signal()
 
         self.stall_req = Valid(WarpStallReq, params)
-        self.join_req = Valid(Signal, range(self.n_warps))
 
         if sim_debug:
             self.id_debug = Valid(IDDebug, params)
@@ -195,12 +197,6 @@ class DecodeStage(HasCoreParams, Elaboratable):
             self.stall_req.valid.eq(self.fetch_packet.fire),
             self.stall_req.bits.wid.eq(self.fetch_packet.bits.wid),
             self.stall_req.bits.stall.eq(stall_warp),
-        ]
-
-        m.d.comb += [
-            self.join_req.valid.eq(self.valid & self.ready
-                                   & (self.uop.opcode == UOpCode.GPU_JOIN)),
-            self.join_req.bits.eq(self.wid),
         ]
 
         m.d.comb += [
