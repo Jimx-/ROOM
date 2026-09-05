@@ -660,12 +660,18 @@ class BankedDataArray(BaseDataArray):
 
         for w in range(self.mem_width):
             m.d.comb += [
+                # Fold low row-index bits into the physical bank so accesses at
+                # the same line offset but in nearby/strided lines do not always
+                # collide. The index is unchanged, making this a bijective layout;
+                # reads and every write source use the same mapping.
                 s0_rbanks[w].eq(
-                    (self.read[w].bits.addr >> bank_off_bits)[:bank_bits]),
+                    (self.read[w].bits.addr >> bank_off_bits)[:bank_bits]
+                    ^ (self.read[w].bits.addr >> bidx_off_bits)[:bank_bits]),
                 s0_ridxs[w].eq(
                     (self.read[w].bits.addr >> bidx_off_bits)[:bidx_bits]),
                 s0_wbanks[w].eq(
-                    (self.write[w].bits.addr >> bank_off_bits)[:bank_bits]),
+                    (self.write[w].bits.addr >> bank_off_bits)[:bank_bits]
+                    ^ (self.write[w].bits.addr >> bidx_off_bits)[:bank_bits]),
                 s0_widxs[w].eq(
                     (self.write[w].bits.addr >> bidx_off_bits)[:bidx_bits]),
             ]
