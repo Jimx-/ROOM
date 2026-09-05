@@ -2008,9 +2008,14 @@ class MSHR(HasL2CacheParams, Elaboratable):
                                        & w_pprobeacklast
                                        & ~w_grantfirst),
             self.status.bits.block_c.eq(~meta_valid),
+            # A same-set C request cannot wait behind an ordinary MSHR whose
+            # Grant is complete but whose client E is still pending: the L1
+            # may itself be waiting for this ReleaseAck before it can emit E.
+            # Route that request through the reserved C MSHR to break the
+            # cross-cluster WritebackUnit/GrantAck dependency cycle.
             self.status.bits.nest_c.eq(meta_valid
                                        & (~w_rprobeackfirst | ~w_pprobeackfirst
-                                          | ~w_grantfirst)),
+                                          | ~w_grantfirst | ~w_grantack)),
         ]
 
         got_t = Signal()
