@@ -1111,7 +1111,7 @@ class LineBufferReadReq(HasDCacheParams, Record):
 
         Record.__init__(self, [
             ('id', Shape.cast(range(self.n_mshrs)).width, DIR_FANOUT),
-            ('offset', self.refill_cycles, DIR_FANOUT),
+            ('offset', range(self.refill_cycles), DIR_FANOUT),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
@@ -1127,7 +1127,7 @@ class LineBufferWriteReq(HasDCacheParams, Record):
 
         Record.__init__(self, [
             ('id', Shape.cast(range(self.n_mshrs)).width, DIR_FANOUT),
-            ('offset', self.refill_cycles, DIR_FANOUT),
+            ('offset', range(self.refill_cycles), DIR_FANOUT),
             ('data', self.row_bits, DIR_FANOUT),
         ],
                         name=name,
@@ -1154,6 +1154,7 @@ class MSHR(HasDCacheParams, Elaboratable):
         self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.row_bits,
                                    size_width=bits_for(self.lg_block_bytes),
+                                   source_id_width=self.source_id_bits,
                                    sink_id_width=sink_id_width)
 
         self.mem_finish = Decoupled(tl.ChannelE, sink_id_width=sink_id_width)
@@ -1642,6 +1643,7 @@ class MSHRFile(HasDCacheParams, Elaboratable):
         self.mem_grant = Decoupled(tl.ChannelD,
                                    data_width=self.row_bits,
                                    size_width=bits_for(self.lg_block_bytes),
+                                   source_id_width=self.source_id_bits,
                                    sink_id_width=sink_id_width)
 
         self.mem_access = Decoupled(tl.ChannelA,
