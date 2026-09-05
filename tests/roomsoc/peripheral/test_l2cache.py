@@ -55,6 +55,16 @@ def _l2_params(**overrides):
     return params
 
 
+def _six_mshr_params(**overrides):
+    """Deployed l2m6 shape: four ordinary plus reserved BC/C MSHRs."""
+    params = _l2_params(
+        n_mshrs=6,
+        out_bus=dict(source_id_width=3, sink_id_width=2),
+    )
+    params.update(overrides)
+    return params
+
+
 class L2Top(Elaboratable):
     """Bare L2Cache wrapper exposing ``in_bus`` and ``out_bus`` for driving."""
 
@@ -199,7 +209,8 @@ def _collect_get_responses(bus, expected, *, ready_fn=lambda cycle: 1,
     raise AssertionError(f"timed out waiting for sources {sorted(remaining)}")
 
 
-def _probe_responder(bus, clients, probes, done, *, beat_gap=0):
+def _probe_responder(bus, clients, probes, done, *, beat_gap=0,
+                     hold_source=None, respond_now=None, responded=None):
     """Respond to inner B-channel probes using per-client cache state.
 
     ``clients`` is keyed by the first source ID assigned to each client. Each
@@ -208,6 +219,12 @@ def _probe_responder(bus, clients, probes, done, *, beat_gap=0):
     ProbeAck. Every observed probe is appended to ``probes`` for assertions.
     ``beat_gap`` inserts invalid C cycles between data beats, which is legal
     TileLink traffic and useful for exercising BankedStore reservations.
+
+    When ``hold_source`` is set, the probe addressed to that client is
+    accepted but its response is deferred until ``respond_now[0]`` becomes
+    true; the agent then finishes the response and sets ``responded[0]``.
+    This lets a test land a ProbeAckData at an exact cycle (the SinkC
+    way-CAM race regression).
     """
     beat_bytes = bus.data_width // 8
     yield bus.b.ready.eq(1)
@@ -244,6 +261,10 @@ def _probe_responder(bus, clients, probes, done, *, beat_gap=0):
         yield  # accept B
         yield bus.b.ready.eq(0)
 
+        if source == hold_source:
+            while not respond_now[0]:
+                yield
+
         yield bus.c.bits.opcode.eq(
             tilelink.ChannelCOpcode.ProbeAckData
             if has_data else tilelink.ChannelCOpcode.ProbeAck)
@@ -274,9 +295,39 @@ def _probe_responder(bus, clients, probes, done, *, beat_gap=0):
         else:
             state["cap"] = tilelink.CapParam.toB
             state["dirty"] = False
+        if source == hold_source:
+            responded[0] = True
         yield bus.b.ready.eq(1)
 
     yield bus.b.ready.eq(0)
+    yield bus.c.valid.eq(0)
+
+
+def _send_release_data(bus, address, *, size, source, data,
+                       param=tilelink.ShrinkReportParam.TtoN):
+    """Drive a voluntary full-line ReleaseData on C, without collecting
+    its ReleaseAck.
+
+    Unlike :func:`tl_release` this does not touch the D channel, so it can
+    be used while inner D is backpressured and the ReleaseAck is drained
+    later with other stalled responses.
+    """
+    beats = (1 << size) // (bus.data_width // 8)
+    yield bus.c.bits.opcode.eq(tilelink.ChannelCOpcode.ReleaseData)
+    yield bus.c.bits.param.eq(param)
+    yield bus.c.bits.size.eq(size)
+    yield bus.c.bits.source.eq(source)
+    yield bus.c.bits.address.eq(address)
+    yield bus.c.bits.corrupt.eq(0)
+    yield bus.c.valid.eq(1)
+
+    for beat in range(beats):
+        yield bus.c.bits.data.eq(
+            (data >> (beat * bus.data_width)) & ((1 << bus.data_width) - 1))
+        yield
+        while not (yield bus.c.ready):
+            yield
+
     yield bus.c.valid.eq(0)
 
 
@@ -386,13 +437,9 @@ def test_l2_get_miss_fetches_from_outer():
     run_sim(top, *_common(top, model, done), driver)
 
 
-def test_l2_four_concurrent_get_misses():
-    """Fill all four MSHRs before accepting any inner D response.
-
-    Responses are checked by source rather than arrival order, exercising the
-    source routing used when independently completed misses are interleaved.
-    """
-    top = L2Top(_l2_params(n_mshrs=4))
+def test_l2_four_queued_get_misses_default_window():
+    """Queue four Gets through the default two-ordinary-MSHR window."""
+    top = L2Top(_l2_params())
     model = _model(top)
     done = [False]
     addresses = [0x00, 0x18, 0x50, 0x98]
@@ -414,14 +461,9 @@ def test_l2_four_concurrent_get_misses():
     run_sim(top, *_common(top, model, done), driver)
 
 
-def test_l2_conflict_miss_stress_with_backpressure():
-    """Run sustained MSHR-full waves through one set with D backpressure.
-
-    Sixteen distinct tags mapping to set zero repeatedly replace both ways.
-    The deterministic ready pattern also checks that stalled responses remain
-    stable and that no response source is lost or duplicated.
-    """
-    top = L2Top(_l2_params(n_mshrs=4))
+def test_l2_default_window_conflict_stress_with_backpressure():
+    """Preserve the same-set replacement stress for the default window."""
+    top = L2Top(_l2_params())
     model = _model(top)
     done = [False]
 
@@ -441,8 +483,6 @@ def test_l2_conflict_miss_stress_with_backpressure():
                                              size=3,
                                              source=source)
 
-            # Two accepting cycles followed by one stalled cycle. Offset each
-            # wave so stalls hit different response boundaries.
             ready_fn = lambda cycle, wave=wave: (cycle + wave) % 3 != 2
             yield from _collect_get_responses(top.in_bus,
                                               expected,
@@ -451,6 +491,175 @@ def test_l2_conflict_miss_stress_with_backpressure():
         done[0] = True
 
     run_sim(top, *_common(top, model, done), driver)
+
+
+def test_l2m6_nested_release_probeackdata_way_cam_race():
+    """Regression for the SinkC way-CAM race (l2_race_audit Finding 1).
+
+    An ordinary MSHR owns a set while collecting a dirty ProbeAckData from
+    one client.  A second client's voluntary ReleaseData for a *different
+    tag in the same set* is nested into the reserved C MSHR, which then
+    parks on the set waiting for SourceD (pinned busy by a stalled grant).
+    The delayed ProbeAckData beats arrive while both MSHRs own the set;
+    SinkC must resolve their bank writes to the ordinary MSHR's way.  A CAM
+    that gives the reserved C MSHR top precedence misroutes them into the
+    nested Release's way instead: the acquirer of the probed line is
+    granted the stale bank contents and the line's eventual writeback
+    loses the client's dirty data.
+    """
+    params = _six_mshr_params(
+        block_bytes=64,
+        outer_beat_bytes=64,
+        port_factor=4,
+        client_source_map={0: (0, 1), 1: (2, 3)},
+    )
+    top = L2Top(params)
+    model = _model(top)
+    done = [False]
+    clients = {}
+    probes = []
+    respond_now = [False]
+    responded = [False]
+    size = log2_int(64)
+
+    addr_a = 0x000  # set 0, tag 0: probed line, dirty at client 0
+    addr_b = 0x400  # set 0, tag 1: nested-release line, dirty at client 1
+    addr_c = 0x040  # set 1: blocker Get that keeps SourceD busy
+    beats_a = [0xA17D000000000000 + beat for beat in range(8)]
+    beats_b = [0xB17D000000000000 + beat for beat in range(8)]
+    value_a = sum(value << (64 * beat) for beat, value in enumerate(beats_a))
+    value_b = sum(value << (64 * beat) for beat, value in enumerate(beats_b))
+
+    def driver():
+        # Setup: two private dirty lines, same set, distinct tags/ways.
+        res_a = yield from _acquire(top.in_bus,
+                                    addr_a,
+                                    size=size,
+                                    source=0,
+                                    grow_param=tilelink.GrowParam.NtoT)
+        assert res_a[1] == tilelink.CapParam.toT.value
+        clients[0] = dict(cap=tilelink.CapParam.toT,
+                          data=value_a,
+                          dirty=True)
+        res_b = yield from _acquire(top.in_bus,
+                                    addr_b,
+                                    size=size,
+                                    source=2,
+                                    grow_param=tilelink.GrowParam.NtoT)
+        assert res_b[1] == tilelink.CapParam.toT.value
+        clients[2] = dict(cap=tilelink.CapParam.toT,
+                          data=value_b,
+                          dirty=True)
+        assert probes == [], "setup must not probe (unexpected victim way)"
+
+        # Pin SourceD busy: the blocker Get's grant stalls on D.
+        yield top.in_bus.d.ready.eq(0)
+        yield from _send_get_request(top.in_bus, addr_c, size=size, source=0)
+        for _ in range(10000):
+            if (yield top.in_bus.d.valid):
+                break
+            yield
+        else:
+            raise AssertionError("blocker grant never presented")
+
+        # Client 1 acquires line A for T: an ordinary MSHR probes client 0,
+        # the dirty owner.  The agent accepts the probe but holds the
+        # answer until the nested Release below has landed.
+        yield from _send_acquire_request(top.in_bus, addr_a,
+                                         size=size, source=2,
+                                         grow=tilelink.GrowParam.NtoT)
+        for _ in range(10000):
+            if probes:
+                break
+            yield
+        else:
+            raise AssertionError("probe to the dirty owner never issued")
+        assert probes[0] == (0, addr_a, tilelink.CapParam.toN.value, True)
+
+        # Client 1's L1 evicts line B (same set, other tag/way) while the
+        # acquire is outstanding: nest_c routes the ReleaseData into the
+        # reserved C MSHR, which cannot retire while SourceD is busy.
+        yield from _send_release_data(top.in_bus, addr_b, size=size,
+                                      source=3, data=value_b)
+        for _ in range(4):
+            yield
+        assert (yield top.in_bus.d.valid), "SourceD left busy during window"
+
+        # Answer the held probe: client 0's dirty ProbeAckData beats for
+        # line A must be written to line A's way.
+        respond_now[0] = True
+        while not responded[0]:
+            yield
+        for _ in range(4):
+            yield
+
+        # Drain: blocker AccessAckData, the nested Release's ReleaseAck,
+        # then client 1's GrantData for line A, which must carry client
+        # 0's dirty bytes rather than the stale outer image.
+        remaining = {
+            (tilelink.ChannelDOpcode.AccessAckData.value, 0): 8,
+            (tilelink.ChannelDOpcode.ReleaseAck.value, 3): 1,
+            (tilelink.ChannelDOpcode.GrantData.value, 2): 8,
+        }
+        grant = []
+        grant_sink = None
+        yield top.in_bus.d.ready.eq(1)
+        yield
+        for _ in range(20000):
+            if (yield top.in_bus.d.valid):
+                opcode = (yield top.in_bus.d.bits.opcode)
+                source = (yield top.in_bus.d.bits.source)
+                key = (opcode, source)
+                assert key in remaining, f"unexpected response {key}"
+                assert remaining[key] > 0, f"duplicate response {key}"
+                assert (yield top.in_bus.d.bits.denied) == 0
+                assert (yield top.in_bus.d.bits.corrupt) == 0
+                remaining[key] -= 1
+                if opcode == tilelink.ChannelDOpcode.GrantData.value:
+                    if not grant:
+                        grant_sink = (yield top.in_bus.d.bits.sink)
+                        assert (yield top.in_bus.d.bits.param) == \
+                            tilelink.CapParam.toT.value
+                    grant.append((yield top.in_bus.d.bits.data))
+                if not any(remaining.values()):
+                    break
+            yield
+        else:
+            raise AssertionError(f"drain timed out: {remaining}")
+
+        assert grant == beats_a, (
+            f"GrantData for line A served stale bank contents {grant}; "
+            "the dirty ProbeAckData beats were misrouted into the "
+            "nested Release's way")
+        yield from tl_grantack(top.in_bus, sink=grant_sink)
+        clients[2] = dict(cap=tilelink.CapParam.toT,
+                          data=sum(b << (64 * i) for i, b in enumerate(grant)),
+                          dirty=False)
+
+        # Replace both same-set lines; each writeback must carry its own
+        # line's data to the outer memory.
+        yield from tl_get(top.in_bus, 0x800, size=size, source=0)
+        yield from tl_get(top.in_bus, 0xC00, size=size, source=0)
+        for _ in range(10000):
+            if _rd(model, addr_b, 64) == value_b:
+                break
+            yield
+        else:
+            raise AssertionError("line B writeback never reached memory")
+        for _ in range(500):
+            yield
+        assert _rd(model, addr_b, 64) == value_b, \
+            "line B corrupted in DRAM (release merge lost its data)"
+        assert _rd(model, addr_a, 64) == value_a, \
+            "line A writeback lost the client's dirty ProbeAckData"
+        done[0] = True
+
+    run_sim(top,
+            *_common(top, model, done),
+            _proc(_probe_responder, top.in_bus, clients, probes, done,
+                  hold_source=0, respond_now=respond_now,
+                  responded=responded),
+            driver)
 
 
 # ===========================================================================
@@ -979,3 +1188,187 @@ def test_l2_wide_outer_eviction_preserves_gapped_probeack_data():
                   done,
                   beat_gap=1),
             driver)
+
+
+def _send_put_request(bus, address, value, *, source):
+    """Send only the A beat of a full 8-byte Put, without waiting for the
+    AccessAck, so stores can be pipelined ahead of a following acquire."""
+    beat_bytes = bus.data_width // 8
+    yield bus.a.bits.opcode.eq(tilelink.ChannelAOpcode.PutFullData)
+    yield bus.a.bits.param.eq(0)
+    yield bus.a.bits.size.eq(log2_int(beat_bytes))
+    yield bus.a.bits.source.eq(source)
+    yield bus.a.bits.address.eq(address)
+    yield bus.a.bits.mask.eq((1 << beat_bytes) - 1)
+    yield bus.a.bits.data.eq(value)
+    yield bus.a.bits.corrupt.eq(0)
+    yield bus.a.valid.eq(1)
+    yield
+    while not (yield bus.a.ready):
+        yield
+    yield bus.a.valid.eq(0)
+
+
+def _send_acquire_request(bus, address, *, size, source,
+                          grow=tilelink.GrowParam.NtoB):
+    """Send only the A beat of an AcquireBlock."""
+    yield bus.a.bits.opcode.eq(tilelink.ChannelAOpcode.AcquireBlock)
+    yield bus.a.bits.param.eq(grow)
+    yield bus.a.bits.size.eq(size)
+    yield bus.a.bits.source.eq(source)
+    yield bus.a.bits.address.eq(address)
+    yield bus.a.bits.mask.eq((1 << (bus.data_width // 8)) - 1)
+    yield bus.a.bits.data.eq(0)
+    yield bus.a.bits.corrupt.eq(0)
+    yield bus.a.valid.eq(1)
+    yield
+    while not (yield bus.a.ready):
+        yield
+    yield bus.a.valid.eq(0)
+
+
+def _collect_put_and_grant(bus, *, n_puts, grant_source, beats, stored,
+                           round_idx, timeout=10000):
+    """Drain ``n_puts`` AccessAcks and one full GrantData message.
+
+    The puts and the acquire are in flight together, so their D responses
+    may complete in any order; beats of the grant are reassembled from
+    GrantData beats only. Meant to run as its own process so D is drained
+    while the A-channel sender keeps transmitting (a TileLink master must
+    sink D concurrently, or the L2's response queue backpressures the
+    whole pipeline).
+    """
+    acks = 0
+    grant = []
+    grant_sink = None
+    yield bus.d.ready.eq(1)
+    yield
+    for _ in range(timeout):
+        if (yield bus.d.valid):
+            opcode = (yield bus.d.bits.opcode)
+            if opcode == tilelink.ChannelDOpcode.AccessAck.value:
+                acks += 1
+            elif opcode == tilelink.ChannelDOpcode.GrantData.value:
+                assert (yield bus.d.bits.source) == grant_source
+                if not grant:
+                    grant_sink = (yield bus.d.bits.sink)
+                grant.append((yield bus.d.bits.data))
+            if acks >= n_puts and len(grant) >= beats:
+                yield
+                yield bus.d.ready.eq(0)
+                data = sum(g << (64 * i) for i, g in enumerate(grant))
+                for beat, value in stored.items():
+                    got = (data >> (64 * beat)) & ((1 << 64) - 1)
+                    assert got == value, (
+                        f"round {round_idx}: grant beat {beat} is "
+                        f"{got:#x}, expected the final store {value:#x} "
+                        "(grant raced the put-buffer merge)")
+                yield from tl_grantack(bus, sink=grant_sink)
+                return data
+        yield
+    raise AssertionError(
+        f"round {round_idx}: timed out ({acks}/{n_puts} acks, "
+        f"{len(grant)}/{beats} grant beats)")
+
+
+def test_l2_grant_waits_for_inflight_put_merges():
+    """A grant must not read beats whose trailing put-merge has not landed.
+
+    Stores stream into a cached line as one-beat Puts. Each Put's MSHR
+    completes when SourceD emits the AccessAck from s3, but the put-buffer
+    merge into the BankedStore commits later from s4. A grant scheduled
+    right behind the final AccessAck has its beats read by SourceD's s1;
+    without an ordering hazard the read of a beat can be presented before
+    that beat's merge commits, and the non-transparent BankedStore returns
+    the pre-store contents.
+
+    Regression for the l1m4 stale-grant corruption (the granted beat
+    carried the pre-store word 0xaaa315b3 while the storing client's
+    newest merge for the same beat committed two cycles later).
+    """
+    params = _l2_params(block_bytes=64,
+                        outer_beat_bytes=64,
+                        port_factor=4,
+                        n_mshrs=4)
+    top = L2Top(params)
+    model = _model(top)
+    done = [False]
+    clients = {}
+    probes = []
+    size = log2_int(64)
+    beat_bytes = top.in_bus.data_width // 8
+    rounds = 8
+    round_data = {}
+    setup_done = [False] * rounds
+    round_done = [False] * rounds
+
+    for r in range(rounds):
+        address = 0x40 + r * 0x200
+        stored = {}
+        puts = []
+        for step in range(4):
+            for beat in (2, 4):
+                value = (0x5EED0000 + (r << 8) + (step << 4) + beat)
+                stored[beat] = value
+                puts.append((address + beat * beat_bytes, value))
+        round_data[r] = dict(address=address, expected=_rd(model, address,
+                                                           64),
+                             stored=stored, puts=puts)
+
+    def tx():
+        for r in range(rounds):
+            info = round_data[r]
+            # Populate the line without attaching an owning client. This
+            # keeps the regression focused on the Put-merge/grant ordering
+            # and avoids introducing a ProbeAck dependency.
+            yield from _send_get_request(top.in_bus, info['address'],
+                                         size=size, source=0)
+            while not setup_done[r]:
+                yield
+            # Stores pipelined behind one another, then the acquire of a
+            # second source of the same client, all without waiting for
+            # the responses in between.
+            for put_address, value in info['puts']:
+                yield from _send_put_request(top.in_bus, put_address, value,
+                                             source=0)
+            yield from _send_acquire_request(top.in_bus, info['address'],
+                                             size=size, source=1)
+            while not round_done[r]:
+                yield
+        done[0] = True
+
+    def rx():
+        yield top.in_bus.d.ready.eq(1)
+        for r in range(rounds):
+            info = round_data[r]
+            # Setup Get response (source 0, full line).
+            setup = []
+            for _ in range(10000):
+                if (yield top.in_bus.d.valid):
+                    assert (yield top.in_bus.d.bits.opcode) == \
+                        tilelink.ChannelDOpcode.AccessAckData.value
+                    assert (yield top.in_bus.d.bits.source) == 0
+                    setup.append((yield top.in_bus.d.bits.data))
+                    if len(setup) == 8:
+                        # Consume the final D beat before switching to the
+                        # AccessAck/grant collector. Reads are in-cycle in
+                        # pysim; only this naked yield fires the handshake.
+                        yield
+                        break
+                yield
+            setup_done[r] = True
+            # Puts + second acquire: collect acks and the racing grant.
+            data = yield from _collect_put_and_grant(
+                top.in_bus, n_puts=len(info['puts']), grant_source=1,
+                beats=8, stored=info['stored'], round_idx=r)
+            # The client model keeps holding the shared copy granted to
+            # source 1, so a later eviction of this line probes it.
+            clients[0] = dict(cap=tilelink.CapParam.toB,
+                              data=data,
+                              dirty=False)
+            round_done[r] = True
+
+    run_sim(top,
+            *_common(top, model, done),
+            _proc(_probe_responder, top.in_bus, clients, probes, done),
+            tx, rx)

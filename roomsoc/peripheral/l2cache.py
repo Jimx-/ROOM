@@ -1000,15 +1000,23 @@ class SourceD(HasL2CacheParams, Elaboratable):
                         s1_req.opcode == tl.ChannelAOpcode.AcquirePerm)
         s1_need_r = s1_req.prio[0] & ~s1_grant & (
             s1_req.opcode != tl.ChannelAOpcode.PutFullData)
-        s1_valid_r = (busy | self.req.valid) & s1_need_r & ~s1_block_r
         s1_need_pb = Mux(s1_req.prio[0], ~s1_req.opcode[2], s1_req.opcode[0])
+        # A prior request's put-buffer merge may still be draining through
+        # s2/s3/s4 (its MSHR completed at the s3 AccessAck; the s4 merge
+        # write lands later). A new request must not read the BankedStore
+        # for the same set/way until those merges commit, or its grant
+        # beats race the merge writes and stream pre-store contents.
+        s1_merge_hazard = Signal()
+        s1_read_blocked = s1_need_r & ~s1_block_r & s1_merge_hazard
+        s1_valid_r = (busy | self.req.valid) & s1_need_r & ~s1_block_r \
+            & ~s1_merge_hazard
         s1_single = Mux(s1_req.prio[0], s1_grant,
                         s1_req.opcode == tl.ChannelCOpcode.Release)
-        s1_num_beats = Mux(s1_single, 1,
-                           (1 << s1_req.size) >> log2_int(
-                               self.inner_beat_bytes))
-        s1_beat = (s1_req.offset >> log2_int(
-            self.inner_beat_bytes)) | s1_counter
+        s1_num_beats = Mux(
+            s1_single, 1,
+            (1 << s1_req.size) >> log2_int(self.inner_beat_bytes))
+        s1_beat = (
+            s1_req.offset >> log2_int(self.inner_beat_bytes)) | s1_counter
         s1_last = s1_counter == s1_num_beats - 1
         s1_first = s1_counter == 0
 
@@ -1063,7 +1071,8 @@ class SourceD(HasL2CacheParams, Elaboratable):
 
         m.d.comb += [
             s1_valid.eq((busy | self.req.valid)
-                        & (~s1_valid_r | self.bs_rport.ready)),
+                        & (~s1_valid_r | self.bs_rport.ready)
+                        & ~s1_read_blocked),
             self.req.ready.eq(~busy),
         ]
 
@@ -1252,6 +1261,13 @@ class SourceD(HasL2CacheParams, Elaboratable):
 
         m.d.comb += s4_ready.eq(~s4_full | self.bs_wport.ready | ~s4_need_wb)
 
+        m.d.comb += s1_merge_hazard.eq(
+            (s2_full & s2_need_pb
+             & (s2_req.set == s1_req.set) & (s2_req.way == s1_req.way))
+            | (s3_full & s3_need_pb
+               & (s3_req.set == s1_req.set) & (s3_req.way == s1_req.way))
+            | (s4_full & s4_need_wb
+               & (s4_req.set == s1_req.set) & (s4_req.way == s1_req.way)))
         m.d.comb += [
             self.evict_safe.eq((~busy | (self.evict_req.way != s1_req_reg.way)
                                 | (self.evict_req.set != s1_req_reg.set))
@@ -2786,11 +2802,17 @@ class Scheduler(HasL2CacheParams, Elaboratable):
                 m.d.comb += mshr.directory.valid.eq(directory.result.valid)
             m.d.comb += mshr.directory.bits.eq(directory.result.bits)
 
-        for i, mshr in enumerate(mshrs):
+        # The SinkC way CAM must not see the reserved C MSHR: it parks on a
+        # same-set ReleaseData while an ordinary MSHR owns the set, and being
+        # last in this loop it would override the ordinary MSHR's way and
+        # misroute ProbeAckData beats into the wrong way. The BC MSHR stays
+        # after the ordinary MSHRs.
+        for mshr in mshrs[:-1]:
             with m.If(mshr.status.valid
                       & (mshr.status.bits.set == sink_c.set)):
                 m.d.comb += sink_c.way.eq(mshr.status.bits.way)
 
+        for i, mshr in enumerate(mshrs):
             with m.If(sink_d.source == i):
                 m.d.comb += [
                     sink_d.set.eq(mshr.status.bits.set),
