@@ -954,8 +954,25 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                             getattr(UOpCode, f'FSGNJ_{fmt}'))
 
                                     with m.Case(0b00101):  # fmin/fmax.fmt
-                                        m.d.comb += UOPC(
-                                            getattr(UOpCode, f'FMINMAX_{fmt}'))
+                                        with m.Switch(inuop.inst[12:15]):
+                                            with m.Case(0b000,
+                                                        0b001):  # fmin/fmax
+                                                m.d.comb += UOPC(
+                                                    getattr(
+                                                        UOpCode,
+                                                        f'FMINMAX_{fmt}'))
+
+                                            if self.use_zfa:
+                                                with m.Case(
+                                                        0b010,
+                                                        0b011):  # fminm/fmaxm
+                                                    m.d.comb += UOPC(
+                                                        getattr(
+                                                            UOpCode,
+                                                            f'FMINMAX_{fmt}'))
+
+                                            with m.Default():
+                                                m.d.comb += ILL_INSN
 
                                     with m.Case(0b01000):  # fcvt.fmt.fmt
                                         m.d.comb += [
@@ -963,7 +980,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                             IMM_SEL_I,
                                         ]
 
-                                        with m.Switch(inuop.inst[20:22]):
+                                        with m.Switch(inuop.inst[20:25]):
                                             for src_fmt in fmts:
                                                 if src_fmt == fmt:
                                                     continue
@@ -978,28 +995,98 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                                             f'FCVT_{fmt}_{src_fmt}'
                                                         ))
 
+                                            if self.use_zfa:
+                                                with m.Case(
+                                                        0b00100, 0b00101
+                                                ):  # fround/froundnx
+                                                    with m.If(
+                                                        (inuop.inst[12:15] ==
+                                                         0b101)
+                                                            |
+                                                        (inuop.inst[12:15] ==
+                                                         0b110)):
+                                                        m.d.comb += ILL_INSN
+
+                                                    with m.Elif(inuop.inst[20]
+                                                                == 0):
+                                                        m.d.comb += UOPC(
+                                                            getattr(
+                                                                UOpCode,
+                                                                f'FROUND_{fmt}'
+                                                            ))
+
+                                                    with m.Else():
+                                                        m.d.comb += UOPC(
+                                                            getattr(
+                                                                UOpCode,
+                                                                f'FROUNDNX_{fmt}'
+                                                            ))
+
                                             with m.Default():
                                                 m.d.comb += ILL_INSN
 
                                     with m.Case(0b10100):  # feq/flt/fle.fmt
                                         m.d.comb += [
-                                            UOPC(
-                                                getattr(
-                                                    UOpCode, f'CMPR_{fmt}')),
                                             uop.fu_type.eq(FUType.F2I),
                                             uop.dst_rtype.eq(RegisterType.FIX),
                                         ]
 
+                                        with m.Switch(inuop.inst[12:15]):
+                                            with m.Case(0b000, 0b001,
+                                                        0b010):  # fle/flt/feq
+                                                m.d.comb += UOPC(
+                                                    getattr(
+                                                        UOpCode,
+                                                        f'CMPR_{fmt}'))
+
+                                            if self.use_zfa:
+                                                with m.Case(
+                                                        0b100,
+                                                        0b101):  # fleq/fltq
+                                                    m.d.comb += UOPC(
+                                                        getattr(
+                                                            UOpCode,
+                                                            f'CMPR_{fmt}'))
+
+                                            with m.Default():
+                                                m.d.comb += ILL_INSN
+
                                     with m.Case(0b11000):  # fcvt.int.fmt
                                         m.d.comb += [
-                                            UOPC(
-                                                getattr(
-                                                    UOpCode, f'FCVT_X_{fmt}')),
                                             uop.fu_type.eq(FUType.F2I),
                                             uop.dst_rtype.eq(RegisterType.FIX),
                                             uop.lrs2_rtype.eq(RegisterType.X),
                                             IMM_SEL_I,
                                         ]
+
+                                        if fmt == 'D':
+                                            # rs2=01000 is reserved for
+                                            # Zfa fcvtmod.w.d (rm must be
+                                            # RTZ); without Zfa it is
+                                            # illegal.
+                                            with m.If(inuop.inst[20:25] ==
+                                                      0b01000):
+                                                if self.use_zfa:
+                                                    with m.If(inuop.inst[12:15]
+                                                              == 0b001):
+                                                        m.d.comb += UOPC(
+                                                            UOpCode.FCVTMOD_W_D
+                                                        )
+
+                                                    with m.Else():
+                                                        m.d.comb += ILL_INSN
+                                                else:
+                                                    m.d.comb += ILL_INSN
+
+                                            with m.Else():
+                                                m.d.comb += UOPC(
+                                                    getattr(
+                                                        UOpCode,
+                                                        f'FCVT_X_{fmt}'))
+                                        else:
+                                            m.d.comb += UOPC(
+                                                getattr(
+                                                    UOpCode, f'FCVT_X_{fmt}'))
 
                                     with m.Case(0b11010):  # fcvt.fmt.int
                                         m.d.comb += [
@@ -1038,11 +1125,9 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                             with m.Default():
                                                 m.d.comb += ILL_INSN
 
-                                    with m.Case(0b11110):  # fmv.fmt.x
+                                    with m.Case(
+                                            0b11110):  # fmv.fmt.x / fli.fmt
                                         m.d.comb += [
-                                            UOPC(
-                                                getattr(
-                                                    UOpCode, f'FMV_{fmt}_X')),
                                             uop.iq_type.eq(IssueQueueType.INT),
                                             uop.fu_type.eq(FUType.I2F),
                                             uop.lrs1_rtype.eq(
@@ -1050,6 +1135,27 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                             uop.lrs2_rtype.eq(RegisterType.X),
                                             IMM_SEL_I,
                                         ]
+
+                                        with m.Switch(inuop.inst[20:25]):
+                                            with m.Case(0b00000):  # fmv.fmt.x
+                                                m.d.comb += UOPC(
+                                                    getattr(
+                                                        UOpCode,
+                                                        f'FMV_{fmt}_X'))
+
+                                            if self.use_zfa:
+                                                with m.Case(
+                                                        0b00001):  # fli.fmt
+                                                    m.d.comb += [
+                                                        UOPC(
+                                                            getattr(
+                                                                UOpCode,
+                                                                f'FLI_{fmt}')),
+                                                        uop.lrs1.eq(0),
+                                                    ]
+
+                                            with m.Default():
+                                                m.d.comb += ILL_INSN
 
                                     with m.Default():
                                         m.d.comb += ILL_INSN

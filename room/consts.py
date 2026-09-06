@@ -203,6 +203,18 @@ class UOpCode(IntEnum):
     VSETIVLI = 195
     VEC = 196
 
+    # Zfa
+    FLI_H = 197
+    FLI_S = 198
+    FLI_D = 199
+    FROUND_H = 200
+    FROUND_S = 201
+    FROUND_D = 202
+    FROUNDNX_H = 203
+    FROUNDNX_S = 204
+    FROUNDNX_D = 205
+    FCVTMOD_W_D = 206
+
 
 class RegisterType(IntEnum):
     X = 0

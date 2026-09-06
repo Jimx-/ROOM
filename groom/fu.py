@@ -11,7 +11,7 @@ import groom.csrnames as gpucsrnames
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.alu import ALU, Multiplier, IntDiv
-from room.fpu import HasFPUParams, FPUOperator, FPFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
+from room.fpu import HasFPUParams, FPUOperator, FPFormat, IntFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
 from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe
 
 from roomsoc.interconnect.stream import Valid, Decoupled
@@ -523,8 +523,7 @@ class GPUControlUnit(PipelinedFunctionalUnit):
         #
 
         stack_ptr = Signal(range(self.ipdom_stack_depth + 1))
-        m.d.sync += stack_ptr.eq(
-            Array(self.stack_ptrs)[self.req.bits.wid])
+        m.d.sync += stack_ptr.eq(Array(self.stack_ptrs)[self.req.bits.wid])
         with m.If(self.resp.bits.uop.opcode == UOpCode.GPU_SPLIT):
             for w in range(self.n_threads):
                 m.d.comb += self.resp.bits.data[w].eq(stack_ptr)
@@ -629,12 +628,21 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
         m = super().elaborate(platform)
 
         cast_en = Signal()
+        fli_en = Signal()
 
         with m.Switch(self.req.bits.uop.opcode):
             with m.Case(UOpCode.FCVT_S_X, UOpCode.FCVT_D_X):
                 m.d.comb += cast_en.eq(1)
 
+            if self.use_zfa:
+                with m.Case(UOpCode.FLI_S, UOpCode.FLI_D, UOpCode.FLI_H):
+                    m.d.comb += [
+                        cast_en.eq(1),
+                        fli_en.eq(1),
+                    ]
+
         typ = generate_imm_type(self.req.bits.uop.imm_packed)
+        fli_idx = self.req.bits.uop.imm_packed[3:8]
 
         for w in range(self.n_threads):
             in_pipe = Pipe(width=len(self.req.bits.rs1_data[w]),
@@ -645,15 +653,20 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
                 in_pipe.in_data.eq(self.req.bits.rs1_data[w]),
             ]
 
-            ifpu = FPUCastMulti(latency=self.latency)
+            ifpu = FPUCastMulti(self.flen,
+                                self.float_types[-1][0],
+                                latency=self.latency,
+                                use_zfa=self.use_zfa)
             setattr(m.submodules, f'ifpu{w}', ifpu)
 
             m.d.comb += [
                 ifpu.inp.valid.eq(self.req.valid & cast_en),
-                ifpu.inp.bits.fn.eq(FPUOperator.I2F),
+                ifpu.inp.bits.fn.eq(
+                    Mux(fli_en, FPUOperator.FLI, FPUOperator.I2F)),
                 ifpu.inp.bits.fn_mod.eq(typ[0]),
                 ifpu.inp.bits.rm.eq(self.frm),
-                ifpu.inp.bits.in1.eq(self.req.bits.rs1_data[w]),
+                ifpu.inp.bits.in1.eq(
+                    Mux(fli_en, fli_idx, self.req.bits.rs1_data[w])),
                 ifpu.inp.bits.dst_fmt.eq(
                     self.tag_to_format(self.req.bits.uop.fp_out_tag)),
                 ifpu.inp.bits.int_fmt.eq(Cat(typ[1], 1)),
@@ -760,6 +773,31 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                     fmt_int.eq(Cat(typ[1], 1)),
                 ]
 
+            if self.use_zfa:
+                with m.Case(UOpCode.FCVTMOD_W_D):
+                    m.d.comb += [
+                        cast_en.eq(1),
+                        fma_op.eq(FPUOperator.MODF2I),
+                        fmt_int.eq(IntFormat.INT32),
+                    ]
+
+                with m.Case(UOpCode.FROUND_S, UOpCode.FROUND_D,
+                            UOpCode.FROUND_H):
+                    m.d.comb += [
+                        cast_en.eq(1),
+                        fma_op.eq(FPUOperator.ROUND),
+                        fmt_int.eq(IntFormat.INT32),
+                    ]
+
+                with m.Case(UOpCode.FROUNDNX_S, UOpCode.FROUNDNX_D,
+                            UOpCode.FROUNDNX_H):
+                    m.d.comb += [
+                        cast_en.eq(1),
+                        fma_op.eq(FPUOperator.ROUND),
+                        fma_op_mod.eq(1),
+                        fmt_int.eq(IntFormat.INT32),
+                    ]
+
             with m.Case(UOpCode.FCVT_D_S, UOpCode.FCVT_S_D, UOpCode.FCVT_H_S,
                         UOpCode.FCVT_S_H, UOpCode.FCVT_D_H, UOpCode.FCVT_H_D):
                 m.d.comb += [
@@ -823,12 +861,18 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
             m.d.comb += sfma.inp.valid.eq(self.req.valid & fma_en
                                           & (fmt_out == FPFormat.S))
 
-            fpiu = FPUCastMulti(latency=self.fma_latency)
+            fpiu = FPUCastMulti(32,
+                                FPFormat.S,
+                                latency=self.fma_latency,
+                                use_zfa=self.use_zfa)
             setattr(m.submodules, f'fpiu{w}', fpiu)
             set_fu_input(fpiu.inp)
             m.d.comb += fpiu.inp.valid.eq(self.req.valid & cast_en)
 
-            scmp = FPUComp(32, FPFormat.S, latency=self.fma_latency)
+            scmp = FPUComp(32,
+                           FPFormat.S,
+                           latency=self.fma_latency,
+                           use_zfa=self.use_zfa)
             setattr(m.submodules, f'scmp{w}', scmp)
             set_fu_input(scmp.inp)
             m.d.comb += scmp.inp.valid.eq(self.req.valid & cmp_en

@@ -611,6 +611,20 @@ class FPRegReadDecoder(HasFPUParams, Elaboratable):
                             OUT_TAG(getattr(self.type_tag, typ)),
                         ]
 
+                if self.use_zfa:
+                    with m.Case(getattr(UOpCode, f'FLI_{typ}')):
+                        m.d.comb += [
+                            IN_TAG(self.type_tag.I),
+                            OUT_TAG(getattr(self.type_tag, typ)),
+                        ]
+
+                    for op in ('FROUND', 'FROUNDNX'):
+                        with m.Case(getattr(UOpCode, f'{op}_{typ}')):
+                            m.d.comb += [
+                                IN_TAG(getattr(self.type_tag, typ)),
+                                OUT_TAG(getattr(self.type_tag, typ)),
+                            ]
+
                 for other_typ in ('H', 'S', 'D'):
                     if typ != other_typ:
                         with m.Case(getattr(UOpCode,
@@ -619,6 +633,13 @@ class FPRegReadDecoder(HasFPUParams, Elaboratable):
                                 IN_TAG(getattr(self.type_tag, typ)),
                                 OUT_TAG(getattr(self.type_tag, other_typ)),
                             ]
+
+            if self.use_zfa:
+                with m.Case(UOpCode.FCVTMOD_W_D):
+                    m.d.comb += [
+                        IN_TAG(self.type_tag.D),
+                        OUT_TAG(self.type_tag.I),
+                    ]
 
         return m
 

@@ -23,6 +23,9 @@ class FPUOperator(IntEnum):
     F2I = 9
     I2F = 10
     REC = 11
+    FLI = 12
+    MODF2I = 13
+    ROUND = 14
 
 
 class FPFormat(IntEnum):
@@ -1136,13 +1139,54 @@ class FPUDivSqrtMulti(Elaboratable):
 
 class FPUCastMulti(Elaboratable):
 
-    def __init__(self, latency=3):
+    _FLI_TABLES = {
+        FPFormat.H: [
+            0xbc00, 0x0400, 0x0100, 0x0200, 0x1c00, 0x2000, 0x2c00, 0x3000,
+            0x3400, 0x3500, 0x3600, 0x3700, 0x3800, 0x3900, 0x3a00, 0x3b00,
+            0x3c00, 0x3d00, 0x3e00, 0x3f00, 0x4000, 0x4100, 0x4200, 0x4400,
+            0x4800, 0x4c00, 0x5800, 0x5c00, 0x7800, 0x7c00, 0x7c00, 0x7e00
+        ],
+        FPFormat.S: [
+            0xbf800000, 0x00800000, 0x37800000, 0x38000000, 0x3b800000,
+            0x3c000000, 0x3d800000, 0x3e000000, 0x3e800000, 0x3ea00000,
+            0x3ec00000, 0x3ee00000, 0x3f000000, 0x3f200000, 0x3f400000,
+            0x3f600000, 0x3f800000, 0x3fa00000, 0x3fc00000, 0x3fe00000,
+            0x40000000, 0x40200000, 0x40400000, 0x40800000, 0x41000000,
+            0x41800000, 0x43000000, 0x43800000, 0x47000000, 0x47800000,
+            0x7f800000, 0x7fc00000
+        ],
+        FPFormat.D: [
+            0xbff0000000000000, 0x0010000000000000, 0x3ef0000000000000,
+            0x3f00000000000000, 0x3f70000000000000, 0x3f80000000000000,
+            0x3fb0000000000000, 0x3fc0000000000000, 0x3fd0000000000000,
+            0x3fd4000000000000, 0x3fd8000000000000, 0x3fdc000000000000,
+            0x3fe0000000000000, 0x3fe4000000000000, 0x3fe8000000000000,
+            0x3fec000000000000, 0x3ff0000000000000, 0x3ff4000000000000,
+            0x3ff8000000000000, 0x3ffc000000000000, 0x4000000000000000,
+            0x4004000000000000, 0x4008000000000000, 0x4010000000000000,
+            0x4020000000000000, 0x4030000000000000, 0x4060000000000000,
+            0x4070000000000000, 0x40e0000000000000, 0x40f0000000000000,
+            0x7ff0000000000000, 0x7ff8000000000000
+        ],
+    }
+
+    def __init__(self, width=64, format=FPFormat.D, latency=3, use_zfa=False):
         if latency < 1:
             raise ValueError('Latency should be at least 1 cycle')
 
-        self.width = 64
-        self.ftyp = FType.FP64
+        self.width = width
+        self.ftyp = _fmt_ftypes[format]
         self.latency = latency
+        self.use_zfa = use_zfa
+
+        # Formats and integer widths that fit in self.width. Narrower
+        # operands are NaN-boxed by the callers; wider ones are not
+        # representable and must not be decoded into this unit.
+        self.fmt_types = [(fmt, _fmt_ftypes[fmt.value]) for fmt in FPFormat
+                          if _fmt_ftypes[fmt.value].width <= width]
+        self.int_types = [
+            fmt for fmt in IntFormat if (1 << (fmt.value + 3)) <= width
+        ]
 
         self.inp = Valid(FPUInput, self.width)
         self.out = Valid(FPUResult, self.width)
@@ -1174,6 +1218,8 @@ class FPUCastMulti(Elaboratable):
 
         src_is_int = s1_inp.fn == FPUOperator.I2F
         dst_is_int = s1_inp.fn == FPUOperator.F2I
+        if self.use_zfa:
+            dst_is_int |= s1_inp.fn == FPUOperator.MODF2I
 
         fmt_sign = Signal()
         fmt_exponent = Signal(signed(EXP_WIDTH))
@@ -1186,10 +1232,8 @@ class FPUCastMulti(Elaboratable):
 
         m.d.comb += fmt_is_boxed.eq(1)
         with m.Switch(s1_inp.src_fmt):
-            for fmt in FPFormat:
+            for fmt, ftyp in self.fmt_types:
                 with m.Case(fmt.value):
-                    ftyp = _fmt_ftypes[fmt.value]
-
                     m.d.comb += [
                         fmt_info.eq(ftyp.classify(s1_inp.in1)),
                         fmt_sign.eq(s1_inp.in1[ftyp.exp +
@@ -1212,7 +1256,7 @@ class FPUCastMulti(Elaboratable):
         int_mantissa = Signal(MAN_WIDTH)
 
         with m.Switch(s1_inp.int_fmt):
-            for fmt in IntFormat:
+            for fmt in self.int_types:
                 with m.Case(fmt.value):
                     int_width = 1 << (fmt.value + 3)
 
@@ -1265,9 +1309,8 @@ class FPUCastMulti(Elaboratable):
 
         dst_exp = Signal(signed(EXP_WIDTH))
         with m.Switch(s1_inp.dst_fmt):
-            for fmt in FPFormat:
+            for fmt, ftyp in self.fmt_types:
                 with m.Case(fmt.value):
-                    ftyp = _fmt_ftypes[fmt.value]
                     m.d.comb += dst_exp.eq(input_exp + ftyp.bias())
 
         s2_input_sign = Signal.like(input_sign)
@@ -1299,14 +1342,16 @@ class FPUCastMulti(Elaboratable):
             s2_pipe_out.eq(s2_pipe.out.bits),
         ]
 
+        s2_is_modf2i = self.use_zfa & (s2_inp.fn == FPUOperator.MODF2I)
+        s2_is_round = self.use_zfa & (s2_inp.fn == FPUOperator.ROUND)
+        s2_is_fli = self.use_zfa & (s2_inp.fn == FPUOperator.FLI)
+
         dst_exp_bits = Signal(range(self.width))
         dst_man_bits = Signal(range(self.width))
 
         with m.Switch(s2_inp.dst_fmt):
-            for fmt in FPFormat:
+            for fmt, ftyp in self.fmt_types:
                 with m.Case(fmt.value):
-                    ftyp = _fmt_ftypes[fmt.value]
-
                     m.d.comb += [
                         dst_exp_bits.eq(ftyp.exp),
                         dst_man_bits.eq(ftyp.man),
@@ -1332,14 +1377,37 @@ class FPUCastMulti(Elaboratable):
             preshift_mant.eq(s2_input_mant << (MAN_WIDTH + 1)),
         ]
 
-        with m.If(s2_dst_is_int):
+        with m.If(s2_dst_is_int | s2_is_round):
             m.d.comb += denorm_shamt.eq(self.width - 1 - s2_input_exp)
 
-            with m.If((s2_input_exp >= (1 << (s2_inp.int_fmt + 3)) - 1 +
-                       s2_inp.fn_mod)
-                      & ~(~s2_inp.fn_mod & s2_input_sign & (
-                          (s2_input_exp == (1 << (s2_inp.int_fmt + 3)) - 1))
-                          & s2_input_mant[-1] & ~s2_input_mant[:-1].any())):
+            with m.If(s2_is_modf2i):
+                # Zfa fcvtmod.w.d: no clamping, keep the natural
+                # (mod 2^width wrapping) alignment. For |x| >= 2^width
+                # the result is invalid regardless; clamp the shift so
+                # it stays in range. |x| < 0.5 flushes everything to
+                # sticky so NX is raised for any nonzero fraction.
+                with m.If(s2_input_exp < -1):
+                    m.d.comb += denorm_shamt.eq(self.width + 1)
+                with m.Elif(s2_input_exp >= self.width):
+                    m.d.comb += denorm_shamt.eq(0)
+
+            with m.Elif(s2_is_round):
+                # Zfa fround/froundnx: align the binary point at the
+                # final_int LSB so the fraction lands in the
+                # round/sticky bits. Values with |x| < 0.5 flush
+                # everything to sticky; already-integral magnitudes
+                # (|exp| >= man) bypass rounding entirely.
+                with m.If(s2_input_exp < -1):
+                    m.d.comb += denorm_shamt.eq(self.width + 1)
+                with m.Elif(s2_input_exp >= self.width):
+                    m.d.comb += denorm_shamt.eq(0)
+
+            with m.Elif((s2_input_exp >= (1 << (s2_inp.int_fmt + 3)) - 1 +
+                         s2_inp.fn_mod)
+                        & ~(~s2_inp.fn_mod & s2_input_sign & (
+                            (s2_input_exp == (1 << (s2_inp.int_fmt + 3)) - 1))
+                            & s2_input_mant[-1]
+                            & ~s2_input_mant[:-1].any())):
                 m.d.comb += [
                     denorm_shamt.eq(0),
                     of_before_round.eq(1),
@@ -1352,10 +1420,8 @@ class FPUCastMulti(Elaboratable):
 
         with m.Else():
             with m.Switch(s2_inp.dst_fmt):
-                for fmt in FPFormat:
+                for fmt, ftyp in self.fmt_types:
                     with m.Case(fmt.value):
-                        ftyp = _fmt_ftypes[fmt.value]
-
                         with m.If(~s2_src_is_int & s2_src_info.is_inf):
                             m.d.comb += [
                                 final_exp.eq(Const(1, 1).replicate(ftyp.exp)),
@@ -1396,22 +1462,20 @@ class FPUCastMulti(Elaboratable):
             int_round_sticky_bits[0].eq(dst_mant[:-self.width - 1] != 0),
         ]
 
-        round_sticky_bits = Mux(s2_dst_is_int, int_round_sticky_bits,
-                                fp_round_sticky_bits)
+        round_sticky_bits = Mux(s2_dst_is_int | s2_is_round,
+                                int_round_sticky_bits, fp_round_sticky_bits)
 
         fmt_pre_round_abs = Signal(self.width)
         ifmt_pre_round_abs = Signal(self.width)
 
         with m.Switch(s2_inp.dst_fmt):
-            for fmt in FPFormat:
+            for fmt, ftyp in self.fmt_types:
                 with m.Case(fmt.value):
-                    ftyp = _fmt_ftypes[fmt.value]
-
                     m.d.comb += fmt_pre_round_abs.eq(
                         Cat(final_mant[:ftyp.man], final_exp[:ftyp.exp]))
 
         with m.Switch(s2_inp.int_fmt):
-            for fmt in IntFormat:
+            for fmt in self.int_types:
                 with m.Case(fmt.value):
                     width = 1 << (fmt.value + 3)
 
@@ -1422,7 +1486,7 @@ class FPUCastMulti(Elaboratable):
                         ifmt_pre_round_abs[:width].eq(final_int[:width]),
                     ]
 
-        pre_round_abs = Mux(s2_dst_is_int, ifmt_pre_round_abs,
+        pre_round_abs = Mux(s2_dst_is_int | s2_is_round, ifmt_pre_round_abs,
                             fmt_pre_round_abs)
 
         #
@@ -1448,10 +1512,8 @@ class FPUCastMulti(Elaboratable):
             fmt_special_result.eq(~0),
         ]
         with m.Switch(s2_inp.dst_fmt):
-            for fmt in FPFormat:
+            for fmt, ftyp in self.fmt_types:
                 with m.Case(fmt.value):
-                    ftyp = _fmt_ftypes[fmt.value]
-
                     m.d.comb += [
                         fmt_result[:ftyp.width].eq(
                             Mux(
@@ -1477,7 +1539,7 @@ class FPUCastMulti(Elaboratable):
         ifmt_special_result = Signal(self.width)
         ifmt_of_after_round = Signal()
         with m.Switch(s2_inp.int_fmt):
-            for fmt in IntFormat:
+            for fmt in self.int_types:
                 with m.Case(fmt.value):
                     width = 1 << (fmt.value + 3)
 
@@ -1533,7 +1595,7 @@ class FPUCastMulti(Elaboratable):
             fp_regular_status.nx.eq(fp_round_sticky_bits.any()
                                     | (s2_src_is_int | ~s2_src_info.is_inf)
                                     & (of_before_round | of_after_round)),
-            fp_special_status.nv.eq(s2_src_info.is_snan),
+            fp_special_status.nv.eq(s2_src_info.is_snan & s2_is_boxed),
         ]
 
         int_status = FPException()
@@ -1543,8 +1605,170 @@ class FPUCastMulti(Elaboratable):
             int_status.nv.eq(int_result_is_special),
         ]
 
-        result = Mux(s2_dst_is_int, int_result, fp_result)
-        status = Mux(s2_dst_is_int, int_status, fp_status)
+        #
+        # Zfa fli: constant LUT indexed by the rs1 field of the
+        # instruction (carried in in1), table selected by the
+        # destination format. Never raises flags.
+        #
+
+        fli_result = Signal(self.width)
+        if self.use_zfa:
+            with m.Switch(s2_inp.dst_fmt):
+                for fmt, ftyp in self.fmt_types:
+                    with m.Case(fmt.value):
+                        m.d.comb += fli_result.eq(
+                            Array(
+                                FPUCastMulti._FLI_TABLES[fmt])[s2_inp.in1[:5]])
+
+        #
+        # Zfa fcvtmod.w.d: RTZ truncate to the low 32 bits (mod 2^32,
+        # no clamping); NaN/inf -> 0. NV for NaN/inf or out-of-int32
+        # range (checked post-truncation, exact -2^31 is valid) and it
+        # takes precedence over NX.
+        #
+
+        modf_abs32 = Signal(32)
+        modf_signed32 = Signal(32)
+        modf_result = Signal(self.width)
+        modf_nv = Signal()
+        modf_status = FPException()
+        if self.use_zfa and self.width == 64:
+            # fcvtmod.w.d converts from a binary64 source. The regular
+            # F2I alignment cannot represent the left shift needed by
+            # finite inputs with an exponent above 63, even though
+            # fcvtmod must still retain their low 32 bits. Extract those
+            # bits directly from the normalized significand instead.
+            modf_right_shamt = Signal(range(64))
+            modf_left_shamt = Signal(range(21))
+            m.d.comb += [
+                modf_right_shamt.eq(63 - s2_input_exp),
+                modf_left_shamt.eq(s2_input_exp - 63),
+            ]
+
+            with m.If(s2_input_exp < 0):
+                m.d.comb += modf_abs32.eq(0)
+            with m.Elif(s2_input_exp < 64):
+                m.d.comb += modf_abs32.eq(s2_input_mant >> modf_right_shamt)
+            # At exponent 84, binary64's 2^(exp-52) spacing reaches 2^32,
+            # so every finite input thereafter is zero modulo 2^32.
+            with m.Elif(s2_input_exp < 84):
+                m.d.comb += modf_abs32.eq(
+                    s2_input_mant[:32] << modf_left_shamt)
+            with m.Else():
+                m.d.comb += modf_abs32.eq(0)
+
+            m.d.comb += modf_signed32.eq(
+                Mux(s2_input_sign, -modf_abs32, modf_abs32))
+
+            with m.If(s2_src_info.is_nan | s2_src_info.is_inf):
+                m.d.comb += modf_result.eq(0)
+            with m.Else():
+                m.d.comb += modf_result.eq(
+                    sign_extend(modf_signed32, self.width))
+
+            m.d.comb += modf_nv.eq(
+                s2_src_info.is_nan | s2_src_info.is_inf
+                | (s2_input_exp > 31)
+                | ((s2_input_exp == 31)
+                   & Mux(s2_input_sign, modf_abs32[31]
+                         & modf_abs32[:31].any(), modf_abs32[31])))
+
+            m.d.comb += [
+                modf_status.nv.eq(modf_nv),
+                modf_status.nx.eq(~modf_nv & int_round_sticky_bits.any()),
+            ]
+
+        #
+        # Zfa fround/froundnx: roundToIntegral(Exact). Specials and
+        # already-integral magnitudes (|exp| >= man) pass through
+        # unmodified; otherwise the integer-aligned mantissa is rounded
+        # per rm (the fraction lands in the round/sticky bits) and
+        # renormalized into the destination encoding. NV only for sNaN;
+        # NX (froundnx only) iff the result differs from the input;
+        # never OF/UF.
+        #
+
+        src_man_bits = Signal(range(self.width))
+        round_result = Signal(self.width)
+        round_status = FPException()
+        if self.use_zfa:
+            with m.Switch(s2_inp.src_fmt):
+                for fmt, ftyp in self.fmt_types:
+                    with m.Case(fmt.value):
+                        m.d.comb += src_man_bits.eq(ftyp.man)
+
+            round_is_special = s2_src_info.is_nan | s2_src_info.is_inf | \
+                s2_src_info.is_zero | ~s2_is_boxed
+            round_is_integral = s2_input_exp >= src_man_bits
+
+            round_int = rounding.rounded_abs
+            # Re-encode anchor: self.ftyp.man is the widest mantissa of
+            # any supported format (of the canonical type). Non-integral
+            # inputs have exp < man <= ftyp.man, so the rounded integer's
+            # leading 1 sits at bit index <= ftyp.man; normalizing it onto
+            # bit ftyp.man makes [ftyp.man - man:ftyp.man] the destination
+            # mantissa field and its old position the true exponent.
+            round_e = Signal(Shape.cast(range(self.ftyp.man + 1)).width)
+            round_shamt = Signal(Shape.cast(range(self.ftyp.man + 1)).width)
+            m.d.comb += [
+                round_e.eq(0),
+                round_shamt.eq(self.ftyp.man - round_e),
+            ]
+            for i in range(self.ftyp.man + 1):
+                with m.If(round_int[i]):
+                    m.d.comb += round_e.eq(i)
+
+            m.d.comb += round_result.eq(~0)  # nan-box narrower formats
+            m.d.comb += [
+                # A badly NaN-boxed operand is a canonical qNaN: it
+                # must not raise NV even if the raw narrow bits look
+                # like an sNaN.
+                round_status.nv.eq(s2_src_info.is_snan & s2_is_boxed),
+                round_status.nx.eq(s2_inp.fn_mod & ~round_is_special
+                                   & ~round_is_integral
+                                   & round_sticky_bits.any()),
+            ]
+
+            with m.Switch(s2_inp.dst_fmt):
+                for fmt, ftyp in self.fmt_types:
+                    with m.Case(fmt.value):
+                        with m.If(round_is_special):
+                            with m.If(s2_src_info.is_nan | ~s2_is_boxed):
+                                m.d.comb += round_result[:ftyp.width].eq(
+                                    ftyp.default_nan())
+                            with m.Elif(s2_src_info.is_inf):
+                                m.d.comb += round_result[:ftyp.width].eq(
+                                    ftyp.inf(s2_input_sign))
+                            with m.Else():
+                                m.d.comb += round_result[:ftyp.width].eq(
+                                    ftyp.zero(s2_input_sign))
+
+                        with m.Elif(round_is_integral):
+                            m.d.comb += round_result[:ftyp.width].eq(
+                                s2_inp.in1[:ftyp.width])
+
+                        with m.Else():
+                            round_aligned = round_int << round_shamt
+                            m.d.comb += round_result[:ftyp.width].eq(
+                                Cat(
+                                    round_aligned[self.ftyp.man -
+                                                  ftyp.man:self.ftyp.man],
+                                    Mux(round_int == 0, 0,
+                                        (round_e + ftyp.bias())[:ftyp.exp]),
+                                    rounding.out_sign))
+
+        result = Mux(
+            s2_is_fli, fli_result,
+            Mux(
+                s2_is_modf2i, modf_result,
+                Mux(s2_is_round, round_result,
+                    Mux(s2_dst_is_int, int_result, fp_result))))
+        status = Mux(
+            s2_is_fli, 0,
+            Mux(
+                s2_is_modf2i, modf_status,
+                Mux(s2_is_round, round_status,
+                    Mux(s2_dst_is_int, int_status, fp_status))))
 
         out_pipe = m.submodules.out_pipe = Pipe(width=len(result) +
                                                 len(status),
@@ -1562,10 +1786,11 @@ class FPUCastMulti(Elaboratable):
 
 class FPUComp(Elaboratable):
 
-    def __init__(self, width, format, latency=3):
+    def __init__(self, width, format, latency=3, use_zfa=False):
         self.width = width
         self.ftyp = _fmt_ftypes[format]
         self.latency = latency
+        self.use_zfa = use_zfa
 
         self.inp = Valid(FPUInput, self.width)
         self.out = Valid(FPUResult, self.width)
@@ -1639,11 +1864,28 @@ class FPUComp(Elaboratable):
                 minmax_result.man.eq(2**(self.ftyp.man - 1)),
             ]
 
-        with m.Elif(info1.is_nan):
-            m.d.comb += minmax_result.eq(in2)
+        with m.Elif(info1.is_nan | info2.is_nan):
+            if self.use_zfa:
+                with m.If((s1_inp.rm == RoundingMode.RDN)
+                          | (s1_inp.rm == RoundingMode.RUP)):
+                    # Zfa fminm/fmaxm: any NaN operand yields canonical NaN
+                    m.d.comb += [
+                        minmax_result.sign.eq(0),
+                        minmax_result.exp.eq(~0),
+                        minmax_result.man.eq(2**(self.ftyp.man - 1)),
+                    ]
 
-        with m.Elif(info2.is_nan):
-            m.d.comb += minmax_result.eq(in1)
+                with m.Elif(info1.is_nan):
+                    m.d.comb += minmax_result.eq(in2)
+
+                with m.Else():
+                    m.d.comb += minmax_result.eq(in1)
+            else:
+                with m.If(info1.is_nan):
+                    m.d.comb += minmax_result.eq(in2)
+
+                with m.Else():
+                    m.d.comb += minmax_result.eq(in1)
 
         with m.Else():
             with m.Switch(s1_inp.rm):
@@ -1652,6 +1894,15 @@ class FPUComp(Elaboratable):
 
                 with m.Case(RoundingMode.RTZ):
                     m.d.comb += minmax_result.eq(Mux(in1_smaller, in2, in1))
+
+                if self.use_zfa:
+                    with m.Case(RoundingMode.RDN):  # Zfa fminm
+                        m.d.comb += minmax_result.eq(Mux(
+                            in1_smaller, in1, in2))
+
+                    with m.Case(RoundingMode.RUP):  # Zfa fmaxm
+                        m.d.comb += minmax_result.eq(Mux(
+                            in1_smaller, in2, in1))
 
         #
         # Comparison
@@ -1687,6 +1938,21 @@ class FPUComp(Elaboratable):
                         m.d.comb += cmp_result.eq(s1_inp.fn_mod)
                     with m.Else():
                         m.d.comb += cmp_result.eq(in_equal ^ s1_inp.fn_mod)
+
+                if self.use_zfa:
+                    with m.Case(4):  # Zfa fleq: like fle but quiet on qNaN
+                        with m.If(info1.is_nan | info2.is_nan):
+                            m.d.comb += cmp_result.eq(0)
+                        with m.Else():
+                            m.d.comb += cmp_result.eq((in1_smaller | in_equal)
+                                                      ^ s1_inp.fn_mod)
+
+                    with m.Case(5):  # Zfa fltq: like flt but quiet on qNaN
+                        with m.If(info1.is_nan | info2.is_nan):
+                            m.d.comb += cmp_result.eq(0)
+                        with m.Else():
+                            m.d.comb += cmp_result.eq((in1_smaller & ~in_equal)
+                                                      ^ s1_inp.fn_mod)
 
         #
         # Classification
