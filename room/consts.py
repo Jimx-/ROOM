@@ -416,5 +416,5 @@ class RoundingMode(IntEnum):
 class PrivilegeMode(IntEnum):
     U = 0
     S = 1
-    H = 2
+    RESERVED = 2
     M = 3

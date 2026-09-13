@@ -64,6 +64,7 @@ class FetchBundle(HasCoreParams):
         self.ftq_idx = Signal(range(self.ftq_size), name=f'{name}_ftq_size')
 
         self.exc_pf_if = Signal(name=f'{name}_exc_pf_if')
+        self.exc_gf_if = Signal(name=f'{name}_exc_gf_if')
         self.exc_ae_if = Signal(name=f'{name}_exc_ae_if')
 
         self.bp_exc_if = Signal(self.fetch_width, name=f'{name}_bp_exc_if')
@@ -87,6 +88,7 @@ class FetchBundle(HasCoreParams):
             self.cfi_is_ret.eq(rhs.cfi_is_ret),
             self.ftq_idx.eq(rhs.ftq_idx),
             self.exc_pf_if.eq(rhs.exc_pf_if),
+            self.exc_gf_if.eq(rhs.exc_gf_if),
             self.exc_ae_if.eq(rhs.exc_ae_if),
             self.bp_exc_if.eq(rhs.bp_exc_if),
             self.bp_debug_if.eq(rhs.bp_debug_if),
@@ -159,6 +161,7 @@ class FetchBuffer(HasFrontendParams, Elaboratable):
                                     & self.w_data.cfi_valid),
                 in_uops[w].exc_ae_if.eq(self.w_data.exc_ae_if),
                 in_uops[w].exc_pf_if.eq(self.w_data.exc_pf_if),
+                in_uops[w].exc_gf_if.eq(self.w_data.exc_gf_if),
                 in_uops[w].bp_exc_if.eq(self.w_data.bp_exc_if[w]),
                 in_uops[w].bp_debug_if.eq(self.w_data.bp_debug_if[w]),
             ]
@@ -623,8 +626,11 @@ class IFStage(HasFrontendParams, Elaboratable):
         ]
 
         self.prv = Signal(PrivilegeMode)
+        self.v = Signal()
         self.status = MStatus(self.xlen)
         self.ptbr = PTBR(self.xlen)
+        self.vsatp = PTBR(self.xlen)
+        self.hgatp = PTBR(self.xlen)
 
         self.pmp = [PMPReg(params, name=f'pmp{i}') for i in range(self.n_pmps)]
 
@@ -657,6 +663,12 @@ class IFStage(HasFrontendParams, Elaboratable):
                                          n_ways=n_tlb_ways,
                                          n_banks=1)
             m.d.comb += [
+                tlb.prv.eq(self.prv),
+                tlb.v.eq(self.v),
+                tlb.status.eq(self.status),
+                tlb.ptbr.eq(self.ptbr),
+                tlb.vsatp.eq(self.vsatp),
+                tlb.hgatp.eq(self.hgatp),
                 tlb.ptw_req.connect(self.ptw_req),
                 tlb.ptw_resp.eq(self.ptw_resp),
             ]
@@ -752,7 +764,8 @@ class IFStage(HasFrontendParams, Elaboratable):
 
             with m.If(s1_valid & ~s1_tlb_miss):
                 m.d.comb += [
-                    s0_valid.eq(~(s1_tlb_resp.ae.inst | s1_tlb_resp.pf.inst)),
+                    s0_valid.eq(~(s1_tlb_resp.ae.inst | s1_tlb_resp.pf.inst
+                                  | s1_tlb_resp.gf.inst)),
                     s0_vpc.eq(f1_predicted_target),
                     s0_ghist.eq(s1_ghist),
                 ]
@@ -770,7 +783,8 @@ class IFStage(HasFrontendParams, Elaboratable):
         s2_tlb_resp = TLBResp(self.params)
         s2_tlb_miss = Signal()
         s2_exception = s2_valid & (s2_tlb_resp.ae.inst
-                                   | s2_tlb_resp.pf.inst) & ~s2_is_replay
+                                   | s2_tlb_resp.pf.inst
+                                   | s2_tlb_resp.gf.inst) & ~s2_is_replay
         f2_clear = Signal()
         f3_ready = Signal()
 
@@ -792,7 +806,8 @@ class IFStage(HasFrontendParams, Elaboratable):
             with m.If((s2_valid & ~icache.resp.valid)
                       | (s2_valid & icache.resp.valid & ~f3_ready)):
                 m.d.comb += [
-                    s0_valid.eq(~(s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst)
+                    s0_valid.eq(~(s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst
+                                  | s2_tlb_resp.gf.inst)
                                 | s2_is_replay | s2_tlb_miss),
                     s0_vpc.eq(s2_vpc),
                     s0_ghist.eq(s2_ghist),
@@ -806,7 +821,8 @@ class IFStage(HasFrontendParams, Elaboratable):
                     m.d.comb += [
                         f1_clear.eq(1),
                         s0_valid.eq(~(
-                            (s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst)
+                            (s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst
+                             | s2_tlb_resp.gf.inst)
                             & ~s2_is_replay)),
                         s0_vpc.eq(f2_predicted_target),
                         s0_ghist.eq(s2_ghist),
@@ -840,7 +856,7 @@ class IFStage(HasFrontendParams, Elaboratable):
 
         f3_clear = Signal()
 
-        f3_pipe_reg = Signal(self.fetch_bytes * 8 + 2 + len(s2_vpc) +
+        f3_pipe_reg = Signal(self.fetch_bytes * 8 + 3 + len(s2_vpc) +
                              len(s2_ghist))
         f3_empty = Signal(reset=1)
 
@@ -848,12 +864,14 @@ class IFStage(HasFrontendParams, Elaboratable):
 
         if self.enable_icache:
             f3_w_en = s2_valid & ~f2_clear & (icache.resp.valid | (
-                (s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst) & ~s2_tlb_miss))
+                (s2_tlb_resp.ae.inst | s2_tlb_resp.pf.inst
+                 | s2_tlb_resp.gf.inst) & ~s2_tlb_miss))
             f3_w_data = Cat(icache.resp.bits.data, s2_tlb_resp.ae.inst,
-                            s2_tlb_resp.pf.inst, s2_vpc, s2_ghist)
+                            s2_tlb_resp.pf.inst, s2_tlb_resp.gf.inst, s2_vpc,
+                            s2_ghist)
         else:
             f3_w_en = s2_valid & ~f2_clear & self.ibus.ack
-            f3_w_data = Cat(self.ibus.dat_r, Const(0, 2), s2_vpc,
+            f3_w_data = Cat(self.ibus.dat_r, Const(0, 3), s2_vpc,
                             Const(0, len(s2_ghist)))
 
         m.d.comb += f3_ready.eq(f3_empty)
@@ -899,12 +917,14 @@ class IFStage(HasFrontendParams, Elaboratable):
         s3_data = Signal(self.fetch_bytes * 8)
         s3_exc_ae = Signal()
         s3_exc_pf = Signal()
+        s3_exc_gf = Signal()
         s3_ghist = GlobalHistory(self.params)
-        assert len(Cat(s3_data, s3_exc_ae, s3_exc_pf, s3_pc,
-                       s3_ghist)) == len(f3_pipe_reg)
+        assert len(
+            Cat(s3_data, s3_exc_ae, s3_exc_pf, s3_exc_gf, s3_pc,
+                s3_ghist)) == len(f3_pipe_reg)
         m.d.comb += [
             s3_valid.eq(~f3_empty),
-            Cat(s3_data, s3_exc_ae, s3_exc_pf, s3_pc,
+            Cat(s3_data, s3_exc_ae, s3_exc_pf, s3_exc_gf, s3_pc,
                 s3_ghist).eq(f3_pipe_reg),
         ]
 
@@ -942,6 +962,7 @@ class IFStage(HasFrontendParams, Elaboratable):
             f3_fetch_bundle.pc.eq(s3_pc),
             f3_fetch_bundle.exc_ae_if.eq(s3_exc_ae),
             f3_fetch_bundle.exc_pf_if.eq(s3_exc_pf),
+            f3_fetch_bundle.exc_gf_if.eq(s3_exc_gf),
         ]
 
         redirects_found = 0
@@ -1152,7 +1173,8 @@ class IFStage(HasFrontendParams, Elaboratable):
                     f1_clear.eq(s1_valid),
                     f2_clear.eq(s2_valid),
                     s0_valid.eq(~(f3_fetch_bundle.exc_ae_if
-                                  | f3_fetch_bundle.exc_pf_if)),
+                                  | f3_fetch_bundle.exc_pf_if
+                                  | f3_fetch_bundle.exc_gf_if)),
                     s0_vpc.eq(f3_predicted_target),
                     s0_ghist.eq(f3_predicted_ghist),
                     s0_is_replay.eq(0),

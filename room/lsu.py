@@ -231,8 +231,11 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         self.lsu_exc = Valid(Exception, params, name='lsu_exc')
 
         self.prv = Signal(PrivilegeMode)
+        self.v = Signal()
         self.status = MStatus(self.xlen)
         self.ptbr = PTBR(self.xlen)
+        self.vsatp = PTBR(self.xlen)
+        self.hgatp = PTBR(self.xlen)
 
         self.pmp = [PMPReg(params, name=f'pmp{i}') for i in range(self.n_pmps)]
 
@@ -268,8 +271,11 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                                      n_banks=self.mem_width)
         m.d.comb += [
             tlb.prv.eq(self.prv),
+            tlb.v.eq(self.v),
             tlb.status.eq(self.status),
             tlb.ptbr.eq(self.ptbr),
+            tlb.vsatp.eq(self.vsatp),
+            tlb.hgatp.eq(self.hgatp),
             tlb.ptw_req.connect(self.ptw_req),
             tlb.ptw_resp.eq(self.ptw_resp),
         ]
@@ -981,6 +987,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         s1_tlb_pf_ld = Signal(self.mem_width)
         s1_tlb_pf_st = Signal(self.mem_width)
+        s1_tlb_gf_ld = Signal(self.mem_width)
+        s1_tlb_gf_st = Signal(self.mem_width)
         s1_tlb_ae_ld = Signal(self.mem_width)
         s1_tlb_ae_st = Signal(self.mem_width)
 
@@ -990,7 +998,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             with m.If(fired_load_incoming[w] | fired_load_retry[w]):
                 ldq_idx = s1_ldq_e[w].uop.ldq_idx
                 with m.If(s1_tlb_miss[w] | s1_tlb_uncacheable[w]
-                          | s1_tlb_pf_ld[w] | s1_tlb_ae_ld[w]):
+                          | s1_tlb_pf_ld[w] | s1_tlb_gf_ld[w]
+                          | s1_tlb_ae_ld[w]):
                     m.d.comb += [
                         dcache.s1_kill[w].eq(dmem_req_fired[w]),
                         s1_set_executed[ldq_idx].eq(0),
@@ -1048,11 +1057,16 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                                    & s1_exc_uops[w].uses_ldq),
                 s1_tlb_pf_st[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.pf.st
                                    & s1_exc_uops[w].uses_stq),
+                s1_tlb_gf_ld[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.gf.ld
+                                   & s1_exc_uops[w].uses_ldq),
+                s1_tlb_gf_st[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.gf.st
+                                   & s1_exc_uops[w].uses_stq),
                 s1_tlb_ae_ld[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.ae.ld
                                    & s1_exc_uops[w].uses_ldq),
                 s1_tlb_ae_st[w].eq(tlb.resp[w].valid & tlb.resp[w].bits.ae.st
                                    & s1_exc_uops[w].uses_stq),
-                s1_exc_valids[w].eq((s1_tlb_pf_ld[w] | s1_tlb_pf_st[w]
+                s1_exc_valids[w].eq((s1_tlb_gf_ld[w] | s1_tlb_gf_st[w]
+                                     | s1_tlb_pf_ld[w] | s1_tlb_pf_st[w]
                                      | s1_tlb_ae_ld[w] | s1_tlb_ae_st[w]
                                      | s1_ma_ld[w] | s1_ma_st[w])
                                     & ~exception_d1),
@@ -1062,12 +1076,18 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
                         Mux(
                             s1_ma_st[w], Cause.STORE_MISALIGNED,
                             Mux(
-                                s1_tlb_pf_ld[w], Cause.LOAD_PAGE_FAULT,
+                                s1_tlb_gf_ld[w], Cause.LOAD_GUEST_PAGE_FAULT,
                                 Mux(
-                                    s1_tlb_pf_st[w], Cause.STORE_PAGE_FAULT,
-                                    Mux(s1_tlb_ae_ld[w],
-                                        Cause.LOAD_ACCESS_FAULT,
-                                        Cause.STORE_ACCESS_FAULT)))))),
+                                    s1_tlb_gf_st[w],
+                                    Cause.STORE_GUEST_PAGE_FAULT,
+                                    Mux(
+                                        s1_tlb_pf_ld[w], Cause.LOAD_PAGE_FAULT,
+                                        Mux(
+                                            s1_tlb_pf_st[w],
+                                            Cause.STORE_PAGE_FAULT,
+                                            Mux(s1_tlb_ae_ld[w],
+                                                Cause.LOAD_ACCESS_FAULT, Cause.
+                                                STORE_ACCESS_FAULT)))))))),
             ]
 
         m.d.comb += s1_exc_valid.eq(s1_exc_valids.any())

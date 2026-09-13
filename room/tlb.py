@@ -55,6 +55,7 @@ class TLBResp(HasCoreParams, Record):
             ('miss', 1, Direction.FANOUT),
             ('paddr', self.paddr_bits, Direction.FANOUT),
             ('pf', exc_layout),
+            ('gf', exc_layout),
             ('ae', exc_layout),
             ('ma', exc_layout),
             ('cacheable', 1, Direction.FANOUT),
@@ -90,6 +91,14 @@ class TLB(HasCoreParams, Elaboratable):
                 ('pw', 1, Direction.FANOUT),
                 ('px', 1, Direction.FANOUT),
                 ('c', 1, Direction.FANOUT),
+                ('v', 1, Direction.FANOUT),
+                ('stage1', 1, Direction.FANOUT),
+                ('stage2', 1, Direction.FANOUT),
+                ('pf', 1, Direction.FANOUT),
+                ('gf', 1, Direction.FANOUT),
+                ('hr', 1, Direction.FANOUT),
+                ('hw', 1, Direction.FANOUT),
+                ('hx', 1, Direction.FANOUT),
             ]
 
             if superpage:
@@ -117,8 +126,11 @@ class TLB(HasCoreParams, Elaboratable):
         self.n_superpage_entries = n_superpage_entries
 
         self.prv = Signal(PrivilegeMode)
+        self.v = Signal()
         self.status = MStatus(self.xlen)
         self.ptbr = PTBR(self.xlen)
+        self.vsatp = PTBR(self.xlen)
+        self.hgatp = PTBR(self.xlen)
 
         self.pmp = [PMPReg(params, name=f'pmp{i}') for i in range(self.n_pmps)]
 
@@ -147,8 +159,22 @@ class TLB(HasCoreParams, Elaboratable):
 
         priv_s = self.prv[0]
         priv_use_vm = self.prv <= PrivilegeMode.S
+        stage1_en = Signal()
+        vstage1_en = Signal()
+        stage2_en = Signal()
+        m.d.comb += [
+            stage1_en.eq(
+                Mux(self.use_hypervisor & self.v, self.vsatp.mode[-1],
+                    self.ptbr.mode[-1])),
+            vstage1_en.eq(self.use_hypervisor & self.v & stage1_en),
+            stage2_en.eq(self.use_hypervisor & self.v
+                         & self.hgatp.mode[-1]),
+        ]
 
         r_refill_tag = Signal(self.vpn_bits)
+        r_refill_v = Signal()
+        r_refill_stage1 = Signal()
+        r_refill_stage2 = Signal()
         r_replace_way = Signal(range(self.n_ways))
         r_superpage_replace_way = Signal(range(self.n_superpage_entries))
         refill_valid = Signal()
@@ -174,6 +200,14 @@ class TLB(HasCoreParams, Elaboratable):
             new_entry.pw.eq(prot_w[0]),
             new_entry.px.eq(prot_x[0]),
             new_entry.c.eq(cacheable[0]),
+            new_entry.v.eq(r_refill_v),
+            new_entry.stage1.eq(r_refill_stage1),
+            new_entry.stage2.eq(r_refill_stage2),
+            new_entry.pf.eq(self.ptw_resp.bits.pf),
+            new_entry.gf.eq(self.ptw_resp.bits.gf),
+            new_entry.hr.eq(self.ptw_resp.bits.hr),
+            new_entry.hw.eq(self.ptw_resp.bits.hw),
+            new_entry.hx.eq(self.ptw_resp.bits.hx),
         ]
 
         superpage_entries = [
@@ -183,6 +217,13 @@ class TLB(HasCoreParams, Elaboratable):
                       name=f'superpage_entry{i}')
             for i in range(self.n_superpage_entries)
         ]
+        superpage_masks = Array(
+            Const((1 << self.ppn_bits) -
+                  (1 << ((self.pg_levels - 1 - level) * self.pg_level_bits)),
+                  self.ppn_bits) for level in range(self.pg_levels))
+        refill_superpage_ppn = Signal(self.ppn_bits)
+        m.d.comb += refill_superpage_ppn.eq(
+            new_entry.ppn & superpage_masks[self.ptw_resp.bits.level])
         superpage_valid = Signal(self.n_superpage_entries)
         with m.If(self.sfence.valid):
             m.d.sync += superpage_valid.eq(0)
@@ -194,7 +235,7 @@ class TLB(HasCoreParams, Elaboratable):
                         m.d.sync += [
                             superpage_valid[w].eq(1),
                             superpage_entries[w].tag.eq(r_refill_tag),
-                            superpage_entries[w].ppn.eq(new_entry.ppn),
+                            superpage_entries[w].ppn.eq(refill_superpage_ppn),
                             superpage_entries[w].u.eq(new_entry.u),
                             superpage_entries[w].g.eq(new_entry.g),
                             superpage_entries[w].ae.eq(new_entry.ae),
@@ -205,6 +246,14 @@ class TLB(HasCoreParams, Elaboratable):
                             superpage_entries[w].pw.eq(new_entry.pw),
                             superpage_entries[w].px.eq(new_entry.px),
                             superpage_entries[w].c.eq(new_entry.c),
+                            superpage_entries[w].v.eq(new_entry.v),
+                            superpage_entries[w].stage1.eq(new_entry.stage1),
+                            superpage_entries[w].stage2.eq(new_entry.stage2),
+                            superpage_entries[w].pf.eq(new_entry.pf),
+                            superpage_entries[w].gf.eq(new_entry.gf),
+                            superpage_entries[w].hr.eq(new_entry.hr),
+                            superpage_entries[w].hw.eq(new_entry.hw),
+                            superpage_entries[w].hx.eq(new_entry.hx),
                             superpage_entries[w].level.eq(
                                 self.ptw_resp.bits.level),
                         ]
@@ -395,7 +444,8 @@ class TLB(HasCoreParams, Elaboratable):
             req_vpn = s1_req[w].vaddr[self.pg_offset_bits:self.vaddr_bits]
 
             for i in range(self.n_superpage_entries):
-                tag_match = self.use_vm & superpage_valid[i]
+                tag_match = (self.use_vm & superpage_valid[i]
+                             & (superpage_entries[i].v == self.v))
                 for l in range(self.pg_levels):
                     base = (self.pg_levels - l - 1) * self.pg_level_bits
                     tag_match &= (l > superpage_entries[i].level) | (
@@ -414,11 +464,12 @@ class TLB(HasCoreParams, Elaboratable):
 
             m.d.comb += [
                 s1_vm_enabled[i].eq(self.use_vm & priv_use_vm
-                                    & self.ptbr.mode[-1]
+                                    & (stage1_en | stage2_en)
                                     & ~s1_req[i].passthru),
                 s1_tag_match_way[i].eq(
                     Cat((s1_data[i][w].tag ==
                          (s1_vpn[i] >> tag_off_bits)[:tag_bits])
+                        & (s1_data[i][w].v == self.v)
                         & s1_entry_valid[i][w] & ~s1_nack[i]
                         for w in range(self.n_ways))),
                 s1_hits[i].eq(Cat(s1_tag_match_way[i], s1_superpage_hit[i])),
@@ -440,9 +491,16 @@ class TLB(HasCoreParams, Elaboratable):
                 m.d.comb += [
                     self.ptw_req.valid.eq(1),
                     self.ptw_req.bits.vpn.eq(s1_vpn[w]),
+                    self.ptw_req.bits.vstage1.eq(vstage1_en),
+                    self.ptw_req.bits.stage2.eq(stage2_en),
                 ]
 
-                m.d.sync += r_refill_tag.eq(s1_vpn[w])
+                m.d.sync += [
+                    r_refill_tag.eq(s1_vpn[w]),
+                    r_refill_v.eq(self.v),
+                    r_refill_stage1.eq(stage1_en),
+                    r_refill_stage2.eq(stage2_en),
+                ]
 
         with m.If(self.ptw_req.fire):
             m.d.sync += [
@@ -597,9 +655,12 @@ class TLB(HasCoreParams, Elaboratable):
                     #
                     r_ok_array[w][i].eq(priv_rw_array[w][i]
                                         & (entry.sr
-                                           | (self.status.mxr & entry.sx))),
-                    w_ok_array[w][i].eq(priv_rw_array[w][i] & entry.sw),
-                    x_ok_array[w][i].eq(priv_x_array[w][i] & entry.sx),
+                                           | (self.status.mxr & entry.sx))
+                                        | ~entry.stage1),
+                    w_ok_array[w][i].eq((priv_rw_array[w][i] & entry.sw)
+                                        | ~entry.stage1),
+                    x_ok_array[w][i].eq((priv_x_array[w][i] & entry.sx)
+                                        | ~entry.stage1),
                     #
                     pr_ok_array[w][i].eq(entry.pr & ~ptw_ae_array[w][i]),
                     pw_ok_array[w][i].eq(entry.pw & ~ptw_ae_array[w][i]),
@@ -608,12 +669,18 @@ class TLB(HasCoreParams, Elaboratable):
                     #
                     pf_ld_array[w]
                     [i].eq(cmd_read[w]
-                           & ~(r_ok_array[w][i] | ptw_ae_array[w][i])),
+                           & (entry.pf
+                              | ~(r_ok_array[w][i]
+                                  | ptw_ae_array[w][i])) & ~entry.gf),
                     pf_st_array[w][i].eq(
                         cmd_write[w]
-                        & ~(w_ok_array[w][i] | ptw_ae_array[w][i])),
-                    pf_inst_array[w][i].eq(~(x_ok_array[w][i]
-                                             | ptw_ae_array[w][i])),
+                        & (entry.pf
+                           | ~(w_ok_array[w][i] | ptw_ae_array[w][i]))
+                        & ~entry.gf),
+                    pf_inst_array[w][i].eq(
+                        (entry.pf
+                         | ~(x_ok_array[w][i] | ptw_ae_array[w][i]))
+                        & ~entry.gf),
                     #
                     ae_ld_array[w][i].eq(cmd_read[w] & ~pr_ok_array[w][i]),
                     ae_st_array[w][i].eq(cmd_write[w] & ~pw_ok_array[w][i]),
@@ -655,6 +722,17 @@ class TLB(HasCoreParams, Elaboratable):
                         (pf_st_array[w] & s1_hits[w]).any()),
                     self.resp[w].bits.pf.inst.eq(
                         (pf_inst_array[w] & s1_hits[w]).any()),
+                    self.resp[w].bits.gf.ld.eq((Cat(cmd_read[w] & e.stage2
+                                                    & (e.gf | ~e.hr)
+                                                    for e in all_entries[w])
+                                                & s1_hits[w]).any()),
+                    self.resp[w].bits.gf.st.eq((Cat(cmd_write[w] & e.stage2
+                                                    & (e.gf | ~e.hw)
+                                                    for e in all_entries[w])
+                                                & s1_hits[w]).any()),
+                    self.resp[w].bits.gf.inst.eq(
+                        (Cat(e.stage2 & (e.gf | ~e.hx)
+                             for e in all_entries[w]) & s1_hits[w]).any()),
                     #
                     self.resp[w].bits.ae.ld.eq(
                         (ae_ld_array[w] & s1_hits[w]).any()),

@@ -89,6 +89,18 @@ def misa_layout(xlen):
 
 class CSRFile(HasCoreParams, Elaboratable):
 
+    _H_SUPERVISOR_ALIASES = {
+        0x100: 0x200,  # sstatus -> vsstatus
+        0x104: 0x204,  # sie -> vsie
+        0x105: 0x205,  # stvec -> vstvec
+        0x140: 0x240,  # sscratch -> vsscratch
+        0x141: 0x241,  # sepc -> vsepc
+        0x142: 0x242,  # scause -> vscause
+        0x143: 0x243,  # stval -> vstval
+        0x144: 0x244,  # sip -> vsip
+        0x180: 0x280,  # satp -> vsatp
+    }
+
     def __init__(self, params, width=32, depth=2**12):
         super().__init__(params)
 
@@ -98,6 +110,7 @@ class CSRFile(HasCoreParams, Elaboratable):
         self._ports = []
 
         self.prv = Signal(PrivilegeMode)
+        self.v = Signal()
         self.decode = [
             CSRDecode(name=f'decode{w}') for w in range(self.core_width)
         ]
@@ -175,8 +188,18 @@ class CSRFile(HasCoreParams, Elaboratable):
 
         for p in self._ports:
             rmw_data = Signal(self.width)
+            resolved_addr = Signal.like(p.addr)
 
-            with m.Switch(p.addr):
+            m.d.comb += resolved_addr.eq(p.addr)
+            if self.use_hypervisor:
+                with m.If(self.v):
+                    with m.Switch(p.addr):
+                        for s_addr, vs_addr in self._H_SUPERVISOR_ALIASES.items(
+                        ):
+                            with m.Case(s_addr):
+                                m.d.comb += resolved_addr.eq(vs_addr)
+
+            with m.Switch(resolved_addr):
                 w_data = (Mux(p.cmd[1], rmw_data, 0)
                           | p.w_data) & ~Mux(p.cmd[0] & p.cmd[1], p.w_data, 0)
 
@@ -201,7 +224,14 @@ class CSRFile(HasCoreParams, Elaboratable):
         for dec in self.decode:
             csr_addr = dec.inst[20:]
             csr_mode = csr_addr[8:10]
-            csr_prv_ok = self.prv >= csr_mode
+            if self.use_hypervisor:
+                # CSR privilege encoding 2 denotes the HS-level CSR space in
+                # the ratified H extension; HS itself is S-mode with V=0.
+                csr_prv_ok = Mux(csr_mode == 2, (self.prv == PrivilegeMode.M)
+                                 | ((self.prv == PrivilegeMode.S) & ~self.v),
+                                 self.prv >= csr_mode)
+            else:
+                csr_prv_ok = self.prv >= csr_mode
             csr_is_time = (csr_addr == csrnames.time) | (csr_addr
                                                          == csrnames.timeh)
 

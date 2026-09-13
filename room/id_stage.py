@@ -1378,6 +1378,11 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                 uop.exception.eq(1),
                 uop.exc_cause.eq(Cause.BREAKPOINT),
             ]
+        with m.Elif(inuop.exc_gf_if):
+            m.d.comb += [
+                uop.exception.eq(1),
+                uop.exc_cause.eq(Cause.FETCH_GUEST_PAGE_FAULT),
+            ]
         with m.Elif(inuop.exc_pf_if):
             m.d.comb += [
                 uop.exception.eq(1),

@@ -244,6 +244,7 @@ class Core(HasCoreParams, Elaboratable):
         m.d.comb += [
             exc_unit.interrupts.eq(self.interrupts),
             csr.prv.eq(exc_unit.prv),
+            csr.v.eq(exc_unit.v),
         ]
 
         #
@@ -292,6 +293,7 @@ class Core(HasCoreParams, Elaboratable):
         m.d.comb += [
             if_stage.reset_vector.eq(self.reset_vector),
             if_stage.prv.eq(exc_unit.prv),
+            if_stage.v.eq(exc_unit.v),
             if_stage.status.eq(exc_unit.mstatus.r),
         ]
 
@@ -404,6 +406,7 @@ class Core(HasCoreParams, Elaboratable):
                                                sim_debug=self.sim_debug)
         m.d.comb += [
             lsu.prv.eq(exc_unit.dprv),
+            lsu.v.eq(exc_unit.v),
             lsu.status.eq(exc_unit.mstatus.r),
         ]
 
@@ -1296,6 +1299,13 @@ class Core(HasCoreParams, Elaboratable):
                 lsu.ptbr.eq(ptw.satp.r),
                 ptw_arbiter.out.connect(ptw.req),
             ]
+            if self.use_hypervisor:
+                m.d.comb += [
+                    if_stage.vsatp.eq(ptw.vsatp.r),
+                    if_stage.hgatp.eq(ptw.hgatp.r),
+                    lsu.vsatp.eq(ptw.vsatp.r),
+                    lsu.hgatp.eq(ptw.hgatp.r),
+                ]
             core_mem_users.append((ptw.mem_req, ptw.mem_nack, ptw.mem_resp))
 
             with m.Switch(ptw_resp_dst):

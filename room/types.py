@@ -55,6 +55,12 @@ class HasCoreParams:
             self.use_vm = params['use_vm']
             self.use_user = params['use_user']
             self.use_supervisor = params['use_supervisor']
+            self.use_hypervisor = params.get('use_hypervisor', False)
+
+            if self.use_hypervisor and not (self.use_supervisor
+                                            and self.use_vm):
+                raise ValueError(
+                    'The H extension requires supervisor mode and VM support')
 
             self.paddr_bits = params['paddr_bits']
             self.core_max_addr_bits = max(self.vaddr_bits_extended,
@@ -238,6 +244,7 @@ class MicroOp(HasCoreParams, Record):
             ('flush_on_commit', 1),
             ('exc_ae_if', 1),
             ('exc_pf_if', 1),
+            ('exc_gf_if', 1),
             ('bp_debug_if', 1),
             ('bp_exc_if', 1),
             ('exception', 1),
