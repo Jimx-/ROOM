@@ -119,6 +119,8 @@ class HasDCacheParams(HasCoreParams):
         self.n_iomshrs = dcache_params['n_iomshrs']
         self.sdq_size = dcache_params['sdq_size']
         self.rpq_size = dcache_params['rpq_size']
+        self.enable_prefetching = dcache_params.get(
+            'enable_prefetching', params.get('enable_prefetching', False))
 
         self.source_id_bits = bits_for(self.n_mshrs + self.n_iomshrs + 1)
 
@@ -144,6 +146,7 @@ class DCacheReqType(IntEnum):
     MSHR_META = 3
     REPLAY = 4
     PROBE = 5
+    PREFETCH = 6
 
 
 class DCacheReq(HasCoreParams):
@@ -186,6 +189,62 @@ class DCacheResp(HasCoreParams):
         return [getattr(self, a).eq(getattr(rhs, a)) for a in attrs]
 
 
+class DataPrefetcher(HasDCacheParams, Elaboratable):
+
+    def __init__(self, params):
+        super().__init__(params)
+
+        self.mshr_avail = Signal()
+        self.req_valid = Signal()
+        self.req_addr = Signal(self.core_max_addr_bits)
+        self.req_write = Signal()
+
+        self.prefetch = Decoupled(DCacheReq, params)
+
+
+class NullPrefetcher(DataPrefetcher):
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.d.comb += self.prefetch.valid.eq(0)
+
+        return m
+
+
+class NextLinePrefetcher(DataPrefetcher):
+
+    def elaborate(self, platform):
+        m = Module()
+
+        req_valid = Signal()
+        req_addr = Signal.like(self.req_addr)
+        req_cmd = Signal(MemoryCommand)
+        next_addr = self.req_addr + self.block_bytes
+
+        pma = m.submodules.pma = PMAChecker(self.params)
+        m.d.comb += pma.paddr.eq(next_addr)
+
+        with m.If(self.req_valid & pma.resp.cacheable):
+            m.d.sync += [
+                req_valid.eq(1),
+                req_addr.eq(next_addr),
+                req_cmd.eq(
+                    Mux(self.req_write, MemoryCommand.PREFETCH_WRITE,
+                        MemoryCommand.PREFETCH_READ)),
+            ]
+        with m.Elif(self.prefetch.fire):
+            m.d.sync += req_valid.eq(0)
+
+        m.d.comb += [
+            self.prefetch.valid.eq(req_valid & self.mshr_avail),
+            self.prefetch.bits.addr.eq(req_addr),
+            self.prefetch.bits.uop.mem_cmd.eq(req_cmd),
+        ]
+
+        return m
+
+
 #
 # Cache metadata
 #
@@ -204,19 +263,20 @@ class CacheState(IntEnum):
     @staticmethod
     def on_access(m, state, cmd):
         cmd_is_write = MemoryCommand.is_write(cmd)
+        cmd_write_intent = MemoryCommand.is_write_intent(cmd)
 
         is_hit = Signal()
         next_state = Signal(CacheState)
 
         with m.Switch(state):
             with m.Case(CacheState.NOTHING):
-                with m.If(cmd_is_write):
+                with m.If(cmd_write_intent):
                     m.d.comb += next_state.eq(tl.GrowParam.NtoT)
                 with m.Else():
                     m.d.comb += next_state.eq(tl.GrowParam.NtoB)
 
             with m.Case(CacheState.BRANCH):
-                with m.If(cmd_is_write):
+                with m.If(cmd_write_intent):
                     m.d.comb += next_state.eq(tl.GrowParam.BtoT)
                 with m.Else():
                     m.d.comb += [
@@ -242,17 +302,20 @@ class CacheState(IntEnum):
     @staticmethod
     def on_grant(m, cmd, param):
         cmd_is_write = MemoryCommand.is_write(cmd)
+        cmd_write_intent = MemoryCommand.is_write_intent(cmd)
 
         grant_state = Signal(CacheState, reset=CacheState.NOTHING)
 
         with m.Switch(param):
             with m.Case(tl.CapParam.toB):
-                with m.If(~cmd_is_write):
+                with m.If(~cmd_write_intent):
                     m.d.comb += grant_state.eq(CacheState.BRANCH)
 
             with m.Case(tl.CapParam.toT):
-                with m.If(cmd_is_write):
-                    m.d.comb += grant_state.eq(CacheState.DIRTY)
+                with m.If(cmd_write_intent):
+                    m.d.comb += grant_state.eq(
+                        Mux(cmd_is_write, CacheState.DIRTY,
+                            CacheState.TRUNK))
                 with m.Else():
                     m.d.comb += grant_state.eq(CacheState.TRUNK)
 
@@ -265,12 +328,12 @@ class CacheState(IntEnum):
 
         hit_again = hit_pri & hit_sec
 
-        sec_is_write = MemoryCommand.is_write(cmd_sec)
-        dirtier_state = Mux(sec_is_write, next_state_sec, next_state_pri)
-        dirtier_cmd = Mux(sec_is_write, cmd_sec, cmd_pri)
+        sec_write_intent = MemoryCommand.is_write_intent(cmd_sec)
+        dirtier_state = Mux(sec_write_intent, next_state_sec, next_state_pri)
+        dirtier_cmd = Mux(sec_write_intent, cmd_sec, cmd_pri)
 
-        need_sec_acq = MemoryCommand.is_write(
-            cmd_sec) & ~MemoryCommand.is_write(cmd_pri)
+        need_sec_acq = sec_write_intent & ~MemoryCommand.is_write_intent(
+            cmd_pri)
 
         return need_sec_acq, hit_again, dirtier_state, dirtier_cmd
 
@@ -1105,8 +1168,8 @@ class MSHRReq(HasDCacheParams, DCacheReq):
 
     def eq(self, rhs):
         return super().eq(rhs) + [
-            getattr(self, a).eq(getattr(rhs, a))
-            for a in ['tag_match', 'old_meta', 'way_en', 'sdq_id']
+            getattr(self, a).eq(getattr(rhs, a)) for a in
+            ['tag_match', 'old_meta', 'way_en', 'sdq_id']
         ]
 
 
@@ -1198,6 +1261,10 @@ class MSHR(HasDCacheParams, Elaboratable):
         self.prober_state = Valid(Signal, 32)
         self.probe_rdy = Signal()
 
+        self.commit_valid = Signal()
+        self.commit_addr = Signal(self.core_max_addr_bits)
+        self.commit_write = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -1206,6 +1273,7 @@ class MSHR(HasDCacheParams, Elaboratable):
         req_tag = self.addr_tag(req.addr)
 
         state_invalid = Signal()
+        new_state = Signal(CacheState)
 
         m.d.comb += [
             self.idx.valid.eq(~state_invalid),
@@ -1214,6 +1282,9 @@ class MSHR(HasDCacheParams, Elaboratable):
             self.way.bits.eq(req.way_en),
             self.tag.valid.eq(~state_invalid),
             self.tag.bits.eq(req_tag),
+            self.commit_addr.eq(req.addr),
+            self.commit_write.eq((new_state == CacheState.TRUNK)
+                                 | (new_state == CacheState.DIRTY)),
         ]
 
         rpq = m.submodules.rpq = BranchKillableFIFO(
@@ -1227,8 +1298,10 @@ class MSHR(HasDCacheParams, Elaboratable):
         m.d.comb += [
             rpq.br_update.eq(self.br_update),
             rpq.flush.eq(self.exception),
-            rpq.w_en.eq((self.req_pri_valid & self.req_pri_ready)
-                        | (self.req_sec_valid & self.req_sec_ready)),
+            rpq.w_en.eq(((self.req_pri_valid & self.req_pri_ready)
+                         | (self.req_sec_valid & self.req_sec_ready))
+                        & ~MemoryCommand.is_prefetch(
+                            self.req.uop.mem_cmd)),
             rpq.w_data.eq(self.req),
             rpq.w_br_mask.eq(self.req.uop.br_mask),
         ]
@@ -1241,8 +1314,6 @@ class MSHR(HasDCacheParams, Elaboratable):
         grantack = Valid(tl.ChannelE, sink_id_width=self.sink_id_width)
         grant_had_data = Signal()
         commit_line = Signal()
-
-        new_state = Signal(CacheState)
 
         _, grow_param = CacheState.on_access(m, new_state, req.uop.mem_cmd)
         _, shrink_param, _ = CacheState.on_cache_control(
@@ -1405,10 +1476,13 @@ class MSHR(HasDCacheParams, Elaboratable):
 
                 with m.If(rpq.r_en & rpq.r_rdy):
                     m.d.sync += commit_line.eq(1)
-                with m.Elif(rpq.empty & ~commit_line):
+                with m.Elif(rpq.empty & ~commit_line
+                            & ~MemoryCommand.is_prefetch(req.uop.mem_cmd)):
                     with m.If(~(rpq.w_en & rpq.w_rdy)):
                         m.next = 'MEM_FINISH_1'
                 with m.Elif(rpq.empty | (rpq.r_rdy & ~drain_load)):
+                    m.d.comb += self.commit_valid.eq(
+                        ~MemoryCommand.is_prefetch(req.uop.mem_cmd))
                     m.next = 'META_READ'
 
             with m.State('META_READ'):
@@ -1691,8 +1765,15 @@ class MSHRFile(HasDCacheParams, Elaboratable):
         self.prober_state = Valid(Signal, 32)
         self.probe_rdy = Signal()
 
+        self.prefetch = Decoupled(DCacheReq, params)
+
     def elaborate(self, platform):
         m = Module()
+
+        prefetcher_cls = (NextLinePrefetcher
+                          if self.enable_prefetching else NullPrefetcher)
+        prefetcher = m.submodules.prefetcher = prefetcher_cls(self.params)
+        m.d.comb += prefetcher.prefetch.connect(self.prefetch)
 
         req_idx = Signal(range(self.mem_width))
         req = MSHRReq(self.params)
@@ -1834,6 +1915,9 @@ class MSHRFile(HasDCacheParams, Elaboratable):
         sec_ready = 0
 
         mshrs = []
+        commit_valid = Signal()
+        commit_addr = Signal(self.core_max_addr_bits)
+        commit_write = Signal()
         for i in range(self.n_mshrs):
             mshr = MSHR(i, self.params, sink_id_width=self.sink_id_width)
             setattr(m.submodules, f'mshr{i}', mshr)
@@ -1895,6 +1979,13 @@ class MSHRFile(HasDCacheParams, Elaboratable):
 
             m.d.comb += mshr.resp.connect(resp_arb.inp[i])
 
+            with m.If(mshr.commit_valid):
+                m.d.comb += [
+                    commit_valid.eq(1),
+                    commit_addr.eq(mshr.commit_addr),
+                    commit_write.eq(mshr.commit_write),
+                ]
+
             m.d.comb += mshr.prober_state.eq(self.prober_state)
             for w in range(self.mem_width):
                 with m.If(~mshr.probe_rdy & idx_matches[w][i]
@@ -1902,6 +1993,13 @@ class MSHRFile(HasDCacheParams, Elaboratable):
                     m.d.comb += self.probe_rdy.eq(0)
 
             mshrs.append(mshr)
+
+        m.d.comb += [
+            prefetcher.mshr_avail.eq(pri_ready),
+            prefetcher.req_valid.eq(commit_valid),
+            prefetcher.req_addr.eq(commit_addr),
+            prefetcher.req_write.eq(commit_write),
+        ]
 
         for i in reversed(range(self.n_mshrs)):
             with m.If(mshrs[i].req_pri_ready):
@@ -2116,9 +2214,10 @@ class DCache(HasDCacheParams, Elaboratable):
         # 0 - MSHR refill, 1 - Prober
         meta_write_arb = m.submodules.meta_write_arb = Arbiter(
             2, MetaWriteReq, self.params)
-        # 0 - MSHR replay, 1 - Prober, 2 - WB, 3 - MSHR meta read, 4 - LSU
+        # 0 - MSHR replay, 1 - Prober, 2 - WB, 3 - MSHR meta read, 4 - LSU,
+        # 5 - Prefetcher
         meta_read_arb = m.submodules.meta_read_arb = Arbiter(
-            5, L1MetaReadReq, self.params)
+            6, L1MetaReadReq, self.params)
 
         meta = []
         for w in range(self.mem_width):
@@ -2270,13 +2369,31 @@ class DCache(HasDCacheParams, Elaboratable):
         ]
 
         #
+        # Prefetcher
+        #
+
+        prefetch_fire = mshrs.prefetch.fire
+        prefetch_req = [
+            DCacheReq(self.params, name=f'prefetch_req{i}')
+            for i in range(self.mem_width)
+        ]
+        m.d.comb += [
+            prefetch_req[0].eq(mshrs.prefetch.bits),
+            meta_read_arb.inp[5].valid.eq(mshrs.prefetch.valid),
+            meta_read_arb.inp[5].bits.req[0].idx.eq(
+                self.addr_index(mshrs.prefetch.bits.addr)),
+            mshrs.prefetch.ready.eq(meta_read_arb.inp[5].ready),
+        ]
+
+        #
         # S0 - Request arbitration
         #
 
         s0_valid = Mux(
             Cat(r.fire for r in self.req) != 0, Cat(r.valid for r in self.req),
             Mux(
-                wb_fire | mshrs.meta_read.fire | mshrs.replay.fire
+                wb_fire | prefetch_fire | mshrs.meta_read.fire
+                | mshrs.replay.fire
                 | prober_fire, Const(1, self.mem_width), 0))
         s0_req = [
             DCacheReq(self.params, name=f's0_req{i}')
@@ -2297,6 +2414,8 @@ class DCache(HasDCacheParams, Elaboratable):
                 m.d.comb += s0_req[w].eq(wb_req[w])
             with m.Elif(prober_fire):
                 m.d.comb += s0_req[w].eq(prober_req[w])
+            with m.Elif(prefetch_fire):
+                m.d.comb += s0_req[w].eq(prefetch_req[w])
             with m.Elif(mshrs.meta_read.fire):
                 m.d.comb += s0_req[w].eq(mshr_read_req[w])
             with m.Else():
@@ -2309,8 +2428,10 @@ class DCache(HasDCacheParams, Elaboratable):
                     wb_fire, DCacheReqType.WRITEBACK,
                     Mux(
                         prober_fire, DCacheReqType.PROBE,
-                        Mux(mshrs.meta_read.fire, DCacheReqType.MSHR_META,
-                            DCacheReqType.REPLAY)))))
+                        Mux(
+                            prefetch_fire, DCacheReqType.PREFETCH,
+                            Mux(mshrs.meta_read.fire, DCacheReqType.MSHR_META,
+                                DCacheReqType.REPLAY))))))
 
         #
         # S1 - Tag access
@@ -2599,10 +2720,12 @@ class DCache(HasDCacheParams, Elaboratable):
                 mshrs.req[w].valid.eq(
                     s2_valid[w] & ~s2_hit[w] & ~s2_nack_data[w]
                     & ~s2_nack_victim[w] & ~s2_nack_wb[w] & ~s2_nack_probe[w]
-                    & (s2_type == DCacheReqType.LSU)
+                    & ((s2_type == DCacheReqType.LSU)
+                       | (s2_type == DCacheReqType.PREFETCH))
                     & ~self.br_update.uop_killed(s2_req[w].uop)
                     & ~(self.exception & s2_req[w].uop.uses_ldq)
-                    & (MemoryCommand.is_read(s2_req[w].uop.mem_cmd)
+                    & (MemoryCommand.is_prefetch(s2_req[w].uop.mem_cmd)
+                       | MemoryCommand.is_read(s2_req[w].uop.mem_cmd)
                        | MemoryCommand.is_write(s2_req[w].uop.mem_cmd))),
                 mshrs.req[w].bits.uop.eq(s2_req[w].uop),
                 mshrs.req[w].bits.uop.br_mask.eq(
@@ -2849,8 +2972,7 @@ class DCache(HasDCacheParams, Elaboratable):
 
             m.d.comb += s2_data_word[w].eq(s2_data_word_prebypass[w])
 
-        for reqs, valid in ((s5_req, s5_valid),
-                            (s4_req, s4_valid),
+        for reqs, valid in ((s5_req, s5_valid), (s4_req, s4_valid),
                             (s3_req, s3_valid)):
             for i in reversed(range(self.mem_width)):
                 bypass = Cat(valid[i]

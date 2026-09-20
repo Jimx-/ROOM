@@ -366,6 +366,8 @@ class MemoryCommand(IntEnum):
     LR = 12
     SC = 13
     SFENCE = 14
+    PREFETCH_READ = 15
+    PREFETCH_WRITE = 16
 
     @staticmethod
     def is_read(cmd):
@@ -376,6 +378,16 @@ class MemoryCommand(IntEnum):
     def is_write(cmd):
         return (cmd == MemoryCommand.WRITE) | (
             cmd == MemoryCommand.SC) | MemoryCommand.is_amo(cmd)
+
+    @staticmethod
+    def is_prefetch(cmd):
+        return (cmd == MemoryCommand.PREFETCH_READ) | (
+            cmd == MemoryCommand.PREFETCH_WRITE)
+
+    @staticmethod
+    def is_write_intent(cmd):
+        return MemoryCommand.is_write(cmd) | (cmd
+                                              == MemoryCommand.PREFETCH_WRITE)
 
     @staticmethod
     def is_amo_logical(cmd):
