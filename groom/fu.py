@@ -643,6 +643,8 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
 
         typ = generate_imm_type(self.req.bits.uop.imm_packed)
         fli_idx = self.req.bits.uop.imm_packed[3:8]
+        inst_rm = generate_imm_rm(self.req.bits.uop.imm_packed)
+        fp_rm = Mux(inst_rm == 7, self.frm, inst_rm)
 
         for w in range(self.n_threads):
             in_pipe = Pipe(width=len(self.req.bits.rs1_data[w]),
@@ -664,7 +666,7 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
                 ifpu.inp.bits.fn.eq(
                     Mux(fli_en, FPUOperator.FLI, FPUOperator.I2F)),
                 ifpu.inp.bits.fn_mod.eq(typ[0]),
-                ifpu.inp.bits.rm.eq(self.frm),
+                ifpu.inp.bits.rm.eq(fp_rm),
                 ifpu.inp.bits.in1.eq(
                     Mux(fli_en, fli_idx, self.req.bits.rs1_data[w])),
                 ifpu.inp.bits.dst_fmt.eq(

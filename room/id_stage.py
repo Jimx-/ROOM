@@ -1192,13 +1192,13 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                                         m.d.comb += UOPC(
                                             getattr(UOpCode, f'FMSUB_{fmt}'))
 
-                                    with m.Case(0b1001011):  # fnmadd.fmt
-                                        m.d.comb += UOPC(
-                                            getattr(UOpCode, f'FNMADD_{fmt}'))
-
-                                    with m.Case(0b1001111):  # fnmsub.fmt
+                                    with m.Case(0b1001011):  # fnmsub.fmt
                                         m.d.comb += UOPC(
                                             getattr(UOpCode, f'FNMSUB_{fmt}'))
+
+                                    with m.Case(0b1001111):  # fnmadd.fmt
+                                        m.d.comb += UOPC(
+                                            getattr(UOpCode, f'FNMADD_{fmt}'))
 
                         with m.Default():
                             m.d.comb += ILL_INSN

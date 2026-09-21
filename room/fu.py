@@ -7,7 +7,7 @@ from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.branch import GetPCResp, BranchResolution, BranchUpdate
 from room.alu import ALU, Multiplier, IntDiv
-from room.fpu import HasFPUParams, FPUOperator, FPFormat, IntFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
+from room.fpu import HasFPUParams, FPUOperator, FPFormat, IntFormat, FType, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
 from room.exc import Cause
 from room.tlb import SFenceReq
 from room.utils import sign_extend, generate_imm, generate_imm_type, generate_imm_rm, Pipe
@@ -555,12 +555,14 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
 
         typ = generate_imm_type(self.req.bits.uop.imm_packed)
         fli_idx = self.req.bits.uop.imm_packed[3:8]
+        inst_rm = generate_imm_rm(self.req.bits.uop.imm_packed)
+        fp_rm = Mux(inst_rm == 7, self.frm, inst_rm)
 
         m.d.comb += [
             ifpu.inp.valid.eq(self.req.valid & cast_en),
             ifpu.inp.bits.fn.eq(Mux(fli_en, FPUOperator.FLI, FPUOperator.I2F)),
             ifpu.inp.bits.fn_mod.eq(typ[0]),
-            ifpu.inp.bits.rm.eq(self.frm),
+            ifpu.inp.bits.rm.eq(fp_rm),
             ifpu.inp.bits.in1.eq(Mux(fli_en, fli_idx, self.req.bits.rs1_data)),
             ifpu.inp.bits.dst_fmt.eq(
                 self.tag_to_format(self.req.bits.uop.fp_out_tag)),
@@ -743,11 +745,18 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                     fma_op.eq(FPUOperator.CLASSIFY),
                 ]
 
-        def set_fu_input(inp):
+        def set_fu_input(inp, exact_type=None):
+            in1 = self.unbox(self.req.bits.rs1_data,
+                             self.req.bits.uop.fp_in_tag, exact_type)
+            in2 = self.unbox(self.req.bits.rs2_data,
+                             self.req.bits.uop.fp_in_tag, exact_type)
+            in3 = self.unbox(self.req.bits.rs3_data,
+                             self.req.bits.uop.fp_in_tag, exact_type)
+
             m.d.comb += [
-                inp.bits.in1.eq(self.req.bits.rs1_data),
-                inp.bits.in2.eq(self.req.bits.rs2_data),
-                inp.bits.in3.eq(self.req.bits.rs3_data),
+                inp.bits.in1.eq(in1),
+                inp.bits.in2.eq(in2),
+                inp.bits.in3.eq(in3),
                 inp.bits.fn.eq(fma_op),
                 inp.bits.fn_mod.eq(fma_op_mod),
                 inp.bits.rm.eq(fp_rm),
@@ -757,7 +766,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
             ]
 
             with m.If(swap32):
-                m.d.comb += inp.bits.in3.eq(self.req.bits.rs2_data)
+                m.d.comb += inp.bits.in3.eq(in2)
 
         try:
             dfma = m.submodules.dfma = platform.get_fma(
@@ -766,7 +775,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
             dfma = m.submodules.dfma = FPUFMA(self.width,
                                               FPFormat.D,
                                               latency=self.fma_latency)
-        set_fu_input(dfma.inp)
+        set_fu_input(dfma.inp, FType.FP64)
         m.d.comb += dfma.inp.valid.eq(self.req.valid & fma_en
                                       & (fmt_out == FPFormat.D))
 
@@ -777,7 +786,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
             sfma = m.submodules.sfma = FPUFMA(32,
                                               FPFormat.S,
                                               latency=self.fma_latency)
-        set_fu_input(sfma.inp)
+        set_fu_input(sfma.inp, FType.FP32)
         m.d.comb += sfma.inp.valid.eq(self.req.valid & fma_en
                                       & (fmt_out == FPFormat.S))
 
@@ -785,7 +794,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
             hfma = m.submodules.hfma = FPUFMA(16,
                                               FPFormat.H,
                                               latency=self.fma_latency)
-            set_fu_input(hfma.inp)
+            set_fu_input(hfma.inp, FType.FP16)
             m.d.comb += hfma.inp.valid.eq(self.req.valid & fma_en
                                           & (fmt_out == FPFormat.H))
 
@@ -800,7 +809,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                                            FPFormat.D,
                                            latency=self.fma_latency,
                                            use_zfa=self.use_zfa)
-        set_fu_input(dcmp.inp)
+        set_fu_input(dcmp.inp, FType.FP64)
         m.d.comb += dcmp.inp.valid.eq(self.req.valid & cmp_en
                                       & (fmt_in == FPFormat.D))
 
@@ -808,7 +817,7 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                                            FPFormat.S,
                                            latency=self.fma_latency,
                                            use_zfa=self.use_zfa)
-        set_fu_input(scmp.inp)
+        set_fu_input(scmp.inp, FType.FP32)
         m.d.comb += scmp.inp.valid.eq(self.req.valid & cmp_en
                                       & (fmt_in == FPFormat.S))
 
@@ -817,15 +826,19 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                                                FPFormat.H,
                                                latency=self.fma_latency,
                                                use_zfa=self.use_zfa)
-            set_fu_input(hcmp.inp)
+            set_fu_input(hcmp.inp, FType.FP16)
             m.d.comb += hcmp.inp.valid.eq(self.req.valid & cmp_en
                                           & (fmt_in == FPFormat.H))
 
         fmv_data = Signal.like(in_pipe.out.bits)
         m.d.comb += fmv_data.eq(
-            Mux(self.resp.bits.uop.fp_single,
-                sign_extend(in_pipe.out.bits[:32], len(fmv_data)),
-                in_pipe.out.bits))
+            Mux(
+                self.use_zfh
+                & (self.resp.bits.uop.fp_in_tag == self.type_tag.H),
+                sign_extend(in_pipe.out.bits[:16], len(fmv_data)),
+                Mux(self.resp.bits.uop.fp_single,
+                    sign_extend(in_pipe.out.bits[:32], len(fmv_data)),
+                    in_pipe.out.bits)))
 
         m.d.comb += [
             self.resp.bits.data.eq(fmv_data),
@@ -900,8 +913,12 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
         fdiv = m.submodules.fdiv = FPUDivSqrtMulti()
 
         m.d.comb += [
-            fdiv.a.eq(self.req.bits.rs1_data),
-            fdiv.b.eq(self.req.bits.rs2_data),
+            fdiv.a.eq(
+                self.unbox(self.req.bits.rs1_data,
+                           self.req.bits.uop.fp_in_tag)),
+            fdiv.b.eq(
+                self.unbox(self.req.bits.rs2_data,
+                           self.req.bits.uop.fp_in_tag)),
             fdiv.is_sqrt.eq((self.req.bits.uop.opcode == UOpCode.FSQRT_S)
                             | (self.req.bits.uop.opcode == UOpCode.FSQRT_D)
                             | (self.req.bits.uop.opcode == UOpCode.FSQRT_H)),

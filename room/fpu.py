@@ -137,6 +137,21 @@ class HasFPUParams(HasCoreParams):
     def _nan_box(self, x, from_typ, to_typ):
         return x | ((1 << to_typ.width) - (1 << from_typ.width))
 
+    def _unbox(self, x, typ):
+        if typ.width >= self.flen:
+            return x
+
+        is_boxed = x[typ.width:self.flen].all()
+        default_nan = typ.default_nan() | ((1 << self.flen) - (1 << typ.width))
+        return Mux(is_boxed, x, default_nan)
+
+    def unbox(self, x, tag, exact_type=None):
+        if exact_type is not None:
+            return self._unbox(x, exact_type)
+
+        values = Array(self._unbox(x, typ) for _, typ in self.float_types)
+        return values[tag]
+
     def nan_box(self, x, tag):
         return Mux(tag == len(self.float_types) - 1, x,
                    self._nan_box(x, self.float_types[tag][1], self.max_type))
@@ -551,11 +566,15 @@ class FPUFMA(Elaboratable):
             rounding.eff_subtraction.eq(s2_eff_subtraction),
         ]
 
-        uf_after_round = rounding.rounded_abs[self.ftyp.man:self.ftyp.man +
-                                              self.ftyp.exp] == 0
-        of_after_round = rounding.rounded_abs[self.ftyp.man:self.ftyp.man +
-                                              self.ftyp.exp] == Repl(
-                                                  1, self.ftyp.exp)
+        rounded_exponent = rounding.rounded_abs[self.ftyp.man:self.ftyp.man +
+                                                self.ftyp.exp]
+        uf_after_round = (rounded_exponent == 0) | (
+            (pre_round_exponent == 0) & (rounded_exponent == 1)
+            & ((round_sticky_bits != 0b11) |
+               (~sum_sticky_bits[-1]
+                & ((s2_round_mode == RoundingMode.RNE)
+                   | (s2_round_mode == RoundingMode.RMM)))))
+        of_after_round = rounded_exponent == Repl(1, self.ftyp.exp)
 
         regular_result = Cat(rounding.rounded_abs, rounding.out_sign)
         regular_status = FPException()
