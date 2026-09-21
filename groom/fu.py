@@ -11,8 +11,10 @@ import groom.csrnames as gpucsrnames
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
 from room.alu import ALU, Multiplier, IntDiv
-from room.fpu import HasFPUParams, FPUOperator, FPFormat, IntFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp
-from room.utils import generate_imm, generate_imm_type, generate_imm_rm, Pipe
+from room.fpu import (HasFPUParams, FPUOperator, FPFormat, IntFormat, FType,
+                      FPUFMA, FPUDivSqrtMulti, FPUCastMulti, FPUComp)
+from room.utils import (generate_imm, generate_imm_type, generate_imm_rm, Pipe,
+                        sign_extend)
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
@@ -631,7 +633,7 @@ class IntToFPUnit(PipelinedFunctionalUnit, HasFPUParams):
         fli_en = Signal()
 
         with m.Switch(self.req.bits.uop.opcode):
-            with m.Case(UOpCode.FCVT_S_X, UOpCode.FCVT_D_X):
+            with m.Case(UOpCode.FCVT_S_X, UOpCode.FCVT_D_X, UOpCode.FCVT_H_X):
                 m.d.comb += cast_en.eq(1)
 
             if self.use_zfa:
@@ -841,11 +843,17 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                 in_pipe.in_data.eq(self.req.bits.rs1_data[w]),
             ]
 
-            def set_fu_input(inp):
+            def set_fu_input(inp, exact_type=None):
+                in2 = self.unbox(self.req.bits.rs2_data[w],
+                                 self.req.bits.uop.fp_in_tag, exact_type)
                 m.d.comb += [
-                    inp.bits.in1.eq(self.req.bits.rs1_data[w]),
-                    inp.bits.in2.eq(self.req.bits.rs2_data[w]),
-                    inp.bits.in3.eq(self.req.bits.rs3_data[w]),
+                    inp.bits.in1.eq(
+                        self.unbox(self.req.bits.rs1_data[w],
+                                   self.req.bits.uop.fp_in_tag, exact_type)),
+                    inp.bits.in2.eq(in2),
+                    inp.bits.in3.eq(
+                        self.unbox(self.req.bits.rs3_data[w],
+                                   self.req.bits.uop.fp_in_tag, exact_type)),
                     inp.bits.fn.eq(fma_op),
                     inp.bits.fn_mod.eq(fma_op_mod),
                     inp.bits.rm.eq(fp_rm),
@@ -855,13 +863,20 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                 ]
 
                 with m.If(swap32):
-                    m.d.comb += inp.bits.in3.eq(self.req.bits.rs2_data[w])
+                    m.d.comb += inp.bits.in3.eq(in2)
 
             sfma = FPUFMA(32, FPFormat.S, latency=self.fma_latency)
             setattr(m.submodules, f'sfma{w}', sfma)
             set_fu_input(sfma.inp)
             m.d.comb += sfma.inp.valid.eq(self.req.valid & fma_en
                                           & (fmt_out == FPFormat.S))
+
+            if self.use_zfh:
+                hfma = FPUFMA(16, FPFormat.H, latency=self.fma_latency)
+                setattr(m.submodules, f'hfma{w}', hfma)
+                set_fu_input(hfma.inp, FType.FP16)
+                m.d.comb += hfma.inp.valid.eq(self.req.valid & fma_en
+                                              & (fmt_out == FPFormat.H))
 
             fpiu = FPUCastMulti(32,
                                 FPFormat.S,
@@ -880,7 +895,27 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
             m.d.comb += scmp.inp.valid.eq(self.req.valid & cmp_en
                                           & (fmt_in == FPFormat.S))
 
-            m.d.comb += self.resp.bits.data[w].eq(in_pipe.out.bits)
+            if self.use_zfh:
+                hcmp = FPUComp(16,
+                               FPFormat.H,
+                               latency=self.fma_latency,
+                               use_zfa=self.use_zfa)
+                setattr(m.submodules, f'hcmp{w}', hcmp)
+                set_fu_input(hcmp.inp, FType.FP16)
+                m.d.comb += hcmp.inp.valid.eq(self.req.valid & cmp_en
+                                              & (fmt_in == FPFormat.H))
+
+            fmv_data = Signal.like(in_pipe.out.bits)
+            m.d.comb += fmv_data.eq(
+                Mux(
+                    self.use_zfh
+                    & (self.resp.bits.uop.fp_in_tag == self.type_tag.H),
+                    sign_extend(in_pipe.out.bits[:16], len(fmv_data)),
+                    Mux(self.resp.bits.uop.fp_single,
+                        sign_extend(in_pipe.out.bits[:32], len(fmv_data)),
+                        in_pipe.out.bits)))
+
+            m.d.comb += self.resp.bits.data[w].eq(fmv_data)
             with m.If(sfma.out.valid):
                 m.d.comb += [
                     self.resp.bits.data[w].eq(
@@ -902,6 +937,22 @@ class FPUUnit(PipelinedFunctionalUnit, HasFPUParams):
                                 self.type_tag.I, self.type_tag.S))),
                     self.resp.bits.fflags[w].eq(scmp.out.bits.status),
                 ]
+            if self.use_zfh:
+                with m.Elif(hfma.out.valid):
+                    m.d.comb += [
+                        self.resp.bits.data[w].eq(
+                            self.nan_box(hfma.out.bits.data, self.type_tag.H)),
+                        self.resp.bits.fflags[w].eq(hfma.out.bits.status),
+                    ]
+                with m.Elif(hcmp.out.valid):
+                    m.d.comb += [
+                        self.resp.bits.data[w].eq(
+                            self.nan_box(
+                                hcmp.out.bits.data,
+                                Mux(self.resp.bits.uop.fu_type_has(FUType.F2I),
+                                    self.type_tag.I, self.type_tag.H))),
+                        self.resp.bits.fflags[w].eq(hcmp.out.bits.status),
+                    ]
 
         m.d.comb += self.resp.bits.fflags_valid.eq(self.resp.valid)
 
@@ -917,6 +968,10 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
 
     def elaborate(self, platform):
         m = super().elaborate(platform)
+
+        fp_rm = Mux(
+            generate_imm_rm(self.req.bits.uop.imm_packed) == 7, self.frm,
+            generate_imm_rm(self.req.bits.uop.imm_packed))
 
         tmask_valid = Signal()
         tmask = Signal(self.n_threads)
@@ -939,13 +994,18 @@ class FDivUnit(IterativeFunctionalUnit, HasFPUParams):
             setattr(m.submodules, f'fdiv{w}', fdiv)
 
             m.d.comb += [
-                fdiv.a.eq(self.req.bits.rs1_data[w]),
-                fdiv.b.eq(self.req.bits.rs2_data[w]),
+                fdiv.a.eq(
+                    self.unbox(self.req.bits.rs1_data[w],
+                               self.req.bits.uop.fp_in_tag)),
+                fdiv.b.eq(
+                    self.unbox(self.req.bits.rs2_data[w],
+                               self.req.bits.uop.fp_in_tag)),
                 fdiv.is_sqrt.eq((self.req.bits.uop.opcode == UOpCode.FSQRT_S)
+                                | (self.req.bits.uop.opcode == UOpCode.FSQRT_D)
                                 |
-                                (self.req.bits.uop.opcode == UOpCode.FSQRT_D)),
+                                (self.req.bits.uop.opcode == UOpCode.FSQRT_H)),
                 fdiv.fmt.eq(self.tag_to_format(self.req.bits.uop.fp_in_tag)),
-                fdiv.rm.eq(self.frm),
+                fdiv.rm.eq(fp_rm),
                 fdiv.in_valid.eq(self.req.fire & self.req.bits.uop.tmask[w]),
                 self.resp.bits.data[w].eq(
                     self.nan_box(fdiv.out.bits.data,

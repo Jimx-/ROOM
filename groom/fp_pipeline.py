@@ -8,13 +8,14 @@ from groom.fu import ExecResp
 from groom.csr import CSRAccess, AutoCSR, CSR, BankedCSR, ThreadLocalCSR
 
 from room.consts import *
-from room.types import HasCoreParams, MicroOp
+from room.fpu import HasFPUParams
+from room.types import MicroOp
 from room.utils import Arbiter
 
 from roomsoc.interconnect.stream import Valid, Decoupled
 
 
-class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
+class FPPipeline(HasFPUParams, AutoCSR, Elaboratable):
 
     def __init__(self, params, sim_debug=False):
         super().__init__(params)
@@ -153,6 +154,11 @@ class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
         wb_arb = m.submodules.wb_arb = Arbiter(3, ExecResp, self.flen,
                                                self.params)
         wb_req = Valid(ExecResp, self.flen, self.params)
+
+        def mem_size_to_tag(mem_size):
+            return Mux(mem_size == 1, self.type_tag.H,
+                       Mux(mem_size == 2, self.type_tag.S, self.type_tag.D))
+
         m.d.comb += [
             wb_arb.inp[0].bits.eq(exec_unit.fresp.bits),
             wb_arb.inp[0].valid.eq(exec_unit.fresp.valid),
@@ -161,6 +167,13 @@ class FPPipeline(HasCoreParams, AutoCSR, Elaboratable):
             wb_req.eq(wb_arb.out),
             wb_arb.out.ready.eq(1),
         ]
+
+        for out_data, in_data in zip(wb_arb.inp[1].bits.data,
+                                     self.mem_wb_port.bits.data):
+            m.d.comb += out_data.eq(
+                self.nan_box(
+                    in_data,
+                    mem_size_to_tag(self.mem_wb_port.bits.uop.mem_size)))
 
         m.d.comb += [
             scoreboard.wakeup.valid.eq(
