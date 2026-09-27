@@ -254,8 +254,29 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 barrier_arrival_count.eq(self.warp_ctrl.bits.barrier.count),
             ]
 
-        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
-            m.d.sync += active_warps.eq(self.warp_ctrl.bits.wspawn.mask)
+        # Deferred wspawn: hold the request until every warp except the
+        # spawner is inactive, then apply it. A target that parks after
+        # the request cannot erase the spawn, and the spawner stops
+        # fetching until its request is applied.
+        wspawn_pend_valid = Signal(reset=0)
+        wspawn_pend_mask = Signal(self.n_warps)
+        wspawn_pend_pc = Signal(32)
+        wspawn_pend_wid = Signal(range(self.n_warps))
+        wspawn_pend_warp = Signal(self.n_warps)
+        wspawn_apply = Signal()
+        wspawn_hold = Signal(self.n_warps)
+        m.d.comb += [
+            wspawn_pend_warp.eq(0),
+            wspawn_pend_warp.bit_select(wspawn_pend_wid, 1).eq(1),
+            wspawn_apply.eq(wspawn_pend_valid
+                            & ~(active_warps & ~wspawn_pend_warp).any()),
+            wspawn_hold.eq(
+                Repl(wspawn_pend_valid, self.n_warps)
+                & wspawn_pend_warp),
+        ]
+
+        with m.If(wspawn_apply):
+            m.d.sync += active_warps.eq(active_warps | wspawn_pend_mask)
         with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.tmc.valid):
             with m.Switch(self.warp_ctrl.bits.wid):
                 for w in range(self.n_threads):
@@ -263,12 +284,23 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                         m.d.sync += active_warps[w].eq(
                             self.warp_ctrl.bits.tmc.mask.any())
 
+        with m.If(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
+            m.d.sync += [
+                wspawn_pend_valid.eq(1),
+                wspawn_pend_mask.eq(self.warp_ctrl.bits.wspawn.mask),
+                wspawn_pend_pc.eq(self.warp_ctrl.bits.wspawn.pc),
+                wspawn_pend_wid.eq(self.warp_ctrl.bits.wid),
+            ]
+        with m.Elif(wspawn_apply):
+            m.d.sync += wspawn_pend_valid.eq(0)
+
         barrier_stall_mask = 0
         for b in range(self.n_barriers):
             barrier_stall_mask |= barrier_masks[b]
 
         m.d.comb += ready_warps.eq(active_warps
-                                   & ~(stalled_warps | barrier_stall_mask))
+                                   & ~(stalled_warps | barrier_stall_mask
+                                       | wspawn_hold))
 
         schedule_wid = Signal(range(self.n_warps))
         schedule_valid = Signal()
@@ -299,12 +331,10 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                 wspawn_pc[0].eq(self.reset_vector),
             ]
             m.d.sync += warp_pcs[0].eq(self.reset_vector)
-        with m.Elif(self.warp_ctrl.valid & self.warp_ctrl.bits.wspawn.valid):
+        with m.Elif(wspawn_apply):
             m.d.comb += [
-                wspawn_valid.eq(self.warp_ctrl.bits.wspawn.mask
-                                & ~Const(1, self.n_warps)),
-                Cat(*wspawn_pc).eq(
-                    Repl(self.warp_ctrl.bits.wspawn.pc, self.n_warps)),
+                wspawn_valid.eq(wspawn_pend_mask & ~wspawn_pend_warp),
+                Cat(*wspawn_pc).eq(Repl(wspawn_pend_pc, self.n_warps)),
             ]
 
             for w in range(self.n_warps):
