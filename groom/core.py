@@ -193,6 +193,9 @@ class Core(HasCoreParams, Elaboratable):
                 fp_pipeline.sb_wid.eq(dispatcher.sb_wid),
             ]
 
+        lsu = m.submodules.lsu = LoadStoreUnit(self.params,
+                                               sim_debug=self.sim_debug)
+
         #
         # Register read
         #
@@ -213,16 +216,29 @@ class Core(HasCoreParams, Elaboratable):
         dis_is_int = (dispatcher.dis_uop.iq_type &
                       (IssueQueueType.INT | IssueQueueType.MEM)) != 0
 
+        # Hold an LSU-bound uop at dispatch while its warp's LSQ entry is
+        # occupied, so it cannot block the shared register-read output.
+        # The is_sta & ~is_std exception of the LSU request port maps to a
+        # split store whose data half already allocated the entry.
+        dis_is_lsu = dispatcher.dis_uop.fu_type_has(FUType.MEM)
+        dis_split_sta = ((dispatcher.dis_uop.opcode == UOpCode.STA)
+                         & (dispatcher.dis_uop.lrs2_rtype != RegisterType.FIX))
+        lsu_dis_ready = (
+            ~dis_is_lsu
+            | ~lsu.warp_memory.bit_select(dispatcher.dis_wid, 1)
+            | (dis_split_sta
+               & lsu.warp_split_addr.bit_select(dispatcher.dis_wid, 1)))
+
         m.d.comb += [
             iregread.dis_valid.eq(
                 dispatcher.dis_valid & dis_is_int
                 & ((~dis_is_fp | fp_pipeline.dis_ready) if self.use_fpu else 1)
-                & sb_ready),
+                & sb_ready & lsu_dis_ready),
             iregread.dis_uop.eq(dispatcher.dis_uop),
             iregread.dis_wid.eq(dispatcher.dis_wid),
         ]
 
-        dis_ready = ~dis_is_int | iregread.dis_ready
+        dis_ready = (~dis_is_int | iregread.dis_ready) & lsu_dis_ready
         if self.use_fpu:
             dis_ready &= ~dis_is_fp | fp_pipeline.dis_ready
 
@@ -234,7 +250,8 @@ class Core(HasCoreParams, Elaboratable):
 
         if self.use_fpu:
             m.d.comb += [
-                fp_pipeline.int_dis_ready.eq(iregread.dis_ready),
+                fp_pipeline.int_dis_ready.eq(iregread.dis_ready
+                                             & lsu_dis_ready),
                 fp_pipeline.int_sb_ready.eq(scoreboard.dis_ready),
             ]
 
@@ -287,11 +304,11 @@ class Core(HasCoreParams, Elaboratable):
         #
         # Load/store unit
         #
-        lsu = m.submodules.lsu = LoadStoreUnit(self.params,
-                                               sim_debug=self.sim_debug)
         m.d.comb += [
             exec_unit.lsu_req.connect(lsu.exec_req),
             if_stage.warp_memory.eq(lsu.warp_memory),
+            dispatcher.lsu_occupied.eq(lsu.warp_memory),
+            dispatcher.lsu_split_addr.eq(lsu.warp_split_addr),
         ]
 
         for dcache_req, lsu_dcache_req in zip(self.dcache_req, lsu.dcache_req):

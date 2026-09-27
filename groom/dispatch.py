@@ -1,5 +1,6 @@
 from amaranth import *
 
+from room.consts import *
 from room.types import HasCoreParams, MicroOp
 
 from roomsoc.interconnect.stream import Queue
@@ -22,6 +23,11 @@ class Dispatcher(HasCoreParams, Elaboratable):
 
         self.sb_wid = Signal(range(self.n_warps))
         self.sb_uop = MicroOp(params)
+
+        # Per-warp LSU occupancy: a warp with an allocated (or allocating)
+        # LSQ entry, and an entry still waiting for its store address.
+        self.lsu_occupied = Signal(self.n_warps)
+        self.lsu_split_addr = Signal(self.n_warps)
 
     def elaborate(self, platform):
         m = Module()
@@ -66,8 +72,30 @@ class Dispatcher(HasCoreParams, Elaboratable):
                 deq_uops[i].eq(queue.deq.bits),
             ]
 
-            m.d.comb += requests[i].eq(Mux(reading, queue.deq.valid,
-                                           out_valid))
+            # The next grantable uop of this warp: on a fire cycle the queue
+            # output follows the outgoing head, otherwise the held head.
+            head_is_lsu = Signal(name=f'head_is_lsu{i}')
+            head_split_sta = Signal(name=f'head_split_sta{i}')
+            with m.If(reading):
+                m.d.comb += [
+                    head_is_lsu.eq(deq_uops[i].fu_type_has(FUType.MEM)),
+                    head_split_sta.eq(
+                        (deq_uops[i].opcode == UOpCode.STA)
+                        & (deq_uops[i].lrs2_rtype != RegisterType.FIX)),
+                ]
+            with m.Else():
+                m.d.comb += [
+                    head_is_lsu.eq(q_out_buffer[i].fu_type_has(FUType.MEM)),
+                    head_split_sta.eq(
+                        (q_out_buffer[i].opcode == UOpCode.STA)
+                        & (q_out_buffer[i].lrs2_rtype != RegisterType.FIX)),
+                ]
+
+            mem_blocked = (head_is_lsu & self.lsu_occupied[i]
+                           & ~(head_split_sta & self.lsu_split_addr[i]))
+
+            m.d.comb += requests[i].eq(
+                Mux(reading, queue.deq.valid, out_valid) & ~mem_blocked)
 
             with m.If(self.dec_wid == i):
                 m.d.comb += self.dec_ready.eq(queue.enq.ready)
@@ -104,7 +132,15 @@ class Dispatcher(HasCoreParams, Elaboratable):
                                 dis_valid_n.eq(1),
                             ]
 
-        with m.If(dec_fire & can_passthrough):
+        dec_is_lsu = self.dec_uop.fu_type_has(FUType.MEM)
+        dec_split_sta = ((self.dec_uop.opcode == UOpCode.STA)
+                         & (self.dec_uop.lrs2_rtype != RegisterType.FIX))
+        dec_mem_blocked = (
+            dec_is_lsu & self.lsu_occupied.bit_select(self.dec_wid, 1)
+            & ~(dec_split_sta
+                & self.lsu_split_addr.bit_select(self.dec_wid, 1)))
+
+        with m.If(dec_fire & can_passthrough & ~dec_mem_blocked):
             # Let incoming uop pass through
             m.d.comb += [
                 dis_valid_n.eq(1),

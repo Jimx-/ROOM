@@ -261,18 +261,15 @@ class SharedMemory(HasCoreParams, Elaboratable):
                             coalesced_write = (
                                 s0_valids[j] & (s0_banks[j] == b)
                                 & (s0_idxs[j] == s0_idxs[i])
-                                & MemoryCommand.is_write(
-                                    s0_req[j].uop.mem_cmd)
+                                & MemoryCommand.is_write(s0_req[j].uop.mem_cmd)
                                 & s0_write_masks[j][byte])
                             byte_data = Mux(
                                 coalesced_write,
-                                s0_req[j].data.word_select(byte, 8),
-                                byte_data)
+                                s0_req[j].data.word_select(byte, 8), byte_data)
                             byte_en |= coalesced_write
 
                         m.d.comb += [
-                            mem_write.data.word_select(byte,
-                                                       8).eq(byte_data),
+                            mem_write.data.word_select(byte, 8).eq(byte_data),
                             mem_write.en[byte].eq(byte_en),
                         ]
 
@@ -368,6 +365,10 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         self.warp_memory = Signal(self.n_warps)
 
+        # LSQ entry allocated but still missing its store address (split
+        # store whose STD half arrived first).
+        self.warp_split_addr = Signal(self.n_warps)
+
         if sim_debug:
             self.lsu_debug = Valid(LSUDebug, params)
 
@@ -386,6 +387,10 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
             Cat(lsq[w].valid
                 | (self.exec_req.fire & (self.exec_req.bits.wid == w))
                 | (self.fp_std.fire & (self.fp_std.bits.wid == w))
+                for w in range(self.n_warps)))
+
+        m.d.comb += self.warp_split_addr.eq(
+            Cat(lsq[w].valid & ~lsq[w].addr_valid
                 for w in range(self.n_warps)))
 
         s0_tlb_uncacheable = Signal(self.n_threads)
