@@ -34,6 +34,13 @@ class FPPipeline(HasFPUParams, AutoCSR, Elaboratable):
         self.int_dis_ready = Signal()
         self.int_sb_ready = Signal()
 
+        # Per-warp queue heads and registered readiness hints from the
+        # internal scoreboard.
+        self.head_uops = [
+            MicroOp(params, name=f'head_uop{i}') for i in range(self.n_warps)
+        ]
+        self.head_ready = Signal(self.n_warps)
+
         self.mem_wb_port = Decoupled(ExecResp, self.flen, params)
 
         self.from_int = Decoupled(ExecResp, self.flen, params)
@@ -88,6 +95,9 @@ class FPPipeline(HasFPUParams, AutoCSR, Elaboratable):
             scoreboard.sb_wid.eq(self.sb_wid),
             self.sb_ready.eq(scoreboard.dis_ready),
         ]
+        for i in range(self.n_warps):
+            m.d.comb += scoreboard.head_uops[i].eq(self.head_uops[i])
+        m.d.comb += self.head_ready.eq(scoreboard.head_ready)
 
         sb_ready = self.int_sb_ready & scoreboard.dis_ready
 

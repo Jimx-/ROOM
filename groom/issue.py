@@ -32,6 +32,13 @@ class Scoreboard(HasCoreParams, Elaboratable):
         self.sb_wid = Signal(range(self.n_warps))
         self.sb_uop = MicroOp(params)
 
+        # Per-warp queue heads (the heads that will occupy the queue output
+        # buffers after the next edge) and their registered readiness hints.
+        self.head_uops = [
+            MicroOp(params, name=f'head_uop{i}') for i in range(self.n_warps)
+        ]
+        self.head_ready = Signal(self.n_warps, reset=(1 << self.n_warps) - 1)
+
         self.wakeup = Valid(IssueQueueWakeup, self.n_warps)
 
     def elaborate(self, platform):
@@ -92,5 +99,24 @@ class Scoreboard(HasCoreParams, Elaboratable):
 
         m.d.comb += self.dis_ready.eq(~(rd_busy | rs1_busy | rs2_busy
                                         | rs3_busy))
+
+        # Per-warp readiness hints: registered one cycle ahead from the
+        # next-state busy tables. The hint describes the head that will
+        # occupy the queue output buffer after the edge, so it is a
+        # scheduling hint, not an actual-grant validation.
+        for i in range(self.n_warps):
+            head = self.head_uops[i]
+            head_rd_busy = (head.ldst_valid & (head.dst_rtype == rtype)
+                            & busy_regs_n[i].bit_select(head.ldst, 1))
+            head_rs1_busy = ((head.lrs1_rtype == rtype)
+                             & busy_regs_n[i].bit_select(head.lrs1, 1))
+            head_rs2_busy = ((head.lrs2_rtype == rtype)
+                             & busy_regs_n[i].bit_select(head.lrs2, 1))
+            head_rs3_busy = ((head.iq_type == IssueQueueType.FP)
+                             & head.frs3_en
+                             & busy_regs_n[i].bit_select(head.lrs3, 1))
+            m.d.sync += self.head_ready[i].eq(~(head_rd_busy | head_rs1_busy
+                                                | head_rs2_busy
+                                                | head_rs3_busy))
 
         return m

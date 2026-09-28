@@ -180,9 +180,17 @@ class Core(HasCoreParams, Elaboratable):
             scoreboard.sb_uop.eq(dispatcher.sb_uop),
             scoreboard.sb_wid.eq(dispatcher.sb_wid),
         ]
+        for i in range(self.n_warps):
+            m.d.comb += scoreboard.head_uops[i].eq(dispatcher.head_uops[i])
 
         fp_sb_ready = fp_pipeline.sb_ready if self.use_fpu else 1
         sb_ready = scoreboard.dis_ready & fp_sb_ready
+
+        fp_head_ready = (fp_pipeline.head_ready if self.use_fpu else Const(
+            -1, unsigned(self.n_warps)))
+
+        m.d.comb += dispatcher.head_ready.eq(scoreboard.head_ready
+                                             & fp_head_ready)
 
         if self.use_fpu:
             m.d.comb += [
@@ -192,6 +200,9 @@ class Core(HasCoreParams, Elaboratable):
                 fp_pipeline.sb_uop.eq(dispatcher.sb_uop),
                 fp_pipeline.sb_wid.eq(dispatcher.sb_wid),
             ]
+            for i in range(self.n_warps):
+                m.d.comb += fp_pipeline.head_uops[i].eq(
+                    dispatcher.head_uops[i])
 
         lsu = m.submodules.lsu = LoadStoreUnit(self.params,
                                                sim_debug=self.sim_debug)

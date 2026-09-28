@@ -24,6 +24,16 @@ class Dispatcher(HasCoreParams, Elaboratable):
         self.sb_wid = Signal(range(self.n_warps))
         self.sb_uop = MicroOp(params)
 
+        # Per-warp queue heads that will occupy the output buffers after
+        # the next edge, exported for scoreboard readiness hints.
+        self.head_uops = [
+            MicroOp(params, name=f'head_uop{i}') for i in range(self.n_warps)
+        ]
+
+        # Registered per-warp readiness hints gate arbitration requests.
+        # Passthrough grants are checked by the existing sb_uop lookahead.
+        self.head_ready = Signal(self.n_warps)
+
         # Per-warp LSU occupancy: a warp with an allocated (or allocating)
         # LSQ entry, and an entry still waiting for its store address.
         self.lsu_occupied = Signal(self.n_warps)
@@ -94,8 +104,18 @@ class Dispatcher(HasCoreParams, Elaboratable):
             mem_blocked = (head_is_lsu & self.lsu_occupied[i]
                            & ~(head_split_sta & self.lsu_split_addr[i]))
 
+            # Export the head that will occupy q_out_buffer after the next
+            # edge; the scoreboard registers its readiness hint from it.
+            with m.If(writing & going_empty):
+                m.d.comb += self.head_uops[i].eq(self.dec_uop)
+            with m.Elif(reading):
+                m.d.comb += self.head_uops[i].eq(deq_uops[i])
+            with m.Else():
+                m.d.comb += self.head_uops[i].eq(q_out_buffer[i])
+
             m.d.comb += requests[i].eq(
-                Mux(reading, queue.deq.valid, out_valid) & ~mem_blocked)
+                Mux(reading, queue.deq.valid, out_valid) & ~mem_blocked
+                & self.head_ready[i])
 
             with m.If(self.dec_wid == i):
                 m.d.comb += self.dec_ready.eq(queue.enq.ready)
