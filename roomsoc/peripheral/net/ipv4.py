@@ -84,8 +84,15 @@ class Ipv4HeaderExtract(Elaboratable):
         with m.If(sr_shift | sr_shift_leftover):
             m.d.sync += sr.eq(sr_next)
 
-        m.d.comb += header.valid.eq((count == header_beats -
-                                     (1 if aligned else 0))
+        # A packet truncated inside the header still emits a header (with
+        # partial, zero-filled fields): downstream pairing logic queues one
+        # metadata entry per packet, and a missing entry would wedge the
+        # dropper's addr_valid/checksum handshake and the dispatcher's
+        # protocol lookup on the packets that follow.
+        truncated = self.data_in.bits.last & (count < header_beats)
+
+        m.d.comb += header.valid.eq(((count == header_beats -
+                                      (1 if aligned else 0)) | truncated)
                                     & self.data_in.valid & ~done)
 
         self.handler(m, header)
@@ -201,9 +208,23 @@ class Ipv4Checksum(Elaboratable):
             acc = (acc + (acc >> 16)) & 0xffff
 
             with m.If((not self.skip_checksum) | (idx != 5)):
-                with m.If((idx >> 1) < Mux(
-                        count == 0, self.data_in.bits.data[:4], header_len)):
+                # First-beat lanes within the minimum 20-byte header need
+                # no live IHL comparison, keeping upstream realignment
+                # off their adder enable path. Wider interfaces must mask
+                # later lanes, which can already contain payload.
+                first_beat_in_header = (Const(1) if i < 10 else
+                                        (i >> 1) < self.data_in.bits.data[:4])
+                with m.If(
+                        Mux(count == 0, first_beat_in_header, (idx >> 1)
+                            < header_len)):
                     m.d.comb += subsum_next[i].eq(acc)
+
+        # The final multi-operand reduction is deferred by one cycle: the
+        # beat completing the header (or ending a packet truncated inside
+        # the header) arms csum_pending, and the folded result is computed
+        # from the registered subsums in the following cycle. The arming
+        # beat is stalled until the queue can accept the deferred entry.
+        csum_pending = Signal()
 
         with m.If(self.data_in.fire):
             with m.If(~done):
@@ -215,31 +236,55 @@ class Ipv4Checksum(Elaboratable):
 
             with m.If(count == header_words - 1):
                 m.d.sync += done.eq(1)
+
+            with m.If(~done & ((count == header_words - 1)
+                               | self.data_in.bits.last)):
+                m.d.sync += csum_pending.eq(1)
+
             with m.If(self.data_in.bits.last):
                 m.d.sync += [
                     count.eq(0),
                     done.eq(0),
                 ]
-                m.d.sync += [s.eq(0) for s in subsum]
+                # When the packet ends inside the header the subsums hold
+                # the value the deferred enqueue still needs; they are
+                # cleared once that enqueue fires instead.
+                with m.If(done):
+                    m.d.sync += [s.eq(0) for s in subsum]
 
-        csum = sum(subsum_next)
+        csum = sum(subsum)
         csum_queue = m.submodules.csum_queue = Queue(2, Signal, 16)
         m.d.comb += [
             csum_queue.enq.bits.eq((csum + (csum >> 16)) & 0xffff),
-            csum_queue.enq.valid.eq(~done & self.data_in.valid
-                                    & self.data_out.ready
-                                    & ((count == header_words - 1)
-                                       | self.data_in.bits.last)),
+            csum_queue.enq.valid.eq(csum_pending),
             csum_queue.deq.connect(self.checksum),
             self.checksum.bits.eq(~csum_queue.deq.bits),
         ]
 
-        with m.If(~done & (count == header_words - 1)):
+        with m.If(csum_queue.enq.fire):
+            m.d.sync += [
+                csum_pending.eq(0),
+            ]
+            m.d.sync += [s.eq(0) for s in subsum]
+
+        with m.If(~done & ((count == header_words - 1)
+                           | self.data_in.bits.last)):
             m.d.comb += [
                 self.data_in.ready.eq(self.data_out.ready
                                       & csum_queue.enq.ready),
                 self.data_out.valid.eq(self.data_in.valid
                                        & csum_queue.enq.ready),
+            ]
+
+        # After a packet truncated inside the header the deferred enqueue
+        # and the next packet's first beat would update the subsums in the
+        # same cycle; hold the beat for the one cycle the enqueue takes.
+        # A header completed mid-packet needs no stall: done blocks any
+        # subsum update until the packet ends.
+        with m.If(csum_pending & ~done):
+            m.d.comb += [
+                self.data_in.ready.eq(0),
+                self.data_out.valid.eq(0),
             ]
 
         return m
