@@ -58,6 +58,72 @@ class LSUDebug(HasCoreParams, ValueCastable):
         return Value.cast(self).eq(Value.cast(rhs))
 
 
+DMA_ID_WIDTH = 4
+
+
+class SharedMemoryDMAReq(HasCoreParams, ValueCastable):
+
+    def __init__(self,
+                 params,
+                 dma_id_width=DMA_ID_WIDTH,
+                 name=None,
+                 src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+        self.name = name
+
+        self.id = Signal(dma_id_width, name=f'{name}_id')
+        self.offset = Signal(log2_int(self.smem_size) + 1,
+                             name=f'{name}_offset')
+        self.data = Signal(64, name=f'{name}_data')
+        self.byte_enable = Signal(8, name=f'{name}_byte_enable')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.id, self.offset, self.data, self.byte_enable)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
+
+
+class SharedMemoryDMACommit(HasCoreParams, ValueCastable):
+
+    def __init__(self,
+                 params,
+                 dma_id_width=DMA_ID_WIDTH,
+                 name=None,
+                 src_loc_at=0):
+        super().__init__(params)
+
+        if name is None:
+            name = tracer.get_var_name(depth=2 + src_loc_at, default=None)
+        self.name = name
+
+        self.id = Signal(dma_id_width, name=f'{name}_id')
+        self.nbytes = Signal(range(9), name=f'{name}_nbytes')
+
+    @ValueCastable.lowermethod
+    def as_value(self):
+        return Cat(self.id, self.nbytes)
+
+    def shape(self):
+        return self.as_value().shape()
+
+    def __len__(self):
+        return len(Value.cast(self))
+
+    def eq(self, rhs):
+        return Value.cast(self).eq(Value.cast(rhs))
+
+
 class SharedMemory(HasCoreParams, Elaboratable):
 
     def __init__(self, params):
@@ -78,6 +144,14 @@ class SharedMemory(HasCoreParams, Elaboratable):
             for i in range(self.n_threads)
         ]
 
+        if self.use_async_copy:
+            self.dma_req = Decoupled(SharedMemoryDMAReq,
+                                     self.params,
+                                     name='dma_req')
+            self.dma_commit = Decoupled(SharedMemoryDMACommit,
+                                        self.params,
+                                        name='dma_commit')
+
     def elaborate(self, platform):
         m = Module()
 
@@ -92,6 +166,12 @@ class SharedMemory(HasCoreParams, Elaboratable):
         bidx_bits = log2_int(bank_size)
         bidx_off_bits = bank_off_bits + bank_bits
 
+        use_dma = self.use_async_copy
+        dma_bytes = 8
+        dma_span = (dma_bytes - 2 + word_bytes) // word_bytes + 1
+        dma_queue_depth = 4
+        n_reqs = self.n_threads + (dma_span if use_dma else 0)
+
         for w in range(self.n_threads):
             m.d.comb += self.req[w].ready.eq(1)
 
@@ -99,7 +179,7 @@ class SharedMemory(HasCoreParams, Elaboratable):
         # S0
         #
 
-        s0_valids = Cat(req.valid for req in self.req)
+        s0_valids = [self.req[w].valid for w in range(self.n_threads)]
         s0_req = [
             DCacheReq(self.params, name=f's0_req{i}')
             for i in range(self.n_threads)
@@ -115,10 +195,8 @@ class SharedMemory(HasCoreParams, Elaboratable):
         s0_idxs = [
             Signal(bidx_bits, name=f's0_idx{i}') for i in range(self.n_threads)
         ]
-        s0_bank_conflicts = Signal(self.n_threads)
         s0_bank_gnts = [
-            Signal(self.n_threads, name=f's0_bank_gnt{i}')
-            for i in range(n_banks)
+            Signal(n_reqs, name=f's0_bank_gnt{b}') for b in range(n_banks)
         ]
 
         for w in range(self.n_threads):
@@ -140,22 +218,142 @@ class SharedMemory(HasCoreParams, Elaboratable):
                     (self.req[w].bits.addr >> bidx_off_bits)[:bidx_bits]),
             ]
 
-            c = Const(0)
-            for i in range(w):
-                c |= s0_valids[i] & (s0_banks[i] == s0_banks[w])
-            m.d.comb += s0_bank_conflicts[w].eq(c)
+        if use_dma:
+            word_idx_bits = log2_int(self.smem_size // word_bytes)
+
+            shamt = self.dma_req.bits.offset[:word_off_bits]
+            shifted_data = Cat(
+                self.dma_req.bits.data,
+                Const(0, (dma_span - 1) * word_bytes * 8)) << (8 * shamt)
+            shifted_mask = Cat(self.dma_req.bits.byte_enable,
+                               Const(0, (dma_span - 1) * word_bytes)) << shamt
+
+            load_valids = []
+            load_banks = []
+            load_idxs = []
+            load_masks = []
+            load_datas = []
+            load_nbytes = Const(0)
+            for j in range(dma_span):
+                waddr = self.dma_req.bits.offset[word_off_bits:] + j
+                mask = Mux(waddr[word_idx_bits:] == 0,
+                           shifted_mask[j * word_bytes:(j + 1) * word_bytes],
+                           Const(0, word_bytes))
+                load_valids.append(mask != 0)
+                load_banks.append(waddr[:bank_bits])
+                load_idxs.append(waddr[bank_bits:bank_bits + bidx_bits])
+                load_masks.append(mask)
+                load_datas.append(shifted_data[j * self.xlen:(j + 1) *
+                                               self.xlen])
+                for byte in range(word_bytes):
+                    load_nbytes = load_nbytes + mask[byte]
+
+            frag_active = Signal()
+            frag_id = Signal(DMA_ID_WIDTH)
+            frag_nbytes = Signal(range(dma_bytes + 1))
+            frag_pending = Signal(dma_span)
+            frag_banks = [
+                Signal(bank_bits, name=f'frag_bank{j}')
+                for j in range(dma_span)
+            ]
+            frag_idxs = [
+                Signal(bidx_bits, name=f'frag_idx{j}') for j in range(dma_span)
+            ]
+            frag_masks = [
+                Signal(word_bytes, name=f'frag_mask{j}')
+                for j in range(dma_span)
+            ]
+            frag_datas = [
+                Signal(self.xlen, name=f'frag_data{j}')
+                for j in range(dma_span)
+            ]
+
+            s1_commit_v = Signal()
+            s1_commit_id = Signal(DMA_ID_WIDTH)
+            s1_commit_nbytes = Signal(range(dma_bytes + 1))
+            s2_commit_v = Signal()
+            s2_commit_id = Signal(DMA_ID_WIDTH)
+            s2_commit_nbytes = Signal(range(dma_bytes + 1))
+            commit_q_ids = [
+                Signal(DMA_ID_WIDTH, name=f'commit_q_id{i}')
+                for i in range(dma_queue_depth)
+            ]
+            commit_q_nbytes = [
+                Signal(range(dma_bytes + 1), name=f'commit_q_nbytes{i}')
+                for i in range(dma_queue_depth)
+            ]
+            commit_q_head = Signal(range(dma_queue_depth))
+            commit_q_count = Signal(range(dma_queue_depth + 1))
+
+            may_complete = (commit_q_count + s2_commit_v + s1_commit_v
+                            < dma_queue_depth)
+            dma_grantable = Signal(dma_span)
+            with m.If(may_complete):
+                m.d.comb += dma_grantable.eq(frag_pending)
+            with m.Else():
+                m.d.comb += dma_grantable.eq(frag_pending & (frag_pending - 1))
+
+            slot_valids = [
+                Signal(name=f's0_dma_valid{j}') for j in range(dma_span)
+            ]
+            for j in range(dma_span):
+                m.d.comb += slot_valids[j].eq(frag_active & dma_grantable[j])
+
+            s0_valids += slot_valids
+            s0_banks += frag_banks
+            s0_idxs += frag_idxs
+
+        s0_rot = Signal(range(n_reqs))
+        s0_dists = [
+            Signal(range(n_reqs), name=f's0_dist{i}') for i in range(n_reqs)
+        ]
+        for r in range(n_reqs):
+            with m.If(s0_rot <= r):
+                m.d.comb += s0_dists[r].eq(r - s0_rot)
+            with m.Else():
+                m.d.comb += s0_dists[r].eq(r + n_reqs - s0_rot)
+
+        s0_wins = [Signal(name=f's0_wins{i}') for i in range(n_reqs)]
+        for r in range(n_reqs):
+            prior = Const(0)
+            for q in range(n_reqs):
+                if q != r:
+                    prior = prior | (s0_valids[q]
+                                     & (s0_banks[q] == s0_banks[r])
+                                     & (s0_dists[q] < s0_dists[r]))
+            m.d.comb += s0_wins[r].eq(s0_valids[r] & ~prior)
 
         for b in range(n_banks):
-            for w in range(self.n_threads):
-                with m.If(s0_valids[w] & (s0_banks[w] == b)
-                          & ~s0_bank_conflicts[w]):
-                    m.d.comb += s0_bank_gnts[b][w].eq(1)
+            for r in range(n_reqs):
+                with m.If(s0_wins[r] & (s0_banks[r] == b)):
+                    m.d.comb += s0_bank_gnts[b][r].eq(1)
+
+        s0_nacks = Signal(self.n_threads)
+        for w in range(self.n_threads):
+            ride = Const(0)
+            for q in range(self.n_threads):
+                if q != w:
+                    ride = ride | (s0_wins[q] & (s0_banks[q] == s0_banks[w])
+                                   & (s0_idxs[q] == s0_idxs[w]))
+            m.d.comb += s0_nacks[w].eq(s0_valids[w] & ~s0_wins[w] & ~ride)
+
+        nack_terms = [s0_nacks[w] for w in range(self.n_threads)]
+        if use_dma:
+            nack_terms += [
+                slot_valids[j] & ~s0_wins[self.n_threads + j]
+                for j in range(dma_span)
+            ]
+        # Advance through every requester on contention. Advancing past the
+        # highest bank winner lets an unrelated bank repeatedly skip losers.
+        # A persistent loser now becomes first priority within n_reqs cycles.
+        with m.If(Cat(*nack_terms).any()):
+            m.d.sync += s0_rot.eq((s0_rot + 1) % n_reqs)
 
         #
         # S1
         #
 
-        s1_valids = Signal.like(s0_valids)
+        s1_valids = Signal(self.n_threads)
         s1_req = [
             DCacheReq(self.params, name=f's1_req{i}')
             for i in range(self.n_threads)
@@ -164,46 +362,17 @@ class SharedMemory(HasCoreParams, Elaboratable):
             Signal(bank_bits, name=f's1_bank{i}')
             for i in range(self.n_threads)
         ]
-        s1_idxs = [
-            Signal(bidx_bits, name=f's1_idx{i}') for i in range(self.n_threads)
-        ]
-        s1_pipe_selection = [
-            Signal(self.n_threads, name=f's1_pipe_selection{i}')
-            for i in range(self.n_threads)
-        ]
-        s1_idx_match = [
-            Signal(self.n_threads, name=f's1_idx_match{i}')
-            for i in range(self.n_threads)
-        ]
-        s1_bank_selection = [
-            Signal(range(n_banks), name=f's1_bank_selection{i}')
-            for i in range(self.n_threads)
-        ]
         s1_nacks = Signal(self.mem_width)
 
-        m.d.sync += s1_valids.eq(s0_valids)
+        m.d.sync += [
+            s1_valids.eq(Cat(*s0_valids[:self.n_threads])),
+            s1_nacks.eq(s0_nacks),
+        ]
         for w in range(self.n_threads):
             m.d.sync += [
                 s1_req[w].eq(s0_req[w]),
                 s1_banks[w].eq(s0_banks[w]),
-                s1_idxs[w].eq(s0_idxs[w]),
             ]
-
-            m.d.comb += [
-                s1_pipe_selection[w].eq(1 << w),
-                s1_idx_match[w][w].eq(1),
-            ]
-            for i in reversed(range(w)):
-                with m.If(s1_valids[i] & (s1_banks[i] == s1_banks[w])):
-                    m.d.comb += s1_pipe_selection[w].eq(1 << i)
-                m.d.comb += s1_idx_match[w][i].eq(s1_idxs[i] == s1_idxs[w])
-
-            m.d.comb += s1_nacks[w].eq(s1_valids[w] & (
-                (s1_pipe_selection[w] & ~s1_idx_match[w]) != 0))
-
-            for i in reversed(range(self.n_threads)):
-                with m.If(s1_pipe_selection[w][i]):
-                    m.d.comb += s1_bank_selection[w].eq(s1_banks[i])
 
         #
         # S2
@@ -227,7 +396,7 @@ class SharedMemory(HasCoreParams, Elaboratable):
         for w in range(self.n_threads):
             m.d.sync += [
                 s2_req[w].eq(s1_req[w]),
-                s2_bank_selection[w].eq(s1_bank_selection[w]),
+                s2_bank_selection[w].eq(s1_banks[w]),
             ]
 
         s2_bank_reads = Array(
@@ -239,39 +408,54 @@ class SharedMemory(HasCoreParams, Elaboratable):
             mem_read = mem.read_port(transparent=False)
             setattr(m.submodules, f'mem_read{b}', mem_read)
 
-            for i in range(self.n_threads):
-                with m.If(s0_bank_gnts[b][i]):
-                    m.d.comb += mem_read.addr.eq(s0_idxs[i])
+            for r in range(n_reqs):
+                with m.If(s0_bank_gnts[b][r]):
+                    m.d.comb += mem_read.addr.eq(s0_idxs[r])
 
             m.d.sync += s2_bank_reads[b].eq(mem_read.data)
 
             mem_write = mem.write_port(granularity=8)
             setattr(m.submodules, f'mem_write{b}', mem_write)
 
+            for r in range(n_reqs):
+                with m.If(s0_bank_gnts[b][r]):
+                    m.d.comb += mem_write.addr.eq(s0_idxs[r])
+
             for i in range(self.n_threads):
                 with m.If(s0_bank_gnts[b][i]):
-                    m.d.comb += mem_write.addr.eq(s0_idxs[i])
-
                     for byte in range(word_bytes):
                         byte_data = s0_req[i].data.word_select(byte, 8)
                         byte_en = (MemoryCommand.is_write(
                             s0_req[i].uop.mem_cmd) & s0_write_masks[i][byte])
 
-                        for j in range(i + 1, self.n_threads):
-                            coalesced_write = (
-                                s0_valids[j] & (s0_banks[j] == b)
-                                & (s0_idxs[j] == s0_idxs[i])
-                                & MemoryCommand.is_write(s0_req[j].uop.mem_cmd)
-                                & s0_write_masks[j][byte])
-                            byte_data = Mux(
-                                coalesced_write,
-                                s0_req[j].data.word_select(byte, 8), byte_data)
-                            byte_en |= coalesced_write
+                        for q in range(self.n_threads):
+                            if q != i:
+                                coalesced_write = (s0_valids[q] &
+                                                   (s0_banks[q] == b)
+                                                   & (s0_idxs[q] == s0_idxs[i])
+                                                   & MemoryCommand.is_write(
+                                                       s0_req[q].uop.mem_cmd)
+                                                   & s0_write_masks[q][byte])
+                                byte_data = Mux(
+                                    coalesced_write,
+                                    s0_req[q].data.word_select(byte,
+                                                               8), byte_data)
+                                byte_en |= coalesced_write
 
                         m.d.comb += [
                             mem_write.data.word_select(byte, 8).eq(byte_data),
                             mem_write.en[byte].eq(byte_en),
                         ]
+
+            if use_dma:
+                for j in range(dma_span):
+                    with m.If(s0_bank_gnts[b][self.n_threads + j]):
+                        for byte in range(word_bytes):
+                            m.d.comb += [
+                                mem_write.data.word_select(byte, 8).eq(
+                                    frag_datas[j].word_select(byte, 8)),
+                                mem_write.en[byte].eq(frag_masks[j][byte]),
+                            ]
 
         for w in range(self.n_threads):
             load_gen = LoadGen(max_size=self.xlen // 8)
@@ -290,6 +474,83 @@ class SharedMemory(HasCoreParams, Elaboratable):
                 self.nack[w].valid.eq(s2_valids[w] & s2_nacks[w]),
                 self.nack[w].bits.uop.eq(s2_req[w].uop),
             ]
+
+        if use_dma:
+            slot_gnt = Cat(*[
+                Cat(*[
+                    s0_bank_gnts[b][self.n_threads + j] for b in range(n_banks)
+                ]).any() for j in range(dma_span)
+            ])
+            # Empty masks (including fully out-of-bounds requests) still
+            # consume a commit entry, even though they need no bank grant.
+            frag_completing = (frag_active & may_complete
+                               & ((frag_pending & ~slot_gnt) == 0))
+
+            m.d.comb += self.dma_req.ready.eq(~frag_active | frag_completing)
+
+            with m.If(self.dma_req.fire):
+                m.d.sync += [
+                    frag_active.eq(1),
+                    frag_id.eq(self.dma_req.bits.id),
+                    frag_nbytes.eq(load_nbytes),
+                    frag_pending.eq(Cat(*load_valids)),
+                ]
+                for j in range(dma_span):
+                    m.d.sync += [
+                        frag_banks[j].eq(load_banks[j]),
+                        frag_idxs[j].eq(load_idxs[j]),
+                        frag_masks[j].eq(load_masks[j]),
+                        frag_datas[j].eq(load_datas[j]),
+                    ]
+            with m.Else():
+                m.d.sync += frag_pending.eq(frag_pending & ~slot_gnt)
+                with m.If(frag_completing):
+                    m.d.sync += frag_active.eq(0)
+
+            m.d.sync += [
+                s2_commit_v.eq(s1_commit_v),
+                s2_commit_id.eq(s1_commit_id),
+                s2_commit_nbytes.eq(s1_commit_nbytes),
+                s1_commit_v.eq(frag_completing),
+                s1_commit_id.eq(frag_id),
+                s1_commit_nbytes.eq(frag_nbytes),
+            ]
+
+            commit_q_ids_arr = Array(commit_q_ids)
+            commit_q_nbytes_arr = Array(commit_q_nbytes)
+            commit_q_empty = commit_q_count == 0
+            with m.If(commit_q_empty):
+                m.d.comb += [
+                    self.dma_commit.valid.eq(s2_commit_v),
+                    self.dma_commit.bits.id.eq(s2_commit_id),
+                    self.dma_commit.bits.nbytes.eq(s2_commit_nbytes),
+                ]
+            with m.Else():
+                m.d.comb += [
+                    self.dma_commit.valid.eq(1),
+                    self.dma_commit.bits.id.eq(
+                        commit_q_ids_arr[commit_q_head]),
+                    self.dma_commit.bits.nbytes.eq(
+                        commit_q_nbytes_arr[commit_q_head]),
+                ]
+
+            bypass_fire = commit_q_empty & self.dma_commit.fire
+            dequeue = self.dma_commit.fire & ~commit_q_empty
+            enqueue = s2_commit_v & ~bypass_fire
+            commit_q_tail = (commit_q_head + commit_q_count) % dma_queue_depth
+
+            with m.If(enqueue):
+                with m.Switch(commit_q_tail):
+                    for i in range(dma_queue_depth):
+                        with m.Case(i):
+                            m.d.sync += [
+                                commit_q_ids[i].eq(s2_commit_id),
+                                commit_q_nbytes[i].eq(s2_commit_nbytes),
+                            ]
+            m.d.sync += commit_q_count.eq(commit_q_count + enqueue - dequeue)
+            with m.If(dequeue):
+                m.d.sync += commit_q_head.eq(
+                    (commit_q_head + 1) % dma_queue_depth)
 
         return m
 
@@ -369,6 +630,14 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         # store whose STD half arrived first).
         self.warp_split_addr = Signal(self.n_warps)
 
+        if self.use_smem and self.use_async_copy:
+            self.dma_req = Decoupled(SharedMemoryDMAReq,
+                                     self.params,
+                                     name='dma_req')
+            self.dma_commit = Decoupled(SharedMemoryDMACommit,
+                                        self.params,
+                                        name='dma_commit')
+
         if sim_debug:
             self.lsu_debug = Valid(LSUDebug, params)
 
@@ -377,6 +646,12 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
 
         if self.use_smem:
             smem = m.submodules.smem = SharedMemory(self.params)
+
+            if self.use_async_copy:
+                m.d.comb += [
+                    self.dma_req.connect(smem.dma_req),
+                    smem.dma_commit.connect(self.dma_commit),
+                ]
 
         lsq = Array(
             LSQEntry(self.params, name=f'lsq{i}') for i in range(self.n_warps))

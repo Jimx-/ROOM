@@ -1,6 +1,7 @@
 from amaranth import *
 
 from room.dcache import DCache
+from groom.async_copy import AsyncCopyCmd, AsyncCopyDone, AsyncCopyEngine
 from groom.core import Core, CoreDebug
 from groom.ctrl import GroomController
 from groom.raster import RasterUnit
@@ -67,6 +68,27 @@ class Cluster(HasClusterParams, Elaboratable):
                                       name='dbus_mmio')
 
         self.periph_buses = [self.dbus, self.dbus_mmio]
+
+        self.use_async_copy = self.core_params.get('use_async_copy', False)
+
+        if self.use_async_copy:
+            copy_params = self.core_params.copy()
+            copy_params['pma_regions'] = self.pma_regions
+            self.copy_engine = AsyncCopyEngine(
+                self.num_cores,
+                copy_params,
+                block_bytes=self.l2cache_params['block_bytes'])
+            copy_txn_bits = self.source_id_width - 1 - self.core_bits
+            assert 1 + self.copy_engine.slot_bits <= copy_txn_bits
+
+            self.copy_cmd = Decoupled(AsyncCopyCmd,
+                                      self.core_params,
+                                      core_id_width=self.core_bits,
+                                      name='copy_cmd')
+            self.copy_done = Decoupled(AsyncCopyDone,
+                                       self.core_params,
+                                       name='copy_done')
+            self.copy_busy = Signal()
 
         if sim_debug:
             self.core_debug = [
@@ -265,6 +287,43 @@ class Cluster(HasClusterParams, Elaboratable):
                 m.d.comb += core.raster_req.connect(rr)
 
         #
+        # Asynchronous copy engine
+        #
+
+        if self.use_async_copy:
+            copy_engine = self.copy_engine
+            m.submodules.async_copy = copy_engine
+
+            copy_txn_bits = self.source_id_width - 1 - self.core_bits
+            pad_bits = copy_txn_bits - 1 - copy_engine.slot_bits
+
+            copy_a = Decoupled(tl.ChannelA,
+                               data_width=64,
+                               addr_width=32,
+                               size_width=3,
+                               source_id_width=self.source_id_width)
+            m.d.comb += [
+                copy_engine.mem_bus.a.connect(copy_a),
+                copy_a.bits.source.eq(
+                    Cat(copy_engine.mem_bus.a.bits.source, Const(0, pad_bits),
+                        Const(1, 1), Const(0, self.core_bits), Const(1, 1))),
+            ]
+
+            a_arbiter.add(copy_a)
+
+            for i, core in enumerate(cores):
+                m.d.comb += [
+                    copy_engine.dma_req[i].connect(core.dma_req),
+                    core.dma_commit.connect(copy_engine.dma_commit[i]),
+                ]
+
+            m.d.comb += [
+                self.copy_cmd.connect(copy_engine.cmd),
+                copy_engine.done.connect(self.copy_done),
+                self.copy_busy.eq(copy_engine.busy),
+            ]
+
+        #
         # Data bus arbitration
         #
 
@@ -284,6 +343,15 @@ class Cluster(HasClusterParams, Elaboratable):
                     self.dbus.d.connect(dcache_bus.d),
                     dcache_bus.d.bits.source.eq(d_source_id),
                 ]
+
+            if self.use_async_copy:
+                with m.Elif(d_source_id[-1]):
+                    m.d.comb += [
+                        self.dbus.d.connect(copy_engine.mem_bus.d),
+                        copy_engine.mem_bus.d.bits.source.eq(
+                            d_source_id[:copy_engine.slot_bits]),
+                    ]
+
             with m.Else():
                 with m.Switch(d_core_id):
                     for i, core in enumerate(cores):

@@ -187,17 +187,16 @@ class BankedStore(HasL2CacheParams, Elaboratable):
                           if outer else self.inner_beat_bytes)
             num_beats = self.block_bytes // beat_bytes
 
-            Record.__init__(self,
-                            [('noop', 1, DIR_FANOUT),
-                             ('way', range(self.n_ways), DIR_FANOUT),
-                             ('set', self.index_bits, DIR_FANOUT),
-                             ('beat', max(1, bits_for(num_beats - 1)),
-                              DIR_FANOUT),
-                             ('mask', beat_bytes, DIR_FANOUT),
-                             ('data', beat_bytes * 8,
-                              DIR_FANOUT if write else DIR_FANIN)],
-                            name=name,
-                            src_loc_at=1 + src_loc_at)
+            Record.__init__(
+                self,
+                [('noop', 1, DIR_FANOUT),
+                 ('way', range(self.n_ways), DIR_FANOUT),
+                 ('set', self.index_bits, DIR_FANOUT),
+                 ('beat', max(1, bits_for(num_beats - 1)), DIR_FANOUT),
+                 ('mask', beat_bytes, DIR_FANOUT),
+                 ('data', beat_bytes * 8, DIR_FANOUT if write else DIR_FANIN)],
+                name=name,
+                src_loc_at=1 + src_loc_at)
 
     def __init__(self, params):
         super().__init__(params=params)
@@ -229,8 +228,7 @@ class BankedStore(HasL2CacheParams, Elaboratable):
         mem_banks = [
             Memory(width=self.inner_beat_bytes * 8,
                    depth=num_rows,
-                   name=f'mem{i}')
-            for i in range(num_banks)
+                   name=f'mem{i}') for i in range(num_banks)
         ]
 
         class Request(HasL2CacheParams, Record):
@@ -238,17 +236,15 @@ class BankedStore(HasL2CacheParams, Elaboratable):
             def __init__(self, params, name=None, src_loc_at=0):
                 HasL2CacheParams.__init__(self, params)
 
-                Record.__init__(self,
-                                [('wen', 1),
-                                 ('index', num_banks * row_bits),
-                                 ('bank_sel', num_banks),
-                                 ('bank_sum', num_banks),
-                                 ('bank_en', num_banks),
-                                 ('mask', num_banks * self.inner_beat_bytes),
-                                 ('data', num_banks * self.inner_beat_bytes * 8),
-                                 ('lane_sel', outer_lanes * num_banks)],
-                                name=name,
-                                src_loc_at=1 + src_loc_at)
+                Record.__init__(
+                    self, [('wen', 1), ('index', num_banks * row_bits),
+                           ('bank_sel', num_banks), ('bank_sum', num_banks),
+                           ('bank_en', num_banks),
+                           ('mask', num_banks * self.inner_beat_bytes),
+                           ('data', num_banks * self.inner_beat_bytes * 8),
+                           ('lane_sel', outer_lanes * num_banks)],
+                    name=name,
+                    src_loc_at=1 + src_loc_at)
 
         def make_request(port, write, outer=False, name=None):
             out = Request(self.params, name=name)
@@ -272,23 +268,27 @@ class BankedStore(HasL2CacheParams, Elaboratable):
                             out.bank_sel[i].eq(1),
                             out.index[i * row_bits:(i + 1) * row_bits].eq(row),
                             out.lane_sel[lane * num_banks + i].eq(1),
-                            out.data[i * self.inner_beat_bytes * 8:
-                                     (i + 1) * self.inner_beat_bytes * 8].eq(
-                                         port.bits.data[
-                                             lane * self.inner_beat_bytes * 8:
-                                             (lane + 1) * self.inner_beat_bytes * 8]),
-                            out.mask[i * self.inner_beat_bytes:
-                                     (i + 1) * self.inner_beat_bytes].eq(
-                                         port.bits.mask[
-                                             lane * self.inner_beat_bytes:
-                                             (lane + 1) * self.inner_beat_bytes]),
+                            out.data[i * self.inner_beat_bytes * 8:(i + 1) *
+                                     self.inner_beat_bytes * 8].eq(
+                                         port.bits.data[lane *
+                                                        self.inner_beat_bytes *
+                                                        8:(lane + 1) *
+                                                        self.inner_beat_bytes *
+                                                        8]),
+                            out.mask[i * self.inner_beat_bytes:(i + 1) *
+                                     self.inner_beat_bytes].
+                            eq(port.bits.mask[lane *
+                                              self.inner_beat_bytes:(lane +
+                                                                     1) *
+                                              self.inner_beat_bytes]),
                         ]
 
             conflict = (out.bank_sel & out.bank_sum).any()
             m.d.comb += [
                 port.ready.eq(~conflict),
-                out.bank_en.eq(Repl(port.valid & ~port.bits.noop & ~conflict,
-                                    num_banks) & out.bank_sel),
+                out.bank_en.eq(
+                    Repl(port.valid & ~port.bits.noop & ~conflict, num_banks)
+                    & out.bank_sel),
             ]
             return out
 
@@ -331,14 +331,16 @@ class BankedStore(HasL2CacheParams, Elaboratable):
             for req in reversed(reqs):
                 with m.If(req.bank_en[i]):
                     m.d.comb += [
-                        wport.addr.eq(req.index[i * row_bits:(i + 1) * row_bits]),
-                        rport.addr.eq(req.index[i * row_bits:(i + 1) * row_bits]),
+                        wport.addr.eq(req.index[i * row_bits:(i + 1) *
+                                                row_bits]),
+                        rport.addr.eq(req.index[i * row_bits:(i + 1) *
+                                                row_bits]),
                         wport.data.eq(
                             req.data[i * self.inner_beat_bytes * 8:(i + 1) *
                                      self.inner_beat_bytes * 8]),
-                        wport.en.eq(req.mask[i * self.inner_beat_bytes:(i + 1) *
-                                             self.inner_beat_bytes] &
-                                    Repl(req.wen, self.inner_beat_bytes)),
+                        wport.en.eq(req.mask[i * self.inner_beat_bytes:
+                                             (i + 1) * self.inner_beat_bytes]
+                                    & Repl(req.wen, self.inner_beat_bytes)),
                         bank_wen.eq(req.wen),
                     ]
 
@@ -352,9 +354,9 @@ class BankedStore(HasL2CacheParams, Elaboratable):
         sourcec_regsel_d1 = Signal(outer_lanes * num_banks)
         sourcec_regsel_d2 = Signal(outer_lanes * num_banks)
         m.d.sync += [
-            sourcec_regsel_d1.eq(sourcec_req.lane_sel &
-                                 Repl(sourcec_req.bank_en.any(),
-                                      outer_lanes * num_banks)),
+            sourcec_regsel_d1.eq(
+                sourcec_req.lane_sel
+                & Repl(sourcec_req.bank_en.any(), outer_lanes * num_banks)),
             sourcec_regsel_d2.eq(sourcec_regsel_d1),
         ]
 
@@ -362,8 +364,8 @@ class BankedStore(HasL2CacheParams, Elaboratable):
             for i, bank_out in enumerate(regout):
                 with m.If(sourcec_regsel_d2[lane * num_banks + i]):
                     m.d.comb += self.sourcec_port.bits.data[
-                        lane * self.inner_beat_bytes * 8:
-                        (lane + 1) * self.inner_beat_bytes * 8].eq(bank_out)
+                        lane * self.inner_beat_bytes * 8:(lane + 1) *
+                        self.inner_beat_bytes * 8].eq(bank_out)
 
         sourced_regsel_d1 = Signal(num_banks)
         sourced_regsel_d2 = Signal(num_banks)
@@ -1398,7 +1400,8 @@ class SinkA(HasL2CacheParams, Elaboratable):
             addr_width=32,
             data_width=self.inner_beat_bytes * 8,
             size_width=self.in_size_width,
-            source_id_width=self.in_source_id_width)
+            source_id_width=self.in_source_id_width,
+            flow=False)
         m.d.comb += self.a.connect(queue.enq)
         a = queue.deq
 
@@ -1570,9 +1573,7 @@ class SinkC(HasL2CacheParams, Elaboratable):
         self.set = Signal(range(self.n_sets))
         self.way = Signal(range(self.n_ways))
 
-        self.port = Decoupled(BankedStore.Port,
-                              params,
-                              write=True)
+        self.port = Decoupled(BankedStore.Port, params, write=True)
 
         self.rel_pop = Decoupled(PutBufferPop, params)
         self.rel_entry = SinkC.PutBufferEntry(params)
@@ -1726,10 +1727,7 @@ class SinkD(HasL2CacheParams, Elaboratable):
                            size_width=bits_for(self.lg_block_bytes),
                            source_id_width=self.out_source_id_width)
 
-        self.port = Decoupled(BankedStore.Port,
-                              params,
-                              write=True,
-                              outer=True)
+        self.port = Decoupled(BankedStore.Port, params, write=True, outer=True)
 
         self.source = Signal(self.out_source_id_width)
         self.way = Signal(range(self.n_ways))
@@ -1784,8 +1782,8 @@ class SinkD(HasL2CacheParams, Elaboratable):
             self.port.bits.noop.eq(~d.valid | ~has_data),
             self.port.bits.way.eq(self.way),
             self.port.bits.set.eq(self.set),
-            self.port.bits.beat.eq(
-                0 if self.block_bytes == self.outer_beat_bytes else beat),
+            self.port.bits.beat.eq(0 if self.block_bytes ==
+                                   self.outer_beat_bytes else beat),
             self.port.bits.mask.eq(~0),
             self.port.bits.data.eq(d.bits.data),
         ]

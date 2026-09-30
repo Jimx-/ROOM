@@ -10,7 +10,7 @@ from groom.regfile import RegisterFile, RegisterRead, WritebackDebug
 from groom.ex_stage import ALUExecUnit, ExecDebug
 from groom.fu import ExecResp
 from groom.csr import CSRFile
-from groom.lsu import LoadStoreUnit, LSUDebug
+from groom.lsu import LoadStoreUnit, LSUDebug, SharedMemoryDMACommit, SharedMemoryDMAReq
 from room.dcache import DCacheReq, DCacheResp
 from groom.fp_pipeline import FPPipeline
 from groom.raster import RasterRequest
@@ -98,6 +98,14 @@ class Core(HasCoreParams, Elaboratable):
 
         if self.use_raster:
             self.raster_req = Decoupled(RasterRequest, self.params)
+
+        if self.use_smem and self.use_async_copy:
+            self.dma_req = Decoupled(SharedMemoryDMAReq,
+                                     self.params,
+                                     name='dma_req')
+            self.dma_commit = Decoupled(SharedMemoryDMACommit,
+                                        self.params,
+                                        name='dma_commit')
 
         self.ibus = tl.Interface(data_width=64,
                                  addr_width=32,
@@ -330,6 +338,12 @@ class Core(HasCoreParams, Elaboratable):
         for dcache_nack, lsu_dcache_nack in zip(self.dcache_nack,
                                                 lsu.dcache_nack):
             m.d.comb += lsu_dcache_nack.eq(dcache_nack)
+
+        if self.use_smem and self.use_async_copy:
+            m.d.comb += [
+                self.dma_req.connect(lsu.dma_req),
+                lsu.dma_commit.connect(self.dma_commit),
+            ]
 
         if self.use_fpu:
             m.d.comb += [

@@ -189,6 +189,14 @@ class HasCoreParams:
                 self.smem_banks = self.smem_params['n_banks']
 
             #
+            # Asynchronous global-to-shared copy
+            #
+
+            self.use_async_copy = params.get('use_async_copy', False)
+            if self.use_async_copy and not self.use_smem:
+                raise ValueError('use_async_copy requires smem_params')
+
+            #
             # Rasterizer
             #
 
