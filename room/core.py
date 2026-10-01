@@ -478,8 +478,9 @@ class Core(HasCoreParams, Elaboratable):
                     & i_uop.prs2_busy) | (
                         (dis_uops[w].lrs2_rtype == RegisterType.FLT)
                         & f_uop.prs2_busy)),
-                dis_uops[w].prs3_busy.eq(dis_uops[w].frs3_en
-                                         & f_uop.prs3_busy),
+                dis_uops[w].prs3_busy.eq(
+                    (dis_uops[w].lrs3_rtype == RegisterType.FLT)
+                    & f_uop.prs3_busy),
                 ren_stalls[w].eq(
                     ren_stage.stalls[w]
                     | (fp_ren_stage.stalls[w] if self.use_fpu else 0)),

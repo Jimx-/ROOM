@@ -3,7 +3,8 @@ from amaranth import tracer
 from amaranth.hdl.ast import ValueCastable
 
 from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, \
-    GPUControlUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit, RasterUnit
+    GPUControlUnit, WGatherUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit, \
+    RasterUnit
 from groom.if_stage import BranchResolution, WarpControlReq
 from groom.csr import AutoCSR
 from groom.raster import RasterRequest
@@ -204,9 +205,17 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                              & (self.req.bits.uop.opcode != UOpCode.GPU_RAST)),
             self.warp_ctrl.eq(gpu.warp_ctrl),
         ]
-        for gpu_stack_ptr, stack_ptr in zip(gpu.stack_ptrs,
-                                            self.stack_ptrs):
+        for gpu_stack_ptr, stack_ptr in zip(gpu.stack_ptrs, self.stack_ptrs):
             m.d.comb += gpu_stack_ptr.eq(stack_ptr)
+
+        wgather = m.submodules.wgather = WGatherUnit(self.params)
+        iresp_units.append(wgather)
+        m.d.comb += [
+            self.req.connect(wgather.req),
+            wgather.req.valid.eq(
+                self.req.valid
+                & (self.req.bits.uop.fu_type == FUType.WGATHER)),
+        ]
 
         imul = m.submodules.imul = MultiplierUnit(self.data_width, 3,
                                                   self.params)
@@ -360,8 +369,7 @@ class FPUExecUnit(ExecUnit):
         m = super().elaborate(platform)
 
         if self.sim_debug:
-            m.d.comb += self.exec_debug.bits.lrs3.eq(
-                self.req.bits.uop.lrs3)
+            m.d.comb += self.exec_debug.bits.lrs3.eq(self.req.bits.uop.lrs3)
             for w in range(self.n_threads):
                 m.d.comb += self.exec_debug.bits.rs3_data[w].eq(
                     self.req.bits.rs3_data[w])

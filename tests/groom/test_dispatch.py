@@ -1,19 +1,18 @@
-import json
-from pathlib import Path
-
 import pytest
 from amaranth import *
 from amaranth.sim import Passive, Simulator
 
-import room  # noqa
+import json
+from pathlib import Path
+
+from room.consts import FUType, IssueQueueType, MemoryCommand, RegisterType, UOpCode
+from room.types import HasCoreParams, MicroOp
+
 from groom.dispatch import Dispatcher
 from groom.issue import Scoreboard
 from groom.ex_stage import ALUExecUnit
 from groom.lsu import LoadStoreUnit
 from groom.regfile import RegisterFile, RegisterRead
-from room.consts import (FUType, IssueQueueType, MemoryCommand, RegisterType,
-                         UOpCode)
-from room.types import HasCoreParams, MicroOp
 
 TEST_PARAMS = {
     'is_groom': True,
@@ -140,7 +139,7 @@ def uop_fields(uop_id,
                rs2=None,
                rs2_rtype=RegisterType.FIX,
                rs3=None,
-               frs3_en=True,
+               rs3_rtype=RegisterType.FLT,
                iq_type=IssueQueueType.INT):
     # Always emit the complete register-field set: dec_uop is a shared
     # record whose fields persist across sends.
@@ -158,7 +157,7 @@ def uop_fields(uop_id,
         ('lrs2', rs2 if rs2 is not None else 0),
         ('lrs2_rtype', rs2_rtype if rs2 is not None else RegisterType.X),
         ('lrs3', rs3 if rs3 is not None else 0),
-        ('frs3_en', int(rs3 is not None and frs3_en)),
+        ('lrs3_rtype', rs3_rtype if rs3 is not None else RegisterType.X),
     ]
     return fields
 
@@ -257,8 +256,8 @@ def test_busy_head_masked_until_wakeup():
     assert head0(11) == 1
 
 
-# The integer scoreboard intentionally mirrors the existing FP rs3 check too.
-# Exercise both busy tables, rather than assuming rs3 only consults FP state.
+# rs3 hazards follow lrs3_rtype: an FLT rs3 consults the FP busy table, a FIX
+# rs3 (wgather-style INT consumer) the INT busy table.
 DEPENDENCIES = [
     pytest.param(RegisterType.FIX, {'rs1': 5}, id='int-rs1'),
     pytest.param(RegisterType.FIX, {'rs2': 5}, id='int-rs2'),
@@ -285,7 +284,8 @@ DEPENDENCIES = [
                  id='fp-rs3'),
     pytest.param(RegisterType.FIX, {
         'rs3': 5,
-        'iq_type': IssueQueueType.FP
+        'rs3_rtype': RegisterType.FIX,
+        'iq_type': IssueQueueType.INT
     },
                  id='int-rs3'),
 ]
@@ -491,16 +491,20 @@ def test_passthrough_lookahead_checks_same_cycle_reservation(
 
 @pytest.mark.parametrize('rtype', [RegisterType.FIX, RegisterType.FLT])
 @pytest.mark.parametrize('consumer', [
-    pytest.param({
-        'rs3': 5,
-        'frs3_en': False,
-        'iq_type': IssueQueueType.FP
-    },
-                 id='rs3-disabled'),
-    pytest.param({
-        'rs3': 5,
-        'iq_type': IssueQueueType.INT
-    }, id='non-fp-rs3'),
+    pytest.param(
+        {
+            'rs3': 5,
+            'rs3_rtype': RegisterType.X,
+            'iq_type': IssueQueueType.FP
+        },
+        id='rs3-disabled'),
+    pytest.param(
+        {
+            'rs3': 5,
+            'rs3_rtype': RegisterType.X,
+            'iq_type': IssueQueueType.INT
+        },
+        id='non-fp-rs3'),
 ])
 def test_unused_rs3_does_not_stall(rtype, consumer):
     dut = make_dut()

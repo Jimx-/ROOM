@@ -159,6 +159,36 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                     with m.Default():
                         m.d.comb += is_special.eq(0)
 
+            #
+            # Warp lane gather
+            #
+            with m.Case(0b0101011):
+                m.d.comb += is_special.eq(1)
+
+                with m.Switch(inuop.inst[12:15]):
+                    with m.Case(0x0):  # wgather
+                        m.d.comb += [
+                            uop.opcode.eq(UOpCode.GPU_WGATHER),
+                            uop.iq_type.eq(IssueQueueType.INT),
+                            uop.fu_type.eq(FUType.WGATHER),
+                            uop.dst_rtype.eq(RegisterType.FIX),
+                            uop.lrs1_rtype.eq(RegisterType.FIX),
+                            uop.lrs2_rtype.eq(RegisterType.FIX),
+                            uop.lrs3_rtype.eq(RegisterType.FIX),
+                            uop.imm_sel.eq(ImmSel.I),
+                        ]
+
+                    with m.Default():
+                        m.d.comb += is_special.eq(0)
+
+        # Pack the immediate from this decoder's own imm_sel so S-format
+        # custom ops (wspawn reads imm_packed[8:20] as its spawn offset)
+        # carry the real store immediate, not the I-type rs2 field.
+        di20_25 = Mux((uop.imm_sel == ImmSel.B) | (uop.imm_sel == ImmSel.S),
+                      inuop.inst[7:12], inuop.inst[20:25])
+        m.d.comb += uop.imm_packed.eq(
+            Cat(inuop.inst[12:20], di20_25, inuop.inst[25:32]))
+
         with m.If(is_special):
             m.d.comb += self.out_uop.eq(uop)
         with m.Else():

@@ -220,14 +220,14 @@ class Core(HasCoreParams, Elaboratable):
         #
 
         iregfile = m.submodules.iregfile = RegisterFile(
-            rports=self.n_threads * 2,
+            rports=self.n_threads * 3,
             wports=self.n_threads,
             num_regs=32 * self.n_warps,
             data_width=self.xlen)
 
         iregread = m.submodules.iregread = RegisterRead(
-            num_rports=self.n_threads * 2,
-            rports_array=[2] * self.n_threads,
+            num_rports=self.n_threads * 3,
+            rports_array=[3] * self.n_threads,
             reg_width=self.xlen,
             params=self.params)
 

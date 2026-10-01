@@ -93,8 +93,7 @@ class Scoreboard(HasCoreParams, Elaboratable):
                 m.d.sync += rs2_busy.eq(busy_regs_n[self.sb_wid][i])
 
             with m.If((self.sb_uop.lrs3 == i)
-                      & (self.sb_uop.iq_type == IssueQueueType.FP)
-                      & self.sb_uop.frs3_en):
+                      & (self.sb_uop.lrs3_rtype == rtype)):
                 m.d.sync += rs3_busy.eq(busy_regs_n[self.sb_wid][i])
 
         m.d.comb += self.dis_ready.eq(~(rd_busy | rs1_busy | rs2_busy
@@ -112,8 +111,7 @@ class Scoreboard(HasCoreParams, Elaboratable):
                              & busy_regs_n[i].bit_select(head.lrs1, 1))
             head_rs2_busy = ((head.lrs2_rtype == rtype)
                              & busy_regs_n[i].bit_select(head.lrs2, 1))
-            head_rs3_busy = ((head.iq_type == IssueQueueType.FP)
-                             & head.frs3_en
+            head_rs3_busy = ((head.lrs3_rtype == rtype)
                              & busy_regs_n[i].bit_select(head.lrs3, 1))
             m.d.sync += self.head_ready[i].eq(~(head_rd_busy | head_rs1_busy
                                                 | head_rs2_busy

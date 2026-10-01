@@ -254,7 +254,10 @@ class RegisterRead(HasCoreParams, Elaboratable):
                         (rrd_uop.lrs2_rtype == RegisterType.FIX), 0,
                         self.read_ports[idx + 1].data))
             if nrps > 2:
-                m.d.comb += rs3_data.eq(self.read_ports[idx + 2].data)
+                m.d.comb += rs3_data.eq(
+                    Mux((rrd_uop.lrs3 == 0) &
+                        (rrd_uop.lrs3_rtype == RegisterType.FIX), 0,
+                        self.read_ports[idx + 2].data))
 
             idx += nrps
 

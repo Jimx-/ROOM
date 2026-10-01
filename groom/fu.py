@@ -541,6 +541,70 @@ class GPUControlUnit(PipelinedFunctionalUnit):
         return m
 
 
+class WGatherUnit(PipelinedFunctionalUnit):
+    """Warp lane gather: scatters one lane's rs1/rs2/rs3 across its group of
+    four lanes. The source lane of each group (lower 2 bits == wg_src_lane)
+    keeps its rd: the response tmask is rewritten to ~wg_src_mask, forcing
+    writes on every non-source lane regardless of the incoming active mask.
+    When the nominal source lane is inactive, the warp's last active lane is
+    gathered instead."""
+
+    def __init__(self, params):
+        super().__init__(1, params['xlen'], params)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        uop = self.req.bits.uop
+        wg_src_lane = uop.imm_packed[13:15]
+
+        last_tid = Signal(range(self.n_threads))
+        for w in range(self.n_threads):
+            with m.If(uop.tmask[w]):
+                m.d.comb += last_tid.eq(w)
+
+        rs1 = Array(self.req.bits.rs1_data)
+        rs2 = Array(self.req.bits.rs2_data)
+        rs3 = Array(self.req.bits.rs3_data)
+
+        wg_src_mask = Signal(self.n_threads)
+        data = [
+            Signal(self.xlen, name=f's0_data{w}')
+            for w in range(self.n_threads)
+        ]
+        resp_tmask = Signal(self.n_threads)
+
+        m.d.sync += resp_tmask.eq(~wg_src_mask)
+
+        for w in range(self.n_threads):
+            nominal = Signal(range(self.n_threads), name=f'wgather_nominal{w}')
+            src_lane = Signal(range(self.n_threads), name=f'wgather_src{w}')
+
+            m.d.comb += [
+                nominal.eq((w & ~3) | wg_src_lane),
+                src_lane.eq(
+                    Mux(uop.tmask.bit_select(nominal, 1), nominal, last_tid)),
+                wg_src_mask[w].eq((w & 3) == wg_src_lane),
+            ]
+
+            offset = (w - wg_src_lane) & 3
+            with m.Switch(offset):
+                with m.Case(1):
+                    m.d.sync += data[w].eq(rs1[src_lane])
+                with m.Case(2):
+                    m.d.sync += data[w].eq(rs2[src_lane])
+                with m.Case(3):
+                    m.d.sync += data[w].eq(rs3[src_lane])
+                with m.Default():
+                    m.d.sync += data[w].eq(0)
+
+            m.d.comb += self.resp.bits.data[w].eq(data[w])
+
+        m.d.comb += self.resp.bits.uop.tmask.eq(resp_tmask)
+
+        return m
+
+
 class IterativeFunctionalUnit(FunctionalUnit):
 
     def __init__(self, data_width, params, is_raster=False, needs_frm=False):

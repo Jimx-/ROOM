@@ -155,6 +155,7 @@ class UOpCode(IntEnum):
     GPU_BARRIER = 131
     GPU_PRED = 132
     GPU_RAST = 133
+    GPU_WGATHER = 134
 
     # Zicond
     CZERO_EQZ = 160
@@ -342,6 +343,7 @@ class FUType(IntEnum):
     GPU = 1024
     VEC = 2048
     F2IVEC = F2I | VEC
+    WGATHER = 4096
 
 
 class PCSel(IntEnum):

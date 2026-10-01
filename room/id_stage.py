@@ -1172,7 +1172,7 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                         uop.dst_rtype.eq(RegisterType.FLT),
                         uop.lrs1_rtype.eq(RegisterType.FLT),
                         uop.lrs2_rtype.eq(RegisterType.FLT),
-                        uop.frs3_en.eq(1),
+                        uop.lrs3_rtype.eq(RegisterType.FLT),
                     ]
 
                     with m.Switch(inuop.inst[25:27]):

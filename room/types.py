@@ -266,9 +266,9 @@ class MicroOp(HasCoreParams, Record):
             ('dst_rtype', RegisterType),
             ('lrs1_rtype', RegisterType),
             ('lrs2_rtype', RegisterType),
+            ('lrs3_rtype', RegisterType),
             ('fp_valid', 1),
             ('fp_single', 1),
-            ('frs3_en', 1),
             ('fp_in_tag', 2),
             ('fp_out_tag', 2),
         ]
