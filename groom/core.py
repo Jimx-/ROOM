@@ -11,6 +11,7 @@ from groom.ex_stage import ALUExecUnit, ExecDebug
 from groom.fu import ExecResp
 from groom.csr import CSRFile
 from groom.lsu import LoadStoreUnit, LSUDebug, SharedMemoryDMACommit, SharedMemoryDMAReq
+from groom.async_copy import AsyncCopyLaunch, AsyncCopyWait
 from room.dcache import DCacheReq, DCacheResp
 from groom.fp_pipeline import FPPipeline
 from groom.raster import RasterRequest
@@ -100,12 +101,22 @@ class Core(HasCoreParams, Elaboratable):
             self.raster_req = Decoupled(RasterRequest, self.params)
 
         if self.use_smem and self.use_async_copy:
-            self.dma_req = Decoupled(SharedMemoryDMAReq,
-                                     self.params,
-                                     name='dma_req')
-            self.dma_commit = Decoupled(SharedMemoryDMACommit,
-                                        self.params,
-                                        name='dma_commit')
+            self.dma_req = Decoupled(SharedMemoryDMAReq, self.params)
+            self.dma_commit = Decoupled(SharedMemoryDMACommit, self.params)
+
+            core_bits = max(1, Shape.cast(range(self.n_cores)).width)
+            self.copy_launch = Decoupled(AsyncCopyLaunch,
+                                         self.params,
+                                         core_id_width=core_bits)
+            self.copy_wait = Decoupled(AsyncCopyWait, self.params)
+            self.copy_ack_valid = Signal()
+            self.copy_ack_wid = Signal(range(self.n_warps))
+            self.copy_ack_reject = Signal()
+            self.copy_wake_valid = Signal()
+            self.copy_wake_wid = Signal(range(self.n_warps))
+            self.copy_wake_stale = Signal()
+            self.copy_wake_error = Signal()
+            self.copy_wake_done = Signal()
 
         self.ibus = tl.Interface(data_width=64,
                                  addr_width=32,
@@ -285,6 +296,7 @@ class Core(HasCoreParams, Elaboratable):
             self.params,
             has_ifpu=self.use_fpu,
             has_raster=self.use_raster,
+            has_copy=self.use_smem and self.use_async_copy,
             sim_debug=self.sim_debug)
         csr.add_csrs(exec_unit.iter_csrs())
         m.d.comb += [
@@ -343,6 +355,17 @@ class Core(HasCoreParams, Elaboratable):
             m.d.comb += [
                 self.dma_req.connect(lsu.dma_req),
                 lsu.dma_commit.connect(self.dma_commit),
+                exec_unit.copy_launch.connect(self.copy_launch),
+                exec_unit.copy_wait.connect(self.copy_wait),
+                exec_unit.copy_ack_valid.eq(self.copy_ack_valid),
+                exec_unit.copy_ack_wid.eq(self.copy_ack_wid),
+                exec_unit.copy_ack_reject.eq(self.copy_ack_reject),
+                exec_unit.copy_wake_valid.eq(self.copy_wake_valid),
+                exec_unit.copy_wake_wid.eq(self.copy_wake_wid),
+                exec_unit.copy_wake_stale.eq(self.copy_wake_stale),
+                exec_unit.copy_wake_error.eq(self.copy_wake_error),
+                exec_unit.copy_wake_done.eq(self.copy_wake_done),
+                if_stage.warp_wake.eq(exec_unit.copy_warp_wake),
             ]
 
         if self.use_fpu:

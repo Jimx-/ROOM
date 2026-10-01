@@ -18,3 +18,18 @@ def gpu_wspawn(rs1, rs2, imm=0):
 def wgather(rd, rs1, rs2, rs3, src_lane):
     return ((rs3 & 0x1f) << 27) | ((src_lane & 0x3) << 25) | (
         (rs2 & 0x1f) << 20) | ((rs1 & 0x1f) << 15) | (rd << 7) | 0b0101011
+
+
+def gcopy(rd, rs1, rs2):
+    """``gcopy rd, rs1, rs2`` — rd receives the launch result (0 accepted,
+    1 rejected)."""
+    return ((rs2 & 0x1f) << 20) | ((rs1 & 0x1f) << 15) | ((rd & 0x1f) << 7) \
+        | 0b1111011
+
+
+def gcopywait(rs1):
+    return ((rs1 & 0x1f) << 15) | (1 << 12) | 0b1111011
+
+
+def gcopystat(rd, rs1):
+    return ((rs1 & 0x1f) << 15) | (2 << 12) | (rd << 7) | 0b1111011

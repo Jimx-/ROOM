@@ -145,12 +145,8 @@ class SharedMemory(HasCoreParams, Elaboratable):
         ]
 
         if self.use_async_copy:
-            self.dma_req = Decoupled(SharedMemoryDMAReq,
-                                     self.params,
-                                     name='dma_req')
-            self.dma_commit = Decoupled(SharedMemoryDMACommit,
-                                        self.params,
-                                        name='dma_commit')
+            self.dma_req = Decoupled(SharedMemoryDMAReq, self.params)
+            self.dma_commit = Decoupled(SharedMemoryDMACommit, self.params)
 
     def elaborate(self, platform):
         m = Module()
@@ -631,12 +627,8 @@ class LoadStoreUnit(HasCoreParams, Elaboratable):
         self.warp_split_addr = Signal(self.n_warps)
 
         if self.use_smem and self.use_async_copy:
-            self.dma_req = Decoupled(SharedMemoryDMAReq,
-                                     self.params,
-                                     name='dma_req')
-            self.dma_commit = Decoupled(SharedMemoryDMACommit,
-                                        self.params,
-                                        name='dma_commit')
+            self.dma_req = Decoupled(SharedMemoryDMAReq, self.params)
+            self.dma_commit = Decoupled(SharedMemoryDMACommit, self.params)
 
         if sim_debug:
             self.lsu_debug = Valid(LSUDebug, params)

@@ -181,6 +181,51 @@ class DecodeUnit(HasCoreParams, Elaboratable):
                     with m.Default():
                         m.d.comb += is_special.eq(0)
 
+            #
+            # Asynchronous global-to-shared copy
+            #
+            if self.use_async_copy:
+                with m.Case(0b1111011):
+                    m.d.comb += is_special.eq(1)
+
+                    with m.Switch(inuop.inst[12:15]):
+                        with m.Case(0x0):  # gcopy
+                            m.d.comb += [
+                                uop.opcode.eq(UOpCode.GPU_COPY_ISSUE),
+                                uop.iq_type.eq(IssueQueueType.INT),
+                                uop.fu_type.eq(FUType.COPY),
+                                # The launch result in rd reports token
+                                # rejection: 0 accepted, 1 dropped.
+                                uop.dst_rtype.eq(RegisterType.FIX),
+                                uop.lrs1_rtype.eq(RegisterType.FIX),
+                                uop.lrs2_rtype.eq(RegisterType.FIX),
+                                uop.imm_sel.eq(ImmSel.S),
+                                STALL,
+                            ]
+
+                        with m.Case(0x1):  # gcopywait
+                            m.d.comb += [
+                                uop.opcode.eq(UOpCode.GPU_COPY_WAIT),
+                                uop.iq_type.eq(IssueQueueType.INT),
+                                uop.fu_type.eq(FUType.COPY),
+                                uop.lrs1_rtype.eq(RegisterType.FIX),
+                                uop.imm_sel.eq(ImmSel.S),
+                                STALL,
+                            ]
+
+                        with m.Case(0x2):  # gcopystat
+                            m.d.comb += [
+                                uop.opcode.eq(UOpCode.GPU_COPY_STAT),
+                                uop.iq_type.eq(IssueQueueType.INT),
+                                uop.fu_type.eq(FUType.COPY),
+                                uop.dst_rtype.eq(RegisterType.FIX),
+                                uop.lrs1_rtype.eq(RegisterType.FIX),
+                                uop.imm_sel.eq(ImmSel.S),
+                            ]
+
+                        with m.Default():
+                            m.d.comb += is_special.eq(0)
+
         # Pack the immediate from this decoder's own imm_sel so S-format
         # custom ops (wspawn reads imm_packed[8:20] as its spawn offset)
         # carry the real store immediate, not the I-type rs2 field.
@@ -223,10 +268,17 @@ class DecodeStage(HasCoreParams, Elaboratable):
         m.d.comb += dec_unit.in_uop.eq(self.fetch_packet.bits.uop)
 
         stall_warp = self.uop.is_br | self.uop.is_jal | self.uop.is_jalr | self.uop.is_ecall | self.uop.stall_warp
+        copy_op = (self.uop.opcode == UOpCode.GPU_COPY_ISSUE) | (
+            self.uop.opcode == UOpCode.GPU_COPY_WAIT)
+        copy_park = copy_op & self.uop.tmask.any()
+        # An empty-mask launch or wait is a no-op that neither parks nor
+        # stalls: nothing will ever wake a warp stalled for it.
+        copy_nopark = copy_op & ~self.uop.tmask.any()
         m.d.comb += [
             self.stall_req.valid.eq(self.fetch_packet.fire),
             self.stall_req.bits.wid.eq(self.fetch_packet.bits.wid),
-            self.stall_req.bits.stall.eq(stall_warp),
+            self.stall_req.bits.stall.eq(stall_warp & ~copy_nopark),
+            self.stall_req.bits.copy.eq(stall_warp & copy_park),
         ]
 
         m.d.comb += [

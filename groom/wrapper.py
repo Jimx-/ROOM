@@ -1,7 +1,8 @@
 from amaranth import *
 
 from room.dcache import DCache
-from groom.async_copy import AsyncCopyCmd, AsyncCopyDone, AsyncCopyEngine
+from groom.async_copy import AsyncCopyCompletion, AsyncCopyDone, \
+    AsyncCopyEngine
 from groom.core import Core, CoreDebug
 from groom.ctrl import GroomController
 from groom.raster import RasterUnit
@@ -79,15 +80,17 @@ class Cluster(HasClusterParams, Elaboratable):
                 copy_params,
                 block_bytes=self.l2cache_params['block_bytes'])
             copy_txn_bits = self.source_id_width - 1 - self.core_bits
-            assert 1 + self.copy_engine.slot_bits <= copy_txn_bits
+            needed_txn_bits = 1 + self.copy_engine.slot_bits
+            if needed_txn_bits > copy_txn_bits:
+                raise ValueError(
+                    f'async copy source IDs need {needed_txn_bits} '
+                    f'instruction-side transaction bits but only '
+                    f'{copy_txn_bits} are available')
 
-            self.copy_cmd = Decoupled(AsyncCopyCmd,
-                                      self.core_params,
-                                      core_id_width=self.core_bits,
-                                      name='copy_cmd')
-            self.copy_done = Decoupled(AsyncCopyDone,
-                                       self.core_params,
-                                       name='copy_done')
+            self.copy_completion = AsyncCopyCompletion(
+                self.num_cores, copy_params, core_id_width=self.core_bits)
+
+            self.copy_done = Decoupled(AsyncCopyDone, self.core_params)
             self.copy_busy = Signal()
 
         if sim_debug:
@@ -293,6 +296,7 @@ class Cluster(HasClusterParams, Elaboratable):
         if self.use_async_copy:
             copy_engine = self.copy_engine
             m.submodules.async_copy = copy_engine
+            copy_completion = m.submodules.copy_completion = self.copy_completion
 
             copy_txn_bits = self.source_id_width - 1 - self.core_bits
             pad_bits = copy_txn_bits - 1 - copy_engine.slot_bits
@@ -315,12 +319,23 @@ class Cluster(HasClusterParams, Elaboratable):
                 m.d.comb += [
                     copy_engine.dma_req[i].connect(core.dma_req),
                     core.dma_commit.connect(copy_engine.dma_commit[i]),
+                    core.copy_launch.connect(copy_completion.launch[i]),
+                    core.copy_wait.connect(copy_completion.wait[i]),
+                    core.copy_ack_valid.eq(copy_completion.ack_valid[i]),
+                    core.copy_ack_wid.eq(copy_completion.ack_wid[i]),
+                    core.copy_ack_reject.eq(copy_completion.ack_reject[i]),
+                    core.copy_wake_valid.eq(copy_completion.wake_valid[i]),
+                    core.copy_wake_wid.eq(copy_completion.wake_wid[i]),
+                    core.copy_wake_stale.eq(copy_completion.wake_stale[i]),
+                    core.copy_wake_error.eq(copy_completion.wake_error[i]),
+                    core.copy_wake_done.eq(copy_completion.wake_done[i]),
                 ]
 
             m.d.comb += [
-                self.copy_cmd.connect(copy_engine.cmd),
-                copy_engine.done.connect(self.copy_done),
-                self.copy_busy.eq(copy_engine.busy),
+                copy_completion.cmd.connect(copy_engine.cmd),
+                copy_engine.done.connect(copy_completion.done),
+                copy_completion.done_out.connect(self.copy_done),
+                self.copy_busy.eq(copy_engine.busy | copy_completion.busy),
             ]
 
         #
@@ -369,7 +384,14 @@ class Cluster(HasClusterParams, Elaboratable):
         # Status
         #
 
-        m.d.comb += self.busy.eq(Cat(c.busy for c in cores).any())
+        # Copy activity (engine traffic plus unconsumed tokens) is part
+        # of the cluster's busy status: software must wait for it to
+        # clear before disabling cores.
+        core_busy = Cat(c.busy for c in cores).any()
+        if self.use_async_copy:
+            m.d.comb += self.busy.eq(core_busy | self.copy_busy)
+        else:
+            m.d.comb += self.busy.eq(core_busy)
 
         return m
 
@@ -438,6 +460,8 @@ class GroomWrapper(HasClusterParams, Elaboratable):
         m.submodules.ctrl = self.ctrl
 
         clusters = []
+        # Exposed for integration tests; populated during elaboration.
+        self.clusters = clusters
 
         a_arbiter = m.submodules.a_arbiter = tl.Arbiter(
             tl.ChannelA,
@@ -483,6 +507,13 @@ class GroomWrapper(HasClusterParams, Elaboratable):
                 cluster.raster_prim_addr.eq(self.ctrl.raster_prim_addr),
                 cluster.raster_prim_stride.eq(self.ctrl.raster_prim_stride),
             ]
+
+            if cluster.use_async_copy:
+                # The done mirror is optional observation and this wrapper
+                # attaches no consumer: drain it, so the mirror queue can
+                # never back-pressure engine completions. A consumer, when
+                # one exists, replaces this drain.
+                m.d.comb += cluster.copy_done.ready.eq(1)
 
             dbus_a = Decoupled(tl.ChannelA,
                                data_width=cluster.dbus.data_width,

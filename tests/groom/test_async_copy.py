@@ -1678,23 +1678,25 @@ class ClusterTop(Elaboratable):
         return m
 
 
-def test_cluster_copy_source_ids_and_response_routing():
-    """Copy traffic survives the wrapper's source packing round trip.
+def test_cluster_copy_d_response_demux():
+    """Copy-class D responses route to the engine; other classes do not.
 
-    With cores and the DCache held in reset, a copy command must produce a
-    Get on ``dbus`` whose source lies in the instruction-side half with the
-    copy marker bit set (slot 0 of this geometry maps to source 0x50), and
-    a D response carrying that source must demultiplex back into the
-    engine and reach the selected core's DMA port.
+    The debug command ingress is gone and the per-core launch ports
+    belong to the cores (which cannot run under pysim), so cluster-level
+    request traffic is exercised by the bare-core end-to-end test in
+    ``test_gcopy.py`` instead. This test drives the cluster's dbus D
+    channel the way the L2 would and checks the response half of the
+    copy wiring: a source carrying the copy marker connects through to
+    the engine's read slot, while dbus-class and instruction-class
+    sources never reach it. In this geometry, source 0x50 is copy slot 0
+    aimed at core 1 (marker bit set above the slot id), 0x51 is slot 1,
+    0x01 is the DCache's dbus class, and 0x40 is core 1's
+    instruction-cache class.
     """
     params = _cluster_params()
     top = ClusterTop(params)
     cluster = top.cluster
-    engine = cluster.copy_engine
-    model = SparseRAM()
-    done = [False]
-    a_log = []
-    copy_slot0_source = 0x50
+    engine_d = cluster.copy_engine.mem_bus.d
 
     def driver():
         yield cluster.core_enable.eq(0)
@@ -1702,62 +1704,24 @@ def test_cluster_copy_source_ids_and_response_routing():
         yield cluster.raster_enable.eq(0)
         yield
 
-        # A zero-length command proves the cmd/done wiring only.
-        yield from send_cmd(cluster.copy_cmd,
-                            id=5,
-                            core=0,
-                            src=0x800,
-                            nbytes=0,
-                            dst=0x40)
-        res = yield from recv_done(cluster.copy_done)
-        assert res == (5, 0)
-
-        # One line to core 1: the Get must appear on the cluster dbus with
-        # the copy source encoding, and the response must find its way
-        # back to the engine.
-        yield from send_cmd(cluster.copy_cmd,
-                            id=6,
-                            core=1,
-                            src=0x800,
-                            nbytes=64,
-                            dst=0x100)
-        for _ in range(50):
-            if a_log:
-                break
+        def offer(source, slot, expect_engine):
+            yield cluster.dbus.d.bits.opcode.eq(
+                tl.ChannelDOpcode.AccessAckData)
+            yield cluster.dbus.d.bits.source.eq(source)
+            yield cluster.dbus.d.valid.eq(1)
             yield
-        assert a_log == [(copy_slot0_source, 0x800)], \
-            'copy Get must use the instruction-side copy source class'
-
-        # The engine now drains through core 1's shared-memory DMA port.
-        # The cores are held in reset, so the endpoint accepts fragments
-        # (its combinational ready is high) but never acknowledges them;
-        # every fragment of the line must still be offered in order with
-        # the correct destination offsets and payload.
-        expected = model.peek(0x800, 64)
-        seen = []
-        for _ in range(200):
-            if (yield engine.dma_req[1].valid):
-                seen.append(((yield engine.dma_req[1].bits.id),
-                             (yield engine.dma_req[1].bits.offset),
-                             (yield engine.dma_req[1].bits.byte_enable),
-                             (yield engine.dma_req[1].bits.data)))
-            if len(seen) == 8:
-                break
-            yield
-        assert len(seen) == 8, f'only {len(seen)} fragments offered'
-        for i, (fid, offset, mask, data) in enumerate(seen):
-            assert fid == 6
-            assert offset == 0x100 + 8 * i
-            assert mask == 0xff
-            assert data == int.from_bytes(expected[8 * i:8 * i + 8], 'little')
-        assert (yield cluster.copy_busy)
-        done[0] = True
-
-    def core0_guard():
-        while not done[0]:
-            assert not (yield engine.dma_req[0].valid), \
-                'fragment routed to the wrong core'
+            assert (yield engine_d.valid) == expect_engine, \
+                f'source {source:#x} misrouted by the copy demultiplexer'
+            if expect_engine:
+                assert (yield engine_d.bits.source) == slot
+                assert not (yield engine_d.fire), \
+                    'the engine only accepts into a receiving slot'
+            yield cluster.dbus.d.valid.eq(0)
             yield
 
-    _run(top, _proc(tl_copy_responder, cluster.dbus, model, done, a_log=a_log),
-         driver, core0_guard, _proc(_watchdog, done))
+        offer(0x50, 0, True)  # copy class: slot 0, core 1
+        offer(0x51, 1, True)  # copy class: slot 1
+        offer(0x01, 0, False)  # dbus class: the DCache's response
+        offer(0x40, 0, False)  # instruction class, core 1: no marker
+
+    _run(top, driver)

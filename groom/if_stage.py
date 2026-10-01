@@ -48,6 +48,7 @@ class WarpStallReq(HasCoreParams, Record):
         Record.__init__(self, [
             ('wid', range(self.n_warps), DIR_FANOUT),
             ('stall', 1, DIR_FANOUT),
+            ('copy', 1, DIR_FANOUT),
         ],
                         name=name,
                         src_loc_at=1 + src_loc_at)
@@ -182,6 +183,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         self.br_res = Valid(BranchResolution, params)
         self.warp_ctrl = Valid(WarpControlReq, params)
         self.warp_memory = Signal(self.n_warps)
+        self.warp_wake = Signal(self.n_warps)
         self.stack_ptrs = [
             Signal(range(self.ipdom_stack_depth + 1), name=f'stack_ptr{i}')
             for i in range(self.n_warps)
@@ -208,6 +210,7 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
         active_warps = Signal(self.n_warps, reset=1)
         stalled_warps = Signal(self.n_warps)
         ready_warps = Signal(self.n_warps)
+        copy_warps = Signal(self.n_warps, name='copy_warps')
         barrier_masks = Array(
             Signal(self.n_warps, name=f'barrier_mask{i}')
             for i in range(self.n_barriers))
@@ -300,7 +303,8 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
 
         m.d.comb += ready_warps.eq(active_warps
                                    & ~(stalled_warps | barrier_stall_mask
-                                       | wspawn_hold))
+                                       | wspawn_hold)
+                                   & ~copy_warps)
 
         schedule_wid = Signal(range(self.n_warps))
         schedule_valid = Signal()
@@ -418,6 +422,20 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
             for i in range(self.n_warps):
                 with m.If(self.stall_req.bits.wid == i):
                     m.d.sync += stalled_warps[i].eq(self.stall_req.bits.stall)
+                    # An asynchronous-copy instruction parks its warp
+                    # until the cluster wakes it; only a wake may clear
+                    # the park.
+                    with m.If(self.stall_req.bits.stall
+                              & self.stall_req.bits.copy):
+                        m.d.sync += copy_warps[i].eq(1)
+
+        for i in range(self.n_warps):
+            with m.If(self.warp_wake[i]):
+                m.d.sync += copy_warps[i].eq(0)
+                # The wake releases a parked warp without disturbing a
+                # warp stalled for any other reason.
+                with m.If(copy_warps[i]):
+                    m.d.sync += stalled_warps[i].eq(0)
 
         #
         # IPDom stack
@@ -472,7 +490,8 @@ class WarpScheduler(HasCoreParams, AutoCSR, Elaboratable):
                             Mux(wspawn_valid[i], 1, thread_masks[i])),
                     ]
 
-        m.d.comb += self.busy.eq(active_warps.any() | self.warp_memory.any())
+        m.d.comb += self.busy.eq(active_warps.any() | self.warp_memory.any()
+                                 | copy_warps.any())
 
         return m
 
@@ -513,6 +532,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
         self.br_res = Valid(BranchResolution, params)
         self.warp_ctrl = Valid(WarpControlReq, params)
         self.warp_memory = Signal(self.n_warps)
+        self.warp_wake = Signal(self.n_warps)
         self.stack_ptrs = [
             Signal(range(self.ipdom_stack_depth + 1), name=f'stack_ptr{i}')
             for i in range(self.n_warps)
@@ -537,6 +557,7 @@ class IFStage(HasCoreParams, AutoCSR, Elaboratable):
             warp_sched.br_res.eq(self.br_res),
             warp_sched.warp_ctrl.eq(self.warp_ctrl),
             warp_sched.warp_memory.eq(self.warp_memory),
+            warp_sched.warp_wake.eq(self.warp_wake),
             self.busy.eq(warp_sched.busy),
         ]
         for stack_ptr, sched_stack_ptr in zip(self.stack_ptrs,

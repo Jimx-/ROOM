@@ -156,6 +156,9 @@ class UOpCode(IntEnum):
     GPU_PRED = 132
     GPU_RAST = 133
     GPU_WGATHER = 134
+    GPU_COPY_ISSUE = 135
+    GPU_COPY_WAIT = 136
+    GPU_COPY_STAT = 137
 
     # Zicond
     CZERO_EQZ = 160
@@ -344,6 +347,7 @@ class FUType(IntEnum):
     VEC = 2048
     F2IVEC = F2I | VEC
     WGATHER = 4096
+    COPY = 8192
 
 
 class PCSel(IntEnum):

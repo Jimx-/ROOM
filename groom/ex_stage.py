@@ -4,10 +4,11 @@ from amaranth.hdl.ast import ValueCastable
 
 from groom.fu import ExecReq, ExecResp, ALUUnit, MultiplierUnit, AddrGenUnit, \
     GPUControlUnit, WGatherUnit, DivUnit, IntToFPUnit, FPUUnit, FDivUnit, \
-    RasterUnit
+    RasterUnit, AsyncCopyUnit
 from groom.if_stage import BranchResolution, WarpControlReq
 from groom.csr import AutoCSR
 from groom.raster import RasterRequest
+from groom.async_copy import AsyncCopyLaunch, AsyncCopyWait
 
 from room.consts import *
 from room.types import HasCoreParams, MicroOp
@@ -78,6 +79,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         has_ifpu=False,
         has_gpu=False,
         has_raster=False,
+        has_copy=False,
         sim_debug=False,
     ):
         super().__init__(params)
@@ -94,6 +96,7 @@ class ExecUnit(HasCoreParams, Elaboratable):
         self.has_frm = has_ifpu or has_fpu
         self.has_gpu = has_gpu
         self.has_raster = has_raster
+        self.has_copy = has_copy
         self.sim_debug = sim_debug
 
         self.req = Decoupled(ExecReq, data_width, params)
@@ -121,6 +124,22 @@ class ExecUnit(HasCoreParams, Elaboratable):
 
         if has_raster:
             self.raster_req = Decoupled(RasterRequest, params)
+
+        if has_copy:
+            core_bits = max(1, Shape.cast(range(self.n_cores)).width)
+            self.copy_launch = Decoupled(AsyncCopyLaunch,
+                                         params,
+                                         core_id_width=core_bits)
+            self.copy_wait = Decoupled(AsyncCopyWait, params)
+            self.copy_ack_valid = Signal()
+            self.copy_ack_wid = Signal(range(self.n_warps))
+            self.copy_ack_reject = Signal()
+            self.copy_wake_valid = Signal()
+            self.copy_wake_wid = Signal(range(self.n_warps))
+            self.copy_wake_stale = Signal()
+            self.copy_wake_error = Signal()
+            self.copy_wake_done = Signal()
+            self.copy_warp_wake = Signal(self.n_warps)
 
         if has_mem:
             self.lsu_req = Decoupled(ExecResp, self.data_width, params)
@@ -159,6 +178,7 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                  params,
                  has_ifpu=False,
                  has_raster=False,
+                 has_copy=False,
                  sim_debug=False):
         super().__init__(params['xlen'],
                          params,
@@ -169,10 +189,14 @@ class ALUExecUnit(ExecUnit, AutoCSR):
                          has_ifpu=has_ifpu,
                          has_gpu=True,
                          has_raster=has_raster,
+                         has_copy=has_copy,
                          sim_debug=sim_debug)
 
         if has_raster:
             self._raster = RasterUnit(self.data_width, params)
+
+        if has_copy:
+            self._copy = AsyncCopyUnit(params)
 
         self.stack_ptrs = [
             Signal(range(self.ipdom_stack_depth + 1), name=f'stack_ptr{i}')
@@ -316,6 +340,38 @@ class ALUExecUnit(ExecUnit, AutoCSR):
             ]
             iresp_units.append(raster)
 
+        if self.has_copy:
+            copy = m.submodules.copy = self._copy
+            copy_busy = Signal()
+
+            copy_resp_busy = 0
+            for iu in iresp_units:
+                if isinstance(iu, Queue):
+                    copy_resp_busy |= iu.deq.valid
+                else:
+                    copy_resp_busy |= iu.resp.valid
+
+            m.d.comb += [
+                self.req.connect(copy.req),
+                copy.req.valid.eq(self.req.valid
+                                  &
+                                  (self.req.bits.uop.fu_type == FUType.COPY)),
+                copy.copy_launch.connect(self.copy_launch),
+                copy.copy_wait.connect(self.copy_wait),
+                copy.copy_ack_valid.eq(self.copy_ack_valid),
+                copy.copy_ack_wid.eq(self.copy_ack_wid),
+                copy.copy_ack_reject.eq(self.copy_ack_reject),
+                copy.copy_wake_valid.eq(self.copy_wake_valid),
+                copy.copy_wake_wid.eq(self.copy_wake_wid),
+                copy.copy_wake_stale.eq(self.copy_wake_stale),
+                copy.copy_wake_error.eq(self.copy_wake_error),
+                copy.copy_wake_done.eq(self.copy_wake_done),
+                self.copy_warp_wake.eq(copy.warp_wake),
+                copy.resp.ready.eq(~copy_resp_busy),
+                copy_busy.eq(~copy.req.ready),
+            ]
+            iresp_units.append(copy)
+
         for iu in reversed(iresp_units):
             if isinstance(iu, Queue):
                 with m.If(iu.deq.valid):
@@ -350,6 +406,9 @@ class ALUExecUnit(ExecUnit, AutoCSR):
             with m.Elif((self.req.bits.uop.fu_type == FUType.GPU)
                         & (self.req.bits.uop.opcode == UOpCode.GPU_RAST)):
                 m.d.comb += self.req.ready.eq(~raster_busy)
+        if self.has_copy:
+            with m.Elif(self.req.bits.uop.fu_type == FUType.COPY):
+                m.d.comb += self.req.ready.eq(~copy_busy)
 
         return m
 

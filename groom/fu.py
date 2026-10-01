@@ -1169,3 +1169,203 @@ class RasterUnit(IterativeFunctionalUnit, AutoCSR):
                     m.next = 'IDLE'
 
         return m
+
+
+class AsyncCopyUnit(IterativeFunctionalUnit):
+    """Execution unit for asynchronous-copy launch and token instructions.
+
+    A launch reads two warp-packed register vectors built by wgather: rs1
+    carries the launch words (destination offset, meta, source, length) in
+    lanes 0..3 and rs2 the pitched-2D geometry (ignored for 1D). Lane
+    values are consumed regardless of the active mask, matching the
+    gather's forced-write packing; the destination operand reaches the
+    command untruncated so the engine's bounds checks see every bit.
+    Token instructions read one uniform operand from the lowest active
+    lane. The issuing warp parks at decode and is released by the
+    cluster's launch acknowledgement or completion wake; an empty active
+    mask makes every copy instruction a no-op that offers nothing on the
+    cluster ports. Waits park per warp: each waiting warp keeps its own
+    parked bit, so completions for several waiters cannot be lost, and
+    the launch acknowledgement carries a reject status that becomes the
+    instruction's result.
+    """
+
+    def __init__(self, params):
+        # Deferred to break the fu -> async_copy -> lsu -> fu import
+        # cycle regardless of which module loads first.
+        from groom.async_copy import AsyncCopyLaunch, AsyncCopyWait
+
+        super().__init__(params['xlen'], params)
+
+        core_bits = max(1, Shape.cast(range(self.n_cores)).width)
+        self.copy_launch = Decoupled(AsyncCopyLaunch,
+                                     params,
+                                     core_id_width=core_bits)
+        self.copy_wait = Decoupled(AsyncCopyWait, params)
+
+        self.copy_ack_valid = Signal()
+        self.copy_ack_wid = Signal(range(self.n_warps))
+        self.copy_ack_reject = Signal()
+        self.copy_wake_valid = Signal()
+        self.copy_wake_wid = Signal(range(self.n_warps))
+        self.copy_wake_stale = Signal()
+        self.copy_wake_error = Signal()
+        self.copy_wake_done = Signal()
+
+        self.warp_wake = Signal(self.n_warps)
+
+    def elaborate(self, platform):
+        m = super().elaborate(platform)
+
+        uop = self.req.bits.uop
+
+        # meta word (rs1 lane 1): [3:0] token id, [4] generation,
+        # [5] mode (0 = 1D linear, 1 = pitched 2D).
+        meta = self.req.bits.rs1_data[1]
+
+        # Token word (rs1 lane 1): [3:0] token id, [4] generation.
+        token = Signal(32)
+        for w in reversed(range(self.n_threads)):
+            with m.If(uop.tmask[w]):
+                m.d.comb += token.eq(self.req.bits.rs1_data[w])
+
+        # One parked bit per warp: a warp can hold at most one
+        # outstanding wait (it stops fetching when parked), and distinct
+        # warps' completions wake through independent bits, so a second
+        # waiter can never overwrite the first one's wake tracking.
+        park_tab = Signal(self.n_warps)
+
+        stat_stale = Signal()
+        stat_error = Signal()
+        stat_done = Signal()
+
+        # Snapshot of the in-flight request: the ports may present a new
+        # request as soon as this one is accepted.
+        op_active = Signal()
+        op_query = Signal()
+        op_launch = Signal()
+        op_wid = Signal(range(self.n_warps))
+        op_reject = Signal()
+
+        with m.If(self.req.fire):
+            m.d.sync += [
+                op_active.eq(uop.tmask.any()),
+                op_query.eq(uop.opcode == UOpCode.GPU_COPY_STAT),
+                op_launch.eq(uop.opcode == UOpCode.GPU_COPY_ISSUE),
+                op_wid.eq(self.req.bits.wid),
+            ]
+
+        # An immediately answered wait (stale, retained, or a completion
+        # landing in the fire cycle itself) is answered combinationally
+        # and must release the scheduler park in that same cycle: the
+        # parked-wait registration only lands one cycle later, so the
+        # normal wake decode would miss it.
+        wait_answer_pulse = Signal()
+        m.d.comb += wait_answer_pulse.eq(0)
+
+        wake_hit = Signal()
+        m.d.comb += wake_hit.eq(self.copy_wake_valid
+                                & park_tab.bit_select(self.copy_wake_wid, 1))
+
+        for w in range(self.n_warps):
+            m.d.comb += self.warp_wake[w].eq(
+                (self.copy_ack_valid & (self.copy_ack_wid == w))
+                | (wake_hit & (self.copy_wake_wid == w))
+                | (wait_answer_pulse & (op_wid == w)))
+
+        with m.If(wake_hit):
+            m.d.sync += park_tab.bit_select(self.copy_wake_wid, 1).eq(0)
+
+        with m.FSM():
+            with m.State('IDLE'):
+                m.d.comb += self.req.ready.eq(1)
+
+                with m.If(self.req.fire):
+                    with m.Switch(uop.opcode):
+                        with m.Case(UOpCode.GPU_COPY_ISSUE):
+                            m.d.sync += [
+                                self.copy_launch.bits.cmd.id.eq(meta[:4]),
+                                self.copy_launch.bits.cmd.src_addr.eq(
+                                    self.req.bits.rs1_data[2][:32]),
+                                self.copy_launch.bits.cmd.dst_offset.eq(
+                                    self.req.bits.rs1_data[0][:32]),
+                                self.copy_launch.bits.cmd.nbytes.eq(
+                                    self.req.bits.rs1_data[3][:16]),
+                                self.copy_launch.bits.cmd.mode.eq(meta[5]),
+                                self.copy_launch.bits.cmd.src_base.eq(
+                                    self.req.bits.rs2_data[0][:32]),
+                                self.copy_launch.bits.cmd.row_count.eq(
+                                    self.req.bits.rs2_data[1][16:]),
+                                self.copy_launch.bits.cmd.row_bytes.eq(
+                                    self.req.bits.rs2_data[1][:16]),
+                                self.copy_launch.bits.cmd.g_stride.eq(
+                                    self.req.bits.rs2_data[2][16:]),
+                                self.copy_launch.bits.cmd.s_stride.eq(
+                                    self.req.bits.rs2_data[2][:16]),
+                                self.copy_launch.bits.gen.eq(meta[4]),
+                                self.copy_launch.bits.wid.eq(
+                                    self.req.bits.wid),
+                            ]
+                            m.next = 'LAUNCH'
+                        with m.Case(UOpCode.GPU_COPY_WAIT,
+                                    UOpCode.GPU_COPY_STAT):
+                            m.d.sync += [
+                                self.copy_wait.bits.id.eq(token[:4]),
+                                self.copy_wait.bits.gen.eq(token[4]),
+                                self.copy_wait.bits.query.eq(
+                                    uop.opcode == UOpCode.GPU_COPY_STAT),
+                                self.copy_wait.bits.wid.eq(self.req.bits.wid),
+                            ]
+                            m.next = 'WAIT'
+
+            with m.State('LAUNCH'):
+                # An empty active mask drops the command without ever
+                # offering it; the warp never parked, so nothing must be
+                # acknowledged. Otherwise the offer stays stable until
+                # the cluster accepts it, and the acknowledgement (which
+                # pulses in the accept or drop cycle itself) carries the
+                # launch's reject status.
+                m.d.comb += self.copy_launch.valid.eq(op_active)
+                with m.If(~op_active):
+                    m.d.sync += op_reject.eq(0)
+                    m.next = 'RESP'
+                with m.Elif(self.copy_launch.fire):
+                    m.d.sync += op_reject.eq(self.copy_ack_valid
+                                             & self.copy_ack_reject
+                                             & (self.copy_ack_wid == op_wid))
+                    m.next = 'RESP'
+
+            with m.State('WAIT'):
+                m.d.comb += self.copy_wait.valid.eq(op_active)
+                # Queries and stale waits are answered combinationally in
+                # the fire cycle itself, so their result must be captured
+                # now; a parked wait registers its warp and leaves via
+                # RESP, to be woken through the parked-wait table.
+                answered = (self.copy_wake_valid
+                            & (self.copy_wake_wid == op_wid))
+                with m.If(~op_active):
+                    m.next = 'RESP'
+                with m.Elif(self.copy_wait.fire):
+                    with m.If(op_query | answered):
+                        m.d.sync += [
+                            stat_stale.eq(~op_query | self.copy_wake_stale),
+                            stat_error.eq(self.copy_wake_error),
+                            stat_done.eq(self.copy_wake_done),
+                        ]
+                        with m.If(~op_query):
+                            m.d.comb += wait_answer_pulse.eq(1)
+                        m.next = 'RESP'
+                    with m.Else():
+                        m.d.sync += park_tab.bit_select(op_wid, 1).eq(1)
+                        m.next = 'RESP'
+
+            with m.State('RESP'):
+                m.d.comb += self.resp.valid.eq(1)
+                for t in range(self.n_threads):
+                    m.d.comb += self.resp.bits.data[t].eq(
+                        Mux(op_query, Cat(stat_done, stat_error, stat_stale),
+                            Mux(op_launch, op_reject, 0)))
+                with m.If(self.resp.fire):
+                    m.next = 'IDLE'
+
+        return m
