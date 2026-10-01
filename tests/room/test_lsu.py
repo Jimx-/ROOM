@@ -3,7 +3,7 @@ from amaranth.utils import log2_int
 import pytest
 
 from room.lsu import LoadGen, StoreGen
-from room.test import run_test
+from tests.sim import run_test
 
 
 def load_gen_unittest(dut, typ, addr, data_in, data_expected):

@@ -2,7 +2,7 @@ from amaranth.sim import Settle
 import pytest
 
 from room.utils import PopCount, FindFirstSet, SetBeforeFirst
-from room.test import run_test
+from tests.sim import run_test
 
 
 @pytest.mark.parametrize("n", [0, 1, 7, 8])

@@ -13,7 +13,7 @@ responder, cache, and bridge relies on:
   * ``Interface`` construction (``has_bce`` selects B/C/E, width params
     propagate) and ``connect()`` wiring (AD and BCE, both directions).
 
-Combinational checks use ``room.test.run_test`` (no clock, ``yield Settle()``);
+Combinational checks use ``tests.sim.run_test`` (no clock, ``yield Settle()``);
 the ``count()`` beat tracking is clocked (``sync=True``).
 """
 
@@ -24,7 +24,7 @@ from amaranth.sim import Settle
 from amaranth_soc.memory import MemoryMap
 
 from roomsoc.interconnect import tilelink
-from room.test import run_test
+from tests.sim import run_test
 
 
 # ===========================================================================

@@ -1,3 +1,5 @@
+"""Shared simulation helpers for the test suites."""
+
 from amaranth.sim import Simulator
 
 

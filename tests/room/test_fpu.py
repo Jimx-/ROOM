@@ -2,7 +2,7 @@ import struct
 
 from room.consts import RoundingMode
 from room.fpu import FPUOperator, FPFormat, IntFormat, FPUFMA, FPUDivSqrtMulti, FPUCastMulti
-from room.test import run_test
+from tests.sim import run_test
 
 
 def convert_float(f, typ, flen):

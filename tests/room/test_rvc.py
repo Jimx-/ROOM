@@ -2,7 +2,7 @@ from amaranth.sim import Settle
 import pytest
 
 from room.rvc import RVCDecoder
-from room.test import run_test
+from tests.sim import run_test
 
 import tinyrv
 

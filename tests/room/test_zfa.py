@@ -3,7 +3,7 @@ import struct
 from room.consts import RoundingMode
 from room.fpu import (FPUOperator, FPFormat, FPUComp, FPUCastMulti,
                       IntFormat)
-from room.test import run_test
+from tests.sim import run_test
 
 FLI_TABLES = FPUCastMulti._FLI_TABLES
 

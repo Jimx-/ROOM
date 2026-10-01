@@ -2,7 +2,7 @@ from amaranth.sim import Settle
 import pytest
 
 from room.alu import ALU, ALUOperator, ALUWidth, Multiplier, IntDiv
-from room.test import run_test
+from tests.sim import run_test
 
 
 def mask_xlen(data, xlen):
