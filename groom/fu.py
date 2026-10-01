@@ -1220,8 +1220,12 @@ class AsyncCopyUnit(IterativeFunctionalUnit):
         uop = self.req.bits.uop
 
         # meta word (rs1 lane 1): [3:0] token id, [4] generation,
-        # [5] mode (0 = 1D linear, 1 = pitched 2D).
+        # [5] mode (0 = 1D linear, 1 = pitched 2D), [6] completion target
+        # (transaction barrier; unsupported, must be zero), [7] receiver
+        # mode (broadcast), [11:8] barrier identity (only with [6]),
+        # [31:12] reserved, must be zero.
         meta = self.req.bits.rs1_data[1]
+        meta_drop = (meta[12:] != 0) | meta[6]
 
         # Token word (rs1 lane 1): [3:0] token id, [4] generation.
         token = Signal(32)
@@ -1246,6 +1250,7 @@ class AsyncCopyUnit(IterativeFunctionalUnit):
         op_launch = Signal()
         op_wid = Signal(range(self.n_warps))
         op_reject = Signal()
+        op_drop = Signal()
 
         with m.If(self.req.fire):
             m.d.sync += [
@@ -1253,6 +1258,8 @@ class AsyncCopyUnit(IterativeFunctionalUnit):
                 op_query.eq(uop.opcode == UOpCode.GPU_COPY_STAT),
                 op_launch.eq(uop.opcode == UOpCode.GPU_COPY_ISSUE),
                 op_wid.eq(self.req.bits.wid),
+                op_drop.eq((uop.opcode == UOpCode.GPU_COPY_ISSUE)
+                           & meta_drop),
             ]
 
         # An immediately answered wait (stale, retained, or a completion
@@ -1292,6 +1299,7 @@ class AsyncCopyUnit(IterativeFunctionalUnit):
                                 self.copy_launch.bits.cmd.nbytes.eq(
                                     self.req.bits.rs1_data[3][:16]),
                                 self.copy_launch.bits.cmd.mode.eq(meta[5]),
+                                self.copy_launch.bits.cmd.bcast.eq(meta[7]),
                                 self.copy_launch.bits.cmd.src_base.eq(
                                     self.req.bits.rs2_data[0][:32]),
                                 self.copy_launch.bits.cmd.row_count.eq(
@@ -1321,13 +1329,19 @@ class AsyncCopyUnit(IterativeFunctionalUnit):
             with m.State('LAUNCH'):
                 # An empty active mask drops the command without ever
                 # offering it; the warp never parked, so nothing must be
-                # acknowledged. Otherwise the offer stays stable until
-                # the cluster accepts it, and the acknowledgement (which
-                # pulses in the accept or drop cycle itself) carries the
-                # launch's reject status.
-                m.d.comb += self.copy_launch.valid.eq(op_active)
-                with m.If(~op_active):
-                    m.d.sync += op_reject.eq(0)
+                # acknowledged. A launch selecting an unimplemented
+                # completion target or nonzero reserved meta bits is
+                # dropped the same way — no command is offered, the
+                # result is the rejection code, and the park the decode
+                # took must be released in this cycle. Otherwise the
+                # offer stays stable until the cluster accepts it, and
+                # the acknowledgement (which pulses in the accept or
+                # drop cycle itself) carries the launch's reject status.
+                m.d.comb += self.copy_launch.valid.eq(op_active & ~op_drop)
+                with m.If(~op_active | op_drop):
+                    m.d.sync += op_reject.eq(op_drop)
+                    with m.If(op_drop & op_active):
+                        m.d.comb += wait_answer_pulse.eq(1)
                     m.next = 'RESP'
                 with m.Elif(self.copy_launch.fire):
                     m.d.sync += op_reject.eq(self.copy_ack_valid

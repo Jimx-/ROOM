@@ -32,12 +32,15 @@ class AsyncCopyCmd(HasCoreParams, ValueCastable):
         self.row_bytes = Signal(16, name=f'{name}_row_bytes')
         self.g_stride = Signal(16, name=f'{name}_g_stride')
         self.s_stride = Signal(16, name=f'{name}_s_stride')
+        # Receiver mode: 0 routes every fragment to `core`; 1 replays each
+        # fragment to every core's shared memory at the same offset.
+        self.bcast = Signal(name=f'{name}_bcast')
 
     @ValueCastable.lowermethod
     def as_value(self):
         return Cat(self.id, self.core, self.src_addr, self.nbytes,
                    self.dst_offset, self.mode, self.src_base, self.row_count,
-                   self.row_bytes, self.g_stride, self.s_stride)
+                   self.row_bytes, self.g_stride, self.s_stride, self.bcast)
 
     def shape(self):
         return self.as_value().shape()
@@ -183,6 +186,9 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
         q_ss = [
             Signal(16, name=f'cmd_q_ss{i}') for i in range(cmd_queue_depth)
         ]
+        q_bcast = [
+            Signal(name=f'cmd_q_bcast{i}') for i in range(cmd_queue_depth)
+        ]
         q_head = Signal(range(cmd_queue_depth))
         q_tail = Signal(range(cmd_queue_depth))
         q_count = Signal(range(cmd_queue_depth + 1))
@@ -198,6 +204,7 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
         q_rbytes_arr = Array(q_rbytes)
         q_gs_arr = Array(q_gs)
         q_ss_arr = Array(q_ss)
+        q_bcast_arr = Array(q_bcast)
 
         m.d.comb += self.cmd.ready.eq(q_count != cmd_queue_depth)
         with m.If(self.cmd.fire):
@@ -216,6 +223,7 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
                             q_rbytes[i].eq(self.cmd.bits.row_bytes),
                             q_gs[i].eq(self.cmd.bits.g_stride),
                             q_ss[i].eq(self.cmd.bits.s_stride),
+                            q_bcast[i].eq(self.cmd.bits.bcast),
                         ]
             m.d.sync += q_tail.eq((q_tail + 1) % cmd_queue_depth)
 
@@ -235,6 +243,12 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
         xfer_valid = Signal()
         xfer_id = Signal(DMA_ID_WIDTH)
         xfer_core = Signal(self.core_bits)
+        xfer_bcast = Signal()
+        # Broadcast replay cursor: the receiver currently being offered a
+        # fragment. It advances only when that receiver accepts, so a
+        # backpressured endpoint holds the fragment exactly like a stalled
+        # unicast offer.
+        xfer_rx = Signal(self.core_bits)
         xfer_failed = Signal()
         xfer_src = Signal(32)
         xfer_end = Signal(33)
@@ -316,6 +330,8 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
                     xfer_valid.eq(1),
                     xfer_id.eq(q_id_arr[q_head]),
                     xfer_core.eq(q_core_arr[q_head]),
+                    xfer_bcast.eq(q_bcast_arr[q_head]),
+                    xfer_rx.eq(0),
                     xfer_src.eq(head_src0),
                     xfer_end.eq(head_row_end),
                     xfer_dst.eq(q_dst_arr[q_head]),
@@ -511,9 +527,15 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
 
         frag_empty = drain_pick_valid & (raw_mask == 0)
 
+        # A unicast fragment has exactly one receiver (`xfer_core`); a
+        # broadcast fragment is replayed to every core in turn before the
+        # slot may advance.
+        rx_sel = Mux(xfer_bcast, xfer_rx, xfer_core)
+        rx_last = ~xfer_bcast | (xfer_rx == self.n_cores - 1)
+
         offer_valid = drain_pick_valid & (raw_mask != 0)
         for c in range(self.n_cores):
-            with m.Switch(xfer_core):
+            with m.Switch(rx_sel):
                 with m.Case(c):
                     m.d.comb += [
                         self.dma_req[c].valid.eq(offer_valid),
@@ -525,13 +547,24 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
 
         offer_fire = offer_valid & Cat(*[port.fire
                                          for port in self.dma_req]).any()
+        frag_done = offer_fire & rx_last
 
-        with m.If(offer_valid & ~offer_fire):
-            m.d.sync += [drain_locked.eq(1), drain_slot.eq(drain_pick)]
-        with m.If(offer_fire):
-            m.d.sync += drain_locked.eq(0)
+        # The picked slot stays locked for the whole fragment: under
+        # broadcast an intermediate receiver's acceptance is not fragment
+        # completion, and letting the rotation switch slots mid-fragment
+        # would pair the retained replay cursor with another slot's data.
+        with m.If(offer_valid):
+            m.d.sync += [
+                drain_locked.eq(~frag_done),
+                drain_slot.eq(drain_pick),
+            ]
 
-        drain_advance = frag_empty | offer_fire
+        with m.If(frag_done | frag_empty):
+            m.d.sync += xfer_rx.eq(0)
+        with m.Elif(offer_fire):
+            m.d.sync += xfer_rx.eq(xfer_rx + 1)
+
+        drain_advance = frag_empty | frag_done
 
         drain_release_terms = []
         for p in range(self.n_slots):
@@ -550,14 +583,19 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
         drain_release = Cat(*drain_release_terms).any() \
             if drain_release_terms else Const(0)
 
-        commit_fire = Cat(*[port.fire for port in self.dma_commit]).any()
+        # Every accepted offer — one per receiver for a broadcast fragment
+        # — produces exactly one commit event, and several cores may commit
+        # in the same cycle, so the outstanding-fragment count moves by the
+        # number of firing commit ports.
+        commit_fires = Signal(range(self.n_cores + 1))
+        m.d.comb += commit_fires.eq(sum(port.fire for port in self.dma_commit))
         for port in self.dma_commit:
             m.d.comb += port.ready.eq(1)
 
         m.d.sync += [
             lines_out.eq(lines_out + (can_issue & a_fire) - err_release -
                          drain_release),
-            frags_out.eq(frags_out + offer_fire - commit_fire),
+            frags_out.eq(frags_out + offer_fire - commit_fires),
         ]
 
         #
