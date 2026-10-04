@@ -49,6 +49,16 @@ class AsyncCopyCmd(HasCoreParams, ValueCastable):
         return len(Value.cast(self))
 
     def eq(self, rhs):
+        if isinstance(rhs, AsyncCopyCmd):
+            # Core ports use system-wide IDs; cluster ports use local IDs.
+            # A packed assignment across those widths shifts every later
+            # field, corrupting the address, length, and launch identity.
+            return [
+                getattr(self, field).eq(getattr(rhs, field))
+                for field in ('id', 'core', 'src_addr', 'nbytes', 'dst_offset',
+                              'mode', 'src_base', 'row_count', 'row_bytes',
+                              'g_stride', 's_stride', 'bcast')
+            ]
         return Value.cast(self).eq(Value.cast(rhs))
 
 
@@ -465,11 +475,14 @@ class AsyncCopyEngine(HasCoreParams, Elaboratable):
         for i in range(self.n_slots):
             beat_done = d_fire & (d_slot == i) & (slot_beats[i] == beats - 1)
             with m.If(d_fire & (d_slot == i)):
-                m.d.sync += [
-                    slot_data[i].word_select(slot_beats[i],
-                                             64).eq(self.mem_bus.d.bits.data),
-                    slot_beats[i].eq(slot_beats[i] + 1),
-                ]
+                # The counter also represents completion (beats). Explicit
+                # cases avoid out-of-range dynamic-write temporaries in RTL.
+                with m.Switch(slot_beats[i]):
+                    for beat in range(beats):
+                        with m.Case(beat):
+                            m.d.sync += slot_data[i].word_select(beat, 64).eq(
+                                self.mem_bus.d.bits.data)
+                m.d.sync += slot_beats[i].eq(slot_beats[i] + 1)
                 with m.If(d_bad):
                     m.d.sync += [
                         slot_bad[i].eq(1),
@@ -671,6 +684,12 @@ class AsyncCopyLaunch(HasCoreParams, ValueCastable):
         return len(Value.cast(self))
 
     def eq(self, rhs):
+        if isinstance(rhs, AsyncCopyLaunch):
+            return [
+                self.cmd.eq(rhs.cmd),
+                self.gen.eq(rhs.gen),
+                self.wid.eq(rhs.wid)
+            ]
         return Value.cast(self).eq(Value.cast(rhs))
 
 

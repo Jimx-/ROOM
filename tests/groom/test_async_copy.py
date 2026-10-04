@@ -14,7 +14,11 @@
   checking local/remote source ranges, stalled writes, and lane-load
   visibility after completion;
 * a ``Cluster`` wrapper test proving the copy source-ID construction and
-  D-channel demultiplexing with the cores and DCache held in reset.
+  D-channel demultiplexing with the cores and DCache held in reset;
+* a launch-port width-crossing test reproducing the wrapper's core-to-
+  completion connection under multi-cluster geometry, where the command
+  core field is two bits wide on the core side and one bit wide on the
+  cluster side.
 
 All processes honour the amaranth ``pysim`` clock model documented in
 AGENTS.md: only a naked ``yield`` advances the clock, and signal reads/writes
@@ -29,7 +33,7 @@ import pytest
 from amaranth import *
 from amaranth.sim import Simulator
 
-from groom.async_copy import AsyncCopyEngine
+from groom.async_copy import AsyncCopyCompletion, AsyncCopyEngine, AsyncCopyLaunch
 from groom.lsu import SharedMemory
 from room.consts import MemoryCommand
 from room.dcache import DCache
@@ -1723,5 +1727,127 @@ def test_cluster_copy_d_response_demux():
         offer(0x51, 1, True)  # copy class: slot 1
         offer(0x01, 0, False)  # dbus class: the DCache's response
         offer(0x40, 0, False)  # instruction class, core 1: no marker
+
+    _run(top, driver)
+
+
+class LaunchPortCrossingTop(Elaboratable):
+    """The wrapper's per-core launch wiring reproduced under pysim.
+
+    ``Cluster`` connects each core's ``copy_launch`` port — whose command
+    core field ``groom/core.py`` sizes for system-wide core IDs — to the
+    completion unit's ``launch[i]``, which ``groom/wrapper.py`` sizes for
+    cluster-local IDs. The cores cannot run under pysim, so this top
+    performs that exact connection under the production multi-cluster
+    geometry and the testbench drives the core side.
+    """
+
+    def __init__(self, params, n_clusters, n_cores_per_cluster):
+        core_bits = max(
+            1,
+            Shape.cast(range(n_clusters * n_cores_per_cluster)).width)
+        self.core_launch = [
+            Decoupled(AsyncCopyLaunch,
+                      params,
+                      core_id_width=core_bits,
+                      name=f'tb_core_launch{i}')
+            for i in range(n_cores_per_cluster)
+        ]
+        cluster_bits = max(1, Shape.cast(range(n_cores_per_cluster)).width)
+        self.completion = AsyncCopyCompletion(n_cores_per_cluster,
+                                              params,
+                                              core_id_width=cluster_bits)
+
+    def elaborate(self, platform):
+        m = Module()
+        completion = m.submodules.completion = self.completion
+        m.d.comb += completion.done_out.ready.eq(1)
+        for i, port in enumerate(self.core_launch):
+            m.d.comb += port.connect(completion.launch[i])
+        return m
+
+
+def test_cluster_launch_port_core_id_width_crossing():
+    """A launch crosses the core/cluster core-ID width boundary intact.
+
+    With two clusters of two cores the core-side launch port carries a
+    two-bit system-wide core field while the cluster-side completion port
+    carries one bit. The packed ``AsyncCopyCmd`` assignment such a
+    connection used to perform shifted every field after the core ID by
+    the width difference, so an instruction-driven ``src=0x80000000,
+    nbytes=256`` launch reached the engine as a different address with an
+    odd length; only instruction-driven Verilator runs through the real
+    ``Cluster`` exposed it, because every pysim harness either drove the
+    engine/completion units directly or used single-cluster widths. The
+    completion unit rewrites the core field from the port index, so the
+    surviving fields are the observable contract: every one of them must
+    arrive exactly as launched.
+    """
+    params = _params()
+    top = LaunchPortCrossingTop(params, n_clusters=2, n_cores_per_cluster=2)
+    completion = top.completion
+
+    # The geometry really is the hazardous one: the two port flavors of
+    # the same command carry different core-field widths.
+    assert len(top.core_launch[0].bits.cmd.core) == 2
+    assert len(completion.launch[0].bits.cmd.core) == 1
+
+    sent = dict(id=5,
+                src_addr=0x80000001,
+                nbytes=0x8001,
+                dst_offset=0x40000002,
+                mode=1,
+                src_base=0x7FFFFFF0,
+                row_count=0x1234,
+                row_bytes=0x5678,
+                g_stride=0x9ABC,
+                s_stride=0xDEF0,
+                bcast=1)
+
+    def driver():
+        launch = top.core_launch[0]
+        cmd = launch.bits.cmd
+        yield cmd.id.eq(sent['id'])
+        yield cmd.core.eq(0b10)  # system-wide pattern; unused downstream
+        for field in ('src_addr', 'nbytes', 'dst_offset', 'mode', 'src_base',
+                      'row_count', 'row_bytes', 'g_stride', 's_stride',
+                      'bcast'):
+            yield getattr(cmd, field).eq(sent[field])
+        yield launch.bits.gen.eq(0)
+        yield launch.bits.wid.eq(2)
+        yield completion.cmd.ready.eq(1)
+        yield launch.valid.eq(1)
+        yield
+
+        for _ in range(8):
+            if (yield completion.cmd.valid):
+                break
+            assert not (yield completion.ack_valid[0]), \
+                'launch was rejected: the command identity corrupted ' \
+                'while crossing the width mismatch'
+            yield
+        else:
+            raise AssertionError('launch was never serviced')
+
+        assert (yield launch.ready)
+        assert (yield completion.ack_valid[0])
+        assert (yield completion.ack_wid[0]) == 2
+        assert not (yield completion.ack_reject[0])
+
+        got = {'core': (yield completion.cmd.bits.core)}
+        for field in sent:
+            got[field] = (yield getattr(completion.cmd.bits, field))
+        assert got['core'] == 0, \
+            'the completion unit must rewrite core as the port index'
+        for field, value in sent.items():
+            assert got[field] == value, \
+                f'{field} crossed the port as {got[field]:#x}, ' \
+                f'expected {value:#x}'
+
+        yield  # fire the command; the absent engine keeps cmd.ready high
+        yield launch.valid.eq(0)
+        yield
+        assert (yield completion.busy), \
+            'the accepted launch must hold its token in flight'
 
     _run(top, driver)

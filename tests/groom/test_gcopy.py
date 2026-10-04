@@ -34,7 +34,7 @@ from amaranth.sim import Settle
 from room.consts import FUType, IssueQueueType, RegisterType, UOpCode
 from room.exc import Cause
 
-from groom.async_copy import AsyncCopyCompletion, AsyncCopyEngine
+from groom.async_copy import AsyncCopyCompletion, AsyncCopyEngine, AsyncCopyLaunch
 from groom.core import Core
 from groom.id_stage import DecodeUnit
 
@@ -522,6 +522,54 @@ def test_completion_wait_parks_until_done():
                                     gen=0,
                                     query=1)
         assert res == (1, 0, 0, 0, 1)
+
+    run_test(comp, driver, sync=True)
+
+
+def test_completion_flight_query_answers_without_parking():
+    """A query on an in-flight token answers at once with zero status.
+
+    The engine's response is withheld here (controlled latency), so a
+    query that parked would hang its requester. The answer must be an
+    immediate all-zero status — no stale (the token is live), no done,
+    no error — and it must neither consume the token nor disturb the
+    parking wait that follows. This is the architectural property the
+    CUDA polling pattern relies on; the RTL harness pins it
+    deterministically where a fast simulated copy could already have
+    completed before a poll.
+    """
+    comp = _CompTop(_params()).comp
+
+    def driver():
+        yield comp.cmd.ready.eq(1)
+        yield from _send_launch(comp.launch[0], comp, 0, wid=1, tid=2, gen=0)
+
+        # No done has arrived: the token is FLIGHT. Queries answer at
+        # once with all-zero status and stay answerable.
+        for wid in (1, 2):
+            res = yield from _send_wait(comp.wait[0],
+                                        comp,
+                                        0,
+                                        wid=wid,
+                                        tid=2,
+                                        gen=0,
+                                        query=1)
+            assert res == (1, wid, 0, 0, 0), \
+                'FLIGHT query must answer immediately, not park or go stale'
+
+        # A true wait on the still-flight token still parks: no immediate
+        # wake, and the withheld completion later resolves it.
+        res = yield from _send_wait(comp.wait[0],
+                                    comp,
+                                    0,
+                                    wid=3,
+                                    tid=2,
+                                    gen=0,
+                                    query=0)
+        assert res[0] == 0, 'wait on FLIGHT must park, not answer'
+
+        res = yield from _send_done(comp.done, comp, 0, tid=2, error=0)
+        assert res == (1, 3, 0, 0, 1)
 
     run_test(comp, driver, sync=True)
 
@@ -1864,3 +1912,49 @@ def test_core_gcopy_program_end_to_end():
               done,
               release=release), driver, monitor,
         _proc(_watchdog, done, limit=30000))
+
+
+@pytest.mark.parametrize('source_width,dest_width', [(2, 1), (1, 2)])
+def test_launch_connection_preserves_fields_across_core_id_widths(
+        source_width, dest_width):
+    # The default wrapper has four system cores, two per cluster. Exercise
+    # the actual packed launch connection, including the trailing gen/wid.
+    from amaranth.sim import Simulator
+    from roomsoc.interconnect.stream import Decoupled
+
+    params = _params()
+    source = Decoupled(AsyncCopyLaunch, params, core_id_width=source_width)
+    dest = Decoupled(AsyncCopyLaunch, params, core_id_width=dest_width)
+    m = Module()
+    m.d.comb += source.connect(dest)
+    values = dict(id=5,
+                  core=1,
+                  src_addr=0x80000000,
+                  nbytes=256,
+                  dst_offset=0x120,
+                  mode=1,
+                  src_base=0x81234560,
+                  row_count=8,
+                  row_bytes=16,
+                  g_stride=64,
+                  s_stride=32,
+                  bcast=1)
+
+    def process():
+        for field, value in values.items():
+            yield getattr(source.bits.cmd, field).eq(value)
+        yield source.bits.gen.eq(1)
+        yield source.bits.wid.eq(3)
+        yield source.valid.eq(1)
+        yield dest.ready.eq(1)
+        yield Settle()
+        for field, value in values.items():
+            assert (yield getattr(dest.bits.cmd, field)) == value, field
+        assert (yield dest.bits.gen) == 1
+        assert (yield dest.bits.wid) == 3
+        assert (yield dest.valid)
+        assert (yield source.ready)
+
+    sim = Simulator(m)
+    sim.add_process(process)
+    sim.run()
