@@ -429,9 +429,16 @@ class Ipv4Handler(Elaboratable):
         dispatcher = m.submodules.dispatcher = Ipv4Dispatcher(
             data_width=self.data_width)
 
-        udp_queue = m.submodules.udp_queue = Queue(2, self.udp_data_out)
+        # Terminate the MAC/header-parser combinational path here. Both
+        # copies remain coupled at enqueue, but neither may bypass an empty
+        # queue into the UDP/RoCE parsers (including the RX CRC compactor).
+        udp_queue = m.submodules.udp_queue = Queue(2,
+                                                   self.udp_data_out,
+                                                   flow=False)
         m.d.comb += udp_queue.deq.connect(self.udp_data_out)
-        roce_queue = m.submodules.roce_queue = Queue(2, self.roce_data_out)
+        roce_queue = m.submodules.roce_queue = Queue(2,
+                                                     self.roce_data_out,
+                                                     flow=False)
         m.d.comb += roce_queue.deq.connect(self.roce_data_out)
 
         m.d.comb += [

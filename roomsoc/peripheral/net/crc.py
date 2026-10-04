@@ -8,18 +8,6 @@ from .common import *
 __all__ = ("Crc", )
 
 
-def _crc_table(width, polynomial):
-    """Build a byte lookup table for a reflected CRC."""
-    mask = (1 << width) - 1
-    table = []
-    for n in range(256):
-        c = n
-        for _ in range(8):
-            c = (c >> 1) ^ polynomial if (c & 1) else (c >> 1)
-        table.append(c & mask)
-    return table
-
-
 class CrcExtract(Elaboratable):
 
     def __init__(self, data_width):
@@ -124,8 +112,8 @@ class CrcCalculate(Elaboratable):
 
         crc_mask = (1 << crc_width) - 1
         for name, value in (("polynomial", polynomial),
-                            ("initial_value", initial_value),
-                            ("final_xor", final_xor)):
+                            ("initial_value", initial_value), ("final_xor",
+                                                               final_xor)):
             if not 0 <= value <= crc_mask:
                 raise ValueError(f"{name} must fit in crc_width bits")
 
@@ -148,60 +136,93 @@ class CrcCalculate(Elaboratable):
 
         crc = Signal(self.crc_width, reset=self.initial_value)
 
-        q_in = m.submodules.q_in = Queue(2, self.data_in, flow=False)
-        m.d.comb += self.data_in.connect(q_in.enq)
+        # Compact the valid bytes before the input register boundary. The
+        # original beat is carried separately so sparse keep and user metadata
+        # pass through unchanged. Prefix counts avoid a serial byte-mux chain.
+        byte_count = self.data_width // 8
+        q_in = m.submodules.q_in = Queue(
+            2,
+            Record, [
+                ("beat", self.data_in.bits.layout),
+                ("packed", self.data_width),
+                ("count", range(byte_count + 1)),
+            ],
+            flow=False)
+        m.d.comb += [
+            q_in.enq.valid.eq(self.data_in.valid),
+            self.data_in.ready.eq(q_in.enq.ready),
+            q_in.enq.bits.beat.eq(self.data_in.bits),
+            q_in.enq.bits.count.eq(sum(self.data_in.bits.keep)),
+        ]
+        prefixes = []
+        for lane in range(byte_count):
+            prefix = Signal(range(byte_count + 1), name=f"prefix{lane}")
+            m.d.comb += prefix.eq(sum(self.data_in.bits.keep[:lane]))
+            prefixes.append(prefix)
+        for slot in range(byte_count):
+            selected = Const(0, 8)
+            for lane in range(slot, byte_count):
+                selected = selected | Mux(
+                    self.data_in.bits.keep[lane] & (prefixes[lane] == slot),
+                    self.data_in.bits.data.word_select(lane, 8), 0)
+            m.d.comb += q_in.enq.bits.packed.word_select(slot, 8).eq(selected)
 
         q_out = m.submodules.q_out = Queue(2, self.data_out, flow=False)
         m.d.comb += q_out.deq.connect(self.data_out)
 
-        crc_queue = m.submodules.crc_queue = Queue(2, Signal, self.crc_width)
+        # Keep the parallel CRC calculation on the input side of a
+        # register boundary; bypass would extend it through CRC insertion
+        # and into the transmit data FIFO. q_out is registered as well,
+        # so the final data beat and its CRC remain available together.
+        crc_queue = m.submodules.crc_queue = Queue(2,
+                                                   Signal,
+                                                   self.crc_width,
+                                                   flow=False)
         m.d.comb += crc_queue.deq.connect(self.crc)
 
         m.d.comb += [
-            q_in.deq.connect(q_out.enq),
+            q_out.enq.bits.eq(q_in.deq.bits.beat),
             q_out.enq.valid.eq(q_in.deq.valid
-                               & (~q_in.deq.bits.last
+                               & (~q_in.deq.bits.beat.last
                                   | crc_queue.enq.ready)),
             q_in.deq.ready.eq(q_out.enq.ready
-                              & (~q_in.deq.bits.last | crc_queue.enq.ready)),
+                              & (~q_in.deq.bits.beat.last
+                                 | crc_queue.enq.ready)),
         ]
 
         crc_next = Signal.like(crc)
         m.d.comb += crc_queue.enq.bits.eq(crc_next ^ self.final_xor)
 
-        # Each byte advances the reflected CRC by one asynchronous table
-        # lookup instead of eight serial bit shifts.
-        crc_mem = Memory(width=self.crc_width,
-                         depth=256,
-                         init=_crc_table(self.crc_width, self.polynomial))
-
-        crc_bytes = [
-            Signal(self.crc_width, name=f'crc_byte{i}')
-            for i in range(self.data_width // 8 + 1)
-        ]
-        m.d.comb += crc_bytes[0].eq(crc)
-
-        crc_ports = [
-            crc_mem.read_port(domain="comb")
-            for _ in range(self.data_width // 8)
-        ]
-        for i, port in enumerate(crc_ports):
-            setattr(m.submodules, f"crc_port{i}", port)
-            m.d.comb += port.addr.eq(
-                crc_bytes[i][:8]
-                ^ q_in.deq.bits.data[i * 8:(i + 1) * 8])
+        # CRC is linear over GF(2). Expand the whole beat at elaboration
+        # time into XOR masks instead of cascading eight asynchronous ROMs
+        # and keep muxes. Each possible packed length has a parallel XOR
+        # network; the registered byte count selects the result. This keeps
+        # the feedback recurrence within one cycle (one beat per cycle).
+        inputs = Cat(crc, q_in.deq.bits.packed)
+        masks = [1 << bit for bit in range(self.crc_width)]
+        candidates = [crc]
+        for lane in range(byte_count):
+            for bit in range(8):
+                feedback = masks[0] ^ (1 << (self.crc_width + lane * 8 + bit))
+                masks = masks[1:] + [0]
+                masks = [
+                    mask ^ feedback if (self.polynomial >> out) & 1 else mask
+                    for out, mask in enumerate(masks)
+                ]
+            candidate = Signal(self.crc_width, name=f"crc_length{lane + 1}")
+            for out, mask in enumerate(masks):
+                terms = [
+                    inputs[bit] for bit in range(len(inputs))
+                    if (mask >> bit) & 1
+                ]
+                m.d.comb += candidate[out].eq(Cat(*terms).xor())
+            candidates.append(candidate)
+        m.d.comb += crc_next.eq(Array(candidates)[q_in.deq.bits.count])
 
         with m.If(q_in.deq.fire):
-            for i, port in enumerate(crc_ports):
-                updated = port.data ^ (crc_bytes[i] >> 8)
-                m.d.comb += crc_bytes[i + 1].eq(
-                    Mux(q_in.deq.bits.keep[i], updated, crc_bytes[i]))
-
-            m.d.comb += [
-                crc_next.eq(crc_bytes[-1]),
-                crc_queue.enq.valid.eq(q_in.deq.bits.last),
-            ]
-            m.d.sync += crc.eq(Mux(q_in.deq.bits.last, crc.reset, crc_next))
+            m.d.comb += crc_queue.enq.valid.eq(q_in.deq.bits.beat.last)
+            m.d.sync += crc.eq(
+                Mux(q_in.deq.bits.beat.last, crc.reset, crc_next))
 
         return m
 

@@ -37,9 +37,14 @@ class Rocev2Stack(Elaboratable):
         m = Module()
 
         icrc = m.submodules.icrc = Crc(data_width=self.data_width)
+
+        tx_out_buf = m.submodules.tx_out_buf = Queue(2,
+                                                     self.tx_data_out,
+                                                     flow=False)
         m.d.comb += [
             self.rx_data_in.connect(icrc.rx_data_in),
-            icrc.tx_data_out.connect(self.tx_data_out),
+            icrc.tx_data_out.connect(tx_out_buf.enq),
+            tx_out_buf.deq.connect(self.tx_data_out),
         ]
 
         udp_stack = m.submodules.udp_stack = UdpStack(
@@ -53,6 +58,11 @@ class Rocev2Stack(Elaboratable):
 
         ib_stack = m.submodules.ib_stack = InfiniBandTransportProtocol(
             data_width=self.data_width, port=self.port)
+
+        tx_udp_buf = m.submodules.tx_udp_buf = Queue(2,
+                                                     udp_stack.tx_data_in,
+                                                     flow=False)
+
         m.d.comb += [
             self.conn_req.connect(ib_stack.conn_req),
             udp_stack.rx_data_out.connect(ib_stack.rx_data_in),
@@ -61,7 +71,8 @@ class Rocev2Stack(Elaboratable):
             ib_stack.mem_write_cmd.connect(self.mem_write_cmd),
             ib_stack.mem_write_data.connect(self.mem_write_data),
             ib_stack.mem_write_done.eq(self.mem_write_done),
-            ib_stack.tx_data_out.connect(udp_stack.tx_data_in),
+            ib_stack.tx_data_out.connect(tx_udp_buf.enq),
+            tx_udp_buf.deq.connect(udp_stack.tx_data_in),
             ib_stack.tx_meta_out.connect(udp_stack.tx_meta_in),
         ]
 

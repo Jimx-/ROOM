@@ -2,7 +2,7 @@ import pytest
 from amaranth.sim import Simulator
 
 from roomsoc.peripheral.net.crc import (CrcCalculate, CrcExtract, CrcInsert,
-                                       _crc_table)
+                                        _crc_table)
 
 
 def _crc_ref(data, width, polynomial, initial_value, final_xor):
@@ -10,8 +10,7 @@ def _crc_ref(data, width, polynomial, initial_value, final_xor):
     for byte in data:
         crc ^= byte
         for _ in range(8):
-            crc = ((crc >> 1) ^ polynomial
-                   if crc & 1 else crc >> 1)
+            crc = ((crc >> 1) ^ polynomial if crc & 1 else crc >> 1)
     return crc ^ final_xor
 
 
@@ -20,10 +19,13 @@ def _beats(payload, bytes_per_beat, user=0):
     for offset in range(0, len(payload), bytes_per_beat):
         chunk = payload[offset:offset + bytes_per_beat]
         beats.append({
-            "data": sum(byte << (8 * i) for i, byte in enumerate(chunk)),
+            "data":
+            sum(byte << (8 * i) for i, byte in enumerate(chunk)),
             "keep": (1 << len(chunk)) - 1,
-            "last": offset + len(chunk) == len(payload),
-            "user": user,
+            "last":
+            offset + len(chunk) == len(payload),
+            "user":
+            user,
         })
     return beats
 
@@ -41,15 +43,18 @@ def test_crc_table_matches_bitwise_step_for_every_byte():
         for byte, actual in enumerate(table):
             expected = byte
             for _ in range(8):
-                expected = ((expected >> 1) ^ polynomial
-                            if expected & 1 else expected >> 1)
+                expected = ((expected >> 1) ^ polynomial if expected
+                            & 1 else expected >> 1)
             assert actual == expected
 
 
-@pytest.mark.parametrize("data_width,width,polynomial,initial_value,final_xor", [
-    (64, 32, 0xedb88320, 0xffffffff, 0xffffffff),
-    (24, 16, 0xa001, 0x0000, 0x0000),
-])
+@pytest.mark.parametrize("data_width,width,polynomial,initial_value,final_xor",
+                         [
+                             (64, 32, 0xedb88320, 0xffffffff, 0xffffffff),
+                             (24, 16, 0xa001, 0x0000, 0x0000),
+                             (8, 8, 0x8c, 0xa5, 0x5a),
+                             (16, 8, 0, 0xff, 0xff),
+                         ])
 def test_crc_calculate_generic_parameters(data_width, width, polynomial,
                                           initial_value, final_xor):
     payload = b"123456789"
@@ -90,13 +95,35 @@ def test_crc_calculate_generic_parameters(data_width, width, polynomial,
     sim.run()
 
 
-def test_crc_calculate_packet_boundaries_keep_and_backpressure():
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("stalled", [False, True])
+def test_crc_calculate_packet_boundaries_keep_and_backpressure(
+        sparse, stalled):
     packets = [bytes(range(length)) for length in range(1, 18)]
     expected_beats = [
-        beat
-        for packet_id, packet in enumerate(packets)
+        beat for packet_id, packet in enumerate(packets)
         for beat in _beats(packet, 8, user=packet_id)
     ]
+    if sparse:
+        # Exercise all keep masks, including empty beats, with packet resets
+        # and feedback across beats. Nonzero invalid lanes must be ignored.
+        expected_beats = []
+        packets = []
+        for mask in range(256):
+            packet = bytearray()
+            for lane_mask, last in ((0xff, False), (mask, False), (255 - mask,
+                                                                   True)):
+                data = bytes(
+                    (mask * 19 + lane * 37) & 0xff for lane in range(8))
+                packet.extend(byte for lane, byte in enumerate(data)
+                              if lane_mask & (1 << lane))
+                expected_beats.append({
+                    "data": int.from_bytes(data, "little"),
+                    "keep": lane_mask,
+                    "last": last,
+                    "user": mask,
+                })
+            packets.append(packet)
     expected_crcs = [
         _crc_ref(packet, 32, 0xedb88320, 0xffffffff, 0xffffffff)
         for packet in packets
@@ -104,6 +131,7 @@ def test_crc_calculate_packet_boundaries_keep_and_backpressure():
     dut = CrcCalculate(data_width=64, user_width=8)
     output_beats = []
     output_crcs = []
+    output_cycles = []
 
     def tx_process():
         for beat in expected_beats:
@@ -118,21 +146,22 @@ def test_crc_calculate_packet_boundaries_keep_and_backpressure():
         yield dut.data_in.valid.eq(0)
 
     def rx_process():
-        for cycle in range(300):
-            yield dut.data_out.ready.eq(cycle % 4 != 0)
-            if ((yield dut.data_out.valid)
-                    and (yield dut.data_out.ready)):
+        for cycle in range(3000 if sparse else 300):
+            yield dut.data_out.ready.eq(not stalled or cycle % 4 != 0)
+            if ((yield dut.data_out.valid) and (yield dut.data_out.ready)):
+                output_cycles.append(cycle)
                 output_beats.append({
                     "data": (yield dut.data_out.bits.data),
                     "keep": (yield dut.data_out.bits.keep),
-                    "last": bool((yield dut.data_out.bits.last)),
+                    "last":
+                    bool((yield dut.data_out.bits.last)),
                     "user": (yield dut.data_out.bits.user),
                 })
             yield
 
     def crc_process():
-        for cycle in range(300):
-            yield dut.crc.ready.eq(cycle % 5 not in (0, 1))
+        for cycle in range(3000 if sparse else 300):
+            yield dut.crc.ready.eq(not stalled or cycle % 5 not in (0, 1))
             if (yield dut.crc.valid) and (yield dut.crc.ready):
                 output_crcs.append((yield dut.crc.bits))
             yield
@@ -146,6 +175,9 @@ def test_crc_calculate_packet_boundaries_keep_and_backpressure():
 
     assert output_beats == expected_beats
     assert output_crcs == expected_crcs
+    if not stalled:
+        assert output_cycles == list(
+            range(output_cycles[0], output_cycles[0] + len(expected_beats)))
 
 
 def test_crc_calculate_skips_sparse_keep_lanes():
@@ -201,8 +233,7 @@ def test_crc_insert_appends_crc_in_place_or_as_new_beat(payload):
         yield dut.data_out.ready.eq(1)
         for _ in range(30):
             if (yield dut.data_out.valid):
-                _append_kept_bytes(output,
-                                   (yield dut.data_out.bits.data),
+                _append_kept_bytes(output, (yield dut.data_out.bits.data),
                                    (yield dut.data_out.bits.keep), 8)
                 output_last.append(bool((yield dut.data_out.bits.last)))
                 output_users.append((yield dut.data_out.bits.user))
@@ -245,8 +276,7 @@ def test_crc_extract_removes_crc_and_reports_it():
         yield dut.crc.ready.eq(1)
         for _ in range(20):
             if (yield dut.data_out.valid):
-                _append_kept_bytes(output,
-                                   (yield dut.data_out.bits.data),
+                _append_kept_bytes(output, (yield dut.data_out.bits.data),
                                    (yield dut.data_out.bits.keep), 8)
                 assert (yield dut.data_out.bits.last)
             if (yield dut.crc.valid):
