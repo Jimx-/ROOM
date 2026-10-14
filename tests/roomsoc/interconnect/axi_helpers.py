@@ -66,6 +66,11 @@ class AXIResponder(Elaboratable):
 
     ``protocol_error`` asserts if ``w.last`` disagrees with ``aw.len`` on the
     final beat of a write burst.
+
+    ``base_addr`` places the memory in the device address space: beat
+    indexes are taken from ``addr - base_addr`` (so a responder backed
+    by a small image can sit anywhere, e.g. DRAM above 2 GiB), while
+    the monitor taps keep reporting full device addresses.
     """
 
     def __init__(self,
@@ -81,7 +86,8 @@ class AXIResponder(Elaboratable):
                  id_width=1,
                  r_resp=0,
                  b_resp=0,
-                 version='axi4'):
+                 version='axi4',
+                 base_addr=0):
         self.addr_width = addr_width
         self.data_width = data_width
         self.depth = depth
@@ -92,6 +98,10 @@ class AXIResponder(Elaboratable):
         self.aw_depth = aw_depth
         self.r_resp = r_resp
         self.b_resp = b_resp
+        if base_addr < 0 or base_addr % (data_width // 8):
+            raise ValueError('base_addr must be a non-negative beat-'
+                             'aligned device address')
+        self.base_addr = base_addr
 
         self.bus = AXIInterface(addr_width=addr_width,
                                 data_width=data_width,
@@ -99,38 +109,36 @@ class AXIResponder(Elaboratable):
                                 version=version)
 
         aw_len_width = {'axi3': 4, 'axi4': 8}[version]
-        self.ar_monitor = Valid(
-            Record, [("addr", addr_width, Direction.FANOUT),
-                     ("len", aw_len_width, Direction.FANOUT),
-                     ("size", 3, Direction.FANOUT),
-                     ("burst", 2, Direction.FANOUT)])
-        self.aw_monitor = Valid(
-            Record, [("addr", addr_width, Direction.FANOUT),
-                     ("len", aw_len_width, Direction.FANOUT),
-                     ("size", 3, Direction.FANOUT),
-                     ("burst", 2, Direction.FANOUT)])
-        self.w_monitor = Valid(
-            Record, [("addr", addr_width, Direction.FANOUT),
-                     ("data", data_width, Direction.FANOUT),
-                     ("strb", data_width // 8, Direction.FANOUT)])
+        self.ar_monitor = Valid(Record,
+                                [("addr", addr_width, Direction.FANOUT),
+                                 ("len", aw_len_width, Direction.FANOUT),
+                                 ("size", 3, Direction.FANOUT),
+                                 ("burst", 2, Direction.FANOUT)])
+        self.aw_monitor = Valid(Record,
+                                [("addr", addr_width, Direction.FANOUT),
+                                 ("len", aw_len_width, Direction.FANOUT),
+                                 ("size", 3, Direction.FANOUT),
+                                 ("burst", 2, Direction.FANOUT)])
+        self.w_monitor = Valid(Record,
+                               [("addr", addr_width, Direction.FANOUT),
+                                ("data", data_width, Direction.FANOUT),
+                                ("strb", data_width // 8, Direction.FANOUT)])
         self.protocol_error = Signal()
 
     def elaborate(self, platform):
         m = Module()
         lg = log2_int(self.data_width // 8)
 
-        mem = Memory(width=self.data_width,
-                     depth=self.depth,
-                     init=self.init)
+        mem = Memory(width=self.data_width, depth=self.depth, init=self.init)
         rport = m.submodules.rport = mem.read_port(domain='comb')
         wport = m.submodules.wport = mem.write_port(granularity=8)
 
         bus = self.bus
 
-        ar_q = m.submodules.ar_q = Queue(
-            self.ar_depth,
-            Record, [("addr", self.addr_width), ("len", 8), ("size", 3),
-                     ("id", self.bus.id_width)])
+        ar_q = m.submodules.ar_q = Queue(self.ar_depth,
+                                         Record, [("addr", self.addr_width),
+                                                  ("len", 8), ("size", 3),
+                                                  ("id", self.bus.id_width)])
         m.d.comb += [
             ar_q.enq.valid.eq(bus.ar.valid),
             ar_q.enq.bits.addr.eq(bus.ar.bits.addr),
@@ -145,10 +153,10 @@ class AXIResponder(Elaboratable):
             self.ar_monitor.bits.burst.eq(bus.ar.bits.burst),
         ]
 
-        aw_q = m.submodules.aw_q = Queue(
-            self.aw_depth,
-            Record, [("addr", self.addr_width), ("len", 8),
-                     ("id", self.bus.id_width)])
+        aw_q = m.submodules.aw_q = Queue(self.aw_depth,
+                                         Record, [("addr", self.addr_width),
+                                                  ("len", 8),
+                                                  ("id", self.bus.id_width)])
         m.d.comb += [
             aw_q.enq.valid.eq(bus.aw.valid),
             aw_q.enq.bits.addr.eq(bus.aw.bits.addr),
@@ -176,7 +184,7 @@ class AXIResponder(Elaboratable):
             with m.State('IDLE'):
                 with m.If(ar_q.deq.valid):
                     m.d.sync += [
-                        r_base.eq(ar_q.deq.bits.addr >> lg),
+                        r_base.eq((ar_q.deq.bits.addr - self.base_addr) >> lg),
                         r_total.eq(ar_q.deq.bits.len),
                         r_size.eq(ar_q.deq.bits.size),
                         r_upper.eq(ar_q.deq.bits.addr[lg - 1]),
@@ -226,7 +234,7 @@ class AXIResponder(Elaboratable):
             with m.State('IDLE'):
                 with m.If(aw_q.deq.valid):
                     m.d.sync += [
-                        w_base.eq(aw_q.deq.bits.addr >> lg),
+                        w_base.eq((aw_q.deq.bits.addr - self.base_addr) >> lg),
                         w_total.eq(aw_q.deq.bits.len),
                         w_id.eq(aw_q.deq.bits.id),
                         w_beat.eq(0),
@@ -241,7 +249,8 @@ class AXIResponder(Elaboratable):
                         w_fire.replicate(self.data_width // 8)
                         & bus.w.bits.strb),
                     self.w_monitor.valid.eq(w_fire),
-                    self.w_monitor.bits.addr.eq((w_base + w_beat) << lg),
+                    self.w_monitor.bits.addr.eq(((w_base + w_beat) << lg) +
+                                                self.base_addr),
                     self.w_monitor.bits.data.eq(bus.w.bits.data),
                     self.w_monitor.bits.strb.eq(bus.w.bits.strb),
                 ]
@@ -369,8 +378,8 @@ class AXILiteResponder(Elaboratable):
                             Mux(w_fire, bus.w.strb, w_strb)),
                         write_resp.eq(
                             Mux(
-                                Mux(aw_fire, bus.aw.addr, aw_addr)
-                                == self.error_addr, 2, 0)),
+                                Mux(aw_fire, bus.aw.addr,
+                                    aw_addr) == self.error_addr, 2, 0)),
                     ]
                     m.next = "RESP"
 
@@ -554,16 +563,15 @@ def drive_stream(stream, packets, gap=20, bubble_cycles_fn=None):
             yield
 
         for beat_index, offset in enumerate(range(0, len(packet), beat_bytes)):
-            bubble_cycles = (0 if bubble_cycles_fn is None
-                             else bubble_cycles_fn(packet_index, beat_index))
+            bubble_cycles = (0 if bubble_cycles_fn is None else
+                             bubble_cycles_fn(packet_index, beat_index))
             if bubble_cycles:
                 yield stream.valid.eq(0)
                 for _ in range(bubble_cycles):
                     yield
 
             beat = packet[offset:offset + beat_bytes]
-            yield stream.bits.data.eq(
-                int.from_bytes(beat, byteorder="little"))
+            yield stream.bits.data.eq(int.from_bytes(beat, byteorder="little"))
             yield stream.bits.keep.eq((1 << len(beat)) - 1)
             yield stream.bits.last.eq(offset + len(beat) == len(packet))
             yield stream.valid.eq(1)
@@ -596,8 +604,10 @@ def collect_stream(stream, packets, timeout=1000, ready_fn=None):
     for cycle in range(timeout):
         ready = (yield stream.ready)
         valid = (yield stream.valid)
-        beat = ((yield stream.bits.data), (yield stream.bits.keep),
-                (yield stream.bits.last))
+        beat = ((yield
+                 stream.bits.data), (yield
+                                     stream.bits.keep), (yield
+                                                         stream.bits.last))
 
         if stalled_beat is not None:
             assert valid, "valid dropped while a beat was stalled"
@@ -619,8 +629,7 @@ def collect_stream(stream, packets, timeout=1000, ready_fn=None):
         stalled_beat = beat if valid and not ready else None
 
         next_cycle = cycle + 1
-        yield stream.ready.eq(
-            1 if ready_fn is None else ready_fn(next_cycle))
+        yield stream.ready.eq(1 if ready_fn is None else ready_fn(next_cycle))
         yield
 
     assert not current, "simulation ended in the middle of a packet"

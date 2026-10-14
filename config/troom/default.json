@@ -1,0 +1,13 @@
+{
+  "addr_width": 32,
+  "data_width": 512,
+  "id_width": 6,
+  "seg_len": 32,
+  "n_outputs": 2,
+  "n_tokens": 1,
+  "tmem_bytes": 262144,
+  "n_tmem_banks": 8,
+  "cmd_queue_depth": 8,
+  "n_events": 8,
+  "seq_bits": 16
+}
