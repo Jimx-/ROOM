@@ -15,9 +15,8 @@ from scapy.layers.l2 import ARP, Ether
 from scapy.packet import Raw
 
 from roomsoc.interconnect import axi
-from roomsoc.interconnect.axi import (AXIStreamArbiter,
-                                     AXIStreamDepacketizer,
-                                     AXIStreamInterface)
+from roomsoc.interconnect.axi import (AXIStreamArbiter, AXIStreamDepacketizer,
+                                      AXIStreamInterface)
 from roomsoc.interconnect.stream import Decoupled, Queue
 import roomsoc.interconnect.wishbone as wb
 from roomsoc.peripheral.dma import AXIDMAReader, AXIDMAWriter
@@ -41,11 +40,10 @@ def build_test_packets():
     source_ip = "192.168.2.1"
     destination_ip = "192.168.2.2"
 
-    dns_payload = bytes.fromhex(
-        "716e81850001000000000000"
-        "066d6f62696c65066576656e74730464617461"
-        "096d6963726f736f667403636f6d00"
-        "00010001")
+    dns_payload = bytes.fromhex("716e81850001000000000000"
+                                "066d6f62696c65066576656e74730464617461"
+                                "096d6963726f736f667403636f6d00"
+                                "00010001")
     roce_common = {
         "dst_mac": device_mac,
         "src_ip": source_ip,
@@ -54,60 +52,53 @@ def build_test_packets():
 
     return [
         _arp_request(host_mac, source_ip),
-        _build_udp_packet(
-            b"\x98\xee\xcb\xb6f\xb0",
-            b".\x22\x04d>\xc4",
-            "192.168.1.1",
-            "192.168.1.107",
-            53,
-            51186,
-            dns_payload,
-            identification=0x3f99,
-            dont_fragment=True),
-        _connection_setup(
-            driver_mac,
-            local_qpn=2,
-            remote_qpn=2,
-            remote_ip=source_ip,
-            remote_port=8000,
-            initial_rx_psn=1),
-        _build_roce_packet(
-            src_mac=alternate_driver_mac,
-            opcode=BthOpcode.RC_RDMA_WRITE_ONLY,
-            vaddr=0x1230,
-            dmalen=16,
-            payload=bytes(range(16)),
-            psn=1,
-            **roce_common),
-        _build_roce_packet(
-            src_mac=driver_mac,
-            opcode=BthOpcode.RC_RDMA_WRITE_ONLY,
-            vaddr=0x1234,
-            dmalen=4,
-            payload=bytes.fromhex("abcdefff"),
-            psn=2,
-            **roce_common),
-        _build_roce_packet(
-            src_mac=alternate_driver_mac,
-            opcode=BthOpcode.RC_RDMA_READ_REQUEST,
-            vaddr=0x1230,
-            dmalen=16,
-            psn=3,
-            **roce_common),
-        _build_roce_packet(
-            src_mac=driver_mac,
-            opcode=BthOpcode.RC_RDMA_READ_REQUEST,
-            vaddr=0x1230,
-            dmalen=4,
-            psn=4,
-            **roce_common),
-        _build_roce_packet(
-            src_mac=driver_mac,
-            opcode=BthOpcode.RC_RDMA_READ_REQUEST,
-            vaddr=0x1234,
-            dmalen=4,
-            psn=5,
-            **roce_common),
+        _build_udp_packet(b"\x98\xee\xcb\xb6f\xb0",
+                          b".\x22\x04d>\xc4",
+                          "192.168.1.1",
+                          "192.168.1.107",
+                          53,
+                          51186,
+                          dns_payload,
+                          identification=0x3f99,
+                          dont_fragment=True),
+        _connection_setup(driver_mac,
+                          local_qpn=2,
+                          remote_qpn=2,
+                          remote_ip=source_ip,
+                          remote_port=8000,
+                          initial_rx_psn=1),
+        _build_roce_packet(src_mac=alternate_driver_mac,
+                           opcode=BthOpcode.RC_RDMA_WRITE_ONLY,
+                           vaddr=0x1230,
+                           dmalen=16,
+                           payload=bytes(range(16)),
+                           psn=1,
+                           **roce_common),
+        _build_roce_packet(src_mac=driver_mac,
+                           opcode=BthOpcode.RC_RDMA_WRITE_ONLY,
+                           vaddr=0x1234,
+                           dmalen=4,
+                           payload=bytes.fromhex("abcdefff"),
+                           psn=2,
+                           **roce_common),
+        _build_roce_packet(src_mac=alternate_driver_mac,
+                           opcode=BthOpcode.RC_RDMA_READ_REQUEST,
+                           vaddr=0x1230,
+                           dmalen=16,
+                           psn=3,
+                           **roce_common),
+        _build_roce_packet(src_mac=driver_mac,
+                           opcode=BthOpcode.RC_RDMA_READ_REQUEST,
+                           vaddr=0x1230,
+                           dmalen=4,
+                           psn=4,
+                           **roce_common),
+        _build_roce_packet(src_mac=driver_mac,
+                           opcode=BthOpcode.RC_RDMA_READ_REQUEST,
+                           vaddr=0x1234,
+                           dmalen=4,
+                           psn=5,
+                           **roce_common),
     ]
 
 
@@ -120,7 +111,11 @@ DRIVER_MAC = b"pfUZ\x92A"
 SOURCE_IP = "192.168.2.1"
 DEVICE_IP = "192.168.2.2"
 
-_ROCE_COMMON = {"dst_mac": DEVICE_MAC, "src_ip": SOURCE_IP, "dst_ip": DEVICE_IP}
+_ROCE_COMMON = {
+    "dst_mac": DEVICE_MAC,
+    "src_ip": SOURCE_IP,
+    "dst_ip": DEVICE_IP
+}
 
 
 def _mac(value):
@@ -139,12 +134,12 @@ def _build_udp_packet(dst_mac,
                       *,
                       identification=0,
                       dont_fragment=True):
-    packet = (Ether(dst=_mac(dst_mac), src=_mac(src_mac))
-              / IP(src=src_ip,
-                   dst=dst_ip,
-                   id=identification,
-                   flags="DF" if dont_fragment else 0)
-              / UDP(sport=src_port, dport=dst_port) / Raw(payload))
+    packet = (Ether(dst=_mac(dst_mac), src=_mac(src_mac)) /
+              IP(src=src_ip,
+                 dst=dst_ip,
+                 id=identification,
+                 flags="DF" if dont_fragment else 0) /
+              UDP(sport=src_port, dport=dst_port) / Raw(payload))
     return bytes(packet)
 
 
@@ -192,13 +187,13 @@ def _build_roce_packet(dst_mac,
     else:
         raise ValueError(f"unsupported RoCE opcode: 0x{int(opcode):02x}")
 
-    packet = (Ether(dst=_mac(dst_mac), src=_mac(src_mac))
-              / IP(src=src_ip,
-                   dst=dst_ip,
-                   id=identification,
-                   flags="DF" if dont_fragment else 0)
-              / UDP(sport=src_port, dport=dst_port)
-              / bth / extended / Raw(payload + b"\x00" * pad_count))
+    packet = (Ether(dst=_mac(dst_mac), src=_mac(src_mac)) /
+              IP(src=src_ip,
+                 dst=dst_ip,
+                 id=identification,
+                 flags="DF" if dont_fragment else 0) /
+              UDP(sport=src_port, dport=dst_port) / bth / extended /
+              Raw(payload + b"\x00" * pad_count))
     return roce_codec.finalize_roce(packet, mode=icrc_mode)
 
 
@@ -211,12 +206,12 @@ def _roce_payload(packet):
 
 def _arp_request(src_mac, src_ip, target_ip=DEVICE_IP):
     """ARP request from *src_mac*/*src_ip* addressed to the device."""
-    packet = (Ether(dst="ff:ff:ff:ff:ff:ff", src=_mac(src_mac))
-              / ARP(op=1,
-                    hwsrc=_mac(src_mac),
-                    psrc=src_ip,
-                    hwdst="00:00:00:00:00:00",
-                    pdst=target_ip))
+    packet = (Ether(dst="ff:ff:ff:ff:ff:ff", src=_mac(src_mac)) /
+              ARP(op=1,
+                  hwsrc=_mac(src_mac),
+                  psrc=src_ip,
+                  hwdst="00:00:00:00:00:00",
+                  pdst=target_ip))
     return bytes(packet).ljust(60, b"\x00")
 
 
@@ -228,23 +223,19 @@ def _connection_setup(src_mac=DRIVER_MAC,
                       remote_port=8000,
                       initial_rx_psn=0):
     """UDP connection-setup frame that populates the QP connection table."""
-    setup = RDMAConnectionSetup(
-        local_qpn=local_qpn,
-        remote_qpn=remote_qpn,
-        remote_ip=socket.inet_aton(remote_ip) + b"\x00" * 12,
-        remote_port=remote_port,
-        initial_rx_psn=initial_rx_psn)
+    setup = RDMAConnectionSetup(local_qpn=local_qpn,
+                                remote_qpn=remote_qpn,
+                                remote_ip=socket.inet_aton(remote_ip) +
+                                b"\x00" * 12,
+                                remote_port=remote_port,
+                                initial_rx_psn=initial_rx_psn)
     return bytes(
-        Ether(dst=_mac(DEVICE_MAC), src=_mac(src_mac))
-        / IP(src=SOURCE_IP, dst=DEVICE_IP, id=1)
-        / UDP(sport=500, dport=8000) / setup)
+        Ether(dst=_mac(DEVICE_MAC), src=_mac(src_mac)) /
+        IP(src=SOURCE_IP, dst=DEVICE_IP, id=1) / UDP(sport=500, dport=8000) /
+        setup)
 
 
-def _roce_write(vaddr,
-                payload,
-                src_mac=DRIVER_MAC,
-                dest_qp=2,
-                psn=0):
+def _roce_write(vaddr, payload, src_mac=DRIVER_MAC, dest_qp=2, psn=0):
     """RC RDMA_WRITE_ONLY frame carrying *payload* at *vaddr*."""
     return _build_roce_packet(src_mac=src_mac,
                               opcode=BthOpcode.RC_RDMA_WRITE_ONLY,
@@ -256,11 +247,7 @@ def _roce_write(vaddr,
                               **_ROCE_COMMON)
 
 
-def _roce_read_request(vaddr,
-                       dmalen,
-                       src_mac=DRIVER_MAC,
-                       dest_qp=2,
-                       psn=0):
+def _roce_read_request(vaddr, dmalen, src_mac=DRIVER_MAC, dest_qp=2, psn=0):
     """RC RDMA_READ_REQUEST frame for *dmalen* bytes at *vaddr*."""
     return _build_roce_packet(src_mac=src_mac,
                               opcode=BthOpcode.RC_RDMA_READ_REQUEST,
@@ -440,8 +427,13 @@ class DMAHandler(Elaboratable):
             m.d.sync += read_active.eq(0)
 
         write_active = Signal()
+        write_drain = Signal()
         write_narrow = Signal()
         write_upper_lane = Signal()
+        write_beats = Signal(32)
+        write_cmd_narrow = self.write_cmd.bits.len == 4
+        write_cmd_beats = Mux(write_cmd_narrow, 1,
+                              (self.write_cmd.bits.len + 7) >> 3)
         m.d.comb += [
             writer.sink.valid.eq(self.write_cmd.valid & ~write_active),
             writer.sink.bits.addr.eq(self.write_cmd.bits.addr),
@@ -451,29 +443,51 @@ class DMAHandler(Elaboratable):
         with m.If(self.write_cmd.fire):
             m.d.sync += [
                 write_active.eq(1),
-                write_narrow.eq(self.write_cmd.bits.len == 4),
+                write_drain.eq(0),
+                write_narrow.eq(write_cmd_narrow),
                 write_upper_lane.eq(self.write_cmd.bits.addr[2]),
+                write_beats.eq(write_cmd_beats),
             ]
 
         narrow_write_data = Mux(
-            write_upper_lane,
-            Cat(Const(0, 32), self.write_data.bits.data[:32]),
+            write_upper_lane, Cat(Const(0, 32),
+                                  self.write_data.bits.data[:32]),
             Cat(self.write_data.bits.data[:32], Const(0, 32)))
         narrow_write_strb = Mux(write_upper_lane, 0xf0, 0x0f)
         m.d.comb += [
-            writer.data.valid.eq(write_active & self.write_data.valid),
+            writer.data.valid.eq(write_active & ~write_drain
+                                 & self.write_data.valid),
             writer.data.bits.data.eq(
                 Mux(write_narrow, narrow_write_data,
                     self.write_data.bits.data)),
             writer.data.bits.strb.eq(
                 Mux(write_narrow, narrow_write_strb,
                     (1 << (self.data_width // 8)) - 1)),
-            self.write_data.ready.eq(write_active & writer.data.ready),
+            self.write_data.ready.eq(write_active
+                                     & (write_drain | writer.data.ready)),
         ]
-        m.d.comb += self.write_done.eq(write_active & writer.done)
+        with m.If(write_active & self.write_data.fire):
+            m.d.sync += write_beats.eq(write_beats - 1)
+
+        # A rejected descriptor is not consumed on the writer's data
+        # path: drain its payload here so later traffic cannot wedge
+        # behind it, and hold write_done (the RC acknowledgement) so
+        # the failure surfaces as a missing response instead of a
+        # success.
+        m.d.comb += self.write_done.eq(write_active & writer.done
+                                       & ~writer.error)
 
         with m.If(write_active & writer.done):
-            m.d.sync += write_active.eq(0)
+            with m.If(writer.error & (write_beats != 0)):
+                m.d.sync += write_drain.eq(1)
+            with m.Else():
+                m.d.sync += write_active.eq(0)
+
+        with m.If(write_drain & self.write_data.fire & (write_beats == 1)):
+            m.d.sync += [
+                write_active.eq(0),
+                write_drain.eq(0),
+            ]
 
         return m
 
@@ -504,8 +518,9 @@ class Top(Elaboratable):
         mac_addr = 0xbc9a78563412
         ip_addr = 0x0202a8c0
 
-        ip_merger = m.submodules.ip_merger = AXIStreamArbiter(
-            2, data_width=64, user_width=128)
+        ip_merger = m.submodules.ip_merger = AXIStreamArbiter(2,
+                                                              data_width=64,
+                                                              user_width=128)
         m.d.comb += [
             self.rx_data_in.connect(eth_router.data_in),
             eth_router.ipv4_data_out.connect(ipv4_handler.data_in),
@@ -532,8 +547,8 @@ class Top(Elaboratable):
             mac_ip_encoder.arp_table_resp.eq(arp_server.arp_table_resp),
         ]
 
-        eth_merger = m.submodules.eth_merger = AXIStreamArbiter(
-            2, data_width=64)
+        eth_merger = m.submodules.eth_merger = AXIStreamArbiter(2,
+                                                                data_width=64)
         frame_padding = m.submodules.frame_padding = EthernetFramePadding(
             data_width=64)
         m.d.comb += [
@@ -597,7 +612,8 @@ def _drive_rx_packets(dut, packets, gap=20, bubble_cycles_fn=None):
             yield dut.rx_data_in.bits.data.eq(
                 int.from_bytes(beat, byteorder="little"))
             yield dut.rx_data_in.bits.keep.eq((1 << len(beat)) - 1)
-            yield dut.rx_data_in.bits.last.eq(offset + len(beat) == len(packet))
+            yield dut.rx_data_in.bits.last.eq(offset +
+                                              len(beat) == len(packet))
             yield dut.rx_data_in.valid.eq(1)
 
             yield
@@ -630,8 +646,8 @@ def _collect_tx_packets(dut, packets, timeout=1000, ready_fn=None):
         ready = (yield dut.tx_data_out.ready)
         valid = (yield dut.tx_data_out.valid)
         beat = ((yield dut.tx_data_out.bits.data),
-                (yield dut.tx_data_out.bits.keep),
-                (yield dut.tx_data_out.bits.last))
+                (yield dut.tx_data_out.bits.keep), (yield
+                                                    dut.tx_data_out.bits.last))
 
         # AXI-stream payload and control must remain unchanged from the cycle
         # after valid was observed until the stalled transfer is accepted.
@@ -659,8 +675,8 @@ def _collect_tx_packets(dut, packets, timeout=1000, ready_fn=None):
         stalled_beat = beat if valid and not ready else None
 
         next_cycle = cycle + 1
-        yield dut.tx_data_out.ready.eq(
-            1 if ready_fn is None else ready_fn(next_cycle))
+        yield dut.tx_data_out.ready.eq(1 if ready_fn is
+                                       None else ready_fn(next_cycle))
         yield
 
     assert not current, "simulation ended in the middle of a TX frame"
@@ -758,8 +774,9 @@ def run_rdma(requests,
 def test_rdma_write_ack_and_readback(request):
     requests = build_test_packets()
     first_word = (0x1230 // 8) % Top.SRAM_DEPTH
-    responses, after_image = run_rdma(
-        requests, sram_addresses=(first_word, first_word + 1))
+    responses, after_image = run_rdma(requests,
+                                      sram_addresses=(first_word,
+                                                      first_word + 1))
 
     capture_path = request.config.getoption("--rdma-packet-capture")
     if capture_path is not None:
@@ -787,8 +804,8 @@ def test_rdma_write_ack_and_readback(request):
         BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
         BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
     ]
-    assert all(roce_codec.icrc_matches(frame, mode="rtl")
-               for frame in responses[2:])
+    assert all(
+        roce_codec.icrc_matches(frame, mode="rtl") for frame in responses[2:])
     assert [_roce_payload(packet) for packet in roce] == [
         b"",
         b"",
@@ -802,9 +819,8 @@ def test_rdma_write_ack_and_readback(request):
     }
 
 
-@pytest.mark.parametrize("req_mac, req_ip",
-                         [(HOST_MAC, SOURCE_IP),
-                          (DRIVER_MAC, "10.0.0.1")])
+@pytest.mark.parametrize("req_mac, req_ip", [(HOST_MAC, SOURCE_IP),
+                                             (DRIVER_MAC, "10.0.0.1")])
 def test_arp_request_is_replied_with_device_address(req_mac, req_ip):
     # A lone ARP request is answered with exactly one reply whose sender
     # protocol address is the device and whose target protocol address echoes
@@ -820,15 +836,20 @@ def test_arp_request_is_replied_with_device_address(req_mac, req_ip):
     assert reply.pdst == req_ip
 
 
-@pytest.mark.parametrize("vaddr, payload", [
-    (0x1230, bytes(range(8))),  # single full beat, lower word
-    (0x1230, bytes(range(16))),  # two full beats
-    (0x1260, bytes(range(24))),  # three full beats
-    (0x1260, bytes(range(32))),  # four full beats
-    (0x1230, bytes.fromhex("deadbeef")),  # narrow lower lane (addr[2] == 0)
-    (0x1234, bytes.fromhex("abcdefff")),  # narrow upper lane (addr[2] == 1)
-    (0x07F0, bytes(range(32))),  # multi-beat crossing the SRAM wrap (word 254 -> 0)
-])
+@pytest.mark.parametrize(
+    "vaddr, payload",
+    [
+        (0x1230, bytes(range(8))),  # single full beat, lower word
+        (0x1230, bytes(range(16))),  # two full beats
+        (0x1260, bytes(range(24))),  # three full beats
+        (0x1260, bytes(range(32))),  # four full beats
+        (0x1230,
+         bytes.fromhex("deadbeef")),  # narrow lower lane (addr[2] == 0)
+        (0x1234,
+         bytes.fromhex("abcdefff")),  # narrow upper lane (addr[2] == 1)
+        (0x07F0, bytes(
+            range(32))),  # multi-beat crossing the SRAM wrap (word 254 -> 0)
+    ])
 def test_rdma_write_then_read_roundtrip(vaddr, payload):
     # After link setup, a single WRITE followed by a READ of the same range
     # ACKs the write and echoes the written payload back. The matrix exercises
@@ -849,6 +870,60 @@ def test_rdma_write_then_read_roundtrip(vaddr, payload):
         BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
     ]
     assert _roce_payload(roce[1]) == payload
+
+
+def test_rdma_rejected_unaligned_write_is_never_acked():
+    # A WRITE whose address is off the 8-byte grid is rejected by the
+    # DMA writer with done+error and an unconsumed payload. With no
+    # later write, the observable contract is the acknowledgement: the
+    # rejected request must not be ACKed, while the writes before it
+    # and the read after it complete normally.
+    requests = _link_established(
+        _roce_write(0x1230, bytes(range(8)), psn=1),
+        _roce_write(0x1260, b"GOODDATA", psn=2),
+        _roce_write(0x1244, b"MUST-BE-DROPPED!!", psn=3),  # 4 mod 8
+        _roce_read_request(0x1260, 8, psn=4),
+    )
+    responses, _ = run_rdma(requests)
+
+    assert len(responses) == 5  # arp, conn ack, two write acks, read resp
+    roce = [Ether(frame) for frame in responses[2:]]
+    assert [packet[BTH].opcode for packet in roce] == [
+        BthOpcode.RC_ACKNOWLEDGE,
+        BthOpcode.RC_ACKNOWLEDGE,
+        BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
+    ]
+    assert all(packet[BTH].psn != 3 for packet in roce)
+    assert _roce_payload(roce[2]) == b"GOODDATA"
+
+
+def test_rdma_rejected_write_payload_is_drained_and_next_write_lands():
+    # The writer never consumes the payload of a rejected descriptor.
+    # The handler must drain it: the next write's own bytes reach its
+    # address (before the fix the survivor consumed the rejected
+    # write's stranded beat) and the transport keeps completing
+    # transfers.
+    requests = _link_established(
+        _roce_write(0x1244, b"MUST-BE-DROPPED!!", psn=1),  # 4 mod 8
+        _roce_write(0x1260, b"SURVIVOR", psn=2),
+        _roce_read_request(0x1260, 8, psn=3),
+    )
+    word = 0x1260 // 8 % Top.SRAM_DEPTH
+    responses, sram = run_rdma(requests, sram_addresses=(word, ))
+
+    assert len(responses) == 4  # arp, conn ack, one write ack, read resp
+    roce = [Ether(frame) for frame in responses[2:]]
+    assert [packet[BTH].opcode for packet in roce] == [
+        BthOpcode.RC_ACKNOWLEDGE,
+        BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
+    ]
+    # The survivor's completion is the only one, but the responder
+    # pops pending writes in order, so the ack still names the rejected
+    # request's psn. Popping the failed entry itself belongs to the IB
+    # stack; a PSN-checking host treats this ack as stale and fails.
+    assert roce[0][BTH].psn == 1
+    assert _roce_payload(roce[1]) == b"SURVIVOR"
+    assert sram == {word: int.from_bytes(b"SURVIVOR", "little")}
 
 
 @pytest.mark.parametrize("qpn", [0, 2, 63])
@@ -883,8 +958,8 @@ def test_connection_setup_programs_nonzero_responder_psn():
         _roce_write(rejected_addr, bytes(range(8)), psn=0),
         initial_rx_psn=initial_psn,
     )
-    responses, sram = run_rdma(
-        requests, sram_addresses=(accepted_word, rejected_word))
+    responses, sram = run_rdma(requests,
+                               sram_addresses=(accepted_word, rejected_word))
 
     # ARP + setup ACK + ACK for the matching request. The PSN-0 request is
     # rejected, proving the programmed value did not come from reset state.
@@ -948,8 +1023,8 @@ def _roce_with_opcode(frame, opcode):
     """Return *frame* with a new opcode and a recomputed valid ICRC."""
     packet = Ether(frame)
     packet[BTH].opcode = opcode
-    packet[RETH].payload.load = bytes(packet[RETH].payload
-                                      )[:-roce_codec.ICRC_SIZE]
+    packet[RETH].payload.load = bytes(
+        packet[RETH].payload)[:-roce_codec.ICRC_SIZE]
     return roce_codec.finalize_roce(packet)
 
 
@@ -985,8 +1060,7 @@ def test_roce_unsupported_opcode_is_dropped():
     # still reads back its init value, which equals its own index).
     word = (0x1230 // 8) % Top.SRAM_DEPTH
     requests = _link_established(
-        _roce_with_opcode(_roce_write(0x1230, bytes(range(8))), 0x04),
-    )
+        _roce_with_opcode(_roce_write(0x1230, bytes(range(8))), 0x04), )
     responses, sram = run_rdma(requests, sram_addresses=(word, ))
 
     assert len(responses) == 2  # ARP reply + connection UDP ack only
@@ -1029,8 +1103,8 @@ def test_unsupported_write_fragment_does_not_advance_or_execute():
         rejected,
         _roce_write(accepted_addr, accepted_payload, psn=1),
     )
-    responses, sram = run_rdma(
-        requests, sram_addresses=(rejected_word, accepted_word))
+    responses, sram = run_rdma(requests,
+                               sram_addresses=(rejected_word, accepted_word))
 
     assert len(responses) == 3
     assert Ether(responses[2])[BTH].psn == 1
@@ -1055,27 +1129,33 @@ def backpressure_reference():
     return reference
 
 
-@pytest.mark.parametrize("stress", [
-    # TX backpressure: the collector deasserts tx_data_out.ready on a repeating
-    # schedule, from light (1-in-10) through heavy (1-in-2) plus a bursty duty.
-    pytest.param(dict(tx_ready_fn=lambda c: c % 10 != 0), id="tx-ready-1-in-10"),
-    pytest.param(dict(tx_ready_fn=lambda c: c % 3 != 0), id="tx-ready-1-in-3"),
-    pytest.param(dict(tx_ready_fn=lambda c: c % 2 != 0), id="tx-ready-1-in-2"),
-    pytest.param(dict(tx_ready_fn=lambda c: (c % 5) < 3), id="tx-ready-3on-2off"),
-    # A prolonged mid-stream stall proves that a held beat remains stable and
-    # that transmission resumes without loss when ready eventually returns.
-    pytest.param(dict(tx_ready_fn=lambda c: not 100 <= c < 600),
-                 id="tx-ready-long-stall"),
-    # RX cadence: frames driven with fewer idle cycles between them, from
-    # back-to-back (gap 0) up to a moderately relaxed spacing.
-    pytest.param(dict(rx_gap=0), id="rx-gap-0"),
-    pytest.param(dict(rx_gap=2), id="rx-gap-2"),
-    pytest.param(dict(rx_gap=10), id="rx-gap-10"),
-    # Deassert valid within every frame so RX cannot rely on contiguous beats.
-    pytest.param(dict(rx_bubble_cycles_fn=lambda _packet, beat: 2
-                      if beat and beat % 3 == 0 else 0),
-                 id="rx-intra-frame-valid-bubbles"),
-])
+@pytest.mark.parametrize(
+    "stress",
+    [
+        # TX backpressure: the collector deasserts tx_data_out.ready on a repeating
+        # schedule, from light (1-in-10) through heavy (1-in-2) plus a bursty duty.
+        pytest.param(dict(tx_ready_fn=lambda c: c % 10 != 0),
+                     id="tx-ready-1-in-10"),
+        pytest.param(dict(tx_ready_fn=lambda c: c % 3 != 0),
+                     id="tx-ready-1-in-3"),
+        pytest.param(dict(tx_ready_fn=lambda c: c % 2 != 0),
+                     id="tx-ready-1-in-2"),
+        pytest.param(dict(tx_ready_fn=lambda c: (c % 5) < 3),
+                     id="tx-ready-3on-2off"),
+        # A prolonged mid-stream stall proves that a held beat remains stable and
+        # that transmission resumes without loss when ready eventually returns.
+        pytest.param(dict(tx_ready_fn=lambda c: not 100 <= c < 600),
+                     id="tx-ready-long-stall"),
+        # RX cadence: frames driven with fewer idle cycles between them, from
+        # back-to-back (gap 0) up to a moderately relaxed spacing.
+        pytest.param(dict(rx_gap=0), id="rx-gap-0"),
+        pytest.param(dict(rx_gap=2), id="rx-gap-2"),
+        pytest.param(dict(rx_gap=10), id="rx-gap-10"),
+        # Deassert valid within every frame so RX cannot rely on contiguous beats.
+        pytest.param(dict(rx_bubble_cycles_fn=lambda _packet, beat: 2
+                          if beat and beat % 3 == 0 else 0),
+                     id="rx-intra-frame-valid-bubbles"),
+    ])
 def test_rdma_backpressure_is_lossless(stress, backpressure_reference):
     # A well-behaved AXI-stream DUT must emit byte-identical frames -- just
     # slower -- whether the collector throttles TX ready on various duty cycles
@@ -1093,8 +1173,8 @@ def test_rdma_backpressure_is_lossless(stress, backpressure_reference):
 
 def _initial_sram_model():
     """Return the DUT SRAM's byte-addressed, little-endian initial image."""
-    return bytearray().join(word.to_bytes(8, "little")
-                            for word in range(Top.SRAM_DEPTH))
+    return bytearray().join(
+        word.to_bytes(8, "little") for word in range(Top.SRAM_DEPTH))
 
 
 def _model_read(memory, vaddr, size):
@@ -1170,7 +1250,8 @@ def test_rdma_randomized_trace_roundtrips_and_survives_backpressure(seed):
     assert [(packet[BTH].opcode, _roce_payload(packet), packet[BTH].psn)
             for packet in operation_responses] == expected
 
-    ready = lambda cycle, s=seed: ((cycle * 1103515245 + 12345 + s) >> 8) % 10 >= 3
+    ready = lambda cycle, s=seed: (
+        (cycle * 1103515245 + 12345 + s) >> 8) % 10 >= 3
     stressed, _ = run_rdma(requests,
                            collect_timeout=1200,
                            tx_ready_fn=ready,
@@ -1193,7 +1274,8 @@ def test_replay_of_old_psn_is_rejected():
     )
     responses, sram = run_rdma(requests, sram_addresses=(word_a, word_b))
 
-    assert len(responses) == 4  # ARP + conn ack + 2 write ACKs (replay dropped)
+    assert len(
+        responses) == 4  # ARP + conn ack + 2 write ACKs (replay dropped)
     acks = [Ether(f) for f in responses[2:]]
     assert [a[BTH].psn for a in acks] == [1, 2]
     assert sram == {
@@ -1215,8 +1297,8 @@ def test_future_psn_does_not_advance_state():
         _roce_write(future_addr, future_payload, psn=100),
         _roce_write(expected_addr, expected_payload, psn=1),
     )
-    responses, sram = run_rdma(
-        requests, sram_addresses=(future_word, expected_word))
+    responses, sram = run_rdma(requests,
+                               sram_addresses=(future_word, expected_word))
 
     assert len(responses) == 3  # ARP + conn ack + 1 ACK (future dropped)
     ack = Ether(responses[2])
@@ -1244,7 +1326,8 @@ def test_psn_wrap_across_boundary():
     acks = [Ether(f) for f in responses[2:]]
     assert [a[BTH].psn for a in acks] == [0xfffffe, 0xffffff, 0]
     assert sram == {
-        words[i]: int.from_bytes(payloads[i], "little") for i in range(3)
+        words[i]: int.from_bytes(payloads[i], "little")
+        for i in range(3)
     }
 
 
@@ -1289,8 +1372,7 @@ def test_out_of_range_qpn_is_dropped(qpn):
     # check without DMA or ACK.
     word = (0x1230 // 8) % Top.SRAM_DEPTH
     requests = _link_established(
-        _roce_write(0x1230, bytes(range(8)), dest_qp=qpn, psn=1),
-    )
+        _roce_write(0x1230, bytes(range(8)), dest_qp=qpn, psn=1), )
     responses, sram = run_rdma(requests, sram_addresses=(word, ))
 
     assert len(responses) == 2  # ARP + conn ack only
