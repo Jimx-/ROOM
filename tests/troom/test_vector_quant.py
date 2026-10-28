@@ -24,6 +24,7 @@ import pytest
 
 from troom.consts import Format, Opcode, Status, VecOp
 from troom.types import HasTRoomParams
+from troom.stream import pack_stream_q8_0
 
 from tests.troom.model import (
     INV127_BITS,
@@ -45,6 +46,7 @@ from tests.troom.test_full_path import (
     R_DRAM,
     W_BASE,
     W_DRAM,
+    WM_DRAM,
     run_program,
 )
 from tests.troom.test_matrix import gen_wsegs
@@ -449,22 +451,12 @@ def test_core_quant_feeds_matmul(k, rows):
     rstride = -(-(rows * 4) // bb) * bb
 
     image = bytearray(DRAM_SIZE)
-    for r in range(rows):
-        row = pack_row(fmt, wsegs[r * (k // 32):(r + 1) * (k // 32)])
-        row += bytes((-len(row)) % bb)
-        image[W_DRAM + r * stride:W_DRAM + r * stride + len(row)] = row
+    payload, meta = pack_stream_q8_0(wsegs, k, rows, params['n_outputs'])
+    image[W_DRAM:W_DRAM + len(payload)] = payload
+    image[WM_DRAM:WM_DRAM + len(meta)] = meta
     image[VFP_DRAM:VFP_DRAM + 4 * k] = words_to_bytes(words)
 
     program = [
-        dict(opcode=Opcode.LOAD_2D,
-             seq=1,
-             evt=1,
-             dram_addr=W_DRAM,
-             tmem_addr=W_BASE,
-             row_bytes=stride,
-             rows=rows,
-             dram_stride=stride,
-             tmem_stride=stride),
         dict(opcode=Opcode.LOAD_2D,
              seq=2,
              evt=2,
@@ -474,7 +466,6 @@ def test_core_quant_feeds_matmul(k, rows):
              rows=1,
              dram_stride=0,
              tmem_stride=0),
-        dict(opcode=Opcode.WAIT, seq=3, evt=1),
         dict(opcode=Opcode.WAIT, seq=4, evt=2),
         dict(opcode=Opcode.VECTOR,
              seq=5,
@@ -485,21 +476,21 @@ def test_core_quant_feeds_matmul(k, rows):
              r_base=VQ_TMEM,
              m_base=VM_TMEM),
         dict(opcode=Opcode.WAIT, seq=6, evt=6),
-        dict(opcode=Opcode.QUANTIZE,
+        dict(opcode=Opcode.SQUANTIZE,
              seq=7,
              evt=4,
              a_base=VQ_TMEM,
              m_base=VM_TMEM,
              k=k),
         dict(opcode=Opcode.WAIT, seq=8, evt=4),
-        dict(opcode=Opcode.MATMUL,
+        dict(opcode=Opcode.SMATMUL,
              seq=9,
              evt=5,
              fmt=int(fmt),
              k=k,
              rows=rows,
-             w_base=W_BASE,
-             w_stride=stride,
+             dram_addr=W_DRAM,
+             dram_stride=WM_DRAM,
              r_base=RT_BASE),
         dict(opcode=Opcode.WAIT, seq=10, evt=5),
         dict(opcode=Opcode.STORE_2D,

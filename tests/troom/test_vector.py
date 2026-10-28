@@ -494,10 +494,16 @@ O_BASE = 0x1000
 class UnitHarness(Elaboratable):
     """VectorUnit reading from a banked TMEM; writes are captured."""
 
-    def __init__(self, params):
+    def __init__(self, params, commit=False):
         self.params = params
         self.tmem = TMEM(params)
         self.vec = VectorUnit(params)
+        # Committing result beats into the TMEM model lets a chain's
+        # later commands read what earlier ones wrote (the probe uses
+        # this). It also exposes the real write-vs-read bank conflicts
+        # inside TMEM, so the default keeps the historical unit-test
+        # semantics where writes only leave the unit.
+        self.commit = commit
 
     def elaborate(self, platform):
         m = Module()
@@ -507,6 +513,13 @@ class UnitHarness(Elaboratable):
             self.vec.tmem_rreq.connect(self.tmem.rreq),
             self.tmem.rresp.connect(self.vec.tmem_rresp),
         ]
+        if self.commit:
+            m.d.comb += [
+                self.tmem.write.valid.eq(self.vec.tmem_w.valid
+                                         & self.vec.tmem_w.ready),
+                self.tmem.write.bits.addr.eq(self.vec.tmem_w.bits.addr),
+                self.tmem.write.bits.data.eq(self.vec.tmem_w.bits.data),
+            ]
         return m
 
 
@@ -525,6 +538,8 @@ def run_unit(params,
              a_bytes,
              b_bytes=b'',
              *,
+             b_base=B_BASE,
+             commit_writes=False,
              stall_wr=False,
              hold_writes=0,
              hold_after_beats=0,
@@ -544,7 +559,7 @@ def run_unit(params,
 
     hp = HasTRoomParams(params)
     bb = hp.beat_bytes
-    dut = UnitHarness(params)
+    dut = UnitHarness(params, commit=commit_writes)
     writes = []
     results = []
     shared = {'blocked': 0, 'cycles': 0}
@@ -556,7 +571,7 @@ def run_unit(params,
             yield from tmem_write(dut.tmem.write, A_BASE + off, word)
         for off in range(0, len(b_bytes), bb):
             word = int.from_bytes(b_bytes[off:off + bb], 'little')
-            yield from tmem_write(dut.tmem.write, B_BASE + off, word)
+            yield from tmem_write(dut.tmem.write, b_base + off, word)
 
         sink = dut.vec.sink
         for desc in descs:
@@ -585,6 +600,11 @@ def run_unit(params,
                     elements=(yield dut.vec.elements),
                     write_beats=(yield dut.vec.write_beats),
                     stall_cycles=(yield dut.vec.stall_cycles),
+                    active_cycles=(yield dut.vec.active_cycles),
+                    add_issues=(yield dut.vec.add_issues),
+                    mul_issues=(yield dut.vec.mul_issues),
+                    rec_issues=(yield dut.vec.rec_issues),
+                    comp_issues=(yield dut.vec.comp_issues),
                     blocked=shared['blocked'],
                     cycles=shared['cycles'],
                     execution_cycles=shared['cycles'] - start_cycle,

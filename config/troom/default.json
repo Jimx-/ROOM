@@ -3,11 +3,17 @@
   "data_width": 512,
   "id_width": 6,
   "seg_len": 32,
-  "n_outputs": 2,
+  "n_outputs": 4,
   "n_tokens": 1,
   "tmem_bytes": 262144,
   "n_tmem_banks": 8,
   "cmd_queue_depth": 8,
+  "mm_out_depth": 24,
+  "sg_min_burst_beats": 16,
+  "sg_pay_fifo": 64,
+  "sg_meta_fifo": 32,
+  "sg_meta_min_burst_beats": 8,
+  "sg_credits": 64,
   "n_events": 8,
   "seq_bits": 16
 }

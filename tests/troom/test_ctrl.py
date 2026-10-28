@@ -15,6 +15,7 @@ from troom.abi import (
     CAPS_ENGINE_COUNTERS,
     CAPS_MM_EPI_COUNTERS,
     CAPS_FMT0,
+    CAPS_VBUILD,
     CAPS_WATCHDOG,
     CMD_DESC_BYTES,
     CONTROL_CLEAR,
@@ -186,7 +187,8 @@ def test_identity_caps_and_parameters():
         assert (yield from cread(axil, REG_ABI_VERSION)) == TROOM_ABI_VERSION
         caps = ((1 << CAPS_FMT0) | (1 << CAPS_WATCHDOG)
                 | (1 << CAPS_ENGINE_COUNTERS)
-                | (1 << CAPS_MM_EPI_COUNTERS))
+                | (1 << CAPS_MM_EPI_COUNTERS)
+                | (1 << CAPS_VBUILD))
         assert (yield from cread(axil, REG_CAPS)) == caps
         assert (yield from cread(axil, REG_MEM_BASE)) == MEM_BASE
         assert (yield from cread(axil, REG_MEM_SIZE)) == MEM_SIZE

@@ -4,7 +4,6 @@ from troom.ctrl import TroomController
 from troom.dma import DMA
 from troom.epilogue import Epilogue
 from troom.fetch import CommandFetcher
-from troom.matrix import MatrixUnit
 from troom.quantize import ActLoader
 from troom.tmem import TMEM
 from troom.wrapper import TroomWrapper

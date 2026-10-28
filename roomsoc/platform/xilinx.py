@@ -9,6 +9,80 @@ from roomsoc.interconnect.stream import Valid
 
 class XilinxPlatform(VendorXilinxPlatform):
 
+    def get_dsp48e2_int_mac(self, mac):
+        """Implement IntMac's fixed M/P timing using a dedicated cascade."""
+        if len(mac.a) > 27 or len(mac.b) > 18:
+            raise ValueError('DSP48E2 signed operands must fit 27 x 18 bits')
+        m = Module()
+        a = Signal(signed(30))
+        b = Signal(signed(18))
+        m.d.comb += [a.eq(mac.a), b.eq(mac.b)]
+        m.submodules.dsp = Instance(
+            'DSP48E2',
+            p_A_INPUT='DIRECT',
+            p_B_INPUT='DIRECT',
+            p_AMULTSEL='A',
+            p_BMULTSEL='B',
+            p_PREADDINSEL='A',
+            p_USE_MULT='MULTIPLY',
+            p_USE_SIMD='ONE48',
+            p_AREG=0,
+            p_ACASCREG=0,
+            p_BREG=0,
+            p_BCASCREG=0,
+            p_CREG=0,
+            p_DREG=0,
+            p_ADREG=0,
+            p_MREG=1,
+            p_PREG=1,
+            p_INMODEREG=0,
+            p_OPMODEREG=0,
+            p_ALUMODEREG=0,
+            p_CARRYINREG=0,
+            p_CARRYINSELREG=0,
+            i_CLK=ClockSignal(),
+            i_A=a,
+            i_B=b,
+            i_C=0,
+            i_D=0,
+            i_ACIN=0,
+            i_BCIN=0,
+            i_PCIN=0 if mac.first else mac.cascade_in,
+            i_INMODE=0,
+            i_OPMODE=0b000000101 if mac.first else 0b000010101,
+            i_ALUMODE=0,
+            i_CARRYIN=0,
+            i_CARRYINSEL=0,
+            i_CARRYCASCIN=0,
+            i_MULTSIGNIN=0,
+            i_CEA1=0,
+            i_CEA2=0,
+            i_CEB1=0,
+            i_CEB2=0,
+            i_CEC=0,
+            i_CED=0,
+            i_CEAD=0,
+            i_CEM=1,
+            i_CEP=1,
+            i_CEINMODE=0,
+            i_CECTRL=0,
+            i_CEALUMODE=0,
+            i_CECARRYIN=0,
+            i_RSTA=0,
+            i_RSTB=0,
+            i_RSTC=0,
+            i_RSTD=0,
+            i_RSTM=ResetSignal(),
+            i_RSTP=ResetSignal(),
+            i_RSTINMODE=0,
+            i_RSTCTRL=0,
+            i_RSTALUMODE=0,
+            i_RSTALLCARRYIN=0,
+            o_PCOUT=mac.cascade_out,
+            o_P=mac.result,
+        )
+        return m
+
     class AsyncFIFO(Elaboratable):
 
         def __init__(self, *, width, depth, r_domain="read", w_domain="write"):
@@ -199,7 +273,7 @@ class XilinxPlatform(VendorXilinxPlatform):
 
             return m
 
-    def get_fma(self, *, width, format, latency=3):
-        return XilinxPlatform.XilinxFMA(width=width,
-                                        format=format,
-                                        latency=latency)
+    # def get_fma(self, *, width, format, latency=3):
+    #     return XilinxPlatform.XilinxFMA(width=width,
+    #                                     format=format,
+    #                                     latency=latency)

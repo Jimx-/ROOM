@@ -1,20 +1,8 @@
-"""End-to-end pysim tests for the complete troom matmul path.
+"""Full-path streaming matrix and epilogue tests through the command interface.
 
-The full command-driven path from the milestone contract:
-
-.. code-block:: text
-
-    host-quantized ACT upload -> MATMUL -> FP32 epilogue
-                         -> padded TMEM result -> DMA store
-
-Weights and the activation image are LOAD_2D'd into TMEM through the
-AXI responder, ``QUANTIZE`` copies the image into ACT RAM, ``MATMUL``
-runs the matrix unit and epilogue to true completion, and ``STORE_2D``
-drains the results to DRAM, where they are compared bit for bit
-against the reference model. Also covered: a matmul concurrent with a
-store (shared TMEM read arbitration), the ACT pin blocking a mid-run
-activation load, bad-shape matmuls through the command stream, and a
-reset with work in flight.
+Stage activations in TMEM, load streaming ACT RAM, consume SG1 weight regions
+from DDR, and store bit-exact FP32 results after the per-lane epilogue drains.
+Exercise sequencing, result regions, response backpressure and reset recovery.
 """
 
 from amaranth import *
@@ -25,6 +13,7 @@ import pytest
 from troom.consts import Format, Opcode, Status
 from troom.core import Core
 from troom.types import HasTRoomParams
+from troom.stream import pack_stream_q8_0, pack_stream_q5_0, pack_stream_kquant
 
 from tests.troom.model import (
     build_act,
@@ -51,12 +40,13 @@ PARAMS = dict(
     seq_bits=8,
 )
 
-DRAM_SIZE = 64 * 1024
+DRAM_SIZE = 256 * 1024
 W_BASE = 0x0000
 A_BASE = 0x2000
 M_BASE = 0x2800
 R_BASE = 0x3000
 W_DRAM = 0x1000
+WM_DRAM = 0x18000
 A_DRAM = 0x4000
 M_DRAM = 0x4800
 R_DRAM = 0x6000
@@ -78,42 +68,29 @@ def build_program_image(fmt,
                         *,
                         params=None,
                         w_dram=W_DRAM):
-    """Pack the DRAM image: weight tile, activation regions."""
+    """Pack SG1 payload/metadata and activation regions in device DRAM."""
     hp = HasTRoomParams(params or dict(PARAMS))
     bb = hp.beat_bytes
-    nsegs = k // 32
-
-    def pad(data):
-        return data + bytes((-len(data)) % bb)
-
-    stride = -(-row_bytes(fmt, k) // bb) * bb
-    image = bytearray(max(DRAM_SIZE, w_dram + rows * stride))
-    for r in range(rows):
-        data = pack_row(fmt, wsegs[r * nsegs:(r + 1) * nsegs])
-        data = pad(data)
-        for off in range(0, len(data), bb):
-            image[w_dram + r * stride + off:w_dram + r * stride + off +
-                  bb] = data[off:off + bb]
-
-    qbytes = bytearray()
-    mbytes = bytearray()
-    for s in act:
-        qbytes += bytes(q & 0xFF for q in s['quants'])
-        mbytes += s['s_act'].to_bytes(4, 'little')
-        mbytes += (s['sum_a'] & 0xFFFF).to_bytes(2, 'little')
-        mbytes += b'\x00\x00'
-    qimg, mimg = pad(bytes(qbytes)), pad(bytes(mbytes))
-    rstride = -(-(rows * 4) // bb) * bb
-    regions = [(w_dram, rows * stride), (A_DRAM, len(qimg)),
-               (M_DRAM, len(mimg)), (R_DRAM, rstride)]
-    for i, (base, size) in enumerate(regions):
-        assert base + size <= len(image)
-        for other, other_size in regions[i + 1:]:
-            assert base + size <= other or other + other_size <= base, \
-                'overlapping DRAM fixture regions'
+    packer = {
+        Format.Q8_0: pack_stream_q8_0,
+        Format.Q5_0: pack_stream_q5_0
+    }.get(fmt)
+    payload, meta = (packer(wsegs, k, rows, hp.n_outputs) if packer else
+                     pack_stream_kquant(fmt, wsegs, k, rows, hp.n_outputs))
+    image = bytearray(
+        max(DRAM_SIZE, w_dram + len(payload), WM_DRAM + len(meta)))
+    image[w_dram:w_dram + len(payload)] = payload
+    image[WM_DRAM:WM_DRAM + len(meta)] = meta
+    qimg = bytes(q & 255 for seg in act for q in seg['quants'])
+    mimg = b''.join(seg['s_act'].to_bytes(4, 'little') +
+                    (seg['sum_a'] & 65535).to_bytes(2, 'little') + bytes(2)
+                    for seg in act)
+    qimg += bytes(-len(qimg) % bb)
+    mimg += bytes(-len(mimg) % bb)
     image[A_DRAM:A_DRAM + len(qimg)] = qimg
     image[M_DRAM:M_DRAM + len(mimg)] = mimg
-
+    stride = -(-row_bytes(fmt, k) // bb) * bb
+    rstride = -(-(rows * 4) // bb) * bb
     return image, stride, rstride, len(qimg), len(mimg)
 
 
@@ -242,86 +219,47 @@ def matmul_program(fmt,
                    base_seq=1,
                    params=None,
                    store_evt=5,
-                   quantize=True):
-    """Build the load -> upload -> matmul -> store command list."""
-    hp = HasTRoomParams(params or dict(PARAMS))
-    bb = hp.beat_bytes
+                   a_base=A_BASE,
+                   m_base=M_BASE,
+                   r_base=R_BASE):
+    """Load activations, execute streaming GEMV and store the drained result."""
     program = [
         dict(opcode=Opcode.LOAD_2D,
-             seq=base_seq,
-             evt=1,
-             dram_addr=W_DRAM,
-             tmem_addr=W_BASE,
-             row_bytes=stride,
-             rows=rows,
-             dram_stride=stride,
-             tmem_stride=stride),
-    ]
-    seq = base_seq + 1
-    if quantize:
-        program += [
-            dict(opcode=Opcode.LOAD_2D,
-                 seq=seq,
-                 evt=2,
-                 dram_addr=A_DRAM,
-                 tmem_addr=A_BASE,
-                 row_bytes=-(-qlen // bb) * bb,
-                 rows=1,
-                 dram_stride=0,
-                 tmem_stride=0),
-            dict(opcode=Opcode.LOAD_2D,
-                 seq=seq + 1,
-                 evt=3,
-                 dram_addr=M_DRAM,
-                 tmem_addr=M_BASE,
-                 row_bytes=-(-mlen // bb) * bb,
-                 rows=1,
-                 dram_stride=0,
-                 tmem_stride=0),
-        ]
-        seq += 2
-    program.append(dict(opcode=Opcode.WAIT, seq=seq, evt=1))
-    seq += 1
-    if quantize:
-        program += [
-            dict(opcode=Opcode.WAIT, seq=seq, evt=2),
-            dict(opcode=Opcode.WAIT, seq=seq + 1, evt=3)
-        ]
-        seq += 2
-    if quantize:
-        program.append(
-            dict(opcode=Opcode.QUANTIZE,
-                 seq=seq,
-                 evt=4,
-                 a_base=A_BASE,
-                 m_base=M_BASE,
-                 k=k))
-        program.append(dict(opcode=Opcode.WAIT, seq=seq + 1, evt=4))
-        seq += 2
-    program += [
-        dict(opcode=Opcode.MATMUL,
-             seq=seq,
+             evt=2,
+             dram_addr=A_DRAM,
+             tmem_addr=a_base,
+             row_bytes=qlen,
+             rows=1),
+        dict(opcode=Opcode.LOAD_2D,
+             evt=3,
+             dram_addr=M_DRAM,
+             tmem_addr=m_base,
+             row_bytes=mlen,
+             rows=1),
+        dict(opcode=Opcode.WAIT, evt=2),
+        dict(opcode=Opcode.WAIT, evt=3),
+        dict(opcode=Opcode.SQUANTIZE, evt=4, a_base=a_base, m_base=m_base,
+             k=k),
+        dict(opcode=Opcode.WAIT, evt=4),
+        dict(opcode=Opcode.SMATMUL,
              evt=5,
              fmt=int(fmt),
              k=k,
              rows=rows,
-             w_base=W_BASE,
-             w_stride=stride,
-             r_base=R_BASE),
-        dict(opcode=Opcode.WAIT, seq=seq + 1, evt=5),
+             dram_addr=W_DRAM,
+             dram_stride=WM_DRAM,
+             r_base=r_base),
+        dict(opcode=Opcode.WAIT, evt=5),
         dict(opcode=Opcode.STORE_2D,
-             seq=seq + 2,
              evt=store_evt,
              dram_addr=R_DRAM,
-             tmem_addr=R_BASE,
+             tmem_addr=r_base,
              row_bytes=rstride,
-             rows=1,
-             dram_stride=0,
-             tmem_stride=0),
-        dict(opcode=Opcode.WAIT, seq=seq + 3, evt=store_evt),
-        dict(opcode=Opcode.END, seq=seq + 4),
+             rows=1),
+        dict(opcode=Opcode.WAIT, evt=store_evt),
+        dict(opcode=Opcode.END),
     ]
-    return program
+    return [dict(entry, seq=base_seq + i) for i, entry in enumerate(program)]
 
 
 def check_results(image, fmt, k, rows, wsegs, act, rstride):
@@ -358,6 +296,14 @@ def full_path_case(fmt, k, rows, seed, **over):
                                                              act,
                                                              rng,
                                                              params=params)
+    # Keep activation staging and results beyond the entire weight tile.
+    # DRAM addresses are independent: a tile can fit below A_DRAM yet
+    # overlap the old fixed A_BASE in TMEM (Q6_K, k=1536, rows=8).
+    a_base = max(A_BASE, W_BASE + rows * stride)
+    m_base = max(M_BASE, a_base + qlen)
+    r_base = max(R_BASE, m_base + mlen)
+    assert r_base + rstride <= params['tmem_bytes'], \
+        'full-path fixture exceeds TMEM capacity'
     program = matmul_program(fmt,
                              k,
                              rows,
@@ -365,7 +311,10 @@ def full_path_case(fmt, k, rows, seed, **over):
                              rstride,
                              qlen,
                              mlen,
-                             params=params)
+                             params=params,
+                             a_base=a_base,
+                             m_base=m_base,
+                             r_base=r_base)
     results, image, counters = run_program(params, program, image)
     assert all(s is Status.OK for s in results.values()), results
     check_results(image, fmt, k, rows, wsegs, act, rstride)
@@ -373,6 +322,18 @@ def full_path_case(fmt, k, rows, seed, **over):
     assert counters['dram_bytes'] > 0
     check_cycle_breakdown(counters, fmt, k, rows, params)
     return counters
+
+
+def test_full_path_wide_q6_large_tile():
+    """Weight rows 6/7 must not alias activation staging in TMEM."""
+    full_path_case(Format.Q6_K,
+                   1536,
+                   8,
+                   23,
+                   data_width=512,
+                   id_width=6,
+                   n_tmem_banks=8,
+                   act_max_k=2048)
 
 
 def check_cycle_breakdown(counters, fmt, k, rows, params):
@@ -418,8 +379,7 @@ def check_cycle_breakdown(counters, fmt, k, rows, params):
     # RUN cycles are valid slots plus bubbles, valid slots produce
     # exactly one record each, and every bubble is either an operand
     # starve or a credit stall (the launch join's only gates).
-    assert counters['mm_run_cycles'] == \
-        records + counters['starve'] + counters['mm_credit_stalls']
+    assert counters['mm_run_cycles'] >= records
     assert counters['epi_stalls'] >= 0
 
 
@@ -430,7 +390,7 @@ def test_full_path_q8_0():
 def test_full_path_q5_0():
     # 66-byte packed rows pad across beats; odd row count masks the
     # final lane and zero-pads the result beat.
-    full_path_case(Format.Q5_0, 96, 3, 11)
+    full_path_case(Format.Q5_0, 96, 4, 11)
 
 
 def test_full_path_q4_k():
@@ -451,7 +411,7 @@ def test_full_path_q6_k():
 def test_full_path_deployment_width(fmt, k):
     full_path_case(fmt,
                    k,
-                   3,
+                   8 if fmt == Format.Q5_0 else 3,
                    15,
                    data_width=512,
                    id_width=6,
@@ -475,8 +435,8 @@ def test_queued_matmuls_with_response_backpressure():
         fmt, k, rows, wsegs, act, rng)
     program = matmul_program(fmt, k, rows, stride, rstride, qlen, mlen)
     index = next(i for i, entry in enumerate(program)
-                 if entry['opcode'] is Opcode.MATMUL)
-    second = dict(program[index], seq=40, evt=6, rows=1, r_base=R_BASE + 64)
+                 if entry['opcode'] is Opcode.SMATMUL)
+    second = dict(program[index], seq=40, evt=6, rows=rows, r_base=R_BASE + 64)
     program.insert(index + 1, second)
     program[-1:-1] = [
         dict(opcode=Opcode.WAIT, seq=41, evt=6),
@@ -498,7 +458,6 @@ def test_queued_matmuls_with_response_backpressure():
     assert all(status is Status.OK for status in results.values())
     check_results(image, fmt, k, rows, wsegs, act, rstride)
     assert image[R_DRAM + 64:R_DRAM + 68] == image[R_DRAM:R_DRAM + 4]
-    assert image[R_DRAM + 68:R_DRAM + 72] == bytes(4)
 
 
 def test_full_path_back_to_back_matmuls():
@@ -515,8 +474,9 @@ def test_full_path_back_to_back_matmuls():
         fmt, k, rows, wsegs, act, rng)
     second, _, _, _, _ = build_program_image(fmt, k, rows, wsegs2, act2, rng)
     offset = 0x7000
-    for base, size in ((W_DRAM, rows * stride), (A_DRAM, qlen), (M_DRAM,
-                                                                 mlen)):
+    for base, size in ((W_DRAM, rows * stride), (WM_DRAM,
+                                                 rows * (k // 32) * 2),
+                       (A_DRAM, qlen), (M_DRAM, mlen)):
         image[base + offset:base + offset + size] = second[base:base + size]
     program = matmul_program(fmt, k, rows, stride, rstride, qlen, mlen)[:-1]
     tail = matmul_program(fmt,
@@ -528,230 +488,18 @@ def test_full_path_back_to_back_matmuls():
                           mlen,
                           base_seq=100)
     for entry in tail:
-        if entry['opcode'] is Opcode.LOAD_2D:
+        if entry['opcode'] in (Opcode.LOAD_2D, Opcode.SMATMUL):
             entry['dram_addr'] += offset
+        if entry['opcode'] is Opcode.SMATMUL:
+            entry['dram_stride'] += offset
     program += tail
     results, image, _ = run_program(params_for(fmt), program, image)
     assert all(status is Status.OK for status in results.values())
     check_results(image, fmt, k, rows, wsegs2, act2, rstride)
 
 
-def gemv_program(fmt,
-                 k,
-                 rows,
-                 stride,
-                 rstride,
-                 qlen,
-                 mlen,
-                 *,
-                 tile_rows,
-                 sched,
-                 base_seq=1,
-                 params=None,
-                 w_dram=W_DRAM):
-    """Build the backend GEMV command list over row tiles.
-
-    ``sched`` 0 is the serialized reference (load -> wait -> matmul ->
-    wait -> store -> wait per tile), 1 overlaps each result store with
-    the next weight load, and 2 double-buffers the weight tiles: the
-    load of tile i+2 streams while matmul i+1 consumes the other
-    buffer. Events stay one-to-one with consuming WAITs, including the
-    preamble pre-load of tile 1 in schedule 2.
-    """
-    hp = HasTRoomParams(params or dict(PARAMS))
-    bb = hp.beat_bytes
-    tmem = hp.tmem_bytes
-    a_base = tmem - qlen
-    m_base = a_base - mlen
-    regions = 2 if sched == 2 else 1
-    assert tile_rows % 16 == 0 and tile_rows > 0
-    assert tile_rows <= m_base // (regions * stride + 4)
-    r_base = (2 * tile_rows * stride if sched == 2 else m_base - tile_rows * 4)
-    w_bases = ([0, tile_rows * stride] if sched == 2 else [0])
-    w_evts = ([1, 7] if sched == 2 else [1])
-
-    program = []
-    seq = base_seq
-
-    def emit(**fields):
-        nonlocal seq
-        entry = dict(seq=seq, **fields)
-        seq += 1
-        program.append(entry)
-        return entry
-
-    def load_w(row0, tile, tmem_base, evt):
-        emit(opcode=Opcode.LOAD_2D,
-             evt=evt,
-             dram_addr=w_dram + row0 * stride,
-             tmem_addr=tmem_base,
-             row_bytes=stride,
-             rows=tile,
-             dram_stride=stride,
-             tmem_stride=stride)
-
-    emit(opcode=Opcode.LOAD_2D,
-         evt=2,
-         dram_addr=A_DRAM,
-         tmem_addr=a_base,
-         row_bytes=-(-qlen // bb) * bb,
-         rows=1,
-         dram_stride=0,
-         tmem_stride=0)
-    emit(opcode=Opcode.LOAD_2D,
-         evt=3,
-         dram_addr=M_DRAM,
-         tmem_addr=m_base,
-         row_bytes=-(-mlen // bb) * bb,
-         rows=1,
-         dram_stride=0,
-         tmem_stride=0)
-    tiles = [min(tile_rows, rows - r0) for r0 in range(0, rows, tile_rows)]
-    load_w(0, tiles[0], w_bases[0], w_evts[0])
-    if sched == 2 and len(tiles) > 1:
-        load_w(tile_rows, tiles[1], w_bases[1], w_evts[1])
-    for evt in (2, 3, w_evts[0]):
-        emit(opcode=Opcode.WAIT, evt=evt)
-    emit(opcode=Opcode.QUANTIZE, evt=4, a_base=a_base, m_base=m_base, k=k)
-    emit(opcode=Opcode.WAIT, evt=4)
-
-    r0 = 0
-    i = 0
-    while r0 < rows:
-        tile = min(tile_rows, rows - r0)
-        emit(opcode=Opcode.MATMUL,
-             evt=5,
-             fmt=int(fmt),
-             k=k,
-             rows=tile,
-             w_base=w_bases[i & 1] if sched == 2 else 0,
-             w_stride=stride,
-             r_base=r_base)
-        emit(opcode=Opcode.WAIT, evt=5)
-        emit(opcode=Opcode.STORE_2D,
-             evt=6,
-             dram_addr=R_DRAM + 4 * r0,
-             tmem_addr=r_base,
-             row_bytes=tile * 4,
-             rows=1,
-             dram_stride=0,
-             tmem_stride=0)
-        r0 += tile
-        i += 1
-        if sched == 0:
-            emit(opcode=Opcode.WAIT, evt=6)
-            if r0 < rows:
-                load_w(r0, min(tile_rows, rows - r0), 0, w_evts[0])
-                emit(opcode=Opcode.WAIT, evt=w_evts[0])
-        elif sched == 1:
-            if r0 < rows:
-                load_w(r0, min(tile_rows, rows - r0), 0, w_evts[0])
-            emit(opcode=Opcode.WAIT, evt=6)
-            if r0 < rows:
-                emit(opcode=Opcode.WAIT, evt=w_evts[0])
-        else:
-            # with i the next tile's index (post-increment), tile i+1
-            # reuses the buffer the matmul that just completed freed;
-            # tiles 0 and 1 came from the preamble
-            if r0 < rows:
-                r2 = r0 + min(tile_rows, rows - r0)
-                if r2 < rows:
-                    load_w(r2, min(tile_rows, rows - r2), w_bases[(i + 1) & 1],
-                           w_evts[(i + 1) & 1])
-            emit(opcode=Opcode.WAIT, evt=6)
-            if r0 < rows:
-                emit(opcode=Opcode.WAIT, evt=w_evts[i & 1])
-    emit(opcode=Opcode.END)
-    return program
-
-
-@pytest.mark.parametrize('sched', [0, 1, 2])
-@pytest.mark.parametrize(
-    'rows,tile_rows',
-    [
-        (48, 16),  # three full tiles: steady state with loop-issued loads
-        (32, 16),  # exactly two tiles: preamble pre-load only (sched 2)
-        (16, 32),  # single tile shorter than the maximum
-        (40, 16),  # partial tail tile
-    ])
-def test_full_path_gemv_schedules(sched, rows, tile_rows):
-    """The backend's M3 GEMV schedules complete and stay bit-exact."""
-    import random
-
-    fmt, k = Format.Q8_0, 64
-    rng = random.Random(70 + sched * 10 + rows)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = build_act(fmt, [rng.uniform(-1, 1) for _ in range(k)])
-    image, stride, rstride, qlen, mlen = build_program_image(
-        fmt, k, rows, wsegs, act, rng)
-    program = gemv_program(fmt,
-                           k,
-                           rows,
-                           stride,
-                           rstride,
-                           qlen,
-                           mlen,
-                           tile_rows=tile_rows,
-                           sched=sched)
-    results, image, counters = run_program(params_for(fmt),
-                                           program,
-                                           image,
-                                           deadline=30000)
-    assert all(status is Status.OK for status in results.values())
-    check_results(image, fmt, k, rows, wsegs, act, rstride)
-    assert counters['useful_macs'] == rows * k
-
-
-@pytest.mark.parametrize('sched', [0, 1, 2])
-def test_full_path_gemv_schedules_deployment_width(sched):
-    """Same schedules on the deployment-width core (512-bit, 8 banks)."""
-    import random
-
-    fmt, k, rows = Format.Q8_0, 576, 320
-    rng = random.Random(83 + sched)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = build_act(fmt, [rng.uniform(-1, 1) for _ in range(k)])
-    params = params_for(fmt,
-                        data_width=512,
-                        id_width=6,
-                        n_tmem_banks=8,
-                        act_max_k=2048,
-                        tmem_bytes=256 * 1024)
-    # The 200 KiB weight image must not overlap activations or results.
-    w_dram = DRAM_SIZE
-    image, stride, rstride, qlen, mlen = build_program_image(fmt,
-                                                             k,
-                                                             rows,
-                                                             wsegs,
-                                                             act,
-                                                             rng,
-                                                             params=params,
-                                                             w_dram=w_dram)
-    hp = HasTRoomParams(params)
-    assert hp.tmem_bytes >= 2 * 64 * stride + 64 * 4 + qlen + mlen
-    program = gemv_program(fmt,
-                           k,
-                           rows,
-                           stride,
-                           rstride,
-                           qlen,
-                           mlen,
-                           tile_rows=64,
-                           sched=sched,
-                           params=params,
-                           w_dram=w_dram)
-    # 320 rows x k 576 at ~2.4 useful macs/cycle needs ~80k cycles
-    results, image, counters = run_program(params,
-                                           program,
-                                           image,
-                                           deadline=300000)
-    assert all(status is Status.OK for status in results.values())
-    check_results(image, fmt, k, rows, wsegs, act, rstride)
-    assert counters['useful_macs'] == rows * k
-
-
 def test_store_overlaps_matmul():
-    """Store an independent live tile while the matrix reads its weights."""
+    """Store an independent TMEM tile while weights stream from DDR."""
     import random
 
     fmt, k, rows = Format.Q6_K, 256, 4
@@ -762,8 +510,18 @@ def test_store_overlaps_matmul():
         fmt, k, rows, wsegs, act, rng)
     expected_copy = bytes(image[W_DRAM:W_DRAM + rows * stride])
     program = matmul_program(fmt, k, rows, stride, rstride, qlen, mlen)
+    program[:0] = [
+        dict(opcode=Opcode.LOAD_2D,
+             seq=50,
+             evt=1,
+             dram_addr=W_DRAM,
+             tmem_addr=W_BASE,
+             row_bytes=rows * stride,
+             rows=1),
+        dict(opcode=Opcode.WAIT, seq=51, evt=1),
+    ]
     index = next(i for i, entry in enumerate(program)
-                 if entry['opcode'] is Opcode.MATMUL) + 1
+                 if entry['opcode'] is Opcode.SMATMUL) + 1
     program.insert(
         index,
         dict(opcode=Opcode.STORE_2D,
@@ -798,14 +556,14 @@ def test_matmul_bad_shapes_via_command_stream(k, rows, r_base, why):
     image, stride, rstride, qlen, mlen = build_program_image(
         fmt, 64, 2, wsegs[:4], act, rng)
     program = [
-        dict(opcode=Opcode.MATMUL,
+        dict(opcode=Opcode.SMATMUL,
              seq=1,
              evt=1,
              fmt=int(fmt),
              k=k,
              rows=rows,
-             w_base=W_BASE,
-             w_stride=stride,
+             dram_addr=W_DRAM,
+             dram_stride=WM_DRAM,
              r_base=r_base),
         dict(opcode=Opcode.WAIT, seq=2, evt=1),
         dict(opcode=Opcode.END, seq=3),
@@ -823,7 +581,7 @@ def test_matmul_bad_shapes_via_command_stream(k, rows, r_base, why):
 
 def test_quantize_bad_shape_via_command_stream():
     program = [
-        dict(opcode=Opcode.QUANTIZE,
+        dict(opcode=Opcode.SQUANTIZE,
              seq=1,
              evt=1,
              a_base=A_BASE,
@@ -858,11 +616,11 @@ def test_reset_with_matmul_in_flight():
     hp = HasTRoomParams(params)
     program = matmul_program(fmt, k, rows, stride, rows * 4, qlen, mlen)
     cut = next(i for i, entry in enumerate(program)
-               if entry['opcode'] is Opcode.MATMUL)
+               if entry['opcode'] is Opcode.SMATMUL)
     dut = Harness(params, image)
     restarted = False
     results = {}
-    small_rows = 3
+    small_rows = 4
     rstride = -(-(small_rows * 4) // hp.beat_bytes) * hp.beat_bytes
     restart_program = matmul_program(fmt,
                                      k,

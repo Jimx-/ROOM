@@ -150,6 +150,7 @@ CAPS_FMT0 = 0  # format-0 command descriptors supported
 CAPS_WATCHDOG = 1  # MAX_CYCLES hardware watchdog implemented
 CAPS_ENGINE_COUNTERS = 2  # observation-counter window implemented
 CAPS_MM_EPI_COUNTERS = 3  # matrix/epilogue cycle-breakdown window
+CAPS_VBUILD = 4  # device-side V-window tile builder (VBUILD opcode)
 
 
 class WrapperError(IntEnum):

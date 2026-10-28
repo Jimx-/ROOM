@@ -1060,6 +1060,139 @@ def vec_quant_regions(words, beat_bytes):
     return qblob, mblob
 
 
+# ---------------------------------------------------------------------------
+# Device-side V-window tile contract (VBUILD, M5)
+# ---------------------------------------------------------------------------
+#
+# A V tile row is a Q8_0 weight row over the 64 window slots: two
+# blocks of [FP16 d][32 INT8 quants]. The numeric sequence is the
+# frozen VEC_QUANT contract above, re-expressed over the FP16 pool
+# values: the amax folds over the FP16 magnitude patterns (NaN never
+# wins; +inf does), the winning pattern widens exactly
+# (``fp16_to_f32`` matches the RTL's Fp16Widen, canonical NaNs), and
+# the block scale pair and quants follow ``vec_quant_segments`` with
+# the FP16-rounded ``sc`` stored as the block's ``d``:
+#
+#     a   = widen(max |x|)  over the live slots of the block
+#     sc  = R(a * fp32(1/127));  d = fp16_RNE(sc)
+#     r   = the frozen recip sequence of a (+0 when a == 0 or
+#           a >= 2^126, where every quant collapses to zero)
+#     q_i = q8(R(R(widen(x_i) * r) * 127.0))
+#
+# The RTL (troom.vbuild), this model, and the backend's host-side
+# tile builder are bit-frozen together: a tile is byte-identical no
+# matter which side built it.
+
+
+def fp32_to_fp16_rne_bits(x):
+    """FP32 word -> FP16 bits, RNE for every pattern (troom.convert
+    .Fp32To16 bit for bit).
+
+    Normals round their 24-bit significand to 11 bits (one guard plus
+    sticky, ties to even); values below the normal range round into
+    the FP16 subnormal grid 2^-24, a carry out of it becoming the
+    smallest normal; magnitudes at or past the half-way point above
+    the largest finite become infinity; zeros and infinities pass
+    through; NaNs canonicalize to a quiet NaN with the sign kept.
+    """
+    sign = x >> 31
+    e = (x >> 23) & 0xff
+    man = x & 0x7fffff
+    if e == 255:
+        return (sign << 15) | 0x7c00 | (0x200 if man else 0)
+    if e == 0:
+        # FP32 zeros and subnormals are far below the FP16 grid.
+        return sign << 15
+    if e >= 127 + 16:
+        return (sign << 15) | 0x7c00
+    sig = man | 0x800000
+    if e >= 127 - 14:
+        keep = sig >> 13
+        guard = (sig >> 12) & 1
+        sticky = (sig & 0xfff) != 0
+        rne = keep + (1 if guard and (sticky or keep & 1) else 0)
+        exp16 = e - 127 + 15 + (1 if rne == 0x800 else 0)
+        if exp16 >= 31:
+            return (sign << 15) | 0x7c00
+        frac16 = 0 if rne == 0x800 else rne & 0x3ff
+        return (sign << 15) | (exp16 << 10) | frac16
+    sh = 126 - e  # 14..125: scale into FP16 subnormal units of 2^-24
+    full = sig >> sh
+    guard = (sig >> (sh - 1)) & 1 if sh <= 24 else 0
+    sticky = (sig & ((1 << (sh - 1)) - 1)) != 0 if sh <= 24 \
+        else sig != 0
+    rne = full + (1 if guard and (sticky or full & 1) else 0)
+    if rne == 1024:
+        return (sign << 15) | (1 << 10)  # the smallest normal
+    return (sign << 15) | rne
+
+
+def vbuild_amax_bits(xh):
+    """The widened amax of one block of FP16 patterns (bit pattern).
+
+    Mirrors the RTL's magnitude fold: NaN patterns (>= 0x7c01) never
+    win, +inf (0x7c00) does, and the winner widens exactly like
+    Fp16Widen. Equal to the FP32 fmax fold over the widened
+    magnitudes for every input mix.
+    """
+    best = 0
+    for h in xh:
+        mag = h & 0x7fff
+        if mag >= 0x7c01:
+            continue  # NaN never wins
+        if mag > best:
+            best = mag
+    return f32_bits(fp16_to_f32(best))
+
+
+def vbuild_quant_row(xh):
+    """One V tile row (64 FP16 patterns, live slots first, the tail
+    already zeroed) -> its 68 Q8_0 bytes (two blocks)."""
+    assert len(xh) == 64
+    out = bytearray(68)
+    for b in range(2):
+        seg = list(xh[32 * b:32 * b + 32])
+        a = vbuild_amax_bits(seg)
+        e = (a >> 23) & 0xff
+        if e == 0:
+            sc, r = 0, 0
+        elif e >= 253:
+            sc, r = fp32_mul_bits(a, INV127_BITS), 0
+        else:
+            y = fp32_rec_seed_bits(a)
+            for _ in range(2):
+                t = fp32_mul_bits(a, y)
+                t = fp32_add_bits(0x40000000, fp32_neg_bits(t))
+                y = fp32_mul_bits(y, t)
+            sc, r = fp32_mul_bits(a, INV127_BITS), y
+        d16 = fp32_to_fp16_rne_bits(sc)
+        out[34 * b:34 * b + 2] = d16.to_bytes(2, 'little')
+        for i, h in enumerate(seg):
+            x = f32_bits(fp16_to_f32(h))
+            q = q8_rne_bits(fp32_mul_bits(fp32_mul_bits(x, r), F127_BITS))
+            out[34 * b + 2 + i] = q
+    return bytes(out)
+
+
+def vbuild_tile(window, beat_bytes):
+    """The padded V tile image of one 64-slot FP16 window.
+
+    ``window`` is the slot-major TMEM image: 64 slots x 64 dims,
+    little-endian FP16 patterns, live slots first (slots at or above
+    the live count are already zero). The result is the 64-row tile
+    the engine writes: row ``d`` (the transposed dim) is
+    ``vbuild_quant_row`` over that dim's slots, zero-padded to a
+    whole bus beat.
+    """
+    assert len(window) == 64 * 64
+    pad = -68 % beat_bytes
+
+    def col(d):
+        return [window[j * 64 + d] for j in range(64)]
+
+    return b''.join(vbuild_quant_row(col(d)) + bytes(pad) for d in range(64))
+
+
 def vec_word(op, a, b):
     """One elementwise result word from FP32 operand bit patterns."""
     if op is VecOp.VEC_ADD:

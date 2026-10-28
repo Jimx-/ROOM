@@ -150,7 +150,9 @@ def test_datapath_opcodes_report_status():
         (Opcode.VECTOR, 5),
         (Opcode.REDUCE, 6),
         (15, 7),  # reserved encoding
-        (Opcode.END, 8),
+        (Opcode.SQUANTIZE, 8),
+        (Opcode.SMATMUL, 9),
+        (Opcode.END, 10),
     ]
 
     def tx():
@@ -165,19 +167,20 @@ def test_datapath_opcodes_report_status():
             # DMA is implemented; zero-length descriptors are invalid.
             1: Status.BAD_ALIGN,
             2: Status.BAD_ALIGN,
-            # The activation load and matmul engines are implemented;
-            # zero-K and zero-row descriptors are bad shapes.
-            3: Status.BAD_SHAPE,
-            4: Status.BAD_SHAPE,
+            # The legacy matrix opcodes are retired.
+            3: Status.BAD_OPCODE,
+            4: Status.BAD_OPCODE,
             # The vector unit is implemented; the zero element count
             # (and the default VEC_ADD sub-op for REDUCE) is a bad
             # shape.
             5: Status.BAD_SHAPE,
             6: Status.BAD_SHAPE,
             7: Status.BAD_OPCODE,
-            8: Status.OK,
+            8: Status.BAD_SHAPE,
+            9: Status.BAD_SHAPE,
+            10: Status.OK,
         }
-        assert (yield dut.cmds_done) == 8
+        assert (yield dut.cmds_done) == 10
 
     run_streams(dut, tx, rx)
 

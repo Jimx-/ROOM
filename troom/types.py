@@ -127,16 +127,60 @@ class HasTRoomParams:
             raise ValueError('mm_result_q must be at least 1')
 
         #
+        # Direct-stream GEMV prototype (streaming redesign phase B)
+        #
+        # The streaming front end replaces the TMEM weight staging with
+        # a DDR-to-FIFO reader; these bound its request traffic and
+        # queueing exactly like the DMA parameters above. ``burst`` is
+        # the request granularity in beats (trimmed to what remains and
+        # to FIFO space), the FIFO depths are in beats of their own
+        # streams, and ``credits`` bounds outstanding beats per stream
+        # so responses can never overrun a queue even at full burst.
+        # Minimum refill batches default to greedy (one beat); larger
+        # batches need enough FIFO lead time to hide request latency.
+        self.sg_burst_beats = params.get('sg_burst_beats', 16)
+        self.sg_min_burst_beats = params.get('sg_min_burst_beats', 1)
+        self.sg_meta_min_burst_beats = params.get('sg_meta_min_burst_beats', 1)
+        self.sg_pay_fifo = params.get('sg_pay_fifo', 32)
+        self.sg_meta_fifo = params.get('sg_meta_fifo', 8)
+        self.sg_credits = params.get('sg_credits', 64)
+
+        if not (1 <= self.sg_burst_beats <= 256):
+            raise ValueError(
+                f'sg_burst_beats {self.sg_burst_beats} must be in 1..256')
+
+        for name in ('sg_min_burst_beats', 'sg_meta_min_burst_beats'):
+            if not (1 <= getattr(self, name) <= self.sg_burst_beats):
+                raise ValueError(f'{name} must be in 1..sg_burst_beats')
+
+        for name in ('sg_pay_fifo', 'sg_meta_fifo', 'sg_credits'):
+            if getattr(self, name) < 1:
+                raise ValueError(f'{name} must be at least 1')
+
+        # Retired build selectors may identify a streaming checkpoint, but
+        # cannot request the removed legacy/coexistence hardware.
+        for name in ('sg_enable', 'sg_only'):
+            if name in params and params[name] != 1:
+                raise ValueError(f'{name}=0 selects retired legacy hardware')
+
         # Vector/reduction unit
         #
         self.vec_result_q = params.get('vec_result_q', 4)
         self.vec_sq_q = params.get('vec_sq_q', 4)
+        # Interleaved unary-transcendental contexts (M4): independent
+        # per-context dependency chains sharing the FPU blocks, with
+        # in-order result retirement. One context degenerates to the
+        # historical serialized sequencer (plus its classify stage).
+        self.vec_unary_ctx = params.get('vec_unary_ctx', 4)
 
         if self.vec_result_q < 1:
             raise ValueError('vec_result_q must be at least 1')
 
         if self.vec_sq_q < 1:
             raise ValueError('vec_sq_q must be at least 1')
+
+        if self.vec_unary_ctx < 1:
+            raise ValueError('vec_unary_ctx must be at least 1')
 
         #
         # Tensor memory

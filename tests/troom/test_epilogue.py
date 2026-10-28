@@ -74,6 +74,42 @@ def push_record(dut, rec, n_outputs=2):
     yield
 
 
+def stream_records(dut, records, n_outputs=2):
+    """Probe-style back-to-back stream: ``valid`` stays high and the
+    next record is presented the cycle after the previous one fires,
+    exactly what the matrix unit does when its supply path is not the
+    limiter."""
+    sink = dut.sink
+    fields = [
+        (sink.bits.fmt, lambda r: int(r['fmt'])),
+        (sink.bits.row_mask, lambda r: r['row_mask']),
+        (sink.bits.s_act, lambda r: r['s_act']),
+        (sink.bits.sum_a, lambda r: r['sum_a'] & 0xFFFF),
+        (sink.bits.seg_k, lambda r: r['seg_k']),
+        (sink.bits.row_last, lambda r: int(r['row_last'])),
+    ]
+    for p in range(n_outputs):
+        fields.extend([
+            (getattr(sink.bits,
+                     f'S{p}'), lambda r, p=p: r.get(f'S{p}', 0) & 0xFFFFFFFF),
+            (getattr(sink.bits,
+                     f'row{p}'), lambda r, p=p: r.get(f'row{p}', 0)),
+            (getattr(sink.bits, f'd{p}'), lambda r, p=p: r.get(f'd{p}', 0)),
+            (getattr(sink.bits,
+                     f'dmin{p}'), lambda r, p=p: r.get(f'dmin{p}', 0)),
+            (getattr(sink.bits, f'mi{p}'), lambda r, p=p: r.get(f'mi{p}', 0)),
+        ])
+    for rec in records:
+        for sig, get in fields:
+            yield sig.eq(get(rec))
+        yield sink.valid.eq(1)
+        yield
+        while not (yield sink.fire):
+            yield
+    yield sink.valid.eq(0)
+    yield
+
+
 def run_epilogue(params,
                  records,
                  rows,
@@ -82,7 +118,8 @@ def run_epilogue(params,
                  stall_wr=False,
                  seed=3,
                  deadline=10000,
-                 hold_writes=0):
+                 hold_writes=0,
+                 stream=False):
     """Drive records through the epilogue; return collected beats."""
     import random
 
@@ -100,19 +137,25 @@ def run_epilogue(params,
         yield
         yield dut.start.eq(0)
         yield
-        for rec in records:
-            yield from push_record(dut, rec, n_outputs=params['n_outputs'])
-            if rng.random() < 0.3:
-                for _ in range(rng.randint(0, 3)):
-                    yield
+        if stream:
+            yield from stream_records(dut,
+                                      records,
+                                      n_outputs=params['n_outputs'])
+        else:
+            for rec in records:
+                yield from push_record(dut, rec, n_outputs=params['n_outputs'])
+                if rng.random() < 0.3:
+                    for _ in range(rng.randint(0, 3)):
+                        yield
         for _ in range(deadline):
             yield
             if (yield dut.done):
                 yield
                 result['done'] = True
-                result['records'] = (yield dut.records)
-                result['folds'] = (yield dut.folds)
-                result['write_beats'] = (yield dut.write_beats)
+                for name in ('records', 'folds', 'write_beats',
+                             'active_cycles', 'stall_cycles', 'cast_ops',
+                             'mul_ops', 'add_ops'):
+                    result[name] = (yield getattr(dut, name))
                 break
         else:
             raise TimeoutError('epilogue did not finish')
@@ -228,7 +271,13 @@ def test_epilogue_write_backpressure():
 @pytest.mark.parametrize('fmt,k', [(Format.Q8_0, 32), (Format.Q4_K, 256)])
 @pytest.mark.parametrize('n_outputs', [1, 2, 4])
 def test_epilogue_long_write_stall(fmt, k, n_outputs):
-    """Results and fold contexts survive a stall beyond all queue capacity."""
+    """Results and fold contexts survive a stall beyond all queue capacity.
+
+    Short rows exercise admission while a previous capture is still
+    pending: that capture must reserve a snapshot slot. Multiple lanes
+    also exercise snapshot retirement before fold-half results land;
+    those in-flight results must retain their destination reservations.
+    """
     import random
 
     rows = 33
@@ -270,6 +319,50 @@ def test_epilogue_q8_0_real_k():
     ], act)
     writes, _ = run_epilogue(params_for(), records, rows, seed=41)
     check(writes, params_for(), records, rows)
+
+
+# Deployment-width acceptance-rate guard (M3d step 2). The M3c
+# two-entry record-order FIFOs capped the always-fed acceptance
+# cadence at a deterministic 2/3-cycle mix (mean 2.41, whole-run 3.12
+# cyc/record after step 1); three entries must hold the whole-run
+# bound below that cadence.
+WIDE = dict(
+    addr_width=32,
+    data_width=512,
+    id_width=6,
+    seg_len=32,
+    n_outputs=2,
+    n_tokens=1,
+    n_tmem_banks=8,
+    tmem_bytes=256 * 1024,
+    act_max_k=2048,
+)
+
+
+def test_epilogue_wide_q8_acceptance_budget():
+    import random
+
+    fmt, k, rows = Format.Q8_0, 576, 64
+    rng = random.Random(84)
+    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
+    act = [dict(e, sum_a=sum(e['quants'])) for e in gen_act(rng, k // 32)]
+    records = mm_segments(fmt, k, rows, [
+        pack_row(fmt, wsegs[r * (k // 32):(r + 1) * (k // 32)])
+        for r in range(rows)
+    ], act)
+    writes, res = run_epilogue(dict(WIDE), records, rows, stream=True)
+    n = len(records)
+    assert res['records'] == n
+    assert res['folds'] == rows
+    # Exact per-record issue plan for the two-lane Q8_0 family.
+    assert res['cast_ops'] == 4 * n
+    assert res['mul_ops'] == 4 * n
+    assert res['add_ops'] == 2 * n + 3 * rows
+    # Two-entry cadence measured 3.12 cyc/record here (2.41 steady
+    # mean plus the row boundary); leave margin for control changes
+    # while requiring the step-2 gain.
+    assert res['active_cycles'] / n < 3.0, res['active_cycles'] / n
+    check(writes, dict(WIDE), records, rows)
 
 
 # ---------------------------------------------------------------------------

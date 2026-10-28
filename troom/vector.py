@@ -77,11 +77,17 @@ on the producing unit's ``out.valid`` rather than a hardcoded
 latency. The binary/reduction datapaths issue one element per cycle
 when the read windows and credits allow; ``RDC_MAX``'s serial
 dependency issues one comparison per unit latency; the
-transcendentals serialize elements through a dependency
-micro-sequencer that issues each arithmetic request once and
-captures it on ``out.valid`` (operation counts are not cycle counts:
-exp2's fifteen dependent rounded ops occupy roughly sixty cycles per
-element with the three-cycle blocks).
+transcendentals run each element's fixed dependency sequence in one
+of ``vec_unary_ctx`` independent contexts that share the FPU blocks
+through per-unit arbitration (one add, one multiply, and one seed
+issue per cycle across contexts), with per-unit context tags routing
+every ``out.valid`` to its owning context and an in-order retire
+buffer preserving element order. Each element's operation sequence,
+and therefore its numerical contract, is unchanged by the
+interleaving; with four contexts the per-element cost is the op
+count (exp2's sixteen dependent rounded ops) times the four-cycle
+capture loop, divided by four -- roughly sixteen cycles per element
+instead of sixty-one.
 
 Regions are read as consecutive whole beats through per-region byte
 windows (any beat width works; ``data_width`` must be at least 32
@@ -192,6 +198,14 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         self.elements = Signal(48)
         self.write_beats = Signal(48)
         self.stall_cycles = Signal(48)
+        # Per-unit FPU issue fires and the busy window they divide,
+        # for issue-slot utilization attribution (M4). Timing-cold
+        # observation only; nothing in the datapath reads them.
+        self.active_cycles = Signal(48)
+        self.add_issues = Signal(48)
+        self.mul_issues = Signal(48)
+        self.rec_issues = Signal(48)
+        self.comp_issues = Signal(48)
 
     def elaborate(self, platform):
         m = Module()
@@ -436,16 +450,46 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # sequencer shares the elementwise add/multiply ports and the
         # FPURec seed block without contention.
         #
-        un_x = Signal(32)  # original operand
-        un_acc = Signal(32)  # seed / refinement y, Horner p
-        un_tmp = Signal(32)  # iteration temporary t
-        un_f = Signal(32)  # exp2 fraction
-        un_busy = Signal()
-        un_wait = Signal()  # request issued, awaiting out.valid
-        un_step = Signal(5)
+        # Interleaved unary-transcendental datapath. Each element runs
+        # its fixed dependency sequence in its own context: classify
+        # (bypassing the frozen special values), then issue each
+        # arithmetic request exactly once and capture it on the owning
+        # unit's out.valid. The FPU blocks are shared, so at most one
+        # add, one multiply, and one seed issue per cycle across all
+        # contexts; a context holds at most one outstanding request
+        # (un_wait), so per-unit context tag FIFOs route every
+        # out.valid to its owning context. Elements are accepted in
+        # order into free contexts (bounded by res_q credits reserved
+        # at accept) and retire through an in-order done buffer, so
+        # final words enter the packer in element order exactly as the
+        # serialized sequencer produced them. The per-element op
+        # sequence is unchanged; only its wall-clock interleaving is.
+        ctx_n = self.vec_unary_ctx
+        ctx_w = max(1, (ctx_n - 1).bit_length())
 
-        def step_in(*steps):
-            return Cat(un_step == s for s in steps).any()
+        un_x = Array(Signal(32, name=f'un_x{i}') for i in range(ctx_n))
+        un_acc = Array(Signal(32, name=f'un_acc{i}') for i in range(ctx_n))
+        un_tmp = Array(Signal(32, name=f'un_tmp{i}') for i in range(ctx_n))
+        un_f = Array(Signal(32, name=f'un_f{i}') for i in range(ctx_n))
+        # Classify latches: exp2's floor helper i2f for the fraction
+        # subtract and its two's-complement floor i for the final 2^i
+        # scaling.
+        un_i2f = Array(Signal(32, name=f'un_i2f{i}') for i in range(ctx_n))
+        un_ci = Array(Signal(8, name=f'un_ci{i}') for i in range(ctx_n))
+        un_busy = Array(Signal(name=f'un_busy{i}') for i in range(ctx_n))
+        un_wait = Array(Signal(name=f'un_wait{i}') for i in range(ctx_n))
+        un_arm = Array(Signal(name=f'un_arm{i}') for i in range(ctx_n))
+        un_step = Array(Signal(5, name=f'un_step{i}') for i in range(ctx_n))
+        done_val = Array(Signal(name=f'un_done{i}') for i in range(ctx_n))
+        done_word = Array(
+            Signal(32, name=f'un_dword{i}') for i in range(ctx_n))
+
+        # Accept-order ring: contexts were filled in element order, and
+        # the drain walks the ring so final words reach res_q in order.
+        ord_arr = Array(Signal(ctx_w, name=f'un_ord{i}') for i in range(ctx_n))
+        ord_cnt = Signal(range(ctx_n + 1))
+        ord_head = Signal(ctx_w)
+        ord_tail = Signal(ctx_w)
 
         # Issue steps grouped by operation and destination. Capture
         # steps are derived from these same groups, one step later.
@@ -460,21 +504,38 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         exp_mul = tuple(range(2, 27, 4))
         exp_add = tuple(range(4, 29, 4))
 
-        def capture_after(steps):
-            return step_in(*(step + 1 for step in steps))
+        def step_in(steps, s):
+            return Cat(s == t for t in steps).any()
 
-        # Classification of un_x: the frozen special-value table of
-        # tests/troom/model.py. exp2's clamps are bit comparisons:
-        # x >= 128 is exponent field >= 134 (field 134 is [128, 256)),
-        # x < -126 is |x| > 126 (field >= 134, or field 133 with the
-        # 24-bit significand above 126 * 2^17).
-        ux_sign = un_x[31]
-        ux_e = un_x[23:31]
-        ux_man_nz = un_x[:23].any()
+        # One shared classification: at most one context classifies
+        # per cycle (fixed priority), latching the per-context
+        # results. A bypassed element completes through the done
+        # buffer directly, exactly as the serialized sequencer's
+        # bypass path did.
+        cls_req = [
+            un_busy[i] & ~un_arm[i] & ~done_val[i] for i in range(ctx_n)
+        ]
+        cls_go = Cat(*cls_req).any()
+        cls_sel = Signal(ctx_w)
+        m.d.comb += cls_sel.eq(ctx_n - 1)
+        for i in range(ctx_n - 1, -1, -1):
+            with m.If(cls_req[i]):
+                m.d.comb += cls_sel.eq(i)
+        cls_x = un_x[cls_sel]
+
+        # Classification of the selected operand: the frozen
+        # special-value table of tests/troom/model.py. exp2's clamps
+        # are bit comparisons: x >= 128 is exponent field >= 134
+        # (field 134 is [128, 256)), x < -126 is |x| > 126 (field >=
+        # 134, or field 133 with the 24-bit significand above
+        # 126 * 2^17).
+        ux_sign = cls_x[31]
+        ux_e = cls_x[23:31]
+        ux_man_nz = cls_x[:23].any()
         ux_nan = (ux_e == 255) & ux_man_nz
         ux_inf = (ux_e == 255) & ~ux_man_nz
         ux_zero = (ux_e == 0) & ~ux_man_nz
-        ux_sig = Cat(un_x[:23], Const(1, 1))
+        ux_sig = Cat(cls_x[:23], Const(1, 1))
         ux_ge128 = ~ux_sign & (ux_e >= 134)
         ux_lt_m126 = ux_sign & ((ux_e >= 134)
                                 | ((ux_e == 133)
@@ -533,118 +594,249 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             Cat((ux_iz << (23 - ux_k).as_unsigned())[:23], (127 + ux_k)[:8],
                 ux_sign))
 
-        # exp2 final scaling: add i to the polynomial result's
-        # exponent field (p is in [1, 2], so its field is 127 or
-        # 128; the 9-bit sum spans 0..255 over the in-domain i).
-        exp2_pe = Cat(fadd.out.bits.data[23:31], Const(0, 1)).as_signed()
-        exp2_sum = exp2_pe + ux_i.as_signed()
-        un_exp2_word = Mux(
-            exp2_sum >= 255, PINF,
-            Mux(exp2_sum <= 0, PZERO, (fadd.out.bits.data & 0x807fffff)
-                | ((exp2_sum[:8]) << 23)))
+        # The classify outcome: a bypassed element completes through
+        # the done buffer directly (the serialized sequencer's bypass
+        # path); otherwise the context arms and latches the exp2
+        # helpers for its later steps.
+        with m.If(cls_go):
+            with m.If(un_bypass):
+                m.d.sync += [
+                    done_word[cls_sel].eq(un_bypass_val),
+                    done_val[cls_sel].eq(1),
+                ]
+            with m.Else():
+                m.d.sync += [
+                    un_arm[cls_sel].eq(1),
+                    un_i2f[cls_sel].eq(ux_i2f),
+                    un_ci[cls_sel].eq(ux_i),
+                ]
 
-        # Step map: even steps issue, the following odd step awaits.
-        #   VEC_RECIP: 0 classify (+seed); 2/8 R(|x|*y); 4/10
-        #     R(2.0-t); 6/12 R(y*t); 13 final, sign of x applied.
-        #   VEC_RSQRT: 0 classify (+seed); 2 R(0.5*x) into the h
-        #     register (un_f); per Newton iteration 4/12 R(h*y),
-        #     6/14 R(t*y), 8/16 R(1.5-t), 10/18 R(y*t); 19 final.
-        #     h keeps its own register: the iteration's temporary
-        #     would clobber it.
-        #   VEC_EXP2: 0 classify (+f = R(x - float32(i))); per
-        #     Horner step j (2+4j mul, 4+4j add, j = 0..6, so
-        #     coefficient C(6-j)); 29 final, scaled by 2^i.
-        un_go = in_elem & is_unary & ~un_busy & elem_a_ok \
-            & (issued < n_l) & room
-        un_cls = un_busy & (un_step == 0) & ~un_wait
-        un_bypass_go = un_cls & un_bypass
-        un_seed_go = un_cls & ~un_bypass & (op_recip | op_rsqrt)
-        un_fsub_go = un_cls & ~un_bypass & op_exp2
-        un_issue = un_busy & ~un_wait & (un_step != 0)
+        # Unit issue requests and arbiters. A context requests the
+        # unit its next step needs (the op's fixed step map below),
+        # at most one unit per cycle, and only once its previous
+        # request has been captured. Fixed-priority selection cannot
+        # starve: a winning context cannot request again until its
+        # capture lands, so every pending request wins within a few
+        # cycles.
+        #   Step map: even steps issue, the following odd step awaits.
+        #     VEC_RECIP: 0 classify (+seed on frec); 2/8 R(|x|*y);
+        #       4/10 R(2.0-t); 6/12 R(y*t); 13 final, sign of x.
+        #     VEC_RSQRT: 0 classify (+seed); 2 R(0.5*x) into the h
+        #       register (un_f); per Newton iteration 4/12 R(h*y),
+        #       6/14 R(t*y), 8/16 R(1.5-t), 10/18 R(y*t); 19 final.
+        #       h keeps its own register: the iteration's temporary
+        #       would clobber it.
+        #     VEC_EXP2: 0 classify (+f = R(x - float32(i))); per
+        #       Horner step j (2+4j mul, 4+4j add, j = 0..6, so
+        #       coefficient C(6-j)); 29 final, scaled by 2^i.
+        def un_add_step(s):
+            return (op_exp2 & ((s == 0) | step_in(exp_add, s))) \
+                | (op_recip & step_in(rec_sub, s)) \
+                | (op_rsqrt & step_in(rs_sub, s))
 
-        recip_mul = op_recip & un_issue & step_in(*rec_xy, *rec_update)
-        recip_sub = op_recip & un_issue & step_in(*rec_sub)
-        rsqrt_mul = op_rsqrt & un_issue \
-            & step_in(*rs_half, *rs_hy, *rs_ty, *rs_update)
-        rsqrt_sub = op_rsqrt & un_issue & step_in(*rs_sub)
-        exp2_mul = op_exp2 & un_issue \
-            & step_in(*exp_mul)
-        exp2_add = op_exp2 & un_issue \
-            & step_in(*exp_add)
-        un_mul_go = recip_mul | rsqrt_mul | exp2_mul
-        un_add_go = recip_sub | rsqrt_sub | exp2_add | un_fsub_go
+        def un_mul_step(s):
+            return (op_exp2 & step_in(exp_mul, s)) \
+                | (op_recip & (step_in(rec_xy, s)
+                               | step_in(rec_update, s))) \
+                | (op_rsqrt & (step_in(rs_half, s) | step_in(rs_hy, s)
+                               | step_in(rs_ty, s)
+                               | step_in(rs_update, s)))
 
-        # Await/capture decode per owning unit and destination.
-        cap_seed = un_wait & (un_step == 1) & (op_recip | op_rsqrt)
-        cap_mul_t = un_wait & (op_recip & capture_after(rec_xy)
-                               | op_rsqrt & capture_after(rs_hy + rs_ty)
-                               | op_exp2 & capture_after(exp_mul))
-        cap_mul_h = un_wait & op_rsqrt & capture_after(rs_half)
-        cap_mul_a = un_wait & (op_recip & capture_after(rec_update[:-1])
-                               | op_rsqrt & capture_after(rs_update[:-1]))
-        cap_add_t = un_wait & (op_recip & capture_after(rec_sub)
-                               | op_rsqrt & capture_after(rs_sub))
-        cap_add_f = un_wait & op_exp2 & (un_step == 1)
-        cap_add_a = un_wait & op_exp2 \
-            & capture_after(exp_add[:-1])
-        un_fin_mul = un_wait & fmul.out.valid \
-            & (op_recip & capture_after(rec_update[-1:])
-               | op_rsqrt & capture_after(rs_update[-1:]))
-        un_fin_add = un_wait & fadd.out.valid & op_exp2 \
-            & capture_after(exp_add[-1:])
+        add_req = [
+            un_busy[i] & un_arm[i] & ~un_wait[i] & ~done_val[i]
+            & un_add_step(un_step[i]) for i in range(ctx_n)
+        ]
+        mul_req = [
+            un_busy[i] & un_arm[i] & ~un_wait[i] & ~done_val[i]
+            & (un_step[i] != 0) & un_mul_step(un_step[i]) for i in range(ctx_n)
+        ]
+        rec_req = [
+            un_busy[i] & un_arm[i] & ~un_wait[i] & ~done_val[i]
+            & (un_step[i] == 0) & (op_recip | op_rsqrt) for i in range(ctx_n)
+        ]
 
-        # Final word: recip applies the sign of x, exp2 scales the
-        # polynomial by 2^i; rsqrt's last multiply is the result.
-        un_fin_word = Mux(op_recip,
-                          fmul.out.bits.data ^ Cat(Const(0, 31), ux_sign),
-                          Mux(op_rsqrt, fmul.out.bits.data, un_exp2_word))
-        un_enq_valid = un_bypass_go | un_fin_mul | un_fin_add
-        un_enq_word = Mux(un_bypass_go, un_bypass_val, un_fin_word)
+        def pri_sel(reqs):
+            sel = Signal(ctx_w)
+            m.d.comb += sel.eq(ctx_n - 1)
+            for i in range(ctx_n - 1, -1, -1):
+                with m.If(reqs[i]):
+                    m.d.comb += sel.eq(i)
+            return sel, Cat(*reqs).any()
 
+        sel_add, un_add_go = pri_sel(add_req)
+        sel_mul, un_mul_go = pri_sel(mul_req)
+        sel_rec, un_rec_go = pri_sel(rec_req)
+
+        with m.If(un_add_go):
+            m.d.sync += [
+                un_step[sel_add].eq(un_step[sel_add] + 1),
+                un_wait[sel_add].eq(1)
+            ]
+        with m.If(un_mul_go):
+            m.d.sync += [
+                un_step[sel_mul].eq(un_step[sel_mul] + 1),
+                un_wait[sel_mul].eq(1)
+            ]
+        with m.If(un_rec_go):
+            m.d.sync += [
+                un_step[sel_rec].eq(un_step[sel_rec] + 1),
+                un_wait[sel_rec].eq(1)
+            ]
+
+        # Per-unit context tag FIFOs: push the issuing context, pop on
+        # the unit's out.valid. The FPU pipelines complete in order,
+        # so the popped tag owns the completing result; a context
+        # holds at most one outstanding request, so depth ctx_n
+        # suffices.
+        def tag_fifo(prefix, issue_go, issue_sel, out_valid):
+            tags = [
+                Signal(ctx_w, name=f'{prefix}_tag{i}') for i in range(ctx_n)
+            ]
+            tarr = Array(tags)
+            cnt = Signal(range(ctx_n + 1), name=f'{prefix}_tagcnt')
+            pop = out_valid & (cnt != 0)
+            with m.If(pop):
+                for i in range(ctx_n - 1):
+                    m.d.sync += tags[i].eq(tags[i + 1])
+            with m.If(issue_go):
+                with m.If(pop):
+                    m.d.sync += tarr[cnt - 1].eq(issue_sel)
+                with m.Else():
+                    m.d.sync += tarr[cnt].eq(issue_sel)
+            m.d.sync += cnt.eq(cnt + Mux(issue_go, 1, 0) - Mux(pop, 1, 0))
+            return tags[0], cnt
+
+        add_owner, add_tcnt = tag_fifo('unfadd', un_add_go, sel_add,
+                                       fadd.out.valid)
+        mul_owner, mul_tcnt = tag_fifo('unfmul', un_mul_go, sel_mul,
+                                       fmul.out.valid)
+        rec_owner, rec_tcnt = tag_fifo('unfrec', un_rec_go, sel_rec,
+                                       frec.out.valid)
+
+        # Capture decode for the popped owner: un_step[owner] names
+        # the await step (issue step + 1), which identifies the
+        # destination exactly as in the serialized sequencer: exp2's
+        # Horner product p*f lands in un_tmp and the add's result
+        # (the new p) in un_acc.
+        mul_cap = fmul.out.valid & (mul_tcnt != 0)
+        s_mul = un_step[mul_owner]
+        cap_mul_t = (op_recip & step_in((3, 9), s_mul)) \
+            | (op_rsqrt & step_in((5, 13, 7, 15), s_mul)) \
+            | (op_exp2 & step_in((3, 7, 11, 15, 19, 23, 27), s_mul))
+        cap_mul_h = op_rsqrt & (s_mul == 3)
+        cap_mul_a = (op_recip & (s_mul == 7)) \
+            | (op_rsqrt & (s_mul == 11))
+        fin_mul = (op_recip & (s_mul == 13)) | (op_rsqrt & (s_mul == 19))
+
+        add_cap = fadd.out.valid & (add_tcnt != 0)
+        s_add = un_step[add_owner]
+        cap_add_t = (op_recip & step_in((5, 11), s_add)) \
+            | (op_rsqrt & step_in((9, 17), s_add))
+        cap_add_f = op_exp2 & (s_add == 1)
+        cap_add_a = op_exp2 & step_in((5, 9, 13, 17, 21, 25), s_add)
+        fin_add = op_exp2 & (s_add == 29)
+
+        with m.If(mul_cap):
+            with m.If(fin_mul):
+                # Final word: recip applies the sign of x; rsqrt's
+                # last multiply is the result.
+                m.d.sync += [
+                    done_word[mul_owner].eq(
+                        Mux(
+                            op_recip, fmul.out.bits.data
+                            ^ Cat(Const(0, 31), un_x[mul_owner][31]),
+                            fmul.out.bits.data)),
+                    done_val[mul_owner].eq(1),
+                    un_wait[mul_owner].eq(0),
+                ]
+            with m.Else():
+                with m.If(cap_mul_t):
+                    m.d.sync += un_tmp[mul_owner].eq(fmul.out.bits.data)
+                with m.If(cap_mul_h):
+                    m.d.sync += un_f[mul_owner].eq(fmul.out.bits.data)
+                with m.If(cap_mul_a):
+                    m.d.sync += un_acc[mul_owner].eq(fmul.out.bits.data)
+                m.d.sync += [
+                    un_step[mul_owner].eq(s_mul + 1), un_wait[mul_owner].eq(0)
+                ]
+
+        with m.If(add_cap):
+            with m.If(fin_add):
+                # exp2 final scaling: add the latched floor i to the
+                # polynomial result's exponent field (p is in [1, 2],
+                # so its field is 127 or 128; the 9-bit sum spans
+                # 0..255 over the in-domain i).
+                exp2_pe = Cat(fadd.out.bits.data[23:31], Const(0,
+                                                               1)).as_signed()
+                exp2_sum = exp2_pe + un_ci[add_owner].as_signed()
+                m.d.sync += [
+                    done_word[add_owner].eq(
+                        Mux(
+                            exp2_sum >= 255, PINF,
+                            Mux(exp2_sum <= 0, PZERO,
+                                (fadd.out.bits.data & 0x807fffff)
+                                | ((exp2_sum[:8]) << 23)))),
+                    done_val[add_owner].eq(1),
+                    un_wait[add_owner].eq(0),
+                ]
+            with m.Else():
+                with m.If(cap_add_t):
+                    m.d.sync += un_tmp[add_owner].eq(fadd.out.bits.data)
+                with m.If(cap_add_f):
+                    m.d.sync += un_f[add_owner].eq(fadd.out.bits.data)
+                with m.If(cap_add_a):
+                    m.d.sync += un_acc[add_owner].eq(fadd.out.bits.data)
+                m.d.sync += [
+                    un_step[add_owner].eq(s_add + 1), un_wait[add_owner].eq(0)
+                ]
+
+        with m.If(frec.out.valid & (rec_tcnt != 0)):
+            m.d.sync += [
+                un_acc[rec_owner].eq(frec.out.bits.data),
+                un_step[rec_owner].eq(un_step[rec_owner] + 1),
+                un_wait[rec_owner].eq(0)
+            ]
+
+        # Element accept: latch the operand into the lowest free
+        # context and record the element in the retire ring. One
+        # accept per cycle keeps the A-window shift simple; the FPU
+        # issue floor is the throughput limiter, not the accept rate.
+        sel_free, have_free = pri_sel([~un_busy[i] for i in range(ctx_n)])
+        un_go = in_elem & is_unary & elem_a_ok & (issued < n_l) & room \
+            & have_free & (ord_cnt < ctx_n)
         with m.If(un_go):
             m.d.sync += [
-                un_busy.eq(1),
-                un_step.eq(0),
-                un_wait.eq(0),
-                un_x.eq(a_word)
+                un_busy[sel_free].eq(1),
+                un_wait[sel_free].eq(0),
+                un_arm[sel_free].eq(0),
+                un_step[sel_free].eq(0),
+                un_x[sel_free].eq(a_word),
+                ord_arr[ord_tail].eq(sel_free),
+                ord_tail.eq(Mux(ord_tail == ctx_n - 1, 0, ord_tail + 1)),
             ]
-        with m.Elif(un_busy):
-            with m.If(~un_wait):
-                # An issue state advances to its await state; the
-                # bypass path completes through res_q below instead.
-                with m.If(~(un_cls & un_bypass)):
-                    m.d.sync += [un_step.eq(un_step + 1), un_wait.eq(1)]
-            with m.Else():
-                # Awaiting: capture on the owning unit's valid. The
-                # reserved credit guarantees the final enqueue fires
-                # the same cycle, so a final capture ends the element
-                # rather than advancing.
-                with m.If(frec.out.valid & cap_seed):
-                    m.d.sync += un_acc.eq(frec.out.bits.data)
-                with m.If(fmul.out.valid & cap_mul_t):
-                    m.d.sync += un_tmp.eq(fmul.out.bits.data)
-                with m.If(fmul.out.valid & cap_mul_h):
-                    m.d.sync += un_f.eq(fmul.out.bits.data)
-                with m.If(fmul.out.valid & cap_mul_a):
-                    m.d.sync += un_acc.eq(fmul.out.bits.data)
-                with m.If(fadd.out.valid & cap_add_t):
-                    m.d.sync += un_tmp.eq(fadd.out.bits.data)
-                with m.If(fadd.out.valid & cap_add_f):
-                    m.d.sync += un_f.eq(fadd.out.bits.data)
-                with m.If(fadd.out.valid & cap_add_a):
-                    m.d.sync += un_acc.eq(fadd.out.bits.data)
-                with m.If(un_fin_mul | un_fin_add):
-                    m.d.sync += un_wait.eq(0)
-                with m.Elif((frec.out.valid & cap_seed)
-                            | (fmul.out.valid
-                               & (cap_mul_t | cap_mul_h | cap_mul_a))
-                            | (fadd.out.valid
-                               & (cap_add_t | cap_add_f | cap_add_a))):
-                    m.d.sync += [un_step.eq(un_step + 1), un_wait.eq(0)]
-            # The sequencer returns to idle once the final word (or
-            # bypass value) commits to the result FIFO.
-            with m.If(un_enq_valid & res_q.enq.fire):
-                m.d.sync += un_busy.eq(0)
+
+        # In-order retire: the ring head's done word enters res_q
+        # under the credit reserved at accept; the context and ring
+        # slot free only when the word commits. The ring count moves
+        # in one statement so an accept and a retire in the same
+        # cycle compose.
+        ord_head_ctx = ord_arr[ord_head]
+        un_drain_go = in_elem & is_unary & done_val[ord_head_ctx]
+        un_drain_word = done_word[ord_head_ctx]
+        un_retire = un_drain_go & res_q.enq.fire
+        m.d.sync += ord_cnt.eq(ord_cnt + Mux(un_go, 1, 0) -
+                               Mux(un_retire, 1, 0))
+        with m.If(un_retire):
+            m.d.sync += [
+                done_val[ord_head_ctx].eq(0),
+                un_busy[ord_head_ctx].eq(0),
+                ord_head.eq(Mux(ord_head == ctx_n - 1, 0, ord_head + 1)),
+            ]
+
+        # Selected-context steps for the FPU operand muxes below.
+        s_sel_add = un_step[sel_add]
+        un_fsub = op_exp2 & (s_sel_add == 0)
+        s_sel_mul = un_step[sel_mul]
 
         #
         # Activation quantization datapath (VEC_QUANT). One
@@ -902,11 +1094,11 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         m.d.comb += [
             res_q.enq.valid.eq(is_add_op & fadd.out.valid
                                | is_mul_op & fmul.out.valid
-                               | is_unary & un_enq_valid
+                               | is_unary & un_drain_go
                                | op_quant & q_enq_valid),
             res_q.enq.bits.val.eq(
                 Mux(
-                    is_unary, un_enq_word,
+                    is_unary, un_drain_word,
                     Mux(op_quant, q_enq_word,
                         Mux(is_add_op, fadd.out.bits.data,
                             fmul.out.bits.data)))),
@@ -980,24 +1172,31 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         m.d.comb += fadd.inp.valid.eq(elem_add_go | acc_go | fold1_go
                                       | fold2_go | foldff_go
                                       | un_add_go | q_sub_go)
-        m.d.comb += fadd.inp.bits.fn_mod.eq((elem_add_go & op_sub) | recip_sub
-                                            | rsqrt_sub
-                                            | un_fsub_go | q_sub_go)
+        # Unary add issues: the exp2 fraction subtract x - float32(i)
+        # and the Newton corrections 2.0 - t / 1.5 - t subtract; the
+        # exp2 Horner steps add.
+        m.d.comb += fadd.inp.bits.fn_mod.eq((elem_add_go & op_sub)
+                                            | (is_unary & un_add_go
+                                               & ((op_recip | op_rsqrt)
+                                                  | un_fsub))
+                                            | q_sub_go)
         with m.If(is_unary):
-            # fadd: the exp2 fraction subtract and Horner adds, or
-            # the Newton corrections 2.0 - t / 1.5 - t.
+            # fadd: the winning context's fraction subtract or Horner
+            # add, or the Newton correction.
             m.d.comb += [
                 fadd.inp.bits.in1.eq(
                     Mux(
-                        un_fsub_go, un_x,
-                        Mux(recip_sub, Const(0x40000000, 32),
-                            Mux(rsqrt_sub, Const(0x3fc00000, 32), un_tmp)))),
+                        un_fsub, un_x[sel_add],
+                        Mux(
+                            op_exp2, un_tmp[sel_add],
+                            Mux(op_recip, Const(0x40000000, 32),
+                                Const(0x3fc00000, 32))))),
                 fadd.inp.bits.in3.eq(
                     Mux(
-                        un_fsub_go, ux_i2f,
+                        un_fsub, un_i2f[sel_add],
                         Mux(op_exp2,
-                            EXP2_C[((exp_add[-1] - un_step) >> 2)[:3]],
-                            un_tmp))),
+                            EXP2_C[((exp_add[-1] - s_sel_add) >> 2)[:3]],
+                            un_tmp[sel_add]))),
             ]
         with m.Elif(q_sub_go):
             m.d.comb += [
@@ -1034,36 +1233,42 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                                       | q_it_go | q_upd_go | q_sc_go | q_m1_go
                                       | q_m2_go)
         with m.If(is_unary):
-            # fmul: the seed-refinement products in the model's fixed
-            # operand order, and the Horner multiplies p * f. rsqrt's
-            # h multiplies read the h register (un_f).
+            # fmul: the winning context's seed-refinement products in
+            # the model's fixed operand order, and the Horner
+            # multiplies p * f. rsqrt's h multiplies read the h
+            # register (un_f).
             m.d.comb += [
-                fmul.inp.bits.in1.eq(un_acc),
-                fmul.inp.bits.in2.eq(un_tmp)
+                fmul.inp.bits.in1.eq(
+                    Mux(
+                        op_exp2,
+                        Mux(s_sel_mul == exp_mul[0], EXP2_C[7],
+                            un_acc[sel_mul]),
+                        Mux(
+                            op_recip & step_in(rec_xy, s_sel_mul),
+                            un_x[sel_mul] & 0x7fffffff,
+                            Mux(
+                                op_rsqrt
+                                & (s_sel_mul == rs_half[0]),
+                                Const(0x3f000000, 32),
+                                Mux(
+                                    op_rsqrt & step_in(rs_ty, s_sel_mul),
+                                    un_tmp[sel_mul],
+                                    Mux(op_rsqrt & step_in(rs_hy, s_sel_mul),
+                                        un_f[sel_mul], un_acc[sel_mul])))))),
+                fmul.inp.bits.in2.eq(
+                    Mux(
+                        op_exp2, un_f[sel_mul],
+                        Mux(
+                            op_recip & step_in(rec_xy, s_sel_mul),
+                            un_acc[sel_mul],
+                            Mux(
+                                op_rsqrt
+                                & (s_sel_mul == rs_half[0]), un_x[sel_mul],
+                                Mux(
+                                    op_rsqrt
+                                    & step_in(rs_hy + rs_ty, s_sel_mul),
+                                    un_acc[sel_mul], un_tmp[sel_mul]))))),
             ]
-            with m.If(op_exp2):
-                m.d.comb += [
-                    fmul.inp.bits.in1.eq(
-                        Mux(un_step == exp_mul[0], EXP2_C[7], un_acc)),
-                    fmul.inp.bits.in2.eq(un_f),
-                ]
-            with m.Elif(op_recip & step_in(*rec_xy)):
-                m.d.comb += [
-                    fmul.inp.bits.in1.eq(un_x & 0x7fffffff),
-                    fmul.inp.bits.in2.eq(un_acc)
-                ]
-            with m.Elif(op_rsqrt):
-                with m.If(step_in(*rs_half)):
-                    m.d.comb += [
-                        fmul.inp.bits.in1.eq(0x3f000000),
-                        fmul.inp.bits.in2.eq(un_x)
-                    ]
-                with m.Elif(step_in(*rs_hy, *rs_ty)):
-                    m.d.comb += [
-                        fmul.inp.bits.in1.eq(Mux(step_in(*rs_hy), un_f,
-                                                 un_tmp)),
-                        fmul.inp.bits.in2.eq(un_acc),
-                    ]
         with m.Elif(op_quant):
             # The scale products t = amax*y, y = y*t, sc = amax*(1/127),
             # and the element products t = x*r then p = t*127.
@@ -1102,12 +1307,13 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # classify step has already excluded every input whose FPURec
         # estimate would leave the normal domain.
         m.d.comb += [
-            frec.inp.valid.eq(un_seed_go | q_seed_go),
+            frec.inp.valid.eq(un_rec_go | q_seed_go),
             frec.inp.bits.fn.eq(FPUOperator.REC),
             frec.inp.bits.fn_mod.eq(op_rsqrt),
             frec.inp.bits.rm.eq(RoundingMode.RNE),
             frec.inp.bits.in1.eq(
-                Mux(op_quant, q_amax, Mux(op_rsqrt, un_x, un_x & 0x7fffffff))),
+                Mux(op_quant, q_amax,
+                    Mux(op_rsqrt, un_x[sel_rec], un_x[sel_rec] & 0x7fffffff))),
             frec.inp.bits.in2.eq(0),
             frec.inp.bits.in3.eq(0),
         ]
@@ -1267,13 +1473,12 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                         bscalar.eq(0),
                         bscal_ok.eq(0),
                         rd_pend.eq(0),
-                        un_busy.eq(0),
-                        un_wait.eq(0),
-                        un_step.eq(0),
-                        un_x.eq(0),
-                        un_acc.eq(0),
-                        un_tmp.eq(0),
-                        un_f.eq(0),
+                        ord_cnt.eq(0),
+                        ord_head.eq(0),
+                        ord_tail.eq(0),
+                        add_tcnt.eq(0),
+                        mul_tcnt.eq(0),
+                        rec_tcnt.eq(0),
                         q_step.eq(0),
                         q_wait.eq(0),
                         q_valid.eq(0),
@@ -1304,6 +1509,17 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     ]
                     for i in range(4):
                         m.d.sync += part[i].eq(0)
+                    # Unary contexts: control state resets; the data
+                    # registers are dead state, re-latched at accept
+                    # and classify before any use.
+                    for i in range(ctx_n):
+                        m.d.sync += [
+                            un_busy[i].eq(0),
+                            un_wait[i].eq(0),
+                            un_arm[i].eq(0),
+                            un_step[i].eq(0),
+                            done_val[i].eq(0),
+                        ]
                     with m.If(o_reduce):
                         m.next = 'REDUCE'
                     with m.Else():
@@ -1329,5 +1545,14 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         with m.If(running):
             with m.If((consumed != n_l) & ~advance):
                 m.d.sync += self.stall_cycles.eq(self.stall_cycles + 1)
+            m.d.sync += self.active_cycles.eq(self.active_cycles + 1)
+        m.d.sync += self.add_issues.eq(self.add_issues +
+                                       Mux(fadd.inp.valid, 1, 0))
+        m.d.sync += self.mul_issues.eq(self.mul_issues +
+                                       Mux(fmul.inp.valid, 1, 0))
+        m.d.sync += self.rec_issues.eq(self.rec_issues +
+                                       Mux(frec.inp.valid, 1, 0))
+        m.d.sync += self.comp_issues.eq(self.comp_issues +
+                                        Mux(fcomp.inp.valid, 1, 0))
 
         return m

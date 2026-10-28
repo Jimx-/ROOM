@@ -14,8 +14,9 @@ Layers, following ``test_vector.py``:
 * the full command path through ``Core`` per op, plus an RMSNorm-
   shaped reduction -> scale -> add -> rsqrt -> multiply chain with
   ``k = 1`` commands,
-* a per-element cycle measurement documenting the serialized
-  sequencer's cost (the plan's pre-interleaving number).
+* a per-element cycle measurement documenting the interleaved
+  sequencer's cost (M4), plus context-count equivalence and
+  in-order-drain backpressure coverage for the interleaving itself.
 """
 
 from amaranth import *
@@ -318,17 +319,18 @@ def test_unit_unary_rejects_bad_descriptors(desc, status, why):
 
 
 def test_unit_unary_cycles_per_element():
-    """Document the serialized sequencer's cost: every step is one
-    issue cycle plus the three-cycle FPU latency, so recip (seed +
-    6 ops) < 40 cycles, rsqrt (seed + 9) < 55, exp2 (15 ops) < 80,
-    bypasses < 6. These are upper bounds for regression alarms, not
-    the tight per-op numbers."""
+    """Document the interleaved sequencer's cost (M4): with four
+    contexts the per-element floor is the op count times the
+    four-cycle capture loop divided by four -- recip (seed + 8 ops)
+    < 10 cycles, rsqrt (seed + 10) < 14, exp2 (16 ops) < 20. These
+    upper bounds double as regression alarms against a return to
+    serialization (61/29/41 pre-interleave), not as tight numbers."""
     params = dict(PARAMS)
     # Every input executes the complete arithmetic sequence for all ops.
     seq = [f32_bits(1.25)] * 40
     fast = [0x7fc00000, 0x00000000, 0x7f800000, 0x00000001] * 10
-    for op, bound in ((VecOp.VEC_RECIP, 40), (VecOp.VEC_RSQRT, 55),
-                      (VecOp.VEC_EXP2, 80)):
+    for op, bound in ((VecOp.VEC_RECIP, 10), (VecOp.VEC_RSQRT, 14),
+                      (VecOp.VEC_EXP2, 20)):
         _, res0 = run_unit(params,
                            dict(op=int(op), n=2),
                            words_to_bytes(seq[:2]),
@@ -346,6 +348,57 @@ def test_unit_unary_cycles_per_element():
                        deadline=300000)
     per = resb['execution_cycles'] / len(fast)
     assert per <= 6, per
+
+
+@pytest.mark.parametrize('op', UNARY_OPS)
+@pytest.mark.parametrize('ctx', [1, 2, 4])
+def test_unit_unary_interleave_equivalence(op, ctx):
+    """The interleaved sequencer is result-identical to a single
+    context: the per-element op sequence is untouched, so every
+    context count must produce the same beats over the dense pool
+    (bypasses interleaved with full sequences included)."""
+    import random
+
+    rng = random.Random(41)
+    words = unary_pool(rng)
+    # Shuffle specials through the middle so bypass completions and
+    # in-flight contexts mix.
+    words = words[:64] + SPECIALS * 2 + words[64:]
+    params = dict(PARAMS, vec_unary_ctx=ctx)
+    writes, res = run_unit(params,
+                           dict(op=int(op), n=len(words)),
+                           words_to_bytes(words),
+                           deadline=300000)
+    assert res['status'] is Status.OK
+    assert res['elements'] == len(words)
+    exp = expected_beats(params, [un_word(op, w) for w in words])
+    assert writes == [(O_BASE + 8 * i, d) for i, d in enumerate(exp)]
+
+
+@pytest.mark.parametrize('wide', [False, True])
+def test_unit_unary_interleave_write_backpressure(wide):
+    """Interleaved completions must drain in order under a held,
+    random write port: out-of-order done words wait in their
+    contexts while the packer stalls."""
+    import random
+
+    rng = random.Random(42)
+    params = dict(PARAMS, vec_unary_ctx=4)
+    if wide:
+        params.update(data_width=512, n_tmem_banks=8)
+    bb = params['data_width'] // 8
+    n = 53
+    a = unary_pool(rng)[:n]
+    writes, res = run_unit(params,
+                           dict(op=int(VecOp.VEC_EXP2), n=n),
+                           words_to_bytes(a),
+                           stall_wr=True,
+                           hold_writes=10,
+                           deadline=300000)
+    assert res['status'] is Status.OK
+    assert res['blocked'] >= 10, res['blocked']
+    exp = expected_beats(params, [un_word(VecOp.VEC_EXP2, w) for w in a])
+    assert writes == [(O_BASE + bb * i, d) for i, d in enumerate(exp)]
 
 
 # ---------------------------------------------------------------------------

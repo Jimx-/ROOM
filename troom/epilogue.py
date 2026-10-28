@@ -1,180 +1,106 @@
-"""FP32 scale/correction/accumulate epilogue for the troom matrix unit.
+"""Per-lane FP32 epilogue for streaming matrix results.
 
-Consumes the chain-end ``MmSegment`` stream (launch order, one record
-per valid slot) and commits each output row's FP32 result into TMEM as
-packed FP32 words in full beats, with the final beat's unused lanes
-zeroed.
+Each lane owns conversion, scaling, accumulation and fold pipelines. There is
+no shared arithmetic scheduler; independent lanes accept one record per cycle
+when their row snapshots and result drain have capacity.
 
-Per segment record and output lane the arithmetic is, with ``R`` the
-FP32 round-to-nearest-even:
+Per lane (all ``FPUFMA`` MUL/ADD semantics, rounding points and the
+``isum_4`` fold order match the frozen ``mm_row_results`` contract):
 
-.. code-block:: text
+    S,d (,mi*sum_a,dmin for Q4_K) -> i2f/f16w (2 cycles)
+      -> m1 = R(S*d)      , vm1 = R(corr*dmin)     (mul, 3 cycles)
+      -> u  = R(m1*s_act) , v   = R(vm1*s_act)     (mul, 3 cycles)
+      -> t  = u | R(u - v)                          (sub, Q4_K only)
+      -> bank[seg_k mod 4] = R(first_touch ? 0 : bank) + t   (acc)
+      -> row_last: snapshot the four partials, fold
+         R(R(p0+p2) + R(p1+p3)) -> result queue
 
-    u = R(R(float(S) * d) * s_act)
-    v = R(R(float(mi * sum_a) * dmin) * s_act)   # Q4_K only
-    t = R(u - v) | u
-    p[k mod 4] = R(p[k mod 4] + t)
-    result = R(R(p[0] + p[2]) + R(p[1] + p[3]))
+Each unit serves exactly one producer and one consumer, so the lane is
+a fixed free-running pipeline: a unit's registered output drives the
+next unit's input one hop later and a context shift register
+(``sh[l][k]``, pushed at cast issue, depth 14) carries the metadata to
+the hops that need it -- offset 4 (the scale multiply), 7 (the second
+multiplier landing: the Q4_K subtract issue and the non-Q4_K
+accumulate issue), 10 (the subtract landing: the Q4_K accumulate issue
+and the non-Q4_K accumulate landing) and 13 (the Q4_K accumulate
+landing).  Bubbles flow between records; no stage ever stalls, so
+there is nothing to schedule: records are accepted at sink rate and
+the only flow control is row admission.
 
-Every multiply and add is a separate rounding point; none are fused.
-The float(S) and float(mi * sum_a) integer-to-float conversions are
-exact (segment partials are bounded by 2^24), the FP16 d/dmin to FP32
-conversions are exact, and the signed mi * sum_a product is exact in
-signed 23 bits.
-
-The FP32 operations reuse the CPU floating-point blocks: one
-``FPUCastMulti`` performs the int32 and FP16 conversions, one
-``FPUFMA`` serves every multiply, and one ``FPUFMA`` serves every
-add/subtract. An operand-ready scheduler issues at most one op per
-cycle per block and captures results ``latency`` cycles later through
-per-unit destination tags, so the stages are elastic: a record costs a
-handful of cycles (bounded by its conversion count) instead of one, and
-the matrix unit's output-credit backpressure absorbs the difference.
-Because the shared units have multi-cycle latency, every issue guard
-must also cover results still in flight, not just staged values: the
-u/v correction slots hold their ``u_wait``/``v_wait`` reservations from
-issue until the subtract consumes them, the t slot holds ``t_busy``
-until its value lands, the m1/vm1 source products hold ``m1_busy``/
-``vm1_busy`` until they land, and each conversion destination is a
-two-entry FIFO whose ``rsv`` count (occupied slots plus casts in
-flight) is the cast issue gate, so two conversions in a row can never
-race for one landing slot. Multiplies round as R(a*b + 0.0), which
-canonicalizes a negative-zero product to +0; that never changes a row's
-final bits because the four partials start at +0 and +0 plus (or
-minus) a zero never yields a negative zero.
-
-Row state: each lane keeps the four ``isum_4`` partials of its current
-row in registers. The first segment reserves the lane's row context
-until the row's final segment captures the partials into one of two
-fold snapshots; a subsequent row may then be accepted (its own
-row-start record additionally requires a free snapshot buffer), so the
-previous row's fold overlaps the next row's segments. A fold snapshot
-folds through the shared adder (p0+p2, p1+p3, then their sum) into a
-per-lane result queue, one row in flight per lane at a time beyond the
-snapshots; the ff issue gate reserves queue capacity and the global
-``ff_busy`` serializes final folds, so the result enqueue at the ff
-landing cannot fail. Each lane's t
-stage admits one value at a time -- the u (or subtract) op waits until
-the previous t was consumed -- so backpressure can never overrun a
-staged value. Results leave in strict row order, so the packer shifts
-them LSB-first into full TMEM beats.
+Row turnover needs no serialization here.  The shared design had to
+hold a lane's next row behind ``row_busy`` until the final accumulate
+issued because its units could reorder records; this pipeline is
+strictly in order, which makes the bank hazards self-resolving: for
+records r and r+1 the accumulate of r lands at least one cycle before
+the accumulate of r+1 issues (constant unit latencies, >= 1 cycle
+record spacing), so the row-end capture (at the final landing) always
+reads the finished partials before the next row's first-touch landing
+writes any bank, and the next row's segment-4 accumulate reads a bank
+written by its own segment 0 exactly one cycle earlier.  Rows therefore
+turn over with zero gap and admission gates only on fold capacity: a
+row-start record (``seg_k == 0``) is accepted while occupied snapshots
+plus pending captures (``pend``, counted from the last record's fire
+through its capture) leave a buffer -- at most two rows per lane can be
+between their last record and their fold, and a capture always finds a
+free buffer.  Short rows (one segment) throttle naturally to fold rate
+instead of needing separate machinery.
 """
-
-from enum import IntEnum
 
 from amaranth import *
 from amaranth.hdl.rec import Direction, Record
 from amaranth.utils import log2_int
 
 from room.consts import RoundingMode
-from room.fpu import FPUFMA, FPUCastMulti, FPFormat, FPUOperator, IntFormat
+from room.fpu import FPUFMA, FPFormat, FPUOperator
 
 from troom.consts import Format, Status
+from troom.convert import Fp16Widen, IntToFP32
 from troom.matrix import MmSegment
 from troom.types import HasTRoomParams
 
 from roomsoc.interconnect.stream import Decoupled, Queue
 
-
-class Dest(IntEnum):
-    """Destination tags for the per-unit in-flight op queues."""
-
-    FS = 0
-    D = 1
-    FC = 2
-    DM = 3
-    M1 = 4
-    U = 5
-    VM1 = 6
-    V = 7
-    T = 8
-    ACC = 9
-    F1 = 10
-    F2 = 11
-    FF = 12
+# Context taps (offsets from the cast-issue cycle).  The push is
+# registered, so ``sh[k]`` is visible one cycle after the cast: with
+# the converters answering in 2 cycles and every ``FPUFMA`` in 3, the
+# record's events land at cast+5/+8/+11/+14 and the taps sit one
+# earlier.
+_TAP_SCALE = 4  # u/v multiply issue reads s_act (event at +5)
+_TAP_MULB = 7  # u/v landing: subtract issue / non-Q4_K acc issue (+8)
+_TAP_SUB = 10  # subtract landing: Q4_K acc issue / non-Q4_K acc landing (+11)
+_TAP_ACC = 13  # Q4_K accumulate landing (bank write / capture) (+14)
+_SH_DEPTH = 14
 
 
-def _ctx_layout(hp):
-    """Metadata carried beside every in-flight value."""
+def _shadow_layout(hp):
     return [
+        ('v', 1, Direction.FANOUT),
+        ('q4k', 1, Direction.FANOUT),
         ('s_act', 32, Direction.FANOUT),
         ('row', hp.rows_bits, Direction.FANOUT),
         ('seg_k', hp.lg_act_segs, Direction.FANOUT),
         ('row_last', 1, Direction.FANOUT),
-        ('q4k', 1, Direction.FANOUT),
     ]
 
 
-class Ctx(HasTRoomParams, Record):
-    """Record context accompanying a staged value."""
+class _Shadow(HasTRoomParams, Record):
+    """One pipeline hop of a lane's record context."""
 
     def __init__(self, params, name=None, src_loc_at=0):
         HasTRoomParams.__init__(self, params)
         Record.__init__(self,
-                        _ctx_layout(self),
+                        _shadow_layout(self),
                         name=name,
                         src_loc_at=src_loc_at + 1)
 
 
-class _Stage:
-    """One staged value: payload, availability, and its context."""
-
-    def __init__(self, hp, width, name):
-        self.val = Signal(width, name=f'{name}_val')
-        self.avail = Signal(name=f'{name}_avail')
-        self.ctx = Ctx(hp.params, name=f'{name}_ctx')
-
-
-class _CastStage:
-    """Two-entry FIFO of one conversion result, in record order.
-
-    M3b stage 2: with a single entry, a conversion occupied its
-    destination from landing until the consuming multiply issued --
-    its partner's landing latency plus the multiply's issue slot --
-    capping the acceptance interval at six cycles for two-lane Q8_0
-    whatever the cast issue order. Two entries let the next record's
-    conversion land while the previous pair waits for its multiply.
-
-    Ordering is structural: a record casts to a destination at most
-    once, and only before it leaves the input latch (``spent``), so
-    arrivals are in record order; the consuming multiply pops both of
-    its operand stages in the same cycle, so the two FIFOs an ``m1``
-    or ``vm1`` reads stay pair-aligned -- their heads always describe
-    the same record. ``rsv`` counts occupied slots plus casts still in
-    flight and is the cast issue gate, generalizing the old
-    single-entry ``cast_pend`` reservation: at most two reservations
-    exist per destination, and a landing therefore always finds at
-    most one slot occupied.
-    """
-
-    def __init__(self, hp, name):
-        self.e = [_Stage(hp, 32, f'{name}{i}') for i in range(2)]
-        self.rsv = Signal(2, name=f'{name}_rsv')
-
-    def any_avail(self):
-        return self.e[0].avail | self.e[1].avail
-
-
-class _Tag:
-    """One stage of a unit's in-flight destination pipeline."""
-
-    def __init__(self, hp, name):
-        self.v = Signal(name=f'{name}_v')
-        self.dest = Signal(Dest, name=f'{name}_dest')
-        self.lane = Signal(max(log2_int(hp.n_outputs), 1), name=f'{name}_lane')
-        self.ctx = Ctx(hp.params, name=f'{name}_ctx')
-
-
 class Epilogue(HasTRoomParams, Elaboratable):
-    """FP32 epilogue draining the matrix unit's segment stream.
+    """FP32 epilogue with per-lane dedicated pipelines (streaming path).
 
-    ``start`` (with ``rows``/``r_base`` held valid) begins one
-    matmul's drain when ``ready`` is asserted. The caller must wait
-    for ``ready`` before starting another matmul. ``done`` pulses
-    once the final result beat commits to
-    TMEM, which is the matmul's true completion point. ``r_base``
-    must be beat aligned with room for every row's FP32 word; row
-    ``r``'s result lands at byte ``r_base + 4*r``.
+    ``start`` (with
+    ``rows``/``r_base`` held valid) begins one matmul's drain when
+    ``ready`` is asserted; ``done`` pulses once the final result beat
+    commits to TMEM.  Row ``r``'s result lands at byte ``r_base + 4*r``.
     """
 
     def __init__(self, params):
@@ -197,17 +123,11 @@ class Epilogue(HasTRoomParams, Elaboratable):
         self.status = Signal(Status)
         self.active = Signal()
 
-        # Observation counters.
+        # Observation counters for record issue and result retirement.
         self.records = Signal(48)
         self.folds = Signal(48)
         self.write_beats = Signal(48)
         self.stall_cycles = Signal(48)
-        # Cycle-breakdown window (M3b): cycles the epilogue is
-        # running, and issues on its three shared FPU blocks, so unit
-        # utilization is measurable against the active window. Cast
-        # ops count int32/FP16 -> FP32 conversions, mul ops the u/v
-        # product chain, add ops accumulations, corrections, and row
-        # folds alike.
         self.active_cycles = Signal(48)
         self.cast_ops = Signal(48)
         self.mul_ops = Signal(48)
@@ -221,11 +141,42 @@ class Epilogue(HasTRoomParams, Elaboratable):
         bw = self.beat_bytes // 4
         lg_bw = log2_int(bw)
 
-        # Include the FPU input register so scheduling/operand selection
-        # does not share a cycle with floating-point alignment/arithmetic.
-        cast = m.submodules.cast = FPUCastMulti(32, FPFormat.S, latency=3)
-        fmul = m.submodules.fmul = FPUFMA(32, FPFormat.S, latency=3)
-        fadd = m.submodules.fadd = FPUFMA(32, FPFormat.S, latency=3)
+        def fpu(name):
+            u = FPUFMA(32, FPFormat.S, latency=3)
+            m.submodules[name] = u
+            return u
+
+        # Per-lane private banks.  Every unit is valid-only and never
+        # stalls; its registered output is consumed combinationally by
+        # exactly one downstream unit, so the whole lane advances one
+        # hop per cycle with bubbles and no clock enables.
+        i2f_a = []  # S -> fp32
+        i2f_b = []  # Q4_K correction product -> fp32
+        f16w_a = []  # d -> fp32
+        f16w_b = []  # dmin -> fp32
+        mul_a0 = []  # m1  = R(S * d)
+        mul_a1 = []  # vm1 = R(corr * dmin)
+        mul_b0 = []  # u   = R(m1 * s_act)
+        mul_b1 = []  # v   = R(vm1 * s_act)
+        add_sub = []  # t   = R(u - v), Q4_K only
+        add_acc = []  # bank[idx] = R(bank' + t)
+        add_fold = []  # snapshot fold
+        for l in range(n):
+            m.submodules[f'l{l}_i2fa'] = i2f = IntToFP32()
+            m.submodules[f'l{l}_i2fb'] = i2fb = IntToFP32()
+            m.submodules[f'l{l}_f16a'] = f16a = Fp16Widen()
+            m.submodules[f'l{l}_f16b'] = f16b = Fp16Widen()
+            i2f_a.append(i2f)
+            i2f_b.append(i2fb)
+            f16w_a.append(f16a)
+            f16w_b.append(f16b)
+            mul_a0.append(fpu(f'l{l}_ma0'))
+            mul_a1.append(fpu(f'l{l}_ma1'))
+            mul_b0.append(fpu(f'l{l}_mb0'))
+            mul_b1.append(fpu(f'l{l}_mb1'))
+            add_sub.append(fpu(f'l{l}_asub'))
+            add_acc.append(fpu(f'l{l}_aacc'))
+            add_fold.append(fpu(f'l{l}_afold'))
 
         res_q = []
         for l in range(n):
@@ -235,125 +186,54 @@ class Epilogue(HasTRoomParams, Elaboratable):
             res_q.append(q)
             m.submodules[f'epi_res_q{l}'] = q
 
-        #
-        # Per-lane staged values and row state. The four conversion
-        # destinations are two-entry FIFOs (_CastStage); everything a
-        # multiply or add produces stays single-entry.
-        #
-        fS = [_CastStage(self, f'fS{l}') for l in range(n)]
-        dwt = [_CastStage(self, f'dw{l}') for l in range(n)]
-        fC = [_CastStage(self, f'fC{l}') for l in range(n)]
-        dmn = [_CastStage(self, f'dm{l}') for l in range(n)]
-        m1 = [_Stage(self, 32, f'm1_{l}') for l in range(n)]
-        vm1 = [_Stage(self, 32, f'vm1_{l}') for l in range(n)]
-        uv = [_Stage(self, 32, f'u{l}') for l in range(n)]
-        vv = [_Stage(self, 32, f'v{l}') for l in range(n)]
-        tt = [_Stage(self, 32, f't{l}') for l in range(n)]
-        f1 = [_Stage(self, 32, f'f1_{l}') for l in range(n)]
-        f2 = [_Stage(self, 32, f'f2_{l}') for l in range(n)]
-
+        # Accumulator banks, fold snapshots and fold state per lane.
         bank = [[Signal(32, name=f'bank{l}{i}') for i in range(4)]
                 for l in range(n)]
-        # M3b stage 3: two fold snapshots per lane, so the next row's
-        # records are accepted while the previous row's snapshot still
-        # drains through the shared adder. A snapshot carries its own
-        # context: by the time the fold halves launch, the lane's t
-        # stage may already hold a later record. ``snap_rd`` names the
-        # older unretired buffer the fold scheduler reads; a capture
-        # takes the free buffer (acceptance of a row-start record
-        # guarantees one). At most two snapshots per lane can be
-        # unretired: the row-start gate requires a free buffer, and
-        # each lane folds in order, so under result backpressure a
-        # third row simply waits -- exactly the single-snapshot
-        # behavior, one row further out.
         snap = [[[Signal(32, name=f'snap{b}{l}{i}') for i in range(4)]
                  for l in range(n)] for b in range(2)]
-        snap_ctx = [[
-            Ctx(self.params, name=f'snapctx{b}{l}') for l in range(n)
-        ] for b in range(2)]
         snap_avail = [[Signal(name=f'snap_avail{b}{l}') for l in range(n)]
                       for b in range(2)]
-        snap_done = [[Signal(2, name=f'snap_done{b}{l}') for l in range(n)]
-                     for b in range(2)]
+        snap_row = [[
+            Signal(self.rows_bits, name=f'snap_row{b}{l}') for l in range(n)
+        ] for b in range(2)]
         snap_rd = [Signal(name=f'snap_rd{l}') for l in range(n)]
+        # Rows whose last record has fired but whose capture has not
+        # landed yet (0..2); a capture always finds a free buffer.
+        pend = [Signal(2, name=f'pend{l}') for l in range(n)]
+        f1v = [Signal(name=f'f1v{l}') for l in range(n)]
+        f1val = [Signal(32, name=f'f1val{l}') for l in range(n)]
+        f2v = [Signal(name=f'f2v{l}') for l in range(n)]
+        f2val = [Signal(32, name=f'f2val{l}') for l in range(n)]
+        frow = [Signal(self.rows_bits, name=f'frow{l}') for l in range(n)]
+        # Fold FSM: 0 IDLE, 1 F2, 2 WAIT, 3 FIN.
+        fold_st = [Signal(2, name=f'fold_st{l}') for l in range(n)]
+        # Landing-kind tags delayed alongside the fold adder.
+        FC_NONE, FC_F1, FC_F2, FC_FF = 0, 1, 2, 3
+        ftag = [[Signal(2, name=f'ftag{l}{k}') for k in range(3)]
+                for l in range(n)]
+
+        # Context shift chain: pushed at cast issue, tapped by offset.
+        sh = [[
+            _Shadow(self.params, name=f'sh{l}{k}') for k in range(_SH_DEPTH)
+        ] for l in range(n)]
 
         #
-        # Input record latch. The record is held until every conversion
-        # it needs has issued; masked lanes need none.
+        # Input record latch.  The whole record's casts issue on the
+        # latch's first cycle (four converters per lane), so the latch
+        # is always spent immediately and records can stream at one per
+        # cycle.
         #
-        in_rec = MmSegment(self.params, name='epi_in')
+        in_rec = MmSegment(self.params)
         in_valid = Signal()
+        spent = Signal()
+        started = Signal()
         q4k = in_rec.fmt == Format.Q4_K
         lane_on = [in_rec.row_mask.bit_select(l, 1) for l in range(n)]
-        cast_done = [[Signal(name=f'cd{k}{l}') for l in range(n)]
-                     for k in range(4)]
-        need = [[lane_on[l] & (Const(1) if k < 2 else q4k) for l in range(n)]
-                for k in range(4)]
+        m.d.comb += spent.eq(in_valid)
 
-        # A conversion may only issue while its destination FIFO holds
-        # fewer than two reservations (occupied slots plus casts still
-        # in flight, ``_CastStage.rsv``): the cast unit captures
-        # results unconditionally, so an over-issued destination could
-        # land a value with no slot for it. Two reservations are the
-        # capacity of the two-entry stage; at a landing at most one
-        # slot is occupied (the gate ran before the issue), so a
-        # landing never displaces an unconsumed value.
-        casts_left = Const(0)
-        pend_cnt = Const(0)
-        for k in range(4):
-            for l in range(n):
-                pend_need = need[k][l] & ~cast_done[k][l]
-                casts_left = casts_left | pend_need
-                pend_cnt = pend_cnt + pend_need.bool()
-        # M3b scheduling, stage 1: the record leaves the latch the
-        # cycle its final required conversion ISSUES, not one cycle
-        # later. When exactly one needed cast remains and the shared
-        # unit picks it this cycle, the sink may replace the record in
-        # that same cycle, and the next record's casts can begin the
-        # following cycle -- removing the pop and re-accept cycles
-        # from the minimum acceptance interval. The retiring record's
-        # operands are read combinationally from the latch during its
-        # issue cycle, so the end-of-cycle overwrite is safe; its
-        # landing stays protected by cast_pend, and the incoming
-        # record's cast_done reset must win over the issue's set (see
-        # the cast scheduler). A deeper input FIFO would not remove
-        # these cycles: the latch is each record's only operand home.
-        spent = Signal(name='epi_spent')
-
-        started = Signal()
-        row_busy = Signal(n)
-        # A row-start record (seg_k == 0) needs its lanes' row contexts
-        # free AND a free snapshot buffer per masked lane: the row's
-        # final accumulate will capture into it. row_busy retires at
-        # that capture (the fold's queue capacity is reserved by the
-        # ff issue gate and ff_busy serialization), so the next row
-        # overlaps the previous row's fold instead of waiting for its
-        # result to enqueue.
-        row_block = Signal(n)
-        for l in range(n):
-            m.d.comb += row_block[l].eq(row_busy[l] | (snap_avail[0][l]
-                                                       & snap_avail[1][l]))
-        new_row_ready = (self.sink.bits.seg_k
-                         != 0) | ~(row_block & self.sink.bits.row_mask).any()
-        m.d.comb += self.sink.ready.eq(started & new_row_ready
-                                       & (~in_valid | spent))
-        with m.If(self.sink.fire):
-            m.d.sync += [in_rec.eq(self.sink.bits), in_valid.eq(1)]
-            with m.If(self.sink.bits.seg_k == 0):
-                for l in range(n):
-                    with m.If(self.sink.bits.row_mask[l]):
-                        m.d.sync += row_busy[l].eq(1)
-            for k in range(4):
-                for l in range(n):
-                    m.d.sync += cast_done[k][l].eq(0)
-        with m.If(spent):
-            m.d.sync += self.records.eq(self.records + 1)
-            # Without a replacement the latch empties, as before.
-            with m.If(~self.sink.fire):
-                m.d.sync += in_valid.eq(0)
-
-        # The Q4_K correction product mi * sum_a: 6-bit unsigned times
-        # 16-bit signed, exact in signed 23 bits.
+        # Q4_K's integer correction product: 6-bit unsigned minimum
+        # times the activation segment sum, exact in signed 23 bits
+        # (identical to the epilogue).
         cval = []
         for l in range(n):
             mi7 = Signal(signed(7), name=f'mi7_{l}')
@@ -365,8 +245,350 @@ class Epilogue(HasTRoomParams, Elaboratable):
             cval.append(prod)
 
         #
+        # Row admission: snapshot capacity only.  ``tot`` counts
+        # occupied snapshots plus rows pending capture; a row-start
+        # record needs ``tot <= 1`` so the invariant ``tot <= 2`` holds
+        # and every capture finds a free buffer (its own pending entry
+        # guarantees ``occ <= 1`` at the landing).
+        #
+        new_row_ready = Signal()
+        occ_any = [Signal(3, name=f'occ{l}') for l in range(n)]
+        for l in range(n):
+            m.d.comb += occ_any[l].eq(
+                (snap_avail[0][l].as_unsigned() +
+                 snap_avail[1][l].as_unsigned() + pend[l].as_unsigned()))
+        row_block = Signal(n)
+        for l in range(n):
+            m.d.comb += row_block[l].eq(occ_any[l] >= 2)
+        m.d.comb += new_row_ready.eq(
+            (self.sink.bits.seg_k != 0)
+            | ~(row_block & self.sink.bits.row_mask).any())
+
+        m.d.comb += self.sink.ready.eq(started & new_row_ready
+                                       & (~in_valid | spent))
+        with m.If(self.sink.fire):
+            m.d.sync += [in_rec.eq(self.sink.bits), in_valid.eq(1)]
+        with m.If(spent):
+            m.d.sync += self.records.eq(self.records + 1)
+            with m.If(~self.sink.fire):
+                m.d.sync += in_valid.eq(0)
+
+        #
+        # Cast issues and the context push.  All four converters of a
+        # lane issue together; the Q4_K pair only for Q4_K records.
+        # Per-cycle op totals accumulate in Python (a second
+        # ``.eq(sig + x)`` on the same signal would override, not add).
+        #
+        cast_terms = []
+        for l in range(n):
+            ca0 = in_valid & lane_on[l]
+            ca1 = in_valid & lane_on[l] & q4k
+            m.d.comb += [
+                i2f_a[l].inp_valid.eq(ca0),
+                i2f_a[l].inp.eq(getattr(in_rec, f'S{l}')),
+                f16w_a[l].inp_valid.eq(ca0),
+                f16w_a[l].inp.eq(getattr(in_rec, f'd{l}')),
+                i2f_b[l].inp_valid.eq(ca1),
+                i2f_b[l].inp.eq(Cat(cval[l], cval[l][-1].replicate(32 - 23))),
+                f16w_b[l].inp_valid.eq(ca1),
+                f16w_b[l].inp.eq(getattr(in_rec, f'dmin{l}')),
+            ]
+            cast_terms.append(ca0 + ca0 + ca1 + ca1)
+            # Context pipeline advance and push.
+            for k in range(_SH_DEPTH - 1):
+                m.d.sync += sh[l][k + 1].eq(sh[l][k])
+            m.d.sync += [
+                sh[l][0].v.eq(in_valid & lane_on[l]),
+                sh[l][0].q4k.eq(q4k),
+                sh[l][0].s_act.eq(in_rec.s_act),
+                sh[l][0].row.eq(getattr(in_rec, f'row{l}')),
+                sh[l][0].seg_k.eq(in_rec.seg_k),
+                sh[l][0].row_last.eq(in_rec.row_last),
+            ]
+
+        sh5 = [sh[l][_TAP_SCALE] for l in range(n)]
+        sh8 = [sh[l][_TAP_MULB] for l in range(n)]
+        sh11 = [sh[l][_TAP_SUB] for l in range(n)]
+        sh14 = [sh[l][_TAP_ACC] for l in range(n)]
+
+        #
+        # Source products and scale applications.  Each multiplier's
+        # operands are the previous stage's registered outputs; the
+        # scale comes from the tap aligned with that hop.
+        #
+        mul_terms = []
+        for l in range(n):
+            m.d.comb += [
+                mul_a0[l].inp.valid.eq(i2f_a[l].out_valid),
+                mul_a0[l].inp.bits.fn.eq(FPUOperator.MUL),
+                mul_a0[l].inp.bits.rm.eq(RoundingMode.RNE),
+                mul_a0[l].inp.bits.fn_mod.eq(0),
+                mul_a0[l].inp.bits.in3.eq(0),
+                mul_a0[l].inp.bits.in1.eq(i2f_a[l].out),
+                mul_a0[l].inp.bits.in2.eq(f16w_a[l].out),
+                mul_a1[l].inp.valid.eq(i2f_b[l].out_valid),
+                mul_a1[l].inp.bits.fn.eq(FPUOperator.MUL),
+                mul_a1[l].inp.bits.rm.eq(RoundingMode.RNE),
+                mul_a1[l].inp.bits.fn_mod.eq(0),
+                mul_a1[l].inp.bits.in3.eq(0),
+                mul_a1[l].inp.bits.in1.eq(i2f_b[l].out),
+                mul_a1[l].inp.bits.in2.eq(f16w_b[l].out),
+                mul_b0[l].inp.valid.eq(mul_a0[l].out.valid),
+                mul_b0[l].inp.bits.fn.eq(FPUOperator.MUL),
+                mul_b0[l].inp.bits.rm.eq(RoundingMode.RNE),
+                mul_b0[l].inp.bits.fn_mod.eq(0),
+                mul_b0[l].inp.bits.in3.eq(0),
+                mul_b0[l].inp.bits.in1.eq(mul_a0[l].out.bits.data),
+                mul_b0[l].inp.bits.in2.eq(sh5[l].s_act),
+                mul_b1[l].inp.valid.eq(mul_a1[l].out.valid),
+                mul_b1[l].inp.bits.fn.eq(FPUOperator.MUL),
+                mul_b1[l].inp.bits.rm.eq(RoundingMode.RNE),
+                mul_b1[l].inp.bits.fn_mod.eq(0),
+                mul_b1[l].inp.bits.in3.eq(0),
+                mul_b1[l].inp.bits.in1.eq(mul_a1[l].out.bits.data),
+                mul_b1[l].inp.bits.in2.eq(sh5[l].s_act),
+            ]
+            mul_terms.append(i2f_a[l].out_valid + i2f_b[l].out_valid +
+                             mul_a0[l].out.valid + mul_a1[l].out.valid)
+
+        #
+        # Q4_K correction subtract and the accumulate.  The accumulate
+        # fires from the second multiplier's landing (non-Q4_K) or the
+        # subtract's landing (Q4_K); the two can never collide because
+        # one launch is one format.  First touch of a bank inside a row
+        # adds literal zero, exactly as the shared epilogue (banks are
+        # never cleared between rows: the next row's segment-4 read
+        # follows its own segment-0 landing by construction).
+        #
+        add_terms = []
+        sub_fire = [Signal(name=f'subfire{l}') for l in range(n)]
+        acc_fire = [Signal(name=f'accfire{l}') for l in range(n)]
+        acc_from_q4k = [Signal(name=f'accq{l}') for l in range(n)]
+        for l in range(n):
+            m.d.comb += [
+                add_sub[l].inp.valid.eq(sub_fire[l]),
+                add_sub[l].inp.bits.fn.eq(FPUOperator.ADD),
+                add_sub[l].inp.bits.rm.eq(RoundingMode.RNE),
+                add_sub[l].inp.bits.in2.eq(0),
+                sub_fire[l].eq(mul_b0[l].out.valid & sh8[l].q4k),
+            ]
+            m.d.comb += [
+                add_sub[l].inp.bits.in1.eq(mul_b0[l].out.bits.data),
+                add_sub[l].inp.bits.in3.eq(mul_b1[l].out.bits.data),
+                add_sub[l].inp.bits.fn_mod.eq(1),
+            ]
+            m.d.comb += [
+                acc_from_q4k[l].eq(add_sub[l].out.valid),
+                acc_fire[l].eq(acc_from_q4k[l]
+                               | (mul_b0[l].out.valid & ~sh8[l].q4k)),
+                add_acc[l].inp.valid.eq(acc_fire[l]),
+                add_acc[l].inp.bits.fn.eq(FPUOperator.ADD),
+                add_acc[l].inp.bits.rm.eq(RoundingMode.RNE),
+                add_acc[l].inp.bits.fn_mod.eq(0),
+                add_acc[l].inp.bits.in2.eq(0),
+                add_acc[l].inp.bits.in3.eq(
+                    Mux(acc_from_q4k[l], add_sub[l].out.bits.data,
+                        mul_b0[l].out.bits.data)),
+            ]
+            add_terms.append(acc_fire[l] + sub_fire[l])
+            # The issuing record's context: tap 8 for the non-Q4_K
+            # fire, tap 11 for the Q4_K fire.
+            idx_i = Mux(acc_from_q4k[l], sh11[l].seg_k[:2], sh8[l].seg_k[:2])
+            first = Mux(acc_from_q4k[l], sh11[l].seg_k == sh11[l].seg_k[:2],
+                        sh8[l].seg_k == sh8[l].seg_k[:2])
+            m.d.comb += add_acc[l].inp.bits.in1.eq(
+                Mux(first, 0,
+                    Array(bank[l])[idx_i]))
+
+        # Per-lane capture facts (used by the fold retire logic).
+        cap_now = [Signal(name=f'capnow{l}') for l in range(n)]
+        cap_buf = [Signal(name=f'capbuf{l}') for l in range(n)]
+        land_now = [Signal(name=f'landnow{l}') for l in range(n)]
+        land_q4k = [Signal(name=f'landq{l}') for l in range(n)]
+        for l in range(n):
+            m.d.comb += [
+                land_now[l].eq(add_acc[l].out.valid),
+                land_q4k[l].eq(sh14[l].q4k),
+                cap_buf[l].eq(Mux(snap_avail[0][l], 1, 0)),
+            ]
+
+        rd_avail = [Signal(name=f'snap_rda{l}') for l in range(n)]
+        rd_row = [
+            Signal(self.rows_bits, name=f'snap_rdr{l}') for l in range(n)
+        ]
+        rd_snap = [[Signal(32, name=f'snap_rds{i}l{l}') for i in range(4)]
+                   for l in range(n)]
+        for l in range(n):
+            m.d.comb += [
+                rd_avail[l].eq(
+                    Mux(snap_rd[l], snap_avail[1][l], snap_avail[0][l])),
+                rd_row[l].eq(Mux(snap_rd[l], snap_row[1][l], snap_row[0][l])),
+            ]
+            for i in range(4):
+                m.d.comb += rd_snap[l][i].eq(
+                    Mux(snap_rd[l], snap[1][l][i], snap[0][l][i]))
+
+        # Fold launches per lane (used by the add_cnt accounting).
+        fold_f1 = [Signal(name=f'ff1{l}') for l in range(n)]
+        fold_f2 = [Signal(name=f'ff2{l}') for l in range(n)]
+        fold_ff = [Signal(name=f'fff{l}') for l in range(n)]
+
+        for l in range(n):
+            m.d.comb += [
+                fold_f1[l].eq((fold_st[l] == 0) & rd_avail[l]),
+                fold_f2[l].eq(fold_st[l] == 1),
+                fold_ff[l].eq((fold_st[l] == 2) & f1v[l] & f2v[l]
+                              & res_q[l].enq.ready),
+                add_fold[l].inp.valid.eq(fold_f1[l] | fold_f2[l]
+                                         | fold_ff[l]),
+                add_fold[l].inp.bits.fn.eq(FPUOperator.ADD),
+                add_fold[l].inp.bits.rm.eq(RoundingMode.RNE),
+                add_fold[l].inp.bits.fn_mod.eq(0),
+                add_fold[l].inp.bits.in2.eq(0),
+                add_fold[l].inp.bits.in1.eq(
+                    Mux(fold_f1[l], rd_snap[l][0],
+                        Mux(fold_f2[l], rd_snap[l][1], f1val[l]))),
+                add_fold[l].inp.bits.in3.eq(
+                    Mux(fold_f1[l], rd_snap[l][2],
+                        Mux(fold_f2[l], rd_snap[l][3], f2val[l]))),
+            ]
+            add_terms.append(fold_f1[l] + fold_f2[l] + fold_ff[l])
+            # Fold adder tag advance: which landing is F1/F2/FF.
+            code = Mux(
+                fold_ff[l], Const(FC_FF, 2),
+                Mux(fold_f2[l], Const(FC_F2, 2),
+                    Mux(fold_f1[l], Const(FC_F1, 2), Const(FC_NONE, 2))))
+            m.d.sync += [
+                ftag[l][0].eq(code),
+                ftag[l][1].eq(ftag[l][0]),
+                ftag[l][2].eq(ftag[l][1]),
+            ]
+
+        cast_cnt = Signal(range(4 * n + 1))
+        mul_cnt = Signal(range(4 * n + 1))
+        add_cnt = Signal(range(3 * n + 1))
+        m.d.comb += [
+            cast_cnt.eq(sum(cast_terms)),
+            mul_cnt.eq(sum(mul_terms)),
+            add_cnt.eq(sum(add_terms)),
+        ]
+        with m.If(cast_cnt.any()):
+            m.d.sync += self.cast_ops.eq(self.cast_ops + cast_cnt)
+        with m.If(mul_cnt.any()):
+            m.d.sync += self.mul_ops.eq(self.mul_ops + mul_cnt)
+        with m.If(add_cnt.any()):
+            m.d.sync += self.add_ops.eq(self.add_ops + add_cnt)
+
+        #
+        # Accumulate landing: bank write, and the row-end capture.
+        # The landing record sits at tap 14 (Q4_K) or tap 11; the
+        # zero-fill rule (a partial above the row's last segment index
+        # reads as zero) and the free-buffer choice are the epilogue's.
+        #
+        for l in range(n):
+            # The landing record's fields: tap 14 (Q4_K) or tap 11.
+            lrow_last = Mux(land_q4k[l], sh14[l].row_last, sh11[l].row_last)
+            lrow = Mux(land_q4k[l], sh14[l].row, sh11[l].row)
+            lseg_k = Mux(land_q4k[l], sh14[l].seg_k, sh11[l].seg_k)
+            idx = Signal(2, name=f'lwidx{l}')
+            m.d.comb += idx.eq(
+                Mux(land_q4k[l], sh14[l].seg_k[:2], sh11[l].seg_k[:2]))
+            m.d.comb += cap_now[l].eq(land_now[l] & lrow_last)
+            with m.If(land_now[l]):
+                for i in range(4):
+                    with m.If(idx == i):
+                        m.d.sync += bank[l][i].eq(add_acc[l].out.bits.data)
+                with m.If(lrow_last):
+                    for i in range(4):
+                        word = Mux(idx == i, add_acc[l].out.bits.data,
+                                   Mux(i > lseg_k, 0, bank[l][i]))
+                        with m.If(cap_buf[l] == 0):
+                            m.d.sync += snap[0][l][i].eq(word)
+                        with m.Else():
+                            m.d.sync += snap[1][l][i].eq(word)
+                    for b in range(2):
+                        with m.If(cap_buf[l] == b):
+                            m.d.sync += [
+                                snap_avail[b][l].eq(1),
+                                snap_row[b][l].eq(lrow),
+                            ]
+                            with m.If(~rd_avail[l]):
+                                m.d.sync += snap_rd[l].eq(b)
+
+        # Pending-capture accounting: the fire-side increment and the
+        # capture-side decrement MUST combine in one assignment -- two
+        # separate ``.eq`` statements in the same cycle override (last
+        # wins) and the counter drifts, over-admitting rows until a
+        # capture clobbers an occupied snapshot (the shared epilogue's
+        # "unified reservation updates" discipline).
+        pend_inc = [Signal(name=f'pendinc{l}') for l in range(n)]
+        for l in range(n):
+            m.d.comb += pend_inc[l].eq(self.sink.fire
+                                       & self.sink.bits.row_last
+                                       & self.sink.bits.row_mask[l])
+        for l in range(n):
+            with m.If(pend_inc[l] | cap_now[l]):
+                m.d.sync += pend[l].eq(pend[l] + pend_inc[l] - cap_now[l])
+
+        # All lanes can capture in the same cycle: count, never
+        # double-drive the shared counter.
+        cap_cnt = Signal(range(n + 1))
+        m.d.comb += cap_cnt.eq(sum(cap_now))
+        with m.If(cap_cnt.any()):
+            m.d.sync += self.folds.eq(self.folds + cap_cnt)
+
+        #
+        # Fold sequencing per lane: F1 then F2 on consecutive cycles
+        # (one adder), FF once both halves have landed and the result
+        # queue can take the value, and the enqueue at the FF landing.
+        # The snapshot retires when both halves have launched; the
+        # read pointer moves to the other buffer when it already holds
+        # the next row (including one captured this cycle).
+        #
+        for l in range(n):
+            with m.If(fold_f1[l]):
+                m.d.sync += [
+                    fold_st[l].eq(1),
+                    frow[l].eq(rd_row[l]),
+                ]
+            with m.If(fold_f2[l]):
+                m.d.sync += fold_st[l].eq(2)
+                with m.If(snap_rd[l]):
+                    m.d.sync += snap_avail[1][l].eq(0)
+                with m.Else():
+                    m.d.sync += snap_avail[0][l].eq(0)
+                other = ~snap_rd[l]
+                other_pending = (Mux(other, snap_avail[1][l], snap_avail[0][l])
+                                 | (cap_now[l] & (cap_buf[l] == other)))
+                with m.If(other_pending):
+                    m.d.sync += snap_rd[l].eq(other)
+            with m.If(fold_ff[l]):
+                m.d.sync += [
+                    fold_st[l].eq(3),
+                    f1v[l].eq(0),
+                    f2v[l].eq(0),
+                ]
+            with m.If(add_fold[l].out.valid):
+                with m.If(ftag[l][2] == FC_F1):
+                    m.d.sync += [
+                        f1v[l].eq(1), f1val[l].eq(add_fold[l].out.bits.data)
+                    ]
+                with m.If(ftag[l][2] == FC_F2):
+                    m.d.sync += [
+                        f2v[l].eq(1), f2val[l].eq(add_fold[l].out.bits.data)
+                    ]
+                with m.If(ftag[l][2] == FC_FF):
+                    m.d.sync += fold_st[l].eq(0)
+                    m.d.comb += [
+                        res_q[l].enq.valid.eq(1),
+                        res_q[l].enq.bits.val.eq(add_fold[l].out.bits.data),
+                        res_q[l].enq.bits.row.eq(frow[l]),
+                    ]
+
+        #
         # Packer: results arrive in strict row order; shift them into
-        # full-width beats and flush a partial final beat zero-padded.
+        # full-width beats and flush a partial final beat zero-padded
+        # (the frozen row-fold order).
         #
         rows_l = Signal(self.rows_bits)
         r_base_l = Signal(self.tmem_addr_width)
@@ -411,18 +633,19 @@ class Epilogue(HasTRoomParams, Elaboratable):
             ]
 
         #
-        # Run control.
+        # Run control (a lane is quiet when its
+        # context chain, fold state, snapshots, pending captures and
+        # result queue are all empty).
         #
-        any_avail = Const(0)
-        for st in fS + dwt + fC + dmn:
-            any_avail = any_avail | st.any_avail()
-        for st in m1 + vm1 + uv + vv + tt + f1 + f2:
-            any_avail = any_avail | st.avail
-        drained = ~started & ~in_valid & ~any_avail & (wcnt == 0) \
-            & (prow == rows_l)
+        drained = ~started & ~in_valid & (wcnt == 0) & (prow == rows_l)
         for l in range(n):
-            drained = drained & ~snap_avail[0][l] & ~snap_avail[1][l] \
+            quiet = Const(1)
+            for k in range(_SH_DEPTH):
+                quiet = quiet & ~sh[l][k].v
+            quiet = quiet & ~f1v[l] & ~f2v[l] & (fold_st[l] == 0) \
+                & ~snap_avail[0][l] & ~snap_avail[1][l] & (pend[l] == 0) \
                 & (res_q[l].count == 0)
+            drained = drained & quiet
 
         m.d.comb += self.ready.eq(drained)
         begin = self.start & self.ready
@@ -450,666 +673,32 @@ class Epilogue(HasTRoomParams, Elaboratable):
         with m.If(started & self.sink.valid & ~self.sink.fire):
             m.d.sync += self.stall_cycles.eq(self.stall_cycles + 1)
 
-        #
-        # Scheduler scaffolding: per-unit in-flight tag pipelines and the
-        # issued op's destination mux.
-        #
-        cast_tag = [_Tag(self, f'ctag{i}') for i in range(cast.latency)]
-        mul_tag = [_Tag(self, f'mtag{i}') for i in range(fmul.latency)]
-        add_tag = [_Tag(self, f'atag{i}') for i in range(fadd.latency)]
-
-        def push_tag(tags, found, new_dest, new_lane, new_ctx):
-            # These Valid-only FPUs never stall internally. Delay tags
-            # alongside their operands, including bubbles, so adding an
-            # input stage cannot overflow a two-entry metadata queue.
-            for dst, src in zip(tags, tags[1:]):
-                m.d.sync += dst.v.eq(src.v)
-                with m.If(src.v):
-                    m.d.sync += [
-                        dst.dest.eq(src.dest),
-                        dst.lane.eq(src.lane),
-                        dst.ctx.eq(src.ctx)
-                    ]
-            m.d.sync += [
-                tags[-1].v.eq(found),
-            ]
-            with m.If(found):
-                m.d.sync += [
-                    tags[-1].dest.eq(new_dest),
-                    tags[-1].lane.eq(new_lane),
-                    tags[-1].ctx.eq(new_ctx),
-                ]
-
-        def pick(ready, sel, found):
-            """Priority selection: the first ready op wins."""
-            for i in reversed(range(len(ready))):
-                with m.If(ready[i]):
-                    m.d.comb += [found.eq(1), sel.eq(i)]
-
-        #
-        # Shared conversion unit: int32 -> FP32 (S and Q4_K's mi*sum_a)
-        # and NaN-boxed FP16 -> FP32 (d, dmin). Issue priority is
-        # lane-major with the FP16 member of each consumed pair first
-        # (d before S, dmin before the Q4_K correction): the pair's
-        # integer conversion then completes last, so the consuming
-        # multiply (m1/vm1) issues as soon as both stages hold values,
-        # freeing the single-entry destinations earlier than the old
-        # S-first order.
-        #
-        cast_ops_list = [
-            op for l in range(n) for op in ((1, l), (0, l), (3, l), (2, l))
-        ]
-        # Indexed by the cast number k: 0=FS 1=D 2=FC 3=DM.
-        cast_dest = [fS, dwt, fC, dmn]
-        cast_ready = [
-            in_valid & need[k][l] & ~cast_done[k][l]
-            & (cast_dest[k][l].rsv != 2) for k, l in cast_ops_list
-        ]
-        cast_sel = Signal(range(len(cast_ops_list)))
-        cast_found = Signal()
-        pick(cast_ready, cast_sel, cast_found)
-
-        # Stage 1 replacement condition: every needed cast issued in an
-        # earlier cycle, or the one remaining pending cast is exactly
-        # the op the unit picked this cycle (a ready op is always a
-        # pending one).
-        m.d.comb += spent.eq(in_valid & ((pend_cnt == 0)
-                                         | (cast_found & (pend_cnt == 1))))
-
-        cast_ctx = [Ctx(self.params, name=f'ccx{l}') for l in range(n)]
-        for l in range(n):
-            m.d.comb += [
-                cast_ctx[l].s_act.eq(in_rec.s_act),
-                cast_ctx[l].row.eq(getattr(in_rec, f'row{l}')),
-                cast_ctx[l].seg_k.eq(in_rec.seg_k),
-                cast_ctx[l].row_last.eq(in_rec.row_last),
-                cast_ctx[l].q4k.eq(q4k),
-            ]
-
-        m.d.comb += [
-            cast.inp.valid.eq(cast_found),
-            cast.inp.bits.rm.eq(RoundingMode.RNE),
-            cast.inp.bits.fn_mod.eq(0),
-        ]
-        for i, (k, l) in enumerate(cast_ops_list):
-            with m.If(cast_sel == i):
-                if k == 0:
-                    m.d.comb += [
-                        cast.inp.bits.fn.eq(FPUOperator.I2F),
-                        cast.inp.bits.int_fmt.eq(IntFormat.INT32),
-                        cast.inp.bits.dst_fmt.eq(FPFormat.S),
-                        cast.inp.bits.in1.eq(getattr(in_rec, f'S{l}')),
-                    ]
-                elif k == 1:
-                    m.d.comb += [
-                        cast.inp.bits.fn.eq(FPUOperator.F2F),
-                        cast.inp.bits.src_fmt.eq(FPFormat.H),
-                        cast.inp.bits.dst_fmt.eq(FPFormat.S),
-                        cast.inp.bits.in1.eq(
-                            Cat(getattr(in_rec, f'd{l}'), Const(0xFFFF, 16))),
-                    ]
-                elif k == 2:
-                    m.d.comb += [
-                        cast.inp.bits.fn.eq(FPUOperator.I2F),
-                        cast.inp.bits.int_fmt.eq(IntFormat.INT32),
-                        cast.inp.bits.dst_fmt.eq(FPFormat.S),
-                        cast.inp.bits.in1.eq(
-                            Cat(cval[l], cval[l][-1].replicate(32 - 23))),
-                    ]
-                else:
-                    m.d.comb += [
-                        cast.inp.bits.fn.eq(FPUOperator.F2F),
-                        cast.inp.bits.src_fmt.eq(FPFormat.H),
-                        cast.inp.bits.dst_fmt.eq(FPFormat.S),
-                        cast.inp.bits.in1.eq(
-                            Cat(getattr(in_rec, f'dmin{l}'), Const(0xFFFF,
-                                                                   16))),
-                    ]
-        with m.If(cast_found):
-            m.d.sync += self.cast_ops.eq(self.cast_ops + 1)
-            for i, (k, l) in enumerate(cast_ops_list):
-                with m.If(cast_sel == i):
-                    # On a same-cycle record replacement the fire
-                    # block's cast_done reset describes the incoming
-                    # record and must win over this set (assignment
-                    # order alone does not decide it). The destination
-                    # reservation is raised in the unified rsv update
-                    # under Result routing.
-                    m.d.sync += cast_done[k][l].eq(~self.sink.fire)
-
-        c_dest = Signal(Dest, name='cdest')
-        c_lane = Signal(lane_bits, name='clane')
-        c_ctx = Ctx(self.params, name='cctx')
-        m.d.comb += [
-            c_dest.eq([Dest.FS, Dest.D, Dest.FC,
-                       Dest.DM][cast_ops_list[0][0]]),
-            c_lane.eq(cast_ops_list[0][1]),
-            c_ctx.eq(cast_ctx[cast_ops_list[0][1]]),
-        ]
-        for i, (k, l) in enumerate(cast_ops_list):
-            with m.If(cast_sel == i):
-                m.d.comb += [
-                    c_dest.eq([Dest.FS, Dest.D, Dest.FC, Dest.DM][k]),
-                    c_lane.eq(l),
-                    c_ctx.eq(cast_ctx[l])
-                ]
-        push_tag(cast_tag, cast_found, c_dest, c_lane, c_ctx)
-
-        #
-        # Shared multiply unit: the u and v product chains. Sources
-        # first (m1/vm1), then the scale applications.
-        #
-        # t-slot occupancy: at most one t value staged or in flight per
-        # lane, so a delayed accumulate can never be overrun by the
-        # next record's t landing. The Q4_K correction operands carry
-        # the same discipline: u and v hold their slots until the
-        # correction subtract issues, so a later record cannot
-        # overwrite a staged pair.
-        t_busy = [Signal(name=f't_busy{l}') for l in range(n)]
-        u_wait = [Signal(name=f'u_wait{l}') for l in range(n)]
-        v_wait = [Signal(name=f'v_wait{l}') for l in range(n)]
-        # The m1/vm1 products carry the same in-flight discipline:
-        # with two-entry conversion FIFOs the source multiplies of
-        # consecutive records can issue on back-to-back cycles, so a
-        # landing would otherwise overwrite a staged (or still
-        # flying) predecessor before its u/v multiply consumes it.
-        # The stage gate sees only landed values; these reservations
-        # cover the latency window, like cast_pend did for casts.
-        m1_busy = [Signal(name=f'm1_busy{l}') for l in range(n)]
-        vm1_busy = [Signal(name=f'vm1_busy{l}') for l in range(n)]
-        # An m1/vm1 issue pops the head of both of its operand FIFOs
-        # (same record, same cycle), keeping the pair alignment the
-        # _CastStage ordering argument relies on.
-        sd_pop = [Signal(name=f'sd_pop{l}') for l in range(n)]
-        cd_pop = [Signal(name=f'cd_pop{l}') for l in range(n)]
-
-        mul_ops = ([('m1', l) for l in range(n)] + [('vm1', l)
-                                                    for l in range(n)] +
-                   [('u', l) for l in range(n)] + [('v', l) for l in range(n)])
-        mul_ready = []
-        for what, l in mul_ops:
-            if what == 'm1':
-                mul_ready.append(fS[l].e[0].avail & dwt[l].e[0].avail
-                                 & ~m1[l].avail & ~m1_busy[l])
-            elif what == 'vm1':
-                mul_ready.append(fC[l].e[0].avail & dmn[l].e[0].avail
-                                 & ~vm1[l].avail & ~vm1_busy[l])
-            elif what == 'u':
-                mul_ready.append(m1[l].avail & ~tt[l].avail
-                                 & ~t_busy[l] & ~u_wait[l])
-            else:
-                mul_ready.append(vm1[l].avail & ~v_wait[l])
-        mul_sel = Signal(range(len(mul_ops)))
-        mul_found = Signal()
-        pick(mul_ready, mul_sel, mul_found)
-
-        m.d.comb += [
-            fmul.inp.valid.eq(mul_found),
-            fmul.inp.bits.fn.eq(FPUOperator.MUL),
-            fmul.inp.bits.rm.eq(RoundingMode.RNE),
-            fmul.inp.bits.in3.eq(0),
-        ]
-        for i, (what, l) in enumerate(mul_ops):
-            with m.If(mul_sel == i):
-                if what == 'm1':
-                    m.d.comb += [
-                        fmul.inp.bits.in1.eq(fS[l].e[0].val),
-                        fmul.inp.bits.in2.eq(dwt[l].e[0].val)
-                    ]
-                elif what == 'vm1':
-                    m.d.comb += [
-                        fmul.inp.bits.in1.eq(fC[l].e[0].val),
-                        fmul.inp.bits.in2.eq(dmn[l].e[0].val)
-                    ]
-                elif what == 'u':
-                    m.d.comb += [
-                        fmul.inp.bits.in1.eq(m1[l].val),
-                        fmul.inp.bits.in2.eq(m1[l].ctx.s_act)
-                    ]
-                else:
-                    m.d.comb += [
-                        fmul.inp.bits.in1.eq(vm1[l].val),
-                        fmul.inp.bits.in2.eq(vm1[l].ctx.s_act)
-                    ]
-        # Pop pulses fire only on a real issue; mul_sel alone would
-        # idle-match index 0 and pop continuously.
-        for l in range(n):
-            m.d.comb += sd_pop[l].eq(mul_found
-                                     & (mul_sel == mul_ops.index(('m1', l))))
-            m.d.comb += cd_pop[l].eq(mul_found
-                                     & (mul_sel == mul_ops.index(('vm1', l))))
-        with m.If(mul_found):
-            m.d.sync += self.mul_ops.eq(self.mul_ops + 1)
-            for i, (what, l) in enumerate(mul_ops):
-                with m.If(mul_sel == i):
-                    if what == 'm1':
-                        m.d.sync += m1_busy[l].eq(1)
-                    elif what == 'vm1':
-                        m.d.sync += vm1_busy[l].eq(1)
-                    elif what == 'u':
-                        # m1/vm1's operand FIFOs free through the pop
-                        # signals in the operand mux; the destination
-                        # stage stays covered by its in-flight bit
-                        # until the landing retires it.
-                        m.d.sync += [m1[l].avail.eq(0), t_busy[l].eq(1)]
-                        with m.If(m1[l].ctx.q4k):
-                            m.d.sync += u_wait[l].eq(1)
-                    else:
-                        m.d.sync += vm1[l].avail.eq(0)
-                        with m.If(vm1[l].ctx.q4k):
-                            m.d.sync += v_wait[l].eq(1)
-
-        m_dest = Signal(Dest, name='mdest')
-        m_lane = Signal(lane_bits, name='mlane')
-        m_ctx = Ctx(self.params, name='mctx')
-        m_dmap = {'m1': Dest.M1, 'vm1': Dest.VM1, 'u': Dest.U, 'v': Dest.V}
-        m_cmap = {
-            'm1': lambda l: fS[l].e[0].ctx,
-            'vm1': lambda l: fC[l].e[0].ctx,
-            'u': lambda l: m1[l].ctx,
-            'v': lambda l: vm1[l].ctx
-        }
-        m.d.comb += [
-            m_dest.eq(m_dmap[mul_ops[0][0]]),
-            m_lane.eq(mul_ops[0][1]),
-            m_ctx.eq(m_cmap[mul_ops[0][0]](mul_ops[0][1]))
-        ]
-        for i, (what, l) in enumerate(mul_ops):
-            with m.If(mul_sel == i):
-                m.d.comb += [
-                    m_dest.eq(m_dmap[what]),
-                    m_lane.eq(l),
-                    m_ctx.eq(m_cmap[what](l))
-                ]
-        push_tag(mul_tag, mul_found, m_dest, m_lane, m_ctx)
-
-        #
-        # Shared add/subtract unit: fold launches have top priority,
-        # then final folds, accumulation, and Q4_K correction. The row
-        # reservation retains fold state under result backpressure.
-        #
-        ff_busy = Signal()
-        # Fold-scheduler view of the lane's oldest unretired snapshot
-        # (per-lane muxes over the two buffers).
-        rd_avail = [Signal(name=f'snap_rda{l}') for l in range(n)]
-        rd_done = [[Signal(name=f'snap_rdd{b}{l}') for b in range(2)]
-                   for l in range(n)]
-        rd_snap = [[Signal(32, name=f'snap_rds{i}{l}') for i in range(4)]
-                   for l in range(n)]
-        rd_ctx = [Ctx(self.params, name=f'snap_rdctx{l}') for l in range(n)]
-        for l in range(n):
-            m.d.comb += [
-                rd_avail[l].eq(
-                    Mux(snap_rd[l], snap_avail[1][l], snap_avail[0][l])),
-                rd_done[l][0].eq(
-                    Mux(snap_rd[l], snap_done[1][l][0], snap_done[0][l][0])),
-                rd_done[l][1].eq(
-                    Mux(snap_rd[l], snap_done[1][l][1], snap_done[0][l][1])),
-                rd_ctx[l].eq(Mux(snap_rd[l], snap_ctx[1][l], snap_ctx[0][l])),
-            ]
-            for i in range(4):
-                m.d.comb += rd_snap[l][i].eq(
-                    Mux(snap_rd[l], snap[1][l][i], snap[0][l][i]))
-        add_ops = ([('f1', l) for l in range(n)] +
-                   [('f2', l) for l in range(n)] + [('ff', l)
-                                                    for l in range(n)] +
-                   [('acc', l) for l in range(n)] + [('sub', l)
-                                                     for l in range(n)])
-        add_ready = []
-        for what, l in add_ops:
-            if what == 'f1':
-                add_ready.append(rd_avail[l] & ~rd_done[l][0] & ~f1[l].avail)
-            elif what == 'f2':
-                add_ready.append(rd_avail[l] & ~rd_done[l][1] & ~f2[l].avail)
-            elif what == 'acc':
-                add_ready.append(tt[l].avail)
-            elif what == 'sub':
-                add_ready.append(uv[l].avail & vv[l].avail
-                                 & uv[l].ctx.q4k & ~tt[l].avail
-                                 & ~t_busy[l])
-            else:
-                add_ready.append(f1[l].avail & f2[l].avail
-                                 & res_q[l].enq.ready & ~ff_busy)
-        add_sel = Signal(range(len(add_ops)))
-        add_found = Signal()
-        pick(add_ready, add_sel, add_found)
-
-        m.d.comb += [
-            fadd.inp.valid.eq(add_found),
-            fadd.inp.bits.fn.eq(FPUOperator.ADD),
-            fadd.inp.bits.rm.eq(RoundingMode.RNE),
-            fadd.inp.bits.fn_mod.eq(0),
-            fadd.inp.bits.in2.eq(0),
-        ]
-        for i, (what, l) in enumerate(add_ops):
-            with m.If(add_sel == i):
-                if what == 'f1':
-                    m.d.comb += [
-                        fadd.inp.bits.in1.eq(rd_snap[l][0]),
-                        fadd.inp.bits.in3.eq(rd_snap[l][2])
-                    ]
-                elif what == 'f2':
-                    m.d.comb += [
-                        fadd.inp.bits.in1.eq(rd_snap[l][1]),
-                        fadd.inp.bits.in3.eq(rd_snap[l][3])
-                    ]
-                elif what == 'acc':
-                    # A bank's first touch in a row is the segment
-                    # whose index equals it (segments below 4 map to
-                    # their own bank); later touches accumulate.
-                    idx = tt[l].ctx.seg_k[:2]
-                    m.d.comb += [
-                        fadd.inp.bits.in1.eq(
-                            Mux(tt[l].ctx.seg_k == idx, 0,
-                                Array(bank[l])[idx])),
-                        fadd.inp.bits.in3.eq(tt[l].val),
-                    ]
-                elif what == 'sub':
-                    m.d.comb += [
-                        fadd.inp.bits.fn_mod.eq(1),
-                        fadd.inp.bits.in1.eq(uv[l].val),
-                        fadd.inp.bits.in3.eq(vv[l].val),
-                    ]
-                else:
-                    m.d.comb += [
-                        fadd.inp.bits.in1.eq(f1[l].val),
-                        fadd.inp.bits.in3.eq(f2[l].val)
-                    ]
-        with m.If(add_found):
-            m.d.sync += self.add_ops.eq(self.add_ops + 1)
-            for i, (what, l) in enumerate(add_ops):
-                with m.If(add_sel == i):
-                    if what == 'f1':
-                        with m.If(snap_rd[l]):
-                            m.d.sync += snap_done[1][l][0].eq(1)
-                        with m.Else():
-                            m.d.sync += snap_done[0][l][0].eq(1)
-                    elif what == 'f2':
-                        with m.If(snap_rd[l]):
-                            m.d.sync += snap_done[1][l][1].eq(1)
-                        with m.Else():
-                            m.d.sync += snap_done[0][l][1].eq(1)
-                    elif what == 'acc':
-                        m.d.sync += tt[l].avail.eq(0)
-                    elif what == 'sub':
-                        m.d.sync += [
-                            uv[l].avail.eq(0), vv[l].avail.eq(0),
-                            t_busy[l].eq(1), u_wait[l].eq(0), v_wait[l].eq(0)
-                        ]
-                    else:
-                        m.d.sync += [
-                            f1[l].avail.eq(0), f2[l].avail.eq(0),
-                            ff_busy.eq(1)
-                        ]
-
-        a_dest = Signal(Dest, name='adest')
-        a_lane = Signal(lane_bits, name='alane')
-        a_ctx = Ctx(self.params, name='actx')
-        a_dmap = {
-            'f1': Dest.F1,
-            'f2': Dest.F2,
-            'acc': Dest.ACC,
-            'sub': Dest.T,
-            'ff': Dest.FF
-        }
-        a_cmap = {
-            'f1': lambda l: rd_ctx[l],
-            'f2': lambda l: rd_ctx[l],
-            'acc': lambda l: tt[l].ctx,
-            'sub': lambda l: uv[l].ctx,
-            'ff': lambda l: f1[l].ctx
-        }
-        m.d.comb += [
-            a_dest.eq(a_dmap[add_ops[0][0]]),
-            a_lane.eq(add_ops[0][1]),
-            a_ctx.eq(a_cmap[add_ops[0][0]](add_ops[0][1]))
-        ]
-        for i, (what, l) in enumerate(add_ops):
-            with m.If(add_sel == i):
-                m.d.comb += [
-                    a_dest.eq(a_dmap[what]),
-                    a_lane.eq(l),
-                    a_ctx.eq(a_cmap[what](l))
-                ]
-        push_tag(add_tag, add_found, a_dest, a_lane, a_ctx)
-
-        #
-        # Result routing: capture each unit's output through its
-        # destination tag. All routing is by static lane comparisons;
-        # dest mismatches never write.
-        #
-        # The four conversion destinations are two-entry FIFOs: a pop
-        # (m1/vm1 issue, via sd_pop/cd_pop) shifts or clears the head,
-        # a landing pushes behind it. A landing never sees both slots
-        # occupied -- the rsv issue gate ran before the cast launched
-        # -- so the push target is e1 exactly when e0 holds a value.
-        cast_fire = cast.out.valid & cast_tag[0].v
-        for dest, sts, pops in ((Dest.FS, fS, sd_pop), (Dest.D, dwt, sd_pop),
-                                (Dest.FC, fC, cd_pop), (Dest.DM, dmn, cd_pop)):
-            for l, st in enumerate(sts):
-                land = cast_fire & (cast_tag[0].dest == dest) \
-                    & (cast_tag[0].lane == l)
-                e0, e1 = st.e
-                with m.If(pops[l]):
-                    with m.If(e1.avail):
-                        # Full; no landing is possible this cycle.
-                        m.d.sync += [
-                            e0.val.eq(e1.val),
-                            e0.avail.eq(1),
-                            e0.ctx.eq(e1.ctx),
-                            e1.avail.eq(0)
-                        ]
-                    with m.Else():
-                        with m.If(land):
-                            # The popped head is replaced by the value
-                            # landing this cycle (it is the new head).
-                            m.d.sync += [
-                                e0.val.eq(cast.out.bits.data),
-                                e0.avail.eq(1),
-                                e0.ctx.eq(cast_tag[0].ctx)
-                            ]
-                        with m.Else():
-                            m.d.sync += e0.avail.eq(0)
-                with m.Else():
-                    with m.If(land):
-                        with m.If(e0.avail):
-                            m.d.sync += [
-                                e1.val.eq(cast.out.bits.data),
-                                e1.avail.eq(1),
-                                e1.ctx.eq(cast_tag[0].ctx)
-                            ]
-                        with m.Else():
-                            m.d.sync += [
-                                e0.val.eq(cast.out.bits.data),
-                                e0.avail.eq(1),
-                                e0.ctx.eq(cast_tag[0].ctx)
-                            ]
-
-        # Unified reservation update: a cast issue raises the
-        # destination's count, an m1/vm1 pop retires it, and both in
-        # the same cycle is a hold. Keeping this in one place makes
-        # the same-cycle combination exact.
-        for i, (k, l) in enumerate(cast_ops_list):
-            st = cast_dest[k][l]
-            inc = cast_found & (cast_sel == i)
-            dec = (sd_pop[l] if k in (0, 1) else cd_pop[l])
-            with m.If(inc & dec):
-                pass
-            with m.Elif(inc):
-                m.d.sync += st.rsv.eq(st.rsv + 1)
-            with m.Elif(dec):
-                m.d.sync += st.rsv.eq(st.rsv - 1)
-
-        plain = {Dest.M1: m1, Dest.VM1: vm1, Dest.F1: f1, Dest.F2: f2}
-        for unit, tags in ((cast, cast_tag), (fmul, mul_tag), (fadd, add_tag)):
-            fire = unit.out.valid & tags[0].v
-            with m.If(fire):
-                for d, sts in plain.items():
-                    with m.If(tags[0].dest == d):
-                        for l in range(n):
-                            with m.If(tags[0].lane == l):
-                                m.d.sync += [
-                                    sts[l].val.eq(unit.out.bits.data),
-                                    sts[l].avail.eq(1),
-                                    sts[l].ctx.eq(tags[0].ctx),
-                                ]
-
-        # A landed source product retires its in-flight reservation.
-        with m.If(fmul.out.valid & mul_tag[0].v):
-            with m.If(mul_tag[0].dest == Dest.M1):
-                for l in range(n):
-                    with m.If(mul_tag[0].lane == l):
-                        m.d.sync += m1_busy[l].eq(0)
-            with m.If(mul_tag[0].dest == Dest.VM1):
-                for l in range(n):
-                    with m.If(mul_tag[0].lane == l):
-                        m.d.sync += vm1_busy[l].eq(0)
-
-        # The u product: held for the correction subtract on Q4_K, or
-        # passed straight through as t otherwise (subtracting the +0
-        # the v path produces would be equivalent, at one extra op).
-        # Either way the t slot's in-flight reservation retires.
-        with m.If(fmul.out.valid & mul_tag[0].v & (mul_tag[0].dest == Dest.U)):
-            for l in range(n):
-                with m.If(mul_tag[0].lane == l):
-                    m.d.sync += t_busy[l].eq(0)
-                    with m.If(mul_tag[0].ctx.q4k):
-                        m.d.sync += [
-                            uv[l].val.eq(fmul.out.bits.data),
-                            uv[l].avail.eq(1), uv[l].ctx.eq(mul_tag[0].ctx)
-                        ]
-                    with m.Else():
-                        m.d.sync += [
-                            tt[l].val.eq(fmul.out.bits.data),
-                            tt[l].avail.eq(1), tt[l].ctx.eq(mul_tag[0].ctx)
-                        ]
-
-        # The correction subtract result is the Q4_K t.
-        with m.If(fadd.out.valid & add_tag[0].v & (add_tag[0].dest == Dest.T)):
-            for l in range(n):
-                with m.If(add_tag[0].lane == l):
-                    m.d.sync += [
-                        tt[l].val.eq(fadd.out.bits.data),
-                        tt[l].avail.eq(1),
-                        tt[l].ctx.eq(add_tag[0].ctx),
-                        t_busy[l].eq(0),
-                    ]
-
-        # v always lands in its stage; it is only produced for Q4_K,
-        # where it is exactly +0 whenever the correction vanishes.
-        with m.If(fmul.out.valid & mul_tag[0].v & (mul_tag[0].dest == Dest.V)):
-            for l in range(n):
-                with m.If(mul_tag[0].lane == l):
-                    m.d.sync += [
-                        vv[l].val.eq(fmul.out.bits.data), vv[l].avail.eq(1),
-                        vv[l].ctx.eq(mul_tag[0].ctx)
-                    ]
-
-        # Accumulation writes the addressed bank; a row's final segment
-        # snapshots the four partials for the fold into the free
-        # buffer. The snapshot write is ordered after the fold-launch
-        # consumes above so a same cycle cannot lose either update.
-        # The capture also retires the lane's row reservation: the
-        # fold's queue capacity is reserved by the ff issue gate plus
-        # the global ff_busy serialization, so the next row's records
-        # may be accepted while this fold drains.
-        with m.If(fadd.out.valid & add_tag[0].v
-                  & (add_tag[0].dest == Dest.ACC)):
-            idx = add_tag[0].ctx.seg_k[:2]
-            for l in range(n):
-                with m.If(add_tag[0].lane == l):
-                    with m.If(idx == 0):
-                        m.d.sync += bank[l][0].eq(fadd.out.bits.data)
-                    with m.If(idx == 1):
-                        m.d.sync += bank[l][1].eq(fadd.out.bits.data)
-                    with m.If(idx == 2):
-                        m.d.sync += bank[l][2].eq(fadd.out.bits.data)
-                    with m.If(idx == 3):
-                        m.d.sync += bank[l][3].eq(fadd.out.bits.data)
-                    with m.If(add_tag[0].ctx.row_last):
-                        # Capture target: the free buffer. Both full
-                        # cannot happen -- row-start acceptance
-                        # guarantees a free buffer per lane, and at
-                        # most two rows per lane are open.
-                        cap = Mux(snap_avail[0][l], 1, 0)
-                        for i in range(4):
-                            word = Mux(
-                                idx == i, fadd.out.bits.data,
-                                Mux(i > add_tag[0].ctx.seg_k, 0, bank[l][i]))
-                            with m.If(cap == 0):
-                                m.d.sync += snap[0][l][i].eq(word)
-                            with m.Else():
-                                m.d.sync += snap[1][l][i].eq(word)
-                        m.d.sync += [
-                            row_busy[l].eq(0),
-                            self.folds.eq(self.folds + 1)
-                        ]
-                        for b in range(2):
-                            with m.If(cap == b):
-                                m.d.sync += [
-                                    snap_avail[b][l].eq(1),
-                                    snap_done[b][l].eq(0),
-                                    snap_ctx[b][l].eq(add_tag[0].ctx)
-                                ]
-                                # With nothing pending the captured
-                                # buffer becomes the fold to read.
-                                with m.If(~rd_avail[l]):
-                                    m.d.sync += snap_rd[l].eq(b)
-
-        # Per-lane capture fact, for the retire logic below: a capture
-        # landing in the same cycle as a retire makes the captured
-        # buffer the next to read.
-        cap_now = [Signal(name=f'cap_now{l}') for l in range(n)]
-        cap_buf = [Signal(name=f'cap_buf{l}') for l in range(n)]
-        for l in range(n):
-            m.d.comb += [
-                cap_now[l].eq(fadd.out.valid & add_tag[0].v
-                              & (add_tag[0].dest == Dest.ACC)
-                              & (add_tag[0].lane == l)
-                              & add_tag[0].ctx.row_last),
-                cap_buf[l].eq(Mux(snap_avail[0][l], 1, 0)),
-            ]
-
-        # The read snapshot retires once both fold halves have
-        # launched; the read pointer moves to the other buffer when
-        # that one holds the next pending fold (already captured
-        # earlier, or captured this very cycle). Clearing the done
-        # bits keeps a retired snapshot from killing the next capture
-        # on an unrelated add issue the same cycle.
-        with m.If(add_found):
-            for l in range(n):
-                with m.If(rd_avail[l] & (rd_done[l][0] & rd_done[l][1])):
-                    other = ~snap_rd[l]
-                    with m.If(snap_rd[l]):
-                        m.d.sync += [
-                            snap_avail[1][l].eq(0), snap_done[1][l].eq(0)
-                        ]
-                    with m.Else():
-                        m.d.sync += [
-                            snap_avail[0][l].eq(0), snap_done[0][l].eq(0)
-                        ]
-                    other_pending = Mux(other, snap_avail[1][l],
-                                        snap_avail[0][l]) \
-                        | (cap_now[l] & (cap_buf[l] == other))
-                    with m.If(other_pending):
-                        m.d.sync += snap_rd[l].eq(other)
-
-        # A final fold enqueues its lane's result; ff_busy holds until
-        # it lands, so at most one final fold occupies each queue. The
-        # queue capacity was already checked at issue, and ff_busy
-        # serializes final folds, so the enqueue cannot fail. row_busy
-        # no longer clears here (M3b stage 3: it retired at the
-        # snapshot capture; clearing again could open a third row and
-        # overflow the two snapshot buffers).
-        with m.If(fadd.out.valid & add_tag[0].v
-                  & (add_tag[0].dest == Dest.FF)):
-            m.d.sync += ff_busy.eq(0)
-            for l in range(n):
-                with m.If(add_tag[0].lane == l):
-                    m.d.comb += [
-                        res_q[l].enq.valid.eq(1),
-                        res_q[l].enq.bits.val.eq(fadd.out.bits.data),
-                        res_q[l].enq.bits.row.eq(add_tag[0].ctx.row),
-                    ]
+        # Pysim-only observation points:
+        # plain Python references to existing signals, no statements
+        # added; consumed by bring-up traces.
+        self.dbg = dict(
+            started=started,
+            in_valid=in_valid,
+            spent=spent,
+            new_row_ready=new_row_ready,
+            ca0=[in_valid & lane_on[l] for l in range(n)],
+            i2fa_ov=[i2f_a[l].out_valid for l in range(n)],
+            ma0_iv=[mul_a0[l].inp.valid for l in range(n)],
+            ma0_ov=[mul_a0[l].out.valid for l in range(n)],
+            mb0_iv=[mul_b0[l].inp.valid for l in range(n)],
+            mb0_ov=[mul_b0[l].out.valid for l in range(n)],
+            acc_fire=acc_fire,
+            acc_ov=[add_acc[l].out.valid for l in range(n)],
+            sh8v=[sh[l][_TAP_MULB].v for l in range(n)],
+            sh11v=[sh[l][_TAP_SUB].v for l in range(n)],
+            sh14v=[sh[l][_TAP_ACC].v for l in range(n)],
+            fold_st=fold_st,
+            sav0=[snap_avail[0][l] for l in range(n)],
+            sav1=[snap_avail[1][l] for l in range(n)],
+            pend=pend,
+            resq_count=[res_q[l].count for l in range(n)],
+            prow=prow,
+            wcnt=wcnt,
+        )
 
         return m

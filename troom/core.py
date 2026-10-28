@@ -1,56 +1,10 @@
-"""Top-level integration for the troom tensor accelerator.
+"""Streaming troom accelerator core.
 
-troom is a standalone, explicitly scheduled tensor accelerator. The
-complete engine integrates DRAM-to-TMEM DMA, banked tensor memory, an
-activation-stationary systolic array, and an FP32 vector/reduction unit
-behind a descriptor-based command interface.
-
-``Core`` provides the executable command contract, TMEM, the tensor
-DMA, the matrix datapath, and the FP32 vector/reduction unit:
-
-* a host command stream (``cmd``) and a completion record stream
-  (``resp``) carrying per-command sequence numbers and status codes,
-* ordered command issue with asynchronous engines: ``LOAD_2D``/
-  ``STORE_2D`` descriptors stream through the DMA, ``QUANTIZE`` copies
-  a host-quantized activation image from TMEM into the matrix unit's
-  ACT RAM, ``MATMUL`` runs the matrix unit and its FP32 epilogue, and
-  ``VECTOR``/``REDUCE`` run the vector unit's elementwise and
-  reduction ops over TMEM regions, all while issue continues,
-* an in-order completion tracker: every command produces exactly one
-  completion record, and an engine command's record is emitted only
-  when its work truly completes -- for a load, the final beat
-  committed into TMEM; for a store, the final AXI B response; for a
-  matmul, the last FP32 result beat committed to TMEM; for a vector
-  command, its final result beat -- with errors propagated into its
-  status,
-* ``WAIT``/``SIGNAL`` completion events; engine commands set their
-  event when they finish, including error completions, so a ``WAIT``
-  cannot deadlock on a failed transfer,
-* ``END`` sequence termination that drains all previously issued
-  commands (a sticky ``done`` means every required write has
-  completed),
-* banked TMEM with one shared read path (round-robin across the DMA
-  store reader, the weight feeder, the activation loader, and the
-  vector unit, with tagged response routing) and one shared write
-  path (round-robin across the DMA fill, the epilogue's result drain,
-  and the vector unit's result beats),
-* cycle, completion, DRAM-byte, DMA-stall, TMEM-conflict, useful-MAC,
-  and array-starvation counters, plus the M3b cycle-breakdown window:
-  matrix RUN/DRAIN cycles and output-credit stalls, and the FP32
-  epilogue's active/stall cycles, accepted records, and shared FPU
-  issue counts.
-
-Events are level-held flags: ``SIGNAL`` sets one, ``WAIT`` retires once
-its flag is set and then clears it. Because issue is ordered, a ``WAIT``
-can only be satisfied by an earlier command or by an asynchronous
-engine completion; a ``SIGNAL`` issued after a blocking ``WAIT`` is not
-fetched until the ``WAIT`` retires, so it cannot unblock it.
-
-Every datapath opcode is integrated: reserved opcode encodings still
-complete with ``BAD_OPCODE``, a ``VECTOR``/``REDUCE`` command whose
-``vec_op`` sub-operation belongs to the other opcode class is rejected
-at issue with ``BAD_SHAPE``, and the engines reject malformed
-descriptors themselves.
+DMA, StreamGemv, its per-lane FP32 epilogue, activation loading, vector/reduction
+and V-window building share TMEM and the AXI master. SMATMUL streams SG1 weights
+from DDR; SQUANTIZE loads the activation RAM. Retired MATMUL/QUANTIZE encodings
+complete with BAD_OPCODE. Command issue is asynchronous with in-order completion,
+level-held WAIT/SIGNAL events, and END draining all earlier commands.
 """
 
 from amaranth import *
@@ -74,12 +28,14 @@ from troom.types import (
 
 from troom.dma import DMA
 from troom.epilogue import Epilogue
-from troom.matrix import MatrixUnit
 from troom.quantize import ActLoader
+from troom.stream import StreamAxiReader, StreamGemv
 from troom.tmem import TMEM
 from troom.vector import VectorUnit
+from troom.vbuild import VBuildUnit
 
 from roomsoc.interconnect.axi import AXIInterface
+from roomsoc.interconnect.axi.axi_full import AXIArbiter
 from roomsoc.interconnect.stream import Decoupled, Queue
 
 
@@ -136,7 +92,7 @@ class Completion(HasTRoomParams, Record):
 
 # Completion results are indexed by source; the engines complete
 # their commands in acceptance order.
-ENGINE_SOURCES = (Source.DMA, Source.MATMUL, Source.ACT, Source.VEC)
+ENGINE_SOURCES = (Source.DMA, Source.ACT, Source.VEC, Source.VBUILD)
 
 
 class Core(HasTRoomParams, Elaboratable):
@@ -169,6 +125,11 @@ class Core(HasTRoomParams, Elaboratable):
                                 addr_width=self.addr_width,
                                 id_width=self.id_width)
 
+        self.stream = StreamGemv(self.params,
+                                 mem_base=mem_base,
+                                 mem_size=mem_size)
+        self.sreader = StreamAxiReader(self.params)
+
         # Recovery stops new engine issue while already-issued DMA drains.
         self.halt = Signal()
         self.memory_idle = Signal()
@@ -186,8 +147,8 @@ class Core(HasTRoomParams, Elaboratable):
         self.array_starve = Signal(48)
         # Cycle-breakdown window (M3b): the matrix unit's launch/drain
         # split with its output-credit stalls, and the FP32 epilogue's
-        # activity, sink backpressure, record acceptance, and shared
-        # FPU issue counts.
+        # activity, sink backpressure, record acceptance, and per-lane
+        # FPU issue totals.
         self.mm_credit_stalls = Signal(48)
         self.mm_run_cycles = Signal(48)
         self.mm_drain_cycles = Signal(48)
@@ -201,67 +162,82 @@ class Core(HasTRoomParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        # Current-command opcode, latched at FETCH.
+        cur_opcode = Signal(Opcode)
+
         tmem = m.submodules.tmem = TMEM(self.params)
+        dma_bus = AXIInterface(data_width=self.data_width,
+                               addr_width=self.addr_width,
+                               id_width=self.id_width)
         dma = m.submodules.dma = DMA(self.params,
-                                     self.bus,
+                                     dma_bus,
                                      mem_base=self.mem_base,
                                      mem_size=self.mem_size)
-        matrix = m.submodules.matrix = MatrixUnit(self.params)
+        m.submodules.stream = self.stream
+        m.submodules.sreader = self.sreader
+        core_arb = m.submodules.core_arb = AXIArbiter(
+            addr_width=self.addr_width,
+            data_width=self.data_width,
+            id_width=self.id_width)
+        core_arb.add(dma_bus)
+        core_arb.add(self.sreader.bus)
+        m.d.comb += [
+            core_arb.bus.connect(self.bus),
+            self.stream.mem_rreq.connect(self.sreader.rreq),
+            self.sreader.rresp.connect(self.stream.mem_rresp),
+        ]
         epi = m.submodules.epi = Epilogue(self.params)
         actload = m.submodules.actload = ActLoader(self.params)
         vector = m.submodules.vector = VectorUnit(self.params)
+        vbuild = m.submodules.vbuild = VBuildUnit(self.params)
 
-        # The segment stream flows from the matrix unit's output queue
-        # into the epilogue; the epilogue's acceptance paces the matrix
-        # unit through its output-credit accounting. ACT uploads and
-        # new matmuls wait until the previous result drain completes.
+        # Results retire only after the per-lane epilogue drains to TMEM.
         m.d.comb += [
-            matrix.segs.connect(epi.sink),
-            actload.act_wr.connect(matrix.act_wr),
+            self.stream.segs.connect(epi.sink),
+            epi.start.eq(self.stream.sink.fire & self.stream.start_ok),
         ]
+
+        # Activation loading and streaming compute never overlap.
+        m.d.comb += actload.act_wr.connect(self.stream.act_wr)
 
         cur_rows = Signal(self.rows_bits)
         cur_r_base = Signal(self.tmem_addr_width)
         m.d.comb += [epi.rows.eq(cur_rows), epi.r_base.eq(cur_r_base)]
 
-        # A matmul's result drain starts when the matrix unit accepts a
-        # well-formed descriptor; a rejected one never reaches the
-        # epilogue.
-        m.d.comb += epi.start.eq(matrix.sink.fire & matrix.start_ok)
-
         #
         # TMEM port arbitration. Reads: the DMA store reader, the
-        # weight feeder, the activation loader, and the vector unit
-        # share the single request/response channel round-robin, with
-        # the owner tag routing the response back. Writes: the DMA
-        # fill, the epilogue's result drain, and the vector unit's
-        # result beats share the write channel.
+        # activation loader, the vector unit, and
+        # the V-window builder share the single request/response
+        # channel round-robin, with the owner tag routing the
+        # response back. Writes: the DMA fill, the epilogue's result
+        # drain, the vector unit's result beats, and the V-window
+        # tile drain share the write channel.
         #
         rreqs = [
-            dma.rreq, matrix.tmem_rreq, actload.tmem_rreq, vector.tmem_rreq
+            dma.rreq, actload.tmem_rreq, vector.tmem_rreq, vbuild.tmem_rreq
         ]
         rresps = [
-            dma.rresp, matrix.tmem_rresp, actload.tmem_rresp, vector.tmem_rresp
+            dma.rresp, actload.tmem_rresp, vector.tmem_rresp, vbuild.tmem_rresp
         ]
 
         n_r = len(rreqs)
         r_valid = Array([r.valid for r in rreqs])
         r_addr = Array([r.bits.addr for r in rreqs])
 
-        def rot4(rr, q):
-            """Rotate past four requesters without a width wrap."""
+        def rotate_reader(rr, q):
+            """Rotate past n_r requesters without a width wrap."""
             v = rr + q
             return Mux(v >= n_r, v - n_r, v)
 
-        r_rr = Signal(2)
+        r_rr = Signal(range(n_r))
         r_found = Signal()
-        r_sel = Signal(2)
+        r_sel = Signal(range(n_r))
         for q in reversed(range(n_r)):
-            idx = rot4(r_rr, q)
+            idx = rotate_reader(r_rr, q)
             with m.If(r_valid[idx]):
                 m.d.comb += [r_found.eq(1), r_sel.eq(idx)]
 
-        r_owner = Signal(2)
+        r_owner = Signal(range(n_r))
         m.d.comb += [
             tmem.rreq.valid.eq(r_found),
             tmem.rreq.bits.addr.eq(r_addr[r_sel]),
@@ -269,7 +245,7 @@ class Core(HasTRoomParams, Elaboratable):
         for i, r in enumerate(rreqs):
             m.d.comb += r.ready.eq(tmem.rreq.ready & r_found & (r_sel == i))
         with m.If(tmem.rreq.fire):
-            m.d.sync += [r_owner.eq(r_sel), r_rr.eq(rot4(r_sel, 1))]
+            m.d.sync += [r_owner.eq(r_sel), r_rr.eq(rotate_reader(r_sel, 1))]
 
         rresp_ready = Const(0)
         for i, r in enumerate(rresps):
@@ -280,15 +256,15 @@ class Core(HasTRoomParams, Elaboratable):
             rresp_ready = rresp_ready | ((r_owner == i) & r.ready)
         m.d.comb += tmem.rresp.ready.eq(rresp_ready)
 
-        wreqs = [dma.tmem_w, epi.tmem_w, vector.tmem_w]
+        wreqs = [dma.tmem_w, epi.tmem_w, vector.tmem_w, vbuild.tmem_w]
         w_valid = Array([w.valid for w in wreqs])
         w_addr = Array([w.bits.addr for w in wreqs])
         w_data = Array([w.bits.data for w in wreqs])
 
         n_w = len(wreqs)
 
-        def rot3(rr, q):
-            """Rotate past three writers without a width wrap."""
+        def rot4w(rr, q):
+            """Rotate past four writers without a width wrap."""
             v = rr + q
             return Mux(v >= n_w, v - n_w, v)
 
@@ -296,7 +272,7 @@ class Core(HasTRoomParams, Elaboratable):
         w_found = Signal()
         w_sel = Signal(2)
         for q in reversed(range(n_w)):
-            idx = rot3(w_rr, q)
+            idx = rot4w(w_rr, q)
             with m.If(w_valid[idx]):
                 m.d.comb += [w_found.eq(1), w_sel.eq(idx)]
         m.d.comb += [
@@ -307,7 +283,7 @@ class Core(HasTRoomParams, Elaboratable):
         for i, w in enumerate(wreqs):
             m.d.comb += w.ready.eq(tmem.write.ready & w_found & (w_sel == i))
         with m.If(tmem.write.fire):
-            m.d.sync += w_rr.eq(rot3(w_sel, 1))
+            m.d.sync += w_rr.eq(rot4w(w_sel, 1))
 
         cmd_q = m.submodules.cmd_q = Queue(self.cmd_queue_depth,
                                            Command,
@@ -317,15 +293,12 @@ class Core(HasTRoomParams, Elaboratable):
 
         evt_reg = Signal(self.n_events)
 
-        cur_opcode = Signal(Opcode)
         cur_evt = Signal(self.evt_bits)
         cur_seq = Signal(self.seq_bits)
         cur_dma = DmaDescriptor(self.params)
         cur_fmt = Signal(Format)
         cur_vec_op = Signal(VecOp)
         cur_k = Signal(self.lg_act_k + 1)
-        cur_w_base = Signal(self.tmem_addr_width)
-        cur_w_stride = Signal(self.tmem_addr_width)
         cur_a_base = Signal(self.tmem_addr_width)
         cur_m_base = Signal(self.tmem_addr_width)
 
@@ -335,10 +308,11 @@ class Core(HasTRoomParams, Elaboratable):
         is_wait = cur_opcode == Opcode.WAIT
         is_signal = cur_opcode == Opcode.SIGNAL
         is_end = cur_opcode == Opcode.END
-        is_matmul = cur_opcode == Opcode.MATMUL
-        is_actload = cur_opcode == Opcode.QUANTIZE
         is_vector = (cur_opcode == Opcode.VECTOR) \
             | (cur_opcode == Opcode.REDUCE)
+        is_vbuild = cur_opcode == Opcode.VBUILD
+        is_smatmul = cur_opcode == Opcode.SMATMUL
+        is_actload = cur_opcode == Opcode.SQUANTIZE
 
         # A vector command must name a sub-operation of its own class;
         # reserved sub-op encodings match neither set.
@@ -369,9 +343,11 @@ class Core(HasTRoomParams, Elaboratable):
         #
         n_slots = self.cmd_queue_depth
 
+        sources = ENGINE_SOURCES + (Source.STREAM, )
+
         evt_qs = []
         res_qs = []
-        for _ in ENGINE_SOURCES:
+        for _ in sources:
             evt_q = Queue(n_slots, Record,
                           [('evt', self.evt_bits, Direction.FANOUT)])
             res_q = Queue(n_slots,
@@ -381,42 +357,58 @@ class Core(HasTRoomParams, Elaboratable):
                           flow=False)
             evt_qs.append(evt_q)
             res_qs.append(res_q)
-        dma_evt_q, mm_evt_q, act_evt_q, vec_evt_q = evt_qs
-        dma_res_q, mm_res_q, act_res_q, vec_res_q = res_qs
-        for name, q in zip(('dma_evt_q', 'mm_evt_q', 'act_evt_q', 'vec_evt_q',
-                            'dma_res_q', 'mm_res_q', 'act_res_q', 'vec_res_q'),
-                           evt_qs + res_qs):
+        (dma_evt_q, act_evt_q, vec_evt_q, vb_evt_q, sm_evt_q) = evt_qs
+        (dma_res_q, act_res_q, vec_res_q, vb_res_q, sm_res_q) = res_qs
+        qnames = ('dma_evt_q', 'act_evt_q', 'vec_evt_q', 'vb_evt_q',
+                  'sm_evt_q', 'dma_res_q', 'act_res_q', 'vec_res_q',
+                  'vb_res_q', 'sm_res_q')
+        for name, q in zip(qnames, evt_qs + res_qs):
             setattr(m.submodules, name, q)
 
-        mm_bad = matrix.done & (matrix.status == Status.BAD_SHAPE)
-        mm_done = mm_bad | epi.done
+        sm_bus_err = Signal()
+        with m.If(self.stream.sink.fire & self.stream.start_ok):
+            m.d.sync += sm_bus_err.eq(0)
+        with m.Elif(self.sreader.err):
+            m.d.sync += sm_bus_err.eq(1)
+        sm_bad = self.stream.done & (self.stream.status != Status.OK)
+        sm_status = Mux(
+            sm_bad, self.stream.status,
+            Mux(sm_bus_err | self.sreader.err, Status.DMA_ERROR, epi.status))
+        sm_done = sm_bad | epi.done
 
         m.d.comb += [
             dma_evt_q.enq.valid.eq(dma.sink.fire),
             dma_evt_q.enq.bits.evt.eq(cur_evt),
-            mm_evt_q.enq.valid.eq(matrix.sink.fire),
-            mm_evt_q.enq.bits.evt.eq(cur_evt),
             act_evt_q.enq.valid.eq(actload.sink.fire),
             act_evt_q.enq.bits.evt.eq(cur_evt),
             vec_evt_q.enq.valid.eq(vector.sink.fire),
             vec_evt_q.enq.bits.evt.eq(cur_evt),
+            vb_evt_q.enq.valid.eq(vbuild.sink.fire),
+            vb_evt_q.enq.bits.evt.eq(cur_evt),
             dma_evt_q.deq.ready.eq(dma.done),
-            mm_evt_q.deq.ready.eq(mm_done),
             act_evt_q.deq.ready.eq(actload.done),
             vec_evt_q.deq.ready.eq(vector.done),
+            vb_evt_q.deq.ready.eq(vbuild.done),
             dma_res_q.enq.valid.eq(dma.done),
             dma_res_q.enq.bits.status.eq(dma.status),
             dma_res_q.enq.bits.evt.eq(dma_evt_q.deq.bits.evt),
-            mm_res_q.enq.valid.eq(mm_done),
-            mm_res_q.enq.bits.status.eq(
-                Mux(mm_bad, Status.BAD_SHAPE, epi.status)),
-            mm_res_q.enq.bits.evt.eq(mm_evt_q.deq.bits.evt),
             act_res_q.enq.valid.eq(actload.done),
             act_res_q.enq.bits.status.eq(actload.status),
             act_res_q.enq.bits.evt.eq(act_evt_q.deq.bits.evt),
             vec_res_q.enq.valid.eq(vector.done),
             vec_res_q.enq.bits.status.eq(vector.status),
             vec_res_q.enq.bits.evt.eq(vec_evt_q.deq.bits.evt),
+            vb_res_q.enq.valid.eq(vbuild.done),
+            vb_res_q.enq.bits.status.eq(vbuild.status),
+            vb_res_q.enq.bits.evt.eq(vb_evt_q.deq.bits.evt),
+        ]
+        m.d.comb += [
+            sm_evt_q.enq.valid.eq(self.stream.sink.fire),
+            sm_evt_q.enq.bits.evt.eq(cur_evt),
+            sm_evt_q.deq.ready.eq(sm_done),
+            sm_res_q.enq.valid.eq(sm_done),
+            sm_res_q.enq.bits.status.eq(sm_status),
+            sm_res_q.enq.bits.evt.eq(sm_evt_q.deq.bits.evt),
         ]
         for q in res_qs:
             with m.If(q.enq.fire):
@@ -424,9 +416,13 @@ class Core(HasTRoomParams, Elaboratable):
 
         # Indexed by source value; the issue source never consults
         # these.
-        res_valid_arr = Array([Const(0)] + [q.deq.valid for q in res_qs])
-        res_status_arr = Array([Const(0, Shape.cast(Status))] +
-                               [q.deq.bits.status for q in res_qs])
+        res_by_source = dict(zip(sources, res_qs))
+        res_valid_arr = Array(
+            res_by_source[src].deq.valid if src in res_by_source else Const(0)
+            for src in Source)
+        res_status_arr = Array(res_by_source[src].deq.bits.status if src in
+                               res_by_source else Const(0, Shape.cast(Status))
+                               for src in Source)
 
         #
         # In-order completion tracker. Every issued command occupies
@@ -512,7 +508,7 @@ class Core(HasTRoomParams, Elaboratable):
             self.resp.bits.status.eq(head_status),
         ]
         # Popping an engine slot releases its engine's result.
-        for e, res_q in zip(ENGINE_SOURCES, res_qs):
+        for e, res_q in zip(sources, res_qs):
             m.d.comb += res_q.deq.ready.eq(do_pop & (head_engine == e))
 
         #
@@ -534,8 +530,6 @@ class Core(HasTRoomParams, Elaboratable):
                             cur_vec_op.eq(deq.vec_op),
                             cur_k.eq(deq.k),
                             cur_rows.eq(deq.rows),
-                            cur_w_base.eq(deq.w_base),
-                            cur_w_stride.eq(deq.w_stride),
                             cur_r_base.eq(deq.r_base),
                             cur_a_base.eq(deq.a_base),
                             cur_m_base.eq(deq.m_base),
@@ -594,10 +588,11 @@ class Core(HasTRoomParams, Elaboratable):
                             ]
                             m.next = 'FETCH'
 
-                    with m.Elif(is_matmul):
-                        # A result region the engine cannot express
-                        # completes at issue without disturbing either
-                        # engine.
+                    with m.Elif(is_smatmul):
+                        # Same issue-time result-region contract as
+                        # MATMUL; shape/align/range rejection is the
+                        # stream engine's own accept-time check and
+                        # completes at its reject pulse.
                         with m.If(~r_ok):
                             m.d.comb += [
                                 push.eq(1),
@@ -607,10 +602,10 @@ class Core(HasTRoomParams, Elaboratable):
                             ]
                             m.d.sync += evt_reg.bit_select(cur_evt, 1).eq(1)
                             m.next = 'FETCH'
-                        with m.Elif(matrix.sink.fire):
+                        with m.Elif(self.stream.sink.fire):
                             m.d.comb += [
                                 push.eq(1),
-                                push_engine.eq(Source.MATMUL)
+                                push_engine.eq(Source.STREAM)
                             ]
                             m.next = 'FETCH'
 
@@ -634,6 +629,14 @@ class Core(HasTRoomParams, Elaboratable):
                             ]
                             m.next = 'FETCH'
 
+                    with m.Elif(is_vbuild):
+                        with m.If(vbuild.sink.fire):
+                            m.d.comb += [
+                                push.eq(1),
+                                push_engine.eq(Source.VBUILD)
+                            ]
+                            m.next = 'FETCH'
+
                     with m.Else():
                         m.d.comb += [
                             push.eq(1),
@@ -646,21 +649,14 @@ class Core(HasTRoomParams, Elaboratable):
             with m.State('HALT'):
                 pass
 
-        # Engine descriptor offers, held until accepted.
+        # Hold offers until accepted, after the prior stream and result drain.
+        act_offer_ok = ~self.stream.active
         m.d.comb += [
             dma.sink.valid.eq(fsm.ongoing('EXEC') & ~self.halt & is_dma),
             dma.sink.bits.store.eq(is_store),
-            matrix.sink.valid.eq(
-                fsm.ongoing('EXEC') & ~self.halt & is_matmul
-                & r_ok & epi.ready & ~actload.active),
-            matrix.sink.bits.fmt.eq(cur_fmt),
-            matrix.sink.bits.k.eq(cur_k),
-            matrix.sink.bits.rows.eq(cur_rows),
-            matrix.sink.bits.w_base.eq(cur_w_base),
-            matrix.sink.bits.w_stride.eq(cur_w_stride),
             actload.sink.valid.eq(
                 fsm.ongoing('EXEC') & ~self.halt & is_actload
-                & ~matrix.active & epi.ready),
+                & act_offer_ok & epi.ready),
             actload.sink.bits.a_base.eq(cur_a_base),
             actload.sink.bits.m_base.eq(cur_m_base),
             actload.sink.bits.k.eq(cur_k),
@@ -672,18 +668,35 @@ class Core(HasTRoomParams, Elaboratable):
             vector.sink.bits.a_base.eq(cur_a_base),
             vector.sink.bits.b_base.eq(cur_m_base),
             vector.sink.bits.o_base.eq(cur_r_base),
+            vbuild.sink.valid.eq(fsm.ongoing('EXEC') & ~self.halt & is_vbuild),
+            vbuild.sink.bits.a_base.eq(cur_a_base),
+            vbuild.sink.bits.r_base.eq(cur_r_base),
+            vbuild.sink.bits.k.eq(cur_k),
+        ]
+        m.d.comb += [
+            self.stream.sink.valid.eq(
+                fsm.ongoing('EXEC') & ~self.halt & is_smatmul
+                & r_ok & epi.ready & ~actload.active),
+            self.stream.sink.bits.fmt.eq(cur_fmt),
+            self.stream.sink.bits.k.eq(cur_k),
+            self.stream.sink.bits.rows.eq(cur_rows),
+            self.stream.sink.bits.p_base.eq(cur_dma.dram_addr),
+            self.stream.sink.bits.m_base.eq(cur_dma.dram_stride),
         ]
         for name in DMA_DESC_FIELDS:
             m.d.comb += getattr(dma.sink.bits, name).eq(getattr(cur_dma, name))
 
-        m.d.comb += [
-            self.memory_idle.eq(~dma.active),
-            self.busy.eq(
-                fsm.ongoing('EXEC') | (count != 0)
-                | (fsm.ongoing('FETCH') & cmd_q.deq.valid)
-                | dma.active | matrix.active | epi.active
-                | actload.active | vector.active),
-        ]
+        # Recovery quiescence must cover the reader: the stream unit
+        # only reports done after its reader responses landed and its
+        # queues flushed, so ~active implies no stream reads are in
+        # flight on the public master.
+        m.d.comb += self.memory_idle.eq(~dma.active & ~self.stream.active)
+        m.d.comb += self.busy.eq(
+            fsm.ongoing('EXEC') | (count != 0)
+            | (fsm.ongoing('FETCH') & cmd_q.deq.valid)
+            | dma.active | epi.active
+            | actload.active | vector.active | vbuild.active
+            | self.stream.active)
 
         m.d.sync += self.cycle_count.eq(self.cycle_count + 1)
 
@@ -691,11 +704,11 @@ class Core(HasTRoomParams, Elaboratable):
             self.dram_bytes.eq(dma.dram_bytes),
             self.dma_stalls.eq(dma.stall_cycles),
             self.tmem_conflicts.eq(tmem.conflicts),
-            self.useful_macs.eq(matrix.useful_macs),
-            self.array_starve.eq(matrix.starve_cycles),
-            self.mm_credit_stalls.eq(matrix.credit_stalls),
-            self.mm_run_cycles.eq(matrix.run_cycles),
-            self.mm_drain_cycles.eq(matrix.drain_cycles),
+            self.useful_macs.eq(self.stream.useful_macs),
+            self.array_starve.eq(self.stream.starve_cycles),
+            self.mm_credit_stalls.eq(self.stream.credit_stalls),
+            self.mm_run_cycles.eq(self.stream.run_cycles),
+            self.mm_drain_cycles.eq(self.stream.drain_cycles),
             self.epi_records.eq(epi.records),
             self.epi_active_cycles.eq(epi.active_cycles),
             self.epi_stalls.eq(epi.stall_cycles),

@@ -4,8 +4,12 @@ from enum import IntEnum
 
 
 class Opcode(IntEnum):
-    """Descriptor opcodes from the troom command set."""
+    """Descriptor opcodes with stable host ABI numbers.
 
+    SMATMUL carries SG1 payload/meta bases in dram_addr/dram_stride;
+    SQUANTIZE loads the streaming activation RAM. MATMUL and QUANTIZE
+    are retired encodings and complete with BAD_OPCODE.
+    """
     LOAD_2D = 0
     STORE_2D = 1
     QUANTIZE = 2
@@ -15,15 +19,19 @@ class Opcode(IntEnum):
     WAIT = 6
     SIGNAL = 7
     END = 8
+    VBUILD = 9
+    SMATMUL = 10
+    SQUANTIZE = 11
 
 
 DATAPATH_OPCODES = (
     Opcode.LOAD_2D,
     Opcode.STORE_2D,
-    Opcode.QUANTIZE,
-    Opcode.MATMUL,
+    Opcode.SQUANTIZE,
+    Opcode.SMATMUL,
     Opcode.VECTOR,
     Opcode.REDUCE,
+    Opcode.VBUILD,
 )
 
 DMA_OPCODES = (
@@ -154,3 +162,5 @@ class Source(IntEnum):
     MATMUL = 2
     ACT = 3
     VEC = 4
+    VBUILD = 5
+    STREAM = 6

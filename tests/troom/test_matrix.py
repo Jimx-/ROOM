@@ -1,26 +1,13 @@
-"""Focused pysim tests for the troom matrix unit.
+"""Common matrix stimulus, packed-format goldens and arithmetic model checks.
 
-The reference side is ``tests/troom/model.py``'s MATMUL contract: the
-model packs weight rows and activations, computes the expected
-chain-end records (integer combines with the plan's bounds), and these
-tests run the RTL matrix unit against them field for field, in launch
-order. Coverage per the plan's verification obligations: every format's
-unpack algebra, skew (distinct per-element sentinels), bubbles within
-rows and back-to-back row pairs from randomized TMEM-request gating,
-output backpressure longer than queue plus pipeline capacity, odd
-output counts with a masked lane that never reads beyond its tile,
-short-K many-rows-in-flight, ACT pinning across back-to-back matmuls,
-and capability rejection of unsupported shapes.
+Hardware scheduling and backpressure are exercised by the streaming suites.
 """
 
 from amaranth import *
-from amaranth.sim import Passive, Simulator
 
 import pytest
 
 from troom.consts import Format, Status
-from troom.matrix import MatrixUnit
-from troom.tmem import TMEM
 
 from tests.troom.model import (
     BLOCK_BYTES,
@@ -68,46 +55,6 @@ RECORD_FIELDS = (
     [f'{f}{p}' for p in range(2) for f in ('S', 'row', 'd', 'dmin', 'mi')])
 
 
-class MatrixHarness(Elaboratable):
-    """Matrix unit attached to a banked TMEM with a gate on requests.
-
-    The gate lets a test process stall the weight feeder's read
-    requests cycle by cycle, forcing starvation bubbles independently
-    of TMEM behavior.
-    """
-
-    def __init__(self, params):
-        self.params = params
-        self.tmem = TMEM(params)
-        self.matrix = MatrixUnit(params)
-        self.allow = Signal(reset=1)
-
-    def elaborate(self, platform):
-        m = Module()
-        m.submodules.tmem = self.tmem
-        m.submodules.matrix = self.matrix
-
-        rreq = self.matrix.tmem_rreq
-        m.d.comb += [
-            self.tmem.rreq.valid.eq(rreq.valid & self.allow),
-            self.tmem.rreq.bits.addr.eq(rreq.bits.addr),
-            rreq.ready.eq(self.tmem.rreq.ready & self.allow),
-            self.tmem.rresp.connect(self.matrix.tmem_rresp),
-        ]
-        return m
-
-
-def tmem_write(write, addr, word):
-    yield write.bits.addr.eq(addr)
-    yield write.bits.data.eq(word)
-    yield write.valid.eq(1)
-    yield
-    while not (yield write.fire):
-        yield
-    yield write.valid.eq(0)
-    yield
-
-
 def act_write(unit, seg, entry):
     wr = unit.act_wr
     word = 0
@@ -123,29 +70,6 @@ def act_write(unit, seg, entry):
         yield
     yield wr.valid.eq(0)
     yield
-
-
-def push_desc(unit, fmt, k, rows, stride):
-    sink = unit.sink
-    yield sink.bits.fmt.eq(int(fmt))
-    yield sink.bits.k.eq(k)
-    yield sink.bits.rows.eq(rows)
-    yield sink.bits.w_base.eq(W_BASE)
-    yield sink.bits.w_stride.eq(stride)
-    yield sink.valid.eq(1)
-    yield
-    while not (yield sink.fire):
-        yield
-    yield sink.valid.eq(0)
-    yield
-
-
-def row_beats(data, base, beat=BEAT):
-    """(address, beat word) pairs for beat-padded row bytes."""
-    pad = (-len(data)) % beat
-    data = data + bytes(pad)
-    for off in range(0, len(data), beat):
-        yield base + off, int.from_bytes(data[off:off + beat], 'little')
 
 
 def rand_fp16_bits(rng):
@@ -212,18 +136,6 @@ def gen_act(rng, nsegs):
     ]
 
 
-def build_tile(fmt, k, rows, wsegs, beat=BEAT):
-    """Beat image and stride for a row-major tile at W_BASE."""
-    nsegs = k // 32
-    stride = -(-row_bytes(fmt, k) // beat) * beat
-    beats = {}
-    for r in range(rows):
-        data = pack_row(fmt, wsegs[r * nsegs:(r + 1) * nsegs])
-        for addr, word in row_beats(data, W_BASE + r * stride, beat):
-            beats[addr] = word
-    return stride, beats
-
-
 def check_records(got, exp, n_outputs=2):
     assert len(got) == len(exp), f'{len(got)} records, {len(exp)} expected'
     for i, (g, e) in enumerate(zip(got, exp)):
@@ -238,102 +150,6 @@ def check_records(got, exp, n_outputs=2):
                 # Masked lanes launch zero operands and zero scales.
                 for f in ('S', 'd', 'dmin', 'mi'):
                     assert g[f'{f}{p}'] == 0, (i, f'{f}{p}')
-
-
-def run_matmul(fmt,
-               k,
-               rows,
-               wsegs,
-               act,
-               *,
-               seed=7,
-               stall_rreq=False,
-               stall_sink=False,
-               deadline=300000,
-               params=None):
-    """Run one matmul in the harness; return (records, status, extras)."""
-    import random
-
-    rng = random.Random(seed)
-    params = params if params is not None else params_for(fmt)
-    stride, beats = build_tile(fmt,
-                               k,
-                               rows,
-                               wsegs,
-                               beat=params['data_width'] // 8)
-    act = [dict(entry, sum_a=sum(entry['quants'])) for entry in act]
-    expected = mm_segments(fmt, k, rows, [
-        pack_row(fmt, wsegs[r * (k // 32):(r + 1) * (k // 32)])
-        for r in range(rows)
-    ], act)
-
-    dut = MatrixHarness(params)
-    records = []
-    req_addrs = []
-    result = {}
-
-    def setup():
-        for addr in sorted(beats):
-            yield from tmem_write(dut.tmem.write, addr, beats[addr])
-        for j, entry in enumerate(act):
-            yield from act_write(dut.matrix, j, entry)
-        yield from push_desc(dut.matrix, fmt, k, rows, stride)
-        for _ in range(deadline):
-            yield
-            if (yield dut.matrix.done):
-                result['status'] = Status((yield dut.matrix.status))
-                result['slots'] = (yield dut.matrix.slots)
-                result['bubbles'] = (yield dut.matrix.bubbles)
-                result['starve'] = (yield dut.matrix.starve_cycles)
-                result['credit'] = (yield dut.matrix.credit_stalls)
-                result['macs'] = (yield dut.matrix.useful_macs)
-                break
-        else:
-            raise TimeoutError('matrix unit did not finish')
-
-    def gate():
-        yield Passive()
-        while True:
-            if stall_rreq:
-                yield dut.allow.eq(rng.random() < 0.55)
-            else:
-                yield dut.allow.eq(1)
-            if (yield dut.matrix.tmem_rreq.fire):
-                req_addrs.append((yield dut.matrix.tmem_rreq.bits.addr))
-            yield
-
-    def sink():
-        yield Passive()
-        deq = dut.matrix.segs
-        while True:
-            if stall_sink:
-                yield deq.ready.eq(rng.random() < 0.45)
-            else:
-                yield deq.ready.eq(1)
-            if (yield deq.valid) & (yield deq.ready):
-                rec = {}
-                for f in RECORD_FIELDS:
-                    rec[f] = (yield getattr(deq.bits, f))
-                records.append(rec)
-            yield
-
-    sim = Simulator(dut)
-    sim.add_clock(1e-6)
-    sim.add_sync_process(setup)
-    sim.add_sync_process(gate)
-    sim.add_sync_process(sink)
-    sim.run()
-
-    return dict(records=records,
-                expected=expected,
-                status=result['status'],
-                stride=stride,
-                req_addrs=req_addrs,
-                slots=result.get('slots'),
-                bubbles=result.get('bubbles'),
-                starve=result.get('starve'),
-                credit=result.get('credit'),
-                macs=result.get('macs'))
 
 
 # ---------------------------------------------------------------------------
@@ -450,641 +266,6 @@ def test_segment_bounds_match_plan():
 # RTL versus model, per format and under stalls.
 # ---------------------------------------------------------------------------
 
-
-def run_format_case(fmt, k, rows, seed):
-    import random
-
-    rng = random.Random(seed)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = gen_act(rng, k // 32)
-    out = run_matmul(fmt, k, rows, wsegs, act, seed=seed)
-    assert out['status'] is Status.OK
-    assert out['macs'] == rows * k
-    assert out['slots'] == ((rows + 1) // 2) * (k // 32)
-    check_records(out['records'], out['expected'])
-
-
-def test_matrix_q5_0_records():
-    # 3 blocks per row (66 bytes: beats straddle block boundaries) and
-    # an odd row count exercising the masked final lane.
-    run_format_case(Format.Q5_0, 96, 3, 11)
-
-
-def test_matrix_q8_0_records():
-    run_format_case(Format.Q8_0, 64, 2, 12)
-
-
-def test_matrix_q4_k_records():
-    # Two super-blocks per row: block-to-block transitions through the
-    # ping/pong buffers, five rows with the last lane masked.
-    run_format_case(Format.Q4_K, 512, 5, 13)
-
-
-def test_matrix_q6_k_records():
-    run_format_case(Format.Q6_K, 256, 3, 14)
-
-
-@pytest.mark.parametrize('fmt,k', [
-    (Format.Q5_0, 576),
-    (Format.Q8_0, 576),
-    (Format.Q4_K, 1536),
-    (Format.Q6_K, 1536),
-])
-@pytest.mark.parametrize('stalls', [False, True])
-def test_matrix_wide_block_tails(fmt, k, stalls):
-    """Wide beats span blocks; tails respect ping/pong ownership and padding."""
-    import random
-
-    rng = random.Random(84)
-    rows = 5  # Multiple row transitions and a masked final output lane.
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = gen_act(rng, k // 32)
-    params = params_for(fmt,
-                        mm_formats=tuple(Format),
-                        data_width=512,
-                        id_width=6,
-                        n_tmem_banks=8,
-                        tmem_bytes=256 * 1024,
-                        act_max_k=2048,
-                        mm_out_depth=1 if stalls else 16)
-    out = run_matmul(fmt,
-                     k,
-                     rows,
-                     wsegs,
-                     act,
-                     params=params,
-                     stall_rreq=stalls,
-                     stall_sink=stalls)
-    assert out['status'] is Status.OK
-    check_records(out['records'], out['expected'])
-    assert out['macs'] == rows * k
-    expected_reads = [
-        W_BASE + r * out['stride'] + off for r in range(rows)
-        for off in range(0, out['stride'], 64)
-    ]
-    assert sorted(out['req_addrs']) == expected_reads
-    if stalls:
-        assert out['credit'] > 0  # Force decode/fill to wait for buffer reuse.
-
-
-def test_matrix_wide_q8_supply_throughput():
-    """Prevent a return to byte-at-a-time assembly (3,476 starved cycles)."""
-    import random
-
-    rng = random.Random(84)
-    fmt, k, rows = Format.Q8_0, 576, 16
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = gen_act(rng, k // 32)
-    params = params_for(fmt,
-                        data_width=512,
-                        id_width=6,
-                        n_tmem_banks=8,
-                        tmem_bytes=256 * 1024,
-                        act_max_k=2048)
-    out = run_matmul(fmt, k, rows, wsegs, act, params=params)
-    assert out['status'] is Status.OK
-    check_records(out['records'], out['expected'])
-    assert out['slots'] == 144
-    assert out['macs'] == 9216
-    # Leave margin for control changes while requiring a substantial gain.
-    assert out['slots'] + out['bubbles'] < 1000
-
-
-def test_matrix_extremes_hit_bounds():
-    """Extremes of every operand range, checked against the bounds."""
-    import random
-
-    rng = random.Random(15)
-    # All -128 activations against maximal weights reach the exact
-    # integer bounds from the plan.
-    act = [
-        dict(quants=[-128] * 32, s_act=rand_s_act(rng), sum_a=0)
-        for _ in range(8)
-    ]
-    wsegs = []
-    for _ in range(16):
-        wsegs.append(
-            dict(w=[15] * 32,
-                 d=rand_fp16_bits(rng),
-                 dmin=rand_fp16_bits(rng),
-                 mi=63,
-                 sc0=63,
-                 sc1=0))
-    out = run_matmul(Format.Q4_K, 256, 2, wsegs, act, seed=15)
-    assert out['status'] is Status.OK
-    check_records(out['records'], out['expected'])
-    for rec in out['records']:
-        assert rec['S0'] == -SEGMENT_BOUND[Format.Q4_K]
-
-    wsegs = [
-        dict(w=[-32] * 32, d=0x3C00, dmin=0, mi=0, sc0=-128, sc1=-128)
-        for _ in range(16)
-    ]
-    out = run_matmul(Format.Q6_K, 256, 2, wsegs, act, seed=16)
-    assert out['status'] is Status.OK
-    check_records(out['records'], out['expected'])
-    for rec in out['records']:
-        assert rec['S0'] == -SEGMENT_BOUND[Format.Q6_K]
-
-
-def test_matrix_stalls_bubbles_and_backpressure():
-    """Randomized request gating and sink backpressure.
-
-    The gated feeder must insert invalid slots without losing, duping,
-    or reordering records, and every TMEM request must stay inside the
-    tile (the masked lane never reads beyond it). The counters must
-    account every record as a valid slot of useful MACs and every other
-    run cycle as a bubble.
-    """
-    import random
-
-    fmt, k, rows = Format.Q6_K, 512, 5
-    rng = random.Random(21)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = gen_act(rng, k // 32)
-    out = run_matmul(fmt,
-                     k,
-                     rows,
-                     wsegs,
-                     act,
-                     seed=21,
-                     stall_rreq=True,
-                     stall_sink=True)
-    assert out['status'] is Status.OK
-    check_records(out['records'], out['expected'])
-    end = W_BASE + rows * out['stride']
-    for addr in out['req_addrs']:
-        assert W_BASE <= addr < end, hex(addr)
-
-    # Slot and MAC accounting: one valid slot per record, 32 useful
-    # element products per live pipeline, and the stall run must have
-    # needed starvation bubbles (credit stalls are exercised by the
-    # long-sink-stall test).
-    macs = sum(32 * bin(rec['row_mask']).count('1') for rec in out['records'])
-    assert out['slots'] == len(out['records'])
-    assert out['macs'] == macs
-    assert out['bubbles'] > 0
-    assert out['starve'] + out['credit'] == out['bubbles']
-    assert out['starve'] > 0
-
-
-def test_matrix_long_sink_stall():
-    """A sink stalled far longer than queue plus pipeline capacity.
-
-    Output credit must throttle launch (not overflow or drop records)
-    and done must still mean the final record was dequeued.
-    """
-    import random
-
-    fmt, k, rows = Format.Q4_K, 256, 5
-    rng = random.Random(77)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = gen_act(rng, k // 32)
-    act = [dict(e, sum_a=sum(e['quants'])) for e in act]
-    stride, beats = build_tile(fmt, k, rows, wsegs)
-    expected = mm_segments(fmt, k, rows, [
-        pack_row(fmt, wsegs[r * (k // 32):(r + 1) * (k // 32)])
-        for r in range(rows)
-    ], act)
-
-    dut = MatrixHarness(params_for(fmt))
-    records = []
-    result = {}
-
-    def setup():
-        for addr in sorted(beats):
-            yield from tmem_write(dut.tmem.write, addr, beats[addr])
-        for j, entry in enumerate(act):
-            yield from act_write(dut.matrix, j, entry)
-        yield from push_desc(dut.matrix, fmt, k, rows, stride)
-        for _ in range(300000):
-            yield
-            if (yield dut.matrix.done):
-                result['status'] = Status((yield dut.matrix.status))
-                result['bubbles'] = (yield dut.matrix.bubbles)
-                result['credit'] = (yield dut.matrix.credit_stalls)
-                break
-        else:
-            raise TimeoutError('matrix unit did not finish')
-
-    def sink():
-        yield Passive()
-        deq = dut.matrix.segs
-        # Hold ready low far longer than the 16-entry output queue plus
-        # the 18-cycle record pipeline, then drain everything.
-        for _ in range(400):
-            yield deq.ready.eq(0)
-            yield
-        while True:
-            yield deq.ready.eq(1)
-            if (yield deq.valid) & (yield deq.ready):
-                rec = {}
-                for f in RECORD_FIELDS:
-                    rec[f] = (yield getattr(deq.bits, f))
-                records.append(rec)
-            yield
-
-    sim = Simulator(dut)
-    sim.add_clock(1e-6)
-    sim.add_sync_process(setup)
-    sim.add_sync_process(sink)
-    sim.run()
-
-    assert result['status'] is Status.OK
-    assert result['credit'] > 0
-    check_records(records, expected)
-
-
-def test_matrix_short_k_many_rows():
-    """Seventeen rows of one segment each: many rows in flight."""
-    import random
-
-    fmt, k, rows = Format.Q8_0, 32, 17
-    rng = random.Random(31)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = gen_act(rng, 1)
-    out = run_matmul(fmt, k, rows, wsegs, act, seed=31)
-    assert out['status'] is Status.OK
-    check_records(out['records'], out['expected'])
-
-
-def test_matrix_q8_0_long_k():
-    """A real projection width: K = 576."""
-    import random
-
-    fmt, k, rows = Format.Q8_0, 576, 3
-    rng = random.Random(41)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    vec = [rng.uniform(-1, 1) for _ in range(k)]
-    act = build_act(fmt, vec)
-    out = run_matmul(fmt, k, rows, wsegs, act, seed=41)
-    assert out['status'] is Status.OK
-    check_records(out['records'], out['expected'])
-    results = mm_row_results(out['records'])
-    assert len(results) == rows
-    assert all(r == r and abs(r) < 1e38 for r in results.values())
-
-
-def test_matrix_back_to_back_and_act_pin():
-    """Two matmuls with an ACT rewrite between; writes pin during run."""
-    import random
-
-    fmt, k, rows = Format.Q5_0, 64, 2
-    rng = random.Random(51)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    wsegs2 = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = gen_act(rng, k // 32)
-    act2 = gen_act(rng, k // 32)
-
-    stride, beats = build_tile(fmt, k, rows, wsegs)
-    for r in range(rows):
-        data = pack_row(fmt, wsegs2[r * (k // 32):(r + 1) * (k // 32)])
-        for addr, word in row_beats(data, W_BASE + rows * stride + r * stride):
-            beats[addr] = word
-
-    dut = MatrixHarness(params_for(fmt))
-    act = [dict(e, sum_a=sum(e['quants'])) for e in act]
-    act2 = [dict(e, sum_a=sum(e['quants'])) for e in act2]
-    records = [[], []]
-    expected = [
-        mm_segments(
-            fmt, k, rows,
-            [pack_row(fmt, wsegs[r * 2:(r + 1) * 2])
-             for r in range(rows)], act),
-        mm_segments(
-            fmt, k, rows,
-            [pack_row(fmt, wsegs2[r * 2:(r + 1) * 2])
-             for r in range(rows)], act2),
-    ]
-    result = {}
-
-    def setup():
-        for addr in sorted(beats):
-            yield from tmem_write(dut.tmem.write, addr, beats[addr])
-        for j, entry in enumerate(act):
-            yield from act_write(dut.matrix, j, entry)
-        yield from push_desc(dut.matrix, fmt, k, rows, stride)
-        for _ in range(300000):
-            yield
-            if (yield dut.matrix.done):
-                break
-        else:
-            raise TimeoutError('first matmul did not finish')
-
-        # The unit must be idle again: ACT writes unblocked, a second
-        # descriptor accepted against a different tile and activations.
-        yield dut.matrix.act_wr.bits.seg.eq(0)
-        yield dut.matrix.act_wr.valid.eq(1)
-        yield
-        assert (yield dut.matrix.act_wr.ready)
-        yield dut.matrix.act_wr.valid.eq(0)
-        yield
-        for j, entry in enumerate(act2):
-            yield from act_write(dut.matrix, j, entry)
-        yield from push_desc2(fmt, k, rows, stride, W_BASE + rows * stride)
-        for _ in range(300000):
-            yield
-            if (yield dut.matrix.done):
-                result['status'] = Status((yield dut.matrix.status))
-                break
-        else:
-            raise TimeoutError('second matmul did not finish')
-
-    def push_desc2(fmt_, k_, rows_, stride_, base):
-        sink = dut.matrix.sink
-        yield sink.bits.fmt.eq(int(fmt_))
-        yield sink.bits.k.eq(k_)
-        yield sink.bits.rows.eq(rows_)
-        yield sink.bits.w_base.eq(base)
-        yield sink.bits.w_stride.eq(stride_)
-        yield sink.valid.eq(1)
-        yield
-        while not (yield sink.fire):
-            yield
-        yield sink.valid.eq(0)
-        yield
-
-    def sink():
-        yield Passive()
-        deq = dut.matrix.segs
-        phase = 0
-        while True:
-            yield deq.ready.eq(1)
-            if (yield deq.valid) & (yield deq.ready):
-                rec = {}
-                for f in RECORD_FIELDS:
-                    rec[f] = (yield getattr(deq.bits, f))
-                records[phase].append(rec)
-            yield
-            if (yield dut.matrix.done) and phase == 0:
-                phase = 1
-
-    sim = Simulator(dut)
-    sim.add_clock(1e-6)
-    sim.add_sync_process(setup)
-    sim.add_sync_process(sink)
-    sim.run()
-
-    assert result['status'] is Status.OK
-    check_records(records[0], expected[0])
-    check_records(records[1], expected[1])
-
-
-def test_matrix_act_pinned_during_run():
-    """ACT writes are back-pressured from accept to drain."""
-    import random
-
-    fmt, k, rows = Format.Q6_K, 256, 2
-    rng = random.Random(61)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = gen_act(rng, k // 32)
-    act = [dict(e, sum_a=sum(e['quants'])) for e in act]
-    stride, beats = build_tile(fmt, k, rows, wsegs)
-
-    dut = MatrixHarness(params_for(fmt))
-    seen = {}
-
-    def setup():
-        for addr in sorted(beats):
-            yield from tmem_write(dut.tmem.write, addr, beats[addr])
-        for j, entry in enumerate(act):
-            yield from act_write(dut.matrix, j, entry)
-        yield from push_desc(dut.matrix, fmt, k, rows, stride)
-        for _ in range(64):
-            yield
-            if (yield dut.matrix.active):
-                break
-        else:
-            raise AssertionError('unit never became active')
-        wr = dut.matrix.act_wr
-        yield wr.bits.seg.eq(0)
-        yield wr.valid.eq(1)
-        for _ in range(32):
-            yield
-            assert (yield dut.matrix.active)
-            assert not (yield wr.ready)
-        yield wr.valid.eq(0)
-        seen['pinned'] = True
-        for _ in range(300000):
-            yield
-            if (yield dut.matrix.done):
-                break
-        else:
-            raise TimeoutError('matmul did not finish')
-        # Idle again: the write goes through now.
-        yield wr.valid.eq(1)
-        yield
-        assert (yield wr.ready)
-        yield wr.valid.eq(0)
-
-    def sink():
-        yield Passive()
-        deq = dut.matrix.segs
-        while True:
-            yield deq.ready.eq(1)
-            yield
-
-    sim = Simulator(dut)
-    sim.add_clock(1e-6)
-    sim.add_sync_process(setup)
-    sim.add_sync_process(sink)
-    sim.run()
-    assert seen['pinned']
-
-
-@pytest.mark.parametrize('fmt,k,rows,stride,why', [
-    (Format.Q5_0, 33, 2, 64, 'k not a multiple of 32'),
-    (Format.Q5_0, 576, 0, 528, 'no rows'),
-    (Format.Q5_0, 2048, 2, 64, 'k beyond act_max_k'),
-    (Format.Q4_K, 32, 2, 64, 'k not a multiple of 256 for q4_k'),
-    (Format.Q5_0, 64, 2, 63, 'stride not beat aligned'),
-    (Format.Q5_0, 64, 2, 40, 'stride smaller than the packed row'),
-    (Format.Q6_K, 256, 2, 224, 'format not configured'),
-])
-def test_matrix_rejects_bad_shapes(fmt, k, rows, stride, why):
-    # The unconfigured-format case runs with only Q5_0 decoders.
-    mm_formats = (Format.Q5_0, ) if why == 'format not configured' else None
-
-    dut = MatrixHarness(params_for(fmt, mm_formats=mm_formats))
-    result = {}
-
-    def setup():
-        yield from push_desc(dut.matrix, fmt, k, rows, stride)
-        for _ in range(64):
-            yield
-            if 'status' in result:
-                return
-        raise TimeoutError(f'no completion for {why}')
-
-    def sink():
-        yield Passive()
-        deq = dut.matrix.segs
-        while True:
-            yield deq.ready.eq(1)
-            assert not (yield deq.valid), 'rejected shape produced records'
-            # A rejected descriptor neither starts the feeder nor may
-            # consume shared TMEM read service with stale cursors.
-            assert not (yield dut.matrix.tmem_rreq.valid), \
-                f'{why}: weight read after rejection'
-            assert not (yield dut.matrix.active), \
-                f'{why}: active after rejection'
-            if (yield dut.matrix.done):
-                result['status'] = Status((yield dut.matrix.status))
-            yield
-
-    sim = Simulator(dut)
-    sim.add_clock(1e-6)
-    sim.add_sync_process(setup)
-    sim.add_sync_process(sink)
-    sim.run()
-    assert result['status'] is Status.BAD_SHAPE, why
-
-
-def test_matrix_max_rows_then_fresh_tile():
-    """A maximum-row-count tile must not wrap the fill cursor.
-
-    With ``rows_bits`` narrowed to 8, a full 255-row tile walks
-    pipeline 0's row cursor through row 254 to 256; wrapping there
-    would re-read row 0 and queue its segment for the next command,
-    whose first record then carries a foreign partial. The follow-up
-    tile must complete with only its own records queued.
-    """
-    import random
-
-    fmt = Format.Q8_0
-    k = 32
-    row_bits = 8
-    rng = random.Random(321)
-    act = [dict(e, sum_a=sum(e['quants'])) for e in gen_act(rng, k // 32)]
-
-    tiles = []
-    expected = []
-    for rows in ((1 << row_bits) - 1, 2):
-        wsegs = gen_wsegs(rng, fmt, rows)
-        stride, beats = build_tile(fmt, k, rows, wsegs)
-        tiles.append((rows, stride, beats))
-        expected.append(
-            mm_segments(fmt, k, rows,
-                        [pack_row(fmt, wsegs[r:r + 1]) for r in range(rows)],
-                        act))
-
-    dut = MatrixHarness(params_for(fmt, rows_bits=row_bits))
-    records = []
-    result = {}
-
-    def setup():
-        for i, entry in enumerate(act):
-            yield from act_write(dut.matrix, i, entry)
-        for rows, stride, beats in tiles:
-            for addr in sorted(beats):
-                yield from tmem_write(dut.tmem.write, addr, beats[addr])
-            yield from push_desc(dut.matrix, fmt, k, rows, stride)
-            for _ in range(20000):
-                yield
-                if (yield dut.matrix.done):
-                    assert (yield dut.matrix.status) == Status.OK
-                    # No segment may linger for the next command.
-                    for p in range(2):
-                        assert (yield dut.matrix.supply.seg_q[p].count) \
-                            == 0, f'{rows} rows: pipeline {p} queued'
-                    break
-            else:
-                raise TimeoutError(f'{rows}-row matmul stalled')
-            result.setdefault('done', []).append(rows)
-            yield
-
-    def sink():
-        yield Passive()
-        deq = dut.matrix.segs
-        while True:
-            yield deq.ready.eq(1)
-            if (yield deq.fire):
-                rec = {}
-                for f in RECORD_FIELDS:
-                    rec[f] = (yield getattr(deq.bits, f))
-                records.append(rec)
-            yield
-
-    sim = Simulator(dut)
-    sim.add_clock(1e-6)
-    sim.add_sync_process(setup)
-    sim.add_sync_process(sink)
-    sim.run()
-    assert result['done'] == [255, 2]
-    n0 = len(expected[0])
-    check_records(records[:n0], expected[0])
-    check_records(records[n0:], expected[1])
-    assert len(records) == n0 + len(expected[1])
-
-
-def test_matrix_reject_then_valid_recovers():
-    """A rejected descriptor leaves no configuration or traffic behind.
-
-    The bad shape (K not a multiple of 32) is followed by forty idle
-    cycles with no weight reads, then the valid tile must complete
-    against the reference records with untouched counters.
-    """
-    import random
-
-    fmt = Format.Q8_0
-    k, rows = 64, 2
-    rng = random.Random(91)
-    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
-    act = [dict(e, sum_a=sum(e['quants'])) for e in gen_act(rng, k // 32)]
-    stride, beats = build_tile(fmt, k, rows, wsegs)
-    expected = mm_segments(fmt, k, rows, [
-        pack_row(fmt, wsegs[r * (k // 32):(r + 1) * (k // 32)])
-        for r in range(rows)
-    ], act)
-
-    dut = MatrixHarness(params_for(fmt))
-    records = []
-    result = {}
-
-    def setup():
-        for addr in sorted(beats):
-            yield from tmem_write(dut.tmem.write, addr, beats[addr])
-        for j, entry in enumerate(act):
-            yield from act_write(dut.matrix, j, entry)
-
-        yield from push_desc(dut.matrix, fmt, 33, rows, stride)
-        for _ in range(40):
-            yield
-            assert not (yield dut.matrix.tmem_rreq.valid), \
-                'weight read after rejection'
-            assert not (yield dut.matrix.active)
-
-        yield from push_desc(dut.matrix, fmt, k, rows, stride)
-        for _ in range(20000):
-            yield
-            if (yield dut.matrix.done):
-                result['status'] = Status((yield dut.matrix.status))
-                result['macs'] = (yield dut.matrix.useful_macs)
-                return
-        raise TimeoutError('valid matmul after rejection did not finish')
-
-    def sink():
-        yield Passive()
-        deq = dut.matrix.segs
-        while True:
-            yield deq.ready.eq(1)
-            if (yield deq.fire):
-                rec = {}
-                for f in RECORD_FIELDS:
-                    rec[f] = (yield getattr(deq.bits, f))
-                records.append(rec)
-            yield
-
-    sim = Simulator(dut)
-    sim.add_clock(1e-6)
-    sim.add_sync_process(setup)
-    sim.add_sync_process(sink)
-    sim.run()
-    assert result['status'] is Status.OK
-    check_records(records, expected)
-    assert result['macs'] == rows * k
-
-
 # ---------------------------------------------------------------------------
 # Epilogue contract smoke (RTL epilogue lands in a later milestone).
 # ---------------------------------------------------------------------------
@@ -1141,3 +322,57 @@ def test_model_epilogue_ordering():
     # acc = [1+... ]: k=0->p0=1, k=1->p1=2, k=2->p2=4, k=3->p3=8
     # result = R(R(1+4) + R(2+8)) = 15
     assert mm_row_results(recs) == {0: 15.0}
+
+
+def test_matrix_extremes_hit_bounds():
+    """Extremes of every operand range, checked against the bounds."""
+    import random
+    from tests.troom.test_stream import run_tiles, params_for as stream_params
+
+    def stream_case(fmt, k, rows, wsegs, act, seed):
+        nsegs = k // 32
+        packed = [
+            pack_row(fmt, wsegs[r * nsegs:(r + 1) * nsegs])
+            for r in range(rows)
+        ]
+        tile = dict(fmt=fmt,
+                    k=k,
+                    rows=rows,
+                    wsegs=wsegs,
+                    act=act,
+                    exp=mm_segments(fmt, k, rows, packed, act))
+        out = run_tiles([tile], params=stream_params(fmt), seed=seed)
+        out['status'] = out['results'][0]['status']
+        return out
+
+    rng = random.Random(15)
+    # All -128 activations against maximal weights reach the exact
+    # integer bounds from the plan.
+    act = [
+        dict(quants=[-128] * 32, s_act=rand_s_act(rng), sum_a=0)
+        for _ in range(8)
+    ]
+    wsegs = []
+    for _ in range(16):
+        wsegs.append(
+            dict(w=[15] * 32,
+                 d=rand_fp16_bits(rng),
+                 dmin=rand_fp16_bits(rng),
+                 mi=63,
+                 sc0=63,
+                 sc1=0))
+    out = stream_case(Format.Q4_K, 256, 2, wsegs, act, seed=15)
+    assert out['status'] is Status.OK
+    check_records(out['records'], out['expected'])
+    for rec in out['records']:
+        assert rec['S0'] == -SEGMENT_BOUND[Format.Q4_K]
+
+    wsegs = [
+        dict(w=[-32] * 32, d=0x3C00, dmin=0, mi=0, sc0=-128, sc1=-128)
+        for _ in range(16)
+    ]
+    out = stream_case(Format.Q6_K, 256, 2, wsegs, act, seed=16)
+    assert out['status'] is Status.OK
+    check_records(out['records'], out['expected'])
+    for rec in out['records']:
+        assert rec['S0'] == -SEGMENT_BOUND[Format.Q6_K]
