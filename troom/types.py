@@ -260,6 +260,22 @@ class HasTRoomParams:
         self.tmem_bank_words = (self.tmem_bytes //
                                 (self.n_tmem_banks * self.beat_bytes))
 
+        # P2a resource-contract slice 2 (2026-11-03,
+        # plans/2026-11-02-troom-pipelined-batch-decode.md): split TMEM
+        # clusters. The address space halves into two independent
+        # 128 KiB clusters (top word bit selects) so the maintenance
+        # staging can run on its own write/read port pair off the
+        # attention chains' ports. One cluster reproduces the
+        # historical single-port-pair behavior exactly.
+        self.tmem_clusters = params.get('tmem_clusters', 2)
+        if self.tmem_clusters not in (1, 2):
+            raise ValueError(
+                f'tmem_clusters {self.tmem_clusters} must be 1 or 2')
+        if self.tmem_bank_words % self.tmem_clusters:
+            raise ValueError(
+                f'tmem_bank_words {self.tmem_bank_words} must be a '
+                f'multiple of {self.tmem_clusters} clusters')
+
         #
         # 2D DMA descriptors
         #

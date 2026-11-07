@@ -188,6 +188,15 @@ CAPS_VEC_SILU = 12
 # SMATMUL. Pure relaxation: lists that never overlap the two observe
 # no change, and backends without the bit keep the standing emission.
 CAPS_ACT_BANK = 13
+# P2a resource-contract slice 2 (2026-11-03,
+# plans/2026-11-02-troom-pipelined-batch-decode.md): split TMEM
+# clusters. The address space halves into two independent clusters,
+# each with its own write port and read channel, so a list may place
+# one dataflow class (the KV maintenance staging) in the upper half
+# and off the other class's ports entirely. Pure relaxation: lists
+# confined to the lower half observe no change, and backends without
+# the bit keep the standing staging placement.
+CAPS_TMEM_SPLIT = 14
 # P2b-ii base RTL slice (2026-11-04,
 # plans/2026-11-02-troom-pipelined-batch-decode.md): VECTOR VEC_SMEXP
 # -- the FA softmax body fused into one bit-identical op (the RDC_MAX

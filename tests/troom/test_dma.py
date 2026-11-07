@@ -88,32 +88,109 @@ class Harness(Elaboratable):
 
         m.d.comb += [
             self.bus.connect(self.ram.bus),
-            self.dma.tmem_w.connect(self.tmem.write),
         ]
 
         # The test port has priority; the DMA store path holds its
-        # request when both are presented.
-        owner_test = Signal()
-        with m.If(self.tmem.rreq.fire):
-            m.d.sync += owner_test.eq(self.test_rreq.fire)
+        # request when both are presented. With split TMEM clusters
+        # every beat and request self-routes by its address's top bit
+        # into its cluster's port group (the routing the core
+        # performs), and the DMA store path keeps the historical
+        # one-outstanding read discipline through an in-flight guard
+        # so a store straddling the cluster boundary cannot reorder
+        # its responses.
+        if self.hp.tmem_clusters == 1:
+            m.d.comb += self.dma.tmem_w.connect(self.tmem.write)
 
+            owner_test = Signal()
+            with m.If(self.tmem.rreq.fire):
+                m.d.sync += owner_test.eq(self.test_rreq.fire)
+
+            m.d.comb += [
+                self.tmem.rreq.valid.eq(self.test_rreq.valid
+                                        | self.dma.rreq.valid),
+                self.tmem.rreq.bits.addr.eq(
+                    Mux(self.test_rreq.valid, self.test_rreq.bits.addr,
+                        self.dma.rreq.bits.addr)),
+                self.test_rreq.ready.eq(self.tmem.rreq.ready
+                                        & self.test_rreq.valid),
+                self.dma.rreq.ready.eq(self.tmem.rreq.ready
+                                       & ~self.test_rreq.valid),
+                self.test_rresp.valid.eq(self.tmem.rresp.valid & owner_test),
+                self.test_rresp.bits.data.eq(self.tmem.rresp.bits.data),
+                self.dma.rresp.valid.eq(self.tmem.rresp.valid & ~owner_test),
+                self.dma.rresp.bits.data.eq(self.tmem.rresp.bits.data),
+                self.tmem.rresp.ready.eq(
+                    Mux(owner_test, self.test_rresp.ready,
+                        self.dma.rresp.ready)),
+            ]
+            return m
+
+        half = self.hp.tmem_addr_width - 1
+
+        w_sel = self.dma.tmem_w.bits.addr[half]
+        for wr, sel in ((self.tmem.write, 0), (self.tmem.write_b, 1)):
+            hit = w_sel == sel
+            m.d.comb += [
+                wr.valid.eq(self.dma.tmem_w.valid & hit),
+                wr.bits.addr.eq(self.dma.tmem_w.bits.addr),
+                wr.bits.data.eq(self.dma.tmem_w.bits.data),
+            ]
+        m.d.comb += self.dma.tmem_w.ready.eq(
+            Mux(w_sel, self.tmem.write_b.ready, self.tmem.write.ready))
+
+        d_pend = Signal()
+        d_can = ~d_pend | (self.dma.rresp.valid & self.dma.rresp.ready)
+
+        owners = []
+        t_grants = []
+        d_grants = []
+        for rreq, rresp, sel in ((self.tmem.rreq, self.tmem.rresp, 0),
+                                 (self.tmem.rreq_b, self.tmem.rresp_b, 1)):
+            t_hit = self.test_rreq.valid \
+                & (self.test_rreq.bits.addr[half] == sel)
+            d_hit = self.dma.rreq.valid & d_can \
+                & (self.dma.rreq.bits.addr[half] == sel)
+            owner_test = Signal(name=f'owner_test_{sel}')
+            owners.append((owner_test, rresp))
+            with m.If(rreq.fire):
+                m.d.sync += owner_test.eq(t_hit)
+            m.d.comb += [
+                rreq.valid.eq(t_hit | d_hit),
+                rreq.bits.addr.eq(
+                    Mux(t_hit, self.test_rreq.bits.addr,
+                        self.dma.rreq.bits.addr)),
+            ]
+            t_grants.append(rreq.ready & t_hit)
+            d_grants.append(rreq.ready & ~t_hit & d_hit)
+
+        t_own = [own for own, _ in owners]
+        rresps = [r for _, r in owners]
+        # The data muxes select by the cluster that actually owns a
+        # VALID response for the master (the owner bits alone go
+        # stale after a cluster goes quiet -- the core's owns terms
+        # carry the valid bit for exactly this reason).
+        t_sel_a = rresps[0].valid & t_own[0]
+        d_sel_a = rresps[0].valid & ~t_own[0]
         m.d.comb += [
-            self.tmem.rreq.valid.eq(self.test_rreq.valid
-                                    | self.dma.rreq.valid),
-            self.tmem.rreq.bits.addr.eq(
-                Mux(self.test_rreq.valid, self.test_rreq.bits.addr,
-                    self.dma.rreq.bits.addr)),
-            self.test_rreq.ready.eq(self.tmem.rreq.ready
-                                    & self.test_rreq.valid),
-            self.dma.rreq.ready.eq(self.tmem.rreq.ready
-                                   & ~self.test_rreq.valid),
-            self.test_rresp.valid.eq(self.tmem.rresp.valid & owner_test),
-            self.test_rresp.bits.data.eq(self.tmem.rresp.bits.data),
-            self.dma.rresp.valid.eq(self.tmem.rresp.valid & ~owner_test),
-            self.dma.rresp.bits.data.eq(self.tmem.rresp.bits.data),
-            self.tmem.rresp.ready.eq(
-                Mux(owner_test, self.test_rresp.ready, self.dma.rresp.ready)),
+            self.test_rreq.ready.eq(t_grants[0] | t_grants[1]),
+            self.dma.rreq.ready.eq(d_grants[0] | d_grants[1]),
+            self.test_rresp.valid.eq(t_sel_a
+                                     | (rresps[1].valid & t_own[1])),
+            self.test_rresp.bits.data.eq(
+                Mux(t_sel_a, rresps[0].bits.data, rresps[1].bits.data)),
+            self.dma.rresp.valid.eq(d_sel_a
+                                    | (rresps[1].valid & ~t_own[1])),
+            self.dma.rresp.bits.data.eq(
+                Mux(d_sel_a, rresps[0].bits.data, rresps[1].bits.data)),
+            rresps[0].ready.eq(
+                Mux(t_own[0], self.test_rresp.ready, self.dma.rresp.ready)),
+            rresps[1].ready.eq(
+                Mux(t_own[1], self.test_rresp.ready, self.dma.rresp.ready)),
         ]
+        with m.If(self.dma.rreq.fire):
+            m.d.sync += d_pend.eq(1)
+        with m.If(self.dma.rresp.valid & self.dma.rresp.ready):
+            m.d.sync += d_pend.eq(0)
         return m
 
 

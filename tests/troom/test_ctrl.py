@@ -13,6 +13,7 @@ import pytest
 
 from troom.abi import (
     CAPS_ACT_BANK,
+    CAPS_TMEM_SPLIT,
     CAPS_ENGINE_COUNTERS,
     CAPS_MM_EPI_COUNTERS,
     CAPS_FMT0,
@@ -208,7 +209,8 @@ def test_identity_caps_and_parameters():
                 | (1 << CAPS_VEC_SMEXP)
                 | (1 << CAPS_VBUILD_PART)
                 | (1 << CAPS_VBUILD_VAPP)
-                | (1 << CAPS_ACT_BANK))
+                | (1 << CAPS_ACT_BANK)
+                | (1 << CAPS_TMEM_SPLIT))
         assert (yield from cread(axil, REG_CAPS)) == caps
         assert (yield from cread(axil, REG_MEM_BASE)) == MEM_BASE
         assert (yield from cread(axil, REG_MEM_SIZE)) == MEM_SIZE

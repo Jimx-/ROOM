@@ -213,77 +213,202 @@ class Core(HasTRoomParams, Elaboratable):
         # drain, the vector unit's result beats, and the V-window
         # tile drain share the write channel.
         #
+        # P2a split TMEM (2026-11-03): with two clusters every channel
+        # doubles -- each beat self-routes by its own address's top
+        # bit into its cluster's arbiters, and traffic in different
+        # clusters issues concurrently (the maintenance staging in
+        # the upper half then runs off the attention chains'
+        # lower-half ports entirely). Reads keep the historical
+        # single-outstanding discipline per master: the in-flight
+        # guard below holds a master's next request until its
+        # response fires (the same serialization today's single
+        # response slot enforced globally), so a store straddling the
+        # cluster boundary cannot reorder its W beats. Lists confined
+        # to one cluster observe the historical arbitration bit for
+        # bit -- cluster A's arbiters and guard degrade to exactly
+        # the standing behavior.
+        #
         rreqs = [
             dma.rreq, actload.tmem_rreq, vector.tmem_rreq, vbuild.tmem_rreq
         ]
         rresps = [
             dma.rresp, actload.tmem_rresp, vector.tmem_rresp, vbuild.tmem_rresp
         ]
+        wreqs = [dma.tmem_w, epi.tmem_w, vector.tmem_w, vbuild.tmem_w]
 
         n_r = len(rreqs)
-        r_valid = Array([r.valid for r in rreqs])
-        r_addr = Array([r.bits.addr for r in rreqs])
-
-        def rotate_reader(rr, q):
-            """Rotate past n_r requesters without a width wrap."""
-            v = rr + q
-            return Mux(v >= n_r, v - n_r, v)
-
-        r_rr = Signal(range(n_r))
-        r_found = Signal()
-        r_sel = Signal(range(n_r))
-        for q in reversed(range(n_r)):
-            idx = rotate_reader(r_rr, q)
-            with m.If(r_valid[idx]):
-                m.d.comb += [r_found.eq(1), r_sel.eq(idx)]
-
-        r_owner = Signal(range(n_r))
-        m.d.comb += [
-            tmem.rreq.valid.eq(r_found),
-            tmem.rreq.bits.addr.eq(r_addr[r_sel]),
-        ]
-        for i, r in enumerate(rreqs):
-            m.d.comb += r.ready.eq(tmem.rreq.ready & r_found & (r_sel == i))
-        with m.If(tmem.rreq.fire):
-            m.d.sync += [r_owner.eq(r_sel), r_rr.eq(rotate_reader(r_sel, 1))]
-
-        rresp_ready = Const(0)
-        for i, r in enumerate(rresps):
-            m.d.comb += [
-                r.valid.eq(tmem.rresp.valid & (r_owner == i)),
-                r.bits.data.eq(tmem.rresp.bits.data),
-            ]
-            rresp_ready = rresp_ready | ((r_owner == i) & r.ready)
-        m.d.comb += tmem.rresp.ready.eq(rresp_ready)
-
-        wreqs = [dma.tmem_w, epi.tmem_w, vector.tmem_w, vbuild.tmem_w]
-        w_valid = Array([w.valid for w in wreqs])
-        w_addr = Array([w.bits.addr for w in wreqs])
-        w_data = Array([w.bits.data for w in wreqs])
-
         n_w = len(wreqs)
 
-        def rot4w(rr, q):
-            """Rotate past four writers without a width wrap."""
+        def rot(rr, q, n):
+            """Rotate past ``n`` requesters without a width wrap."""
             v = rr + q
-            return Mux(v >= n_w, v - n_w, v)
+            return Mux(v >= n, v - n, v)
 
-        w_rr = Signal(2)
-        w_found = Signal()
-        w_sel = Signal(2)
-        for q in reversed(range(n_w)):
-            idx = rot4w(w_rr, q)
-            with m.If(w_valid[idx]):
-                m.d.comb += [w_found.eq(1), w_sel.eq(idx)]
-        m.d.comb += [
-            tmem.write.valid.eq(w_found),
-            tmem.write.bits.addr.eq(w_addr[w_sel]),
-            tmem.write.bits.data.eq(w_data[w_sel]),
-        ]
-        for i, w in enumerate(wreqs):
-            m.d.comb += w.ready.eq(tmem.write.ready & w_found & (w_sel == i))
-        with m.If(tmem.write.fire):
-            m.d.sync += w_rr.eq(rot4w(w_sel, 1))
+        if self.tmem_clusters == 1:
+            r_valid = Array([r.valid for r in rreqs])
+            r_addr = Array([r.bits.addr for r in rreqs])
+
+            r_rr = Signal(range(n_r), name='r_rr')
+            r_found = Signal()
+            r_sel = Signal(range(n_r))
+            for q in reversed(range(n_r)):
+                idx = rot(r_rr, q, n_r)
+                with m.If(r_valid[idx]):
+                    m.d.comb += [r_found.eq(1), r_sel.eq(idx)]
+
+            r_owner = Signal(range(n_r))
+            m.d.comb += [
+                tmem.rreq.valid.eq(r_found),
+                tmem.rreq.bits.addr.eq(r_addr[r_sel]),
+            ]
+            for i, r in enumerate(rreqs):
+                m.d.comb += r.ready.eq(tmem.rreq.ready & r_found
+                                       & (r_sel == i))
+            with m.If(tmem.rreq.fire):
+                m.d.sync += [r_owner.eq(r_sel), r_rr.eq(rot(r_sel, 1, n_r))]
+
+            rresp_ready = Const(0)
+            for i, r in enumerate(rresps):
+                m.d.comb += [
+                    r.valid.eq(tmem.rresp.valid & (r_owner == i)),
+                    r.bits.data.eq(tmem.rresp.bits.data),
+                ]
+                rresp_ready = rresp_ready | ((r_owner == i) & r.ready)
+            m.d.comb += tmem.rresp.ready.eq(rresp_ready)
+
+            w_valid = Array([w.valid for w in wreqs])
+            w_addr = Array([w.bits.addr for w in wreqs])
+            w_data = Array([w.bits.data for w in wreqs])
+
+            w_rr = Signal(2, name='w_rr')
+            w_found = Signal()
+            w_sel = Signal(2)
+            for q in reversed(range(n_w)):
+                idx = rot(w_rr, q, n_w)
+                with m.If(w_valid[idx]):
+                    m.d.comb += [w_found.eq(1), w_sel.eq(idx)]
+            m.d.comb += [
+                tmem.write.valid.eq(w_found),
+                tmem.write.bits.addr.eq(w_addr[w_sel]),
+                tmem.write.bits.data.eq(w_data[w_sel]),
+            ]
+            for i, w in enumerate(wreqs):
+                m.d.comb += w.ready.eq(tmem.write.ready & w_found
+                                       & (w_sel == i))
+            with m.If(tmem.write.fire):
+                m.d.sync += w_rr.eq(rot(w_sel, 1, n_w))
+        else:
+            half = self.tmem_addr_width - 1
+
+            # Per-master in-flight guard: set on the master's request
+            # fire, cleared on its response fire. The arbiter gate
+            # clears combinationally (the historical slot's
+            # ``~pending | rresp.fire`` shape), so a master's
+            # back-to-back request stream refills in the response's
+            # fire cycle exactly as the single-channel slot allowed.
+            m_rd_pend = [Signal(name=f'm{i}_rd_pend') for i in range(n_r)]
+            m_resp_fire = [
+                rresps[i].valid & rresps[i].ready for i in range(n_r)
+            ]
+
+            def build_write_arb(tw, tag, sel):
+                """One cluster's write arbiter; returns the per-master
+                ready terms."""
+                w_valid = Array([
+                    wreqs[i].valid
+                    & (wreqs[i].bits.addr[half] == sel) for i in range(n_w)
+                ])
+                w_addr = Array([w.bits.addr for w in wreqs])
+                w_data = Array([w.bits.data for w in wreqs])
+
+                w_rr = Signal(2, name=f'w_rr_{tag}')
+                w_found = Signal(name=f'w_found_{tag}')
+                w_sel = Signal(2, name=f'w_sel_{tag}')
+                for q in reversed(range(n_w)):
+                    idx = rot(w_rr, q, n_w)
+                    with m.If(w_valid[idx]):
+                        m.d.comb += [w_found.eq(1), w_sel.eq(idx)]
+                m.d.comb += [
+                    tw.valid.eq(w_found),
+                    tw.bits.addr.eq(w_addr[w_sel]),
+                    tw.bits.data.eq(w_data[w_sel]),
+                ]
+                grants = [
+                    tw.ready & w_found & (w_sel == i) for i in range(n_w)
+                ]
+                with m.If(tw.fire):
+                    m.d.sync += w_rr.eq(rot(w_sel, 1, n_w))
+                return grants
+
+            def build_read_arb(trreq, trresp, tag, sel):
+                """One cluster's read arbiter with owner routing;
+                returns (per-master ready terms, per-master ownership
+                terms)."""
+                r_valid = Array([
+                    rreqs[i].valid
+                    & (~m_rd_pend[i] | m_resp_fire[i])
+                    & (rreqs[i].bits.addr[half] == sel) for i in range(n_r)
+                ])
+                r_addr = Array([r.bits.addr for r in rreqs])
+
+                r_rr = Signal(range(n_r), name=f'r_rr_{tag}')
+                r_found = Signal(name=f'r_found_{tag}')
+                r_sel = Signal(range(n_r))
+                for q in reversed(range(n_r)):
+                    idx = rot(r_rr, q, n_r)
+                    with m.If(r_valid[idx]):
+                        m.d.comb += [r_found.eq(1), r_sel.eq(idx)]
+
+                r_owner = Signal(range(n_r), name=f'r_owner_{tag}')
+                m.d.comb += [
+                    trreq.valid.eq(r_found),
+                    trreq.bits.addr.eq(r_addr[r_sel]),
+                ]
+                grants = [
+                    trreq.ready & r_found & (r_sel == i) for i in range(n_r)
+                ]
+                with m.If(trreq.fire):
+                    m.d.sync += [
+                        r_owner.eq(r_sel),
+                        r_rr.eq(rot(r_sel, 1, n_r))
+                    ]
+
+                owns = [trresp.valid & (r_owner == i) for i in range(n_r)]
+                rresp_ready = Const(0)
+                for i, r in enumerate(rresps):
+                    rresp_ready = rresp_ready | ((r_owner == i) & r.ready)
+                m.d.comb += trresp.ready.eq(rresp_ready)
+                return grants, owns
+
+            w_grants_a = build_write_arb(tmem.write, 'a', 0)
+            r_grants_a, r_owns_a = build_read_arb(tmem.rreq, tmem.rresp, 'a',
+                                                  0)
+            w_grants_b = build_write_arb(tmem.write_b, 'b', 1)
+            r_grants_b, r_owns_b = build_read_arb(tmem.rreq_b, tmem.rresp_b,
+                                                  'b', 1)
+
+            for i, w in enumerate(wreqs):
+                m.d.comb += w.ready.eq(w_grants_a[i] | w_grants_b[i])
+            for i, r in enumerate(rreqs):
+                m.d.comb += r.ready.eq(r_grants_a[i] | r_grants_b[i])
+            for i, r in enumerate(rresps):
+                m.d.comb += [
+                    r.valid.eq(r_owns_a[i] | r_owns_b[i]),
+                    r.bits.data.eq(
+                        Mux(r_owns_a[i], tmem.rresp.bits.data,
+                            tmem.rresp_b.bits.data)),
+                ]
+
+            # The guard: a master's response fires exactly once (its
+            # valid comes from the one cluster owning its outstanding
+            # request). The set dominates the clear so a same-cycle
+            # refill leaves the new request outstanding.
+            for i, r in enumerate(rresps):
+                with m.If(m_resp_fire[i]):
+                    m.d.sync += m_rd_pend[i].eq(0)
+            for i, r in enumerate(rreqs):
+                with m.If(r.fire):
+                    m.d.sync += m_rd_pend[i].eq(1)
 
         cmd_q = m.submodules.cmd_q = Queue(self.cmd_queue_depth,
                                            Command,

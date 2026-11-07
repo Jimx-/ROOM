@@ -19,6 +19,11 @@ PARAMS = dict(
     data_width=64,
     tmem_bytes=16 * 1024,
     n_tmem_banks=4,
+    # This file pins the historical single-cluster module: with the
+    # P2a split, its roundtrips drive upper-half addresses through the
+    # cluster-A port group, which the split's routing contract forbids
+    # (test_tmem_split.py owns the dual-cluster contract).
+    tmem_clusters=1,
 )
 
 

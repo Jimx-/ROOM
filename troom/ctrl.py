@@ -53,6 +53,7 @@ from amaranth.utils import log2_int
 
 from troom.abi import (
     CAPS_ACT_BANK,
+    CAPS_TMEM_SPLIT,
     CAPS_ENGINE_COUNTERS,
     CAPS_FMT0,
     CAPS_MM_EPI_COUNTERS,
@@ -399,7 +400,8 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                 | (1 << CAPS_VEC_SMEXP)
                 | (1 << CAPS_VBUILD_PART)
                 | (1 << CAPS_VBUILD_VAPP)
-                | Mux(self.act_banks == 2, 1 << CAPS_ACT_BANK, 0)),
+                | Mux(self.act_banks == 2, 1 << CAPS_ACT_BANK, 0)
+                | Mux(self.tmem_clusters == 2, 1 << CAPS_TMEM_SPLIT, 0)),
             self._mem_base.r_data.eq(self.mem_base),
             self._mem_size.r_data.eq(self.mem_size),
             self._beat_bytes.r_data.eq(self.beat_bytes),
