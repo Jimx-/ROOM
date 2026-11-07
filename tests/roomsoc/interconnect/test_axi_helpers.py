@@ -8,7 +8,7 @@ has its own coverage before downstream phases rely on it.
 import pytest
 
 from amaranth import *
-from amaranth.sim import Simulator
+from amaranth.sim import Passive, Simulator
 
 from roomsoc.interconnect.axi import AXIInterface, AXILiteInterface
 from roomsoc.interconnect.axi.axi_stream import AXIStreamInterface
@@ -106,6 +106,87 @@ def test_axi_responder_write_then_read_roundtrip():
         assert saw_write == [(8, beat, 0xff)]
 
     run_sim(top, driver, monitor)
+
+
+@pytest.mark.parametrize('data_width', [32, 64, 512])
+def test_axi_responder_masked_writes_preserve_other_bytes(data_width):
+    beat_bytes = data_width // 8
+    size = beat_bytes.bit_length() - 1
+    top = AXIResponderTop(data_width=data_width, depth=16)
+    full = (1 << beat_bytes) - 1
+    alternating = sum(1 << lane for lane in range(0, beat_bytes, 2))
+    masks = [0, 1, 1 << (beat_bytes - 1), alternating, full]
+    initial = bytes(range(beat_bytes))
+    top.ram.init = [int.from_bytes(initial, 'little')] * top.depth
+    expected = [bytearray(initial) for _ in masks]
+    beats = []
+    for index, mask in enumerate(masks):
+        data = bytes(
+            (0x80 + index + lane) & 0xff for lane in range(beat_bytes))
+        beats.append((int.from_bytes(data, 'little'), mask))
+        for lane in range(beat_bytes):
+            if mask & (1 << lane):
+                expected[index][lane] = data[lane]
+
+    def driver():
+        assert (yield from axi_write_burst(top.axi, 0, beats,
+                                           size=size)) == (0, 0)
+        # Merge another partial write into a word already updated by
+        # the burst, then check a zero-strobe write leaves it intact.
+        patch = bytes([0xe7] * beat_bytes)
+        mask = full ^ alternating
+        assert (yield from axi_write(top.axi,
+                                     3 * beat_bytes,
+                                     int.from_bytes(patch, 'little'),
+                                     mask,
+                                     size=size)) == (0, 0)
+        for lane in range(beat_bytes):
+            if mask & (1 << lane):
+                expected[3][lane] = patch[lane]
+        assert (yield from axi_write(top.axi, 3 * beat_bytes, 0, 0,
+                                     size=size)) == (0, 0)
+        readback = yield from axi_read_burst(top.axi,
+                                             0,
+                                             size=size,
+                                             length=len(beats) - 1)
+        assert [data for data, _, _, _ in readback
+                ] == [int.from_bytes(word, 'little') for word in expected]
+        assert not (yield top.ram.protocol_error)
+
+    run_sim(top, driver)
+
+
+@pytest.mark.parametrize('data_width', [32, 64, 512])
+def test_axi_responder_masked_writes_allow_concurrent_reads(data_width):
+    beat_bytes = data_width // 8
+    size = beat_bytes.bit_length() - 1
+    top = AXIResponderTop(data_width=data_width, depth=16, read_latency=1)
+    top.ram.init = list(range(top.depth))
+    overlap = []
+
+    def writer():
+        beats = [(0xabab, 1 << (index % beat_bytes)) for index in range(8)]
+        assert (yield from axi_write_burst(top.axi,
+                                           8 * beat_bytes,
+                                           beats,
+                                           size=size)) == (0, 0)
+        assert not (yield top.ram.protocol_error)
+
+    def reader():
+        beats = yield from axi_read_burst(top.axi, 0, size=size, length=7)
+        assert [data for data, _, _, _ in beats] == list(range(8))
+        assert all(resp == 0 for _, resp, _, _ in beats)
+
+    def monitor():
+        yield Passive()
+        while True:
+            if (yield top.axi.r.valid & top.axi.r.ready) and (
+                    yield top.axi.w.valid & top.axi.w.ready):
+                overlap.append(True)
+            yield
+
+    run_sim(top, writer, reader, monitor)
+    assert overlap, 'read and write beats must overlap'
 
 
 def test_axi_responder_burst_read_and_ar_monitor():

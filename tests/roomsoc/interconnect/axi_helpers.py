@@ -55,7 +55,7 @@ class AXIResponder(Elaboratable):
         get upper/lower lane steering to match the legacy slave. ``r_resp`` is
         returned on every R beat.
       * AW/W/B path: up to ``aw_depth`` writes are queued; W beats commit to the
-        memory through the byte write port, then a single B is returned after
+        memory with byte strobes, then a single B is returned after
         ``b_latency`` cycles. ``b_resp`` is returned on the B beat.
 
     Monitor taps (all ``Valid``, single-cycle pulses on the accepted beat):
@@ -131,7 +131,8 @@ class AXIResponder(Elaboratable):
 
         mem = Memory(width=self.data_width, depth=self.depth, init=self.init)
         rport = m.submodules.rport = mem.read_port(domain='comb')
-        wport = m.submodules.wport = mem.write_port(granularity=8)
+        merge_port = m.submodules.merge_port = mem.read_port(domain='comb')
+        wport = m.submodules.wport = mem.write_port()
 
         bus = self.bus
 
@@ -227,7 +228,17 @@ class AXIResponder(Elaboratable):
 
         m.d.comb += [
             wport.addr.eq(w_base + w_beat),
-            wport.data.eq(bus.w.bits.data),
+            merge_port.addr.eq(wport.addr),
+            # PySim expands each byte enable into a depth-wide switch.
+            # Merge strobes before a full-word port to avoid generating
+            # that switch once per byte lane. The separate read port
+            # keeps AXI reads independent of the write address.
+            wport.data.eq(
+                Cat(
+                    Mux(bus.w.bits.strb[lane],
+                        bus.w.bits.data.word_select(lane, 8),
+                        merge_port.data.word_select(lane, 8))
+                    for lane in range(self.data_width // 8))),
         ]
 
         with m.FSM(name="write"):
@@ -245,9 +256,7 @@ class AXIResponder(Elaboratable):
                 w_fire = bus.w.valid & bus.w.ready
                 m.d.comb += [
                     bus.w.ready.eq(1),
-                    wport.en.eq(
-                        w_fire.replicate(self.data_width // 8)
-                        & bus.w.bits.strb),
+                    wport.en.eq(w_fire & bus.w.bits.strb.any()),
                     self.w_monitor.valid.eq(w_fire),
                     self.w_monitor.bits.addr.eq(((w_base + w_beat) << lg) +
                                                 self.base_addr),
