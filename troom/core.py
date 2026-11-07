@@ -539,6 +539,21 @@ class Core(HasTRoomParams, Elaboratable):
             with m.If(q.enq.fire):
                 m.d.sync += evt_reg.bit_select(q.enq.bits.evt, 1).eq(1)
 
+        # A completion can land (setting its event) in the very cycle a
+        # WAIT retires on the SAME event's already-high level: the
+        # completion's set is newer than the level the WAIT consumed
+        # (``evt_hit`` sampled the pre-edge value), so the set must
+        # survive the WAIT's clear. Without this term the lexically
+        # later clear drops the simultaneous set -- the completion is
+        # done, nobody re-sets the event, and the completion's own
+        # consumer WAIT deadlocks (the S3 0x4-staging board WATCHDOG,
+        # reproduced deterministically in the deployed-twin rtlsim and
+        # pinned by the core-level faildump replay).
+        evt_set_now = Const(0)
+        for q in res_qs:
+            evt_set_now = evt_set_now \
+                | (q.enq.fire & (q.enq.bits.evt == cur_evt))
+
         # Indexed by source value; the issue source never consults
         # these.
         res_by_source = dict(zip(sources, res_qs))
@@ -684,7 +699,11 @@ class Core(HasTRoomParams, Elaboratable):
                                 push_engine.eq(Source.ISSUE),
                                 push_status.eq(Status.OK),
                             ]
-                            m.d.sync += evt_reg.bit_select(cur_evt, 1).eq(0)
+                            # Clear the consumed level, but keep a
+                            # completion that sets this same event in
+                            # THIS cycle alive (see evt_set_now above).
+                            m.d.sync += evt_reg.bit_select(cur_evt,
+                                                           1).eq(evt_set_now)
                             m.next = 'FETCH'
 
                     with m.Elif(is_end):
