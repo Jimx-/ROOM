@@ -671,7 +671,9 @@ class Core(HasTRoomParams, Elaboratable):
             vbuild.sink.valid.eq(fsm.ongoing('EXEC') & ~self.halt & is_vbuild),
             vbuild.sink.bits.a_base.eq(cur_a_base),
             vbuild.sink.bits.r_base.eq(cur_r_base),
+            vbuild.sink.bits.m_base.eq(cur_m_base),
             vbuild.sink.bits.k.eq(cur_k),
+            vbuild.sink.bits.rows.eq(cur_rows),
         ]
         m.d.comb += [
             self.stream.sink.valid.eq(

@@ -151,6 +151,8 @@ CAPS_WATCHDOG = 1  # MAX_CYCLES hardware watchdog implemented
 CAPS_ENGINE_COUNTERS = 2  # observation-counter window implemented
 CAPS_MM_EPI_COUNTERS = 3  # matrix/epilogue cycle-breakdown window
 CAPS_VBUILD = 4  # device-side V-window tile builder (VBUILD opcode)
+CAPS_VBUILD_SG1 = 5  # VBUILD SG1 drain (payload+meta staging via m_base)
+CAPS_VBUILD_K = 6  # VBUILD K orientation (16 slot rows via rows == 16)
 # E2 ABI rider (decided 2026-10-28, resident-decode follow-up): GEMV
 # engine presence is discovered from this word instead of the
 # reject-only probe launch. This source generation always carries the
@@ -186,6 +188,26 @@ CAPS_VEC_SILU = 12
 # emitting the numerator region at o_base and the denominator beat at
 # b_base. Images without the bit keep the five-op emission.
 CAPS_VEC_SMEXP = 15
+# P2d-a slice (2026-11-05,
+# plans/2026-11-02-troom-pipelined-batch-decode.md): the VBUILD
+# partial-extent drain. Descriptor rows codes 1/2 (one 32-slot V
+# block) and 17 (leading K rows) rebuild only the dirty extent at its
+# natural staging offsets, pre-reading each meta staging beat so the
+# composed beats carry the retained cells the host loaded; the host
+# slices its LOADs/STOREs to the same extents. Lists using rows 0/16
+# are unchanged; backends without the bit keep the full-window
+# emission.
+CAPS_VBUILD_PART = 16
+# P2d-b RTL slice (2026-11-06,
+# plans/2026-11-02-troom-pipelined-batch-decode.md): the VBUILD
+# append mode. Descriptor rows codes 18/19 append one slot to an open
+# 32-slot block under the per-token scale (single amax over the slot's
+# 64 dims, one d16 in both assembly slots), patching the block's 32
+# payload beats and the per-window scale-row beat at m_base (pre-read
+# composed) instead of rewriting the meta staging; the seal stays the
+# rows 1/2 partial. The backend's native open-tail emission keys on
+# this bit; a bit-less image keeps the adopted P2d-a partial path.
+CAPS_VBUILD_VAPP = 17
 
 
 class WrapperError(IntEnum):

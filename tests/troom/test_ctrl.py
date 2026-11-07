@@ -19,6 +19,10 @@ from troom.abi import (
     CAPS_VBUILD,
     CAPS_VEC_SILU,
     CAPS_VEC_SMEXP,
+    CAPS_VBUILD_SG1,
+    CAPS_VBUILD_K,
+    CAPS_VBUILD_PART,
+    CAPS_VBUILD_VAPP,
     CAPS_VEC_F16,
     CAPS_VEC_PSWAP,
     CAPS_WATCHDOG,
@@ -195,10 +199,14 @@ def test_identity_caps_and_parameters():
                 | (1 << CAPS_MM_EPI_COUNTERS)
                 | (1 << CAPS_SGEMV)
                 | (1 << CAPS_VBUILD)
+                | (1 << CAPS_VBUILD_SG1)
+                | (1 << CAPS_VBUILD_K)
                 | (1 << CAPS_VEC_F16)
                 | (1 << CAPS_VEC_PSWAP)
                 | (1 << CAPS_VEC_SILU)
-                | (1 << CAPS_VEC_SMEXP))
+                | (1 << CAPS_VEC_SMEXP)
+                | (1 << CAPS_VBUILD_PART)
+                | (1 << CAPS_VBUILD_VAPP))
         assert (yield from cread(axil, REG_CAPS)) == caps
         assert (yield from cread(axil, REG_MEM_BASE)) == MEM_BASE
         assert (yield from cread(axil, REG_MEM_SIZE)) == MEM_SIZE

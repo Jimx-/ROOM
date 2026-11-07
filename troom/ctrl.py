@@ -57,6 +57,10 @@ from troom.abi import (
     CAPS_MM_EPI_COUNTERS,
     CAPS_SGEMV,
     CAPS_VBUILD,
+    CAPS_VBUILD_SG1,
+    CAPS_VBUILD_K,
+    CAPS_VBUILD_PART,
+    CAPS_VBUILD_VAPP,
     CAPS_VEC_F16,
     CAPS_VEC_PSWAP,
     CAPS_VEC_SILU,
@@ -386,10 +390,14 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                 | (1 << CAPS_MM_EPI_COUNTERS)
                 | (1 << CAPS_SGEMV)
                 | (1 << CAPS_VBUILD)
+                | (1 << CAPS_VBUILD_SG1)
+                | (1 << CAPS_VBUILD_K)
                 | (1 << CAPS_VEC_F16)
                 | (1 << CAPS_VEC_PSWAP)
                 | (1 << CAPS_VEC_SILU)
-                | (1 << CAPS_VEC_SMEXP)),
+                | (1 << CAPS_VEC_SMEXP)
+                | (1 << CAPS_VBUILD_PART)
+                | (1 << CAPS_VBUILD_VAPP)),
             self._mem_base.r_data.eq(self.mem_base),
             self._mem_size.r_data.eq(self.mem_size),
             self._beat_bytes.r_data.eq(self.beat_bytes),

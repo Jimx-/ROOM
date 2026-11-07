@@ -64,6 +64,104 @@ A descriptor whose live count is outside 1..64 completes at accept
 with ``BAD_SHAPE``, whose bases are not beat aligned with
 ``BAD_ALIGN``, and whose window or tile extent leaves TMEM with
 ``BAD_RANGE`` -- all without reading TMEM.
+
+SG1 drain mode (E1-V, 2026-10-28): a descriptor whose ``m_base`` is
+nonzero stages, instead of the legacy row-major tile, the two SG1
+images the streaming engine consumes -- payload (4096 bytes: for each
+four-row group, for each 32-slot block, for each lane, the block's 32
+quant bytes) at ``r_base`` and meta (256 bytes: the FP16 d of the
+same (group, block, lane) cells, row-major four bytes per row) at
+``m_base``. The quantized bytes and scales are the identical frozen
+values in a different placement; the retired regions are
+byte-identical to the host builder's ``troom_sg1_pack`` output for
+the same window. The mode requires a 64-byte bus beat (the deployed
+geometry) and completes otherwise with ``BAD_SHAPE``; every row's
+full contribution is written, so dead-tail and zero-amax skips leave
+the same zero bytes the host path emits. ``m_base == 0`` keeps the
+legacy drain bit for bit; see
+``results/troom-e1-v-20261028/DESIGN.md`` for the ABI rationale.
+
+K orientation (E1-K, 2026-10-28): a descriptor whose ``rows`` field
+is 16 (``VB_K_ROWS``; the field is ignored -- always zero -- by every
+earlier VBUILD contract) builds a K-cache group instead: the same
+slot-major window image now holds the group's 16 slot rows, the
+quantizer's output rows are the slots (each a 68-byte two-block Q8_0
+row over the 64 dims), and ``k`` names the group's live-slot prefix
+(0..16; 0 builds the all-zero group without reading the pool).
+Gathering runs along the dim axis within a slot row instead of
+across slots, and the staging extents shrink to the group's images:
+payload 1024 bytes, meta 64 bytes (one beat). The staged bytes are
+byte-identical to the host builder's ``troom_sg1_pack(..., 64, 16)``
+output for the same group; the quantizer itself is untouched bit for
+bit. K mode requires the SG1 drain (``m_base != 0``) and the
+64-byte beat, allows ``rows`` only 0 or 16, and rejects ``k > 16``
+-- all at accept with ``BAD_SHAPE``; see
+``results/troom-e1-k-20261028/DESIGN.md``.
+
+Partial-extent drain (P2d-a, 2026-11-05): the SG1 staging layout
+interleaves both 32-slot V blocks (and every K row) inside each 64 B
+beat, so a sliced STORE can retire one V block's payload runs (16 runs
+of 128 B at 256 B stride -- beat multiples) or one K lane pair's beats
+(2 runs of 64 B at 128 B stride), but never sub-beat meta cells; the
+meta must leave as whole beats. A partial descriptor (``rows`` 1, 2 or
+17, all requiring ``m_base != 0``) therefore rebuilds only the dirty
+extent *and composes the meta beats from the staging the host loaded*:
+
+* ``rows == 1``/``2`` (V partial, block 0/1): the fill reads only the
+  named block's live prefix (words ``32*32*blk`` up, i.e. the host
+  LOADs just the dirty block's slots re-based at the window image's
+  natural offset), every row gathers/quantizes only that block (the
+  other block bypasses even the zero-amax scale round), the drain
+  writes only that block's payload chunks and meta halfword cells --
+  at their *natural* staging offsets -- and each 64 B meta beat is
+  pre-read from ``m_base`` into the accumulator as the row pass
+  enters its sixteenth row, so the composed beats carry the loaded
+  (retained) cells of the other block.
+* ``rows == 17`` (K partial): ``k`` is the group's live prefix (1..16).
+  The host LOADs only the dirty lane pair re-based at buffer row 0.
+  Parity derives the valid input rows (1 for odd ``k``, 2 otherwise).
+  Payload stays rebased for a sliced STORE, but meta scatters at the
+  original pair base ``(k - 1) & ~1``. All other meta cells retain
+  their pre-read bytes and no other payload beats are written.
+
+The staging bytes a partial run writes are bit-identical to the same
+extents of a full run over the same inputs (the per-block/per-row
+quant sequence is independent of the extent); the unwritten extents
+hold the host-loaded previous build's output, and the host's sliced
+stores retire exactly the rebuilt extents, so the composed DRAM image
+is byte-identical to a full rebuild's. See
+``results/troom-p2da-dirtyblock-20261105/DESIGN.md``.
+
+Append mode (P2d-b, 2026-11-06): a descriptor whose ``rows`` field is
+18/19 appends ONE slot to an open 32-slot block under the per-token
+scale contract (``results/troom-p2db-phasea-20261106/DESIGN.md``):
+
+* the fill reads just the appended slot's 128 B row re-based at the
+  buffer (the host LOADs the slot to the window image), and the walk
+  is the K-mode gather direction over that one row -- the two
+  32-element halves share a SINGLE amax fold, one scale sequence, and
+  one d16 written to both block slots of the 68-byte assembly, so the
+  64 quant bytes are the frozen sequence of ``model
+  .vbuild_quant_row_token``;
+* the drain patches, never rewrites: block ``blk``'s 32 payload beats
+  are pre-read and recomposed with two bytes each (the appended
+  position p in both lanes' chunks, p = (k-1) & 31), and ``m_base``
+  names the per-window SCALE ROW (256 B = four beats of 64 WIDENED
+  F32 words) whose word k-1 takes this token's widened d16 -- the
+  P2d-a meta compose applied to the payload and scale-row extents.
+  The row stores FP32, not FP16: the march's P fold multiplies the
+  softmax numerators by the widened per-slot scales elementwise
+  (VEC_MUL reads F32 words and no widen op exists), so the append
+  composes the exact widened value (``Fp16Widen`` of the d16) and
+  the backend seeds unappended/sealed words with 1.0 (the exact
+  identity under the fold);
+* the meta staging is not touched: the open block's cells stay the
+  uploaded 1.0s until a rows-1/2 partial (the seal) rewrites the
+  block byte-identically to the adopted P2d-a build.
+
+An append descriptor requires the SG1 drain and the 64-byte beat,
+rejects ``k`` outside its block's range at accept with ``BAD_SHAPE``,
+and checks ``m_base`` as the four-beat (256 B) scale-row extent.
 """
 
 from amaranth import *
@@ -86,17 +184,57 @@ VB_DIMS = 64
 VB_SLOT_BYTES = VB_DIMS * 2
 VB_SLOT_WORDS = VB_SLOT_BYTES // 4
 VB_ROW_RAW = 2 * 34  # two Q8_0 blocks: d16 + 32 quants each
+VB_SG1_PAYLOAD = VB_DIMS * 2 * 32  # 64 rows x 2 blocks x 32 quant bytes
+VB_SG1_META = VB_DIMS * 2 * 2  # 64 rows x 2 blocks x 2-byte FP16 d
+VB_SG1_BEAT = 64  # the deployed bus beat; SG1 staging writes whole 64B beats
+VB_K_ROWS = 16  # K group slots (rows == 16 selects the K orientation)
+VB_K_SG1_PAYLOAD = VB_K_ROWS * 2 * 32  # 16 rows x 2 blocks x 32 quant bytes
+VB_K_SG1_META = VB_K_ROWS * 2 * 2  # 16 rows x 2 blocks x 2-byte FP16 d
+VB_SG1_SROW = VB_SLOTS * 4  # P2d-b scale row: 64 widened-F32 words
+
+# Partial-extent drain codes (P2d-a, descriptor ``rows`` field). The
+# SG1 drain of a partial run writes only the rebuilt extents at their
+# natural staging offsets -- the payload chunks and meta halfword
+# cells of one 32-slot V block, or the payload beats and meta cells of
+# the leading K rows -- and pre-reads each meta staging beat so the
+# composed 64 B beats carry the retained cells of the extents the host
+# loaded and will not rebuild. The unwritten staging extents are never
+# stored: the host slices its LOADs/STOREs to the same extents.
+VB_ROWS_V_B0 = 1  # V partial: block-0 extent only (1 <= k <= 32)
+VB_ROWS_V_B1 = 2  # V partial: block-1 extent only (33 <= k <= 64)
+VB_ROWS_K_PART = VB_K_ROWS + 1  # K partial: rows < k only (1 <= k <= 16)
+
+# Append-mode codes (P2d-b): one slot appended to an open block under
+# the per-token scale. ``k`` keeps the window's live prefix (the
+# appended slot is k-1), so the block and its position derive from the
+# same ranges as the partial codes above.
+VB_ROWS_V_APP0 = 18  # V append into open block 0 (1 <= k <= 32)
+VB_ROWS_V_APP1 = 19  # V append into open block 1 (33 <= k <= 64)
 
 
 class VBuildDesc(HasTRoomParams, Record):
-    """V-window build descriptor: window base, tile base, live slots."""
+    """V-window build descriptor: window base, tile base, live slots.
+
+    A nonzero ``m_base`` selects the SG1 drain: ``r_base`` becomes the
+    payload staging base and ``m_base`` the meta staging base. A
+    ``rows`` value of ``VB_K_ROWS`` (16) selects the K orientation:
+    16 slot output rows over the 64 dims, staging extents 1024/64
+    bytes; the partial codes 1/2 (one 32-slot V block extent) and 17
+    (one K lane pair) additionally slice the SG1 drain to the
+    rebuilt extents; the append codes 18/19 (P2d-b) patch one
+    appended slot's bytes into an open block's payload beats and the
+    widened-d16 word of the four-beat F32 scale row at ``m_base``;
+    every other nonzero ``rows`` is rejected at accept.
+    """
 
     def __init__(self, params, name=None, src_loc_at=0):
         HasTRoomParams.__init__(self, params)
         Record.__init__(self, [
             ('a_base', self.tmem_addr_width, Direction.FANOUT),
             ('r_base', self.tmem_addr_width, Direction.FANOUT),
+            ('m_base', self.tmem_addr_width, Direction.FANOUT),
             ('k', self.lg_act_k + 1, Direction.FANOUT),
+            ('rows', self.rows_bits, Direction.FANOUT),
         ],
                         name=name,
                         src_loc_at=src_loc_at + 1)
@@ -160,6 +298,12 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         frec = m.submodules.frec = FPURec(32, FPFormat.S, latency=3)
         f16w = m.submodules.f16w = Fp16Widen()
         f16n = m.submodules.f16n = Fp32To16()
+        # P2d-b: the append's dedicated d16 widen (the token scale's
+        # F32 row word). Not shared with f16w: the scale completion
+        # issues it right where the quant stream's element widens are
+        # about to start, and the shared unit's two-cycle pipeline
+        # would collide at the QUANT entry.
+        f16wa = m.submodules.f16wa = Fp16Widen()
 
         # Local window buffer: 64 slots x 32 words. One sync write
         # port (the fill) and one synchronous read port (the gather),
@@ -169,21 +313,89 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         buf_r = m.submodules.buf_r = buf.read_port(transparent=False)
 
         # ------------------------------------------------------------------
-        # Descriptor validation, on the offered combination.
+        # Descriptor validation, on the offered combination. A nonzero
+        # m_base selects the SG1 drain: its staging extents are the
+        # payload/meta images (4096/256 bytes) instead of the legacy
+        # tile, and the mode itself requires the deployed 64-byte beat.
+        # A rows value of VB_K_ROWS selects the K orientation: 16 slot
+        # rows over the dims, group staging extents (1024/64 bytes), k
+        # = live slots 0..16, and the SG1 drain; any other nonzero
+        # rows is a shape error.
         # ------------------------------------------------------------------
         offer = self.sink.bits
-        a_end_o = offer.a_base + offer.k * VB_SLOT_BYTES
-        r_end_o = offer.r_base + 64 * self.row_pad
-        shape_bad = (offer.k == 0) | (offer.k > VB_SLOTS)
-        align_bad = offer.a_base[:lg].any() | offer.r_base[:lg].any()
+        offer_sg1 = offer.m_base != 0
+        # The K orientation: the full code (16) and the partial
+        # row-extent code (17) share the 16-row geometry.
+        offer_krow = (offer.rows == VB_K_ROWS) \
+            | (offer.rows == VB_ROWS_K_PART)
+        offer_vb0 = offer.rows == VB_ROWS_V_B0
+        offer_vb1 = offer.rows == VB_ROWS_V_B1
+        offer_kp = offer.rows == VB_ROWS_K_PART
+        offer_va0 = offer.rows == VB_ROWS_V_APP0
+        offer_va1 = offer.rows == VB_ROWS_V_APP1
+        offer_va = offer_va0 | offer_va1
+        # K partial k carries the group's live prefix, not merely the
+        # rebased input length. Keep the pair's original metadata position.
+        offer_live = Mux(offer_kp, Mux(offer.k[0], 1, 2), offer.k)
+        # Partial-extent code latched for the run: 0 full, 1 V block 0,
+        # 2 V block 1, 3 K row extent.
+        offer_part = Mux(offer_vb0, 1, Mux(offer_vb1, 2, Mux(offer_kp, 3, 0)))
+        a_end_o = Mux(offer_va, offer.a_base + VB_SLOT_BYTES,
+                      offer.a_base + offer_live * VB_SLOT_BYTES)
+        r_end_o = Mux(
+            offer_krow, offer.r_base + VB_K_SG1_PAYLOAD,
+            Mux(offer_sg1, offer.r_base + VB_SG1_PAYLOAD,
+                offer.r_base + 64 * self.row_pad))
+        # An append's m_base names the four-beat F32 scale row, not
+        # the 256-B meta staging (the same extent, different content).
+        m_end_o = Mux(
+            offer_va, offer.m_base + VB_SG1_SROW,
+            Mux(offer_krow, offer.m_base + VB_K_SG1_META,
+                offer.m_base + VB_SG1_META))
+        shape_bad = ((offer.rows != 0) & ~offer_krow & ~offer_vb0
+                     & ~offer_vb1 & ~offer_kp & ~offer_va) \
+            | Mux(offer_krow,
+                  ~offer_sg1 | (offer.k > VB_K_ROWS),
+                  (offer.k == 0) | (offer.k > VB_SLOTS)) \
+            | Mux(offer_vb0,
+                  ~offer_sg1 | (offer.k == 0) | (offer.k > 32), 0) \
+            | Mux(offer_vb1,
+                  ~offer_sg1 | (offer.k <= 32) | (offer.k > VB_SLOTS), 0) \
+            | Mux(offer_kp,
+                  ~offer_sg1 | (offer.k == 0) | (offer.k > VB_K_ROWS), 0) \
+            | Mux(offer_va0,
+                  ~offer_sg1 | (offer.k == 0) | (offer.k > 32), 0) \
+            | Mux(offer_va1,
+                  ~offer_sg1 | (offer.k <= 32) | (offer.k > VB_SLOTS), 0) \
+            | (offer_sg1 & (self.beat_bytes != VB_SG1_BEAT))
+        align_bad = offer.a_base[:lg].any() | offer.r_base[:lg].any() \
+            | (offer_sg1 & offer.m_base[:lg].any())
         range_bad = (a_end_o > self.tmem_bytes) \
-            | (r_end_o > self.tmem_bytes)
+            | (r_end_o > self.tmem_bytes) \
+            | (offer_sg1 & (m_end_o > self.tmem_bytes))
         bad = shape_bad | align_bad | range_bad
 
         # Latched run state.
         a_base = Signal(aw)
         r_base = Signal(aw)
+        m_base = Signal(aw)
+        sg1 = Signal()  # SG1 drain (payload+meta staging), not legacy tile
+        krow = Signal()  # K orientation: 16 slot rows over the dims
+        part = Signal(2)  # partial-extent code (see offer_part)
         live = Signal(7)
+        pair_base = Signal(4)
+        part_vb0 = part == 1
+        part_vb1 = part == 2
+        part_vb = part_vb0 | part_vb1  # V block-extent partial
+        part_blk = part == 2  # the rebuilt V block index
+        part_k = part == 3  # K row-extent partial
+        vapp = Signal()  # append mode: one slot under the token scale
+        app_blk = Signal()  # the appended-to open block
+        app_pos = Signal(5)  # the slot's position inside that block
+        app_w = Signal(6)  # append drain beat: 0..31 payload, 32..35 srow
+        app_ph = Signal()  # beat latched, write pending
+        app_rd = Signal()  # a beat pre-read is outstanding
+        app_d32 = Signal(32)  # the widened token d16 (the row's patch word)
 
         # Phase membership, driven inside the FSM below.
         in_fill = Signal()
@@ -191,38 +403,49 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         in_scale = Signal()
         in_quant = Signal()
         in_drain = Signal()
-        running = in_fill | in_gather | in_scale | in_quant | in_drain
+        in_sg1w = Signal()  # SG1 staging beat writes
+        in_appw = Signal()  # append-mode patch drain
+        running = in_fill | in_gather | in_scale | in_quant | in_drain \
+            | in_sg1w | in_appw
 
         # ------------------------------------------------------------------
         # Fill: one outstanding TMEM read at a time; each returned
         # beat is absorbed into the buffer one 32-bit word per cycle.
+        # A block-1 partial fills from word 32*32 up (the host LOADs
+        # just the dirty block's slots re-based at the window image's
+        # natural offset), so the read address tracks the same offset.
         # ------------------------------------------------------------------
         fill_word = Signal(12)  # words stored
         fill_total = Signal(12)  # words to store (live * 32)
+        fill_wlo = Signal(12)  # first buffer word of the fill
         fill_beat = Signal(12)  # beats requested
         fill_data = Signal(self.data_width)
         fill_have = Signal()  # a beat is being absorbed
         fill_wcnt = Signal(range(bw + 1))
         rd_pend = Signal()
 
+        # ------------------------------------------------------------------
+        # Meta staging pre-read (partial extents): before the row pass
+        # writes a 64 B meta beat, the beat's current staging content
+        # is read into the meta_hw accumulator, so the composed beats
+        # carry the retained cells of the extents the host loaded and
+        # this run does not rebuild. One beat covers sixteen rows, and
+        # the trigger fires as the pass enters its first row -- dozens
+        # of cycles before that row's scatter -- with a DRAINLOAD-side
+        # wait closing the race for the fastest (zero-amax) rows. The
+        # response latch lives beside the meta accumulator below, so a
+        # same-cycle scatter (priority: the scatter's fresh d16) always
+        # wins over the pre-read's retained byte.
+        # ------------------------------------------------------------------
+        pre_rd = Signal()  # a pre-read beat is outstanding
+        pre_cnt = Signal(3)  # next meta beat to pre-read (V: 0..3, K: 0)
+
         # One beat at a time: the next request issues only after the
         # previous beat fully absorbed into the buffer, so a returned
-        # beat can never clobber an absorption still in flight.
+        # beat can never clobber an absorption still in flight. The
+        # pre-read shares the read port after the fill completes (the
+        # phases are disjoint; a response routes by its pending flag).
         more_fill = ~rd_pend & ~fill_have & (fill_beat * bw < fill_total)
-        m.d.comb += [
-            self.tmem_rreq.valid.eq(in_fill & more_fill),
-            self.tmem_rreq.bits.addr.eq(a_base + (fill_beat << lg)),
-            self.tmem_rresp.ready.eq(running),
-        ]
-        with m.If(in_fill & self.tmem_rreq.fire):
-            m.d.sync += [rd_pend.eq(1), fill_beat.eq(fill_beat + 1)]
-        with m.If(rd_pend & self.tmem_rresp.fire):
-            m.d.sync += [
-                rd_pend.eq(0),
-                fill_have.eq(1),
-                fill_data.eq(self.tmem_rresp.bits.data),
-                fill_wcnt.eq(0),
-            ]
         m.d.comb += [
             buf_w.addr.eq(fill_word),
             buf_w.data.eq(fill_data[:32]),
@@ -238,9 +461,13 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                 m.d.sync += fill_have.eq(0)
 
         # ------------------------------------------------------------------
-        # Gather: one slot per cycle. The fold keeps the winning FP16
+        # Gather: one element per cycle. The fold keeps the winning FP16
         # magnitude pattern; NaN patterns never win (>= 0x7c01), and
-        # tail slots at or above `live` read as +0.
+        # tail slots at or above `live` read as +0. In V orientation
+        # the element is slot `blk*32+gi` of dim row `row`; in K
+        # orientation it is dim `blk*32+gi` of slot row `row`, so the
+        # gather walks inside one buffer row and the liveness test is
+        # whole-row (`row < live`).
         # ------------------------------------------------------------------
         row = Signal(6)
         blk = Signal()
@@ -248,6 +475,7 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         gather_valid = Signal()
         gather_index = Signal(5)
         gather_live = Signal()
+        gather_par = Signal()  # K: the issued element's dim parity
         xmax16 = Signal(16)
         xnan = Signal()  # a live slot of this block is a NaN pattern
         xbuf0 = Array(Signal(16, name=f'xb0_{i}') for i in range(32))
@@ -259,11 +487,14 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         pgather_valid = Signal()
         pgather_index = Signal(5)
         pgather_live = Signal()
+        pgather_par = Signal()
         pxmax16 = Signal(16)
         pxnan = Signal()
         prefetch_done = Signal()
 
-        has_next = (blk == 0) | (row != 63)
+        # The last output row: dim 63 (V) or slot 15 (K).
+        last_row = Mux(krow, VB_K_ROWS - 1, VB_DIMS - 1)
+        has_next = (blk == 0) | (row != last_row)
         next_blk = Mux(blk == 0, 1, 0)
         next_row = Mux(blk == 0, row, row + 1)
 
@@ -271,24 +502,91 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # clamp(live - 32*b, 0, 32). Slots at or above it quantize to
         # exactly zero bytes and fold +0 into the amax, so gathering
         # or streaming them is skippable work, never a numeric change.
+        # In K orientation liveness is whole-row instead: a live slot's
+        # two blocks are always full (the dims are always all present)
+        # and a dead slot row gathers nothing.
         lo_live = Signal(6)  # live slots of block 0 (1..32)
         hi_live = Signal(6)  # live slots of block 1 (0..32)
         m.d.comb += [
             lo_live.eq(Mux(live > 32, 32, live)),
             hi_live.eq(Mux(live > 32, (live - 32)[:6], 0)),
         ]
-        cur_live = Mux(blk == 0, lo_live, hi_live)
-        nxt_live = Mux(blk == 0, hi_live, lo_live)
+        # A V partial run never gathers the unselected block: its
+        # staging extents are the host-loaded previous build's bytes,
+        # so skipping the zero-amax scale round as well changes no
+        # output byte -- only the rebuilt extent ever reaches staging.
+        lo_eff = Mux(part_vb1, 0, lo_live)
+        hi_eff = Mux(part_vb0, 0, hi_live)
+        # A K row-extent run at or above its live prefix: the row's
+        # meta cells keep the pre-read (loaded) bytes instead of the
+        # zeros a full run's dead tail writes.
+        part_k_row_dead = part_k & (row >= live)
+        cur_live = Mux(krow, Mux(row < live, 32, 0),
+                       Mux(blk == 0, lo_eff, hi_eff))
+        # An append never prefetches: its second gather half is the
+        # same row's dims 32..63, not another row.
+        nxt_live = Mux(
+            vapp, 0,
+            Mux(krow, Mux(next_row < live, 32, 0), Mux(blk == 0, hi_eff,
+                                                       lo_eff)))
+
+        # Pre-read issue (see the fill-side comment above): fires as
+        # the row pass gathers the first row of a meta beat's sixteen.
+        pre_go = (part != 0) & ~pre_rd \
+            & (pre_cnt < Mux(krow, 1, 4)) & (row[0:4] == 0) \
+            & (row[4:6] == pre_cnt[0:2]) & in_gather
+        pre_addr = m_base + (pre_cnt[0:2] << 6)
+
+        # Append-mode pre-read: one outstanding beat at a time, the
+        # patch drain's compose source. Beat w < 32 is block app_blk's
+        # payload beat (group w>>1, pair w&1); beats 32..35 are the
+        # four-beat F32 scale row at m_base.
+        app_req = in_appw & ~app_rd & ~app_ph
+        app_raddr = Mux(
+            app_w[5], m_base + (app_w[:5] << 6),
+            r_base + (app_w[1:6] << 8) + (app_w[0] << 6) + (app_blk << 7))
+
+        # The unit's single TMEM read port: the fill while filling,
+        # then the meta pre-reads of a partial run and the append
+        # drain's beat pre-reads.
+        m.d.comb += [
+            self.tmem_rreq.valid.eq((in_fill & more_fill) | pre_go
+                                    | app_req),
+            self.tmem_rreq.bits.addr.eq(
+                Mux(
+                    app_req, app_raddr,
+                    Mux(pre_go, pre_addr,
+                        a_base + (fill_wlo << 2) + (fill_beat << lg)))),
+            self.tmem_rresp.ready.eq(running),
+        ]
+        with m.If(in_fill & more_fill & self.tmem_rreq.fire):
+            m.d.sync += [rd_pend.eq(1), fill_beat.eq(fill_beat + 1)]
+        with m.If(pre_go & self.tmem_rreq.fire):
+            m.d.sync += pre_rd.eq(1)
+        with m.If(app_req & self.tmem_rreq.fire):
+            m.d.sync += app_rd.eq(1)
+        with m.If(rd_pend & self.tmem_rresp.fire):
+            m.d.sync += [
+                rd_pend.eq(0),
+                fill_have.eq(1),
+                fill_data.eq(self.tmem_rresp.bits.data),
+                fill_wcnt.eq(0),
+            ]
 
         # Buffer word j*32 + (d >> 1) is Cat(d[1:6], i, b); the
         # halfword is d & 1. Delay the index and live mask alongside
         # the RAM read; row/blk stay fixed until the last response lands.
+        # K orientation: word row*32 + (blk*32+gi >> 1), halfword gi & 1.
         gather_go = in_gather & (gi < cur_live)
         prefetch_go = in_quant & has_next & (pgi < nxt_live)
         m.d.comb += [
             buf_r.addr.eq(
-                Mux(prefetch_go, Cat(next_row[1:6], pgi[:5], next_blk),
-                    Cat(row[1:6], gi[:5], blk))),
+                Mux(
+                    krow,
+                    Mux(prefetch_go, Cat(pgi[1:5], next_blk, next_row[:6]),
+                        Cat(gi[1:5], blk, row[:6])),
+                    Mux(prefetch_go, Cat(next_row[1:6], pgi[:5], next_blk),
+                        Cat(row[1:6], gi[:5], blk)))),
             buf_r.en.eq(gather_go | prefetch_go),
         ]
         m.d.sync += [
@@ -299,19 +597,27 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             m.d.sync += [
                 gi.eq(gi + 1),
                 gather_index.eq(gi[:5]),
-                gather_live.eq(Cat(gi[:5], blk) < live),
+                gather_live.eq(Mux(krow, row < live,
+                                   Cat(gi[:5], blk) < live)),
+                gather_par.eq(gi[0]),
             ]
         with m.If(prefetch_go):
             m.d.sync += [
                 pgi.eq(pgi + 1),
                 pgather_index.eq(pgi[:5]),
-                pgather_live.eq(Cat(pgi[:5], next_blk) < live),
+                pgather_live.eq(
+                    Mux(krow, next_row < live,
+                        Cat(pgi[:5], next_blk) < live)),
+                pgather_par.eq(pgi[0]),
             ]
         xh_now = Signal(16)
         mag_now = Signal(16)
         nan_now = Signal()
         m.d.comb += [
-            xh_now.eq(Mux(gather_live, (buf_r.data >> (16 * row[0]))[:16], 0)),
+            xh_now.eq(
+                Mux(gather_live, (buf_r.data >>
+                                  (16 * Mux(krow, gather_par, row[0])))[:16],
+                    0)),
             mag_now.eq(xh_now & 0x7fff),
             nan_now.eq(mag_now >= 0x7c01),
         ]
@@ -330,7 +636,9 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         pnan_now = Signal()
         m.d.comb += [
             pxh_now.eq(
-                Mux(pgather_live, (buf_r.data >> (16 * next_row[0]))[:16], 0)),
+                Mux(pgather_live,
+                    (buf_r.data >>
+                     (16 * Mux(krow, pgather_par, next_row[0])))[:16], 0)),
             pmag_now.eq(pxh_now & 0x7fff),
             pnan_now.eq(pmag_now >= 0x7c01),
         ]
@@ -516,6 +824,12 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             f16w.inp.eq(Mux(in_scale, xmax16, quant_x)),
         ]
 
+        # The append's dedicated d16 widen: issued once at the scale
+        # completion, latched two cycles later; the drain reads the
+        # word long after (the whole quant walk runs between).
+        with m.If(f16wa.out_valid):
+            m.d.sync += app_d32.eq(f16wa.out)
+
         # Bounded RNE int8 helper of the second product (the frozen
         # bit helper of troom.vector / q8_rne_bits in the model).
         # The result is registered once: the row-write switch below
@@ -588,11 +902,164 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         dbeat = Signal(range(beats_per_row + 1))
         drain_sr = Signal(8 * self.row_pad)
         drain_prefetched = Signal()
+
+        # ------------------------------------------------------------------
+        # SG1 staging (nonzero m_base, deployed 64-byte beat only): the
+        # row's two 32-byte quant chunks and d16 pair land in the
+        # stream consumption order -- group-major, block within group,
+        # lane within block. Byte offsets from DESIGN.md:
+        #   chunk(row, j) -> r_base + ((row >> 2) * 8 + j * 4 + (row & 3)) * 32
+        #   d16(row, j)   -> m_base + (row >> 4) * 64 + ((row >> 2) & 3) * 16
+        #                    + j * 8 + (row & 3) * 2
+        # A 64-byte payload beat covers a lane pair of one block, so
+        # beats are written when an odd lane completes (the even lane's
+        # chunks wait in hold registers); one meta beat covers sixteen
+        # rows (four groups) and is written when row & 15 == 15, each
+        # row scattering its two d16 halfwords to their (group, block,
+        # lane) cells. Dead-tail and zero-amax skips leave zeros in
+        # rowwords, and every row's full contribution is written, so
+        # staging needs no pre-clear.
+        # ------------------------------------------------------------------
+        sg1_widx = Signal(2)
+        if self.beat_bytes == VB_SG1_BEAT:
+            # Little-endian byte order: the row's LOW bytes are the
+            # chunk's LOW bits, so the Cat runs from the chunk's byte
+            # 0 (row byte 2) upward.
+            chunk0 = Cat(rowwords[0][16:32], rowwords[1], rowwords[2],
+                         rowwords[3], rowwords[4], rowwords[5], rowwords[6],
+                         rowwords[7], rowwords[8][0:16])
+            chunk1 = Cat(rowwords[9], rowwords[10], rowwords[11], rowwords[12],
+                         rowwords[13], rowwords[14], rowwords[15],
+                         rowwords[16])
+            hold_c0 = Signal(256, name='hold_c0')
+            hold_c1 = Signal(256, name='hold_c1')
+            # One halfword cell per (group, block, lane) of a 64-byte
+            # meta beat; an Array (not a dynamic bit-select on one
+            # wide signal, which lowers to a latched comb
+            # read-modify-write) keeps the writes latch-free.
+            meta_hw = Array(Signal(16, name=f'mhw{i}') for i in range(32))
+            # Pre-read latch (partial runs): the loaded beat's 32
+            # halfwords enter the accumulator here -- ABOVE the row
+            # scatter below in elaboration order, so a same-cycle
+            # scatter (a freshly quantized d16 of this very row) wins
+            # the cell, exactly the compose a partial run needs.
+            with m.If(pre_rd & self.tmem_rresp.fire):
+                m.d.sync += [
+                    pre_rd.eq(0),
+                    pre_cnt.eq(pre_cnt + 1),
+                ]
+                for i in range(32):
+                    m.d.sync += meta_hw[i].eq(
+                        self.tmem_rresp.bits.data[16 * i:16 * i + 16])
+            # Append-mode compose (P2d-b): latch the pre-read beat the
+            # same way, then scatter this run's two patch bytes (a
+            # payload beat: the appended position of both lanes'
+            # chunks) or the token d16 (the scale-row beat) into the
+            # LATCHED response -- the compose must not race the
+            # accumulator's old content, so the patched halfwords are
+            # rebuilt from the response directly.
+            with m.If(app_rd & self.tmem_rresp.fire):
+                m.d.sync += [app_rd.eq(0), app_ph.eq(1)]
+                for i in range(32):
+                    m.d.sync += meta_hw[i].eq(
+                        self.tmem_rresp.bits.data[16 * i:16 * i + 16])
+            app_hw0 = app_pos[1:5]
+            app_hw1 = Cat(app_pos[1:5], 1)  # (p >> 1) + 16
+            app_rh0 = self.tmem_rresp.bits.data.word_select(app_hw0, 16)
+            app_rh1 = self.tmem_rresp.bits.data.word_select(app_hw1, 16)
+            # Beat w's lanes are dims 2w and 2w+1: chunk 0 below w 16,
+            # chunk 1 above, byte 2*(w mod 16) (+1 for the odd lane).
+            app_we = Cat(0, app_w[0:4])
+            app_wo = Cat(1, app_w[0:4])
+            app_be = Mux(~app_w[4], chunk0.word_select(app_we, 8),
+                         chunk1.word_select(app_we, 8))
+            app_bo = Mux(~app_w[4], chunk0.word_select(app_wo, 8),
+                         chunk1.word_select(app_wo, 8))
+            with m.If(app_rd & self.tmem_rresp.fire & ~app_w[5]):
+                # Byte p of the beat is the even lane's chunk, 32+p the
+                # odd lane's; the lane within the halfword is p & 1.
+                with m.If(app_pos[0]):
+                    m.d.sync += meta_hw[app_hw0].eq(Cat(app_rh0[:8], app_be))
+                    m.d.sync += meta_hw[app_hw1].eq(Cat(app_rh1[:8], app_bo))
+                with m.Else():
+                    m.d.sync += meta_hw[app_hw0].eq(Cat(app_be, app_rh0[8:]))
+                    m.d.sync += meta_hw[app_hw1].eq(Cat(app_bo, app_rh1[8:]))
+            # Scale-row beats (app_w >= 32): patch WORD k-1 of the
+            # 256-B F32 row with the widened token d16. The word spans
+            # halfword cells 2*((k-1)&15) and +1 of beat
+            # 32 + ((k-1) >> 4); every other cell keeps the latched
+            # response (the 1.0s the host seeded and the previous
+            # appends' words). Cat is LSB-first in this tree: the
+            # beat index is (blk << 1) | p[4] and the cell base is
+            # (p & 15) << 1.
+            app_sw0 = Cat(0, app_pos[0:4])  # 2 * ((k-1) & 15)
+            with m.If(app_rd & self.tmem_rresp.fire & app_w[5]
+                      & (app_w == (32 + Cat(app_pos[4], app_blk)))):
+                m.d.sync += meta_hw[app_sw0].eq(app_d32[:16])
+                m.d.sync += meta_hw[app_sw0 + 1].eq(app_d32[16:])
+            # This row's two halfword cells inside its 64-byte meta
+            # beat: group g' = (row >> 2) & 3 contributes j0 at
+            # 8*g' + lane and j1 at 8*g' + 4 + lane.
+            meta_row = Signal(4)
+            m.d.comb += meta_row.eq(row[:4] + Mux(part_k, pair_base, 0))
+            meta_hw0 = (meta_row[2:4] << 3) + meta_row[0:2]
+            meta_hw1 = (meta_row[2:4] << 3) + 4 + meta_row[0:2]
+            sg1_meta_now = row[:4].all()  # rows 15, 31, 47, 63
+            # Partial payload gating: a V block-extent run writes only
+            # its block's chunks; a K row-extent run writes only the
+            # beats of lane pairs whose first row is live (the pair's
+            # dead odd lane lands as zeros -- the dead-tail bytes the
+            # full drain writes for the same group).
+            pay_ok = Mux(part_vb, sg1_widx[0] == part_blk,
+                         Mux(part_k, row <= live, 1))
+            sg1_wr = in_sg1w & (((sg1_widx != 2) & pay_ok)
+                                | ((sg1_widx == 2) & sg1_meta_now))
+            sg1_waddr = Mux(
+                sg1_widx == 2, m_base + (row[4:6] << 6),
+                r_base + (row[2:6] << 8) + (row[1] << 6) + (sg1_widx[0] << 7))
+            sg1_wdata = Mux(
+                sg1_widx == 2, Cat(*meta_hw),
+                Mux(sg1_widx[0], Cat(hold_c1, chunk1), Cat(hold_c0, chunk0)))
+            # A gated beat advances the walk in the cycle it would have
+            # written, so a partially-gated sequence (V block extent,
+            # K dead pairs) still reaches the meta beat and completes.
+            sg1_adv = (sg1_wr & self.tmem_w.fire) | (~sg1_wr & in_sg1w)
+            with m.If(sg1_wr & self.tmem_w.fire):
+                m.d.sync += [
+                    sg1_widx.eq(sg1_widx + 1),
+                    self.beats.eq(self.beats + 1),
+                ]
+            with m.If(~sg1_wr & in_sg1w):
+                m.d.sync += sg1_widx.eq(sg1_widx + 1)
+            sg1_last = in_sg1w & (((sg1_widx == 1) & ~sg1_meta_now
+                                   | (sg1_widx == 2)) & sg1_adv)
+            app_waddr = Mux(
+                app_w[5], m_base + (app_w[:5] << 6),
+                r_base + (app_w[1:6] << 8) + (app_w[0] << 6) + (app_blk << 7))
+            app_wdata = Cat(*meta_hw)[:self.data_width]
+        else:
+            # Unreachable: an SG1 descriptor completes BAD_SHAPE at
+            # accept below the deployed beat, so in_sg1w never asserts.
+            sg1_wr = Const(0)
+            sg1_waddr = Const(0, aw)
+            sg1_wdata = Const(0, 8 * VB_SG1_BEAT)
+            sg1_last = Const(0)
+            app_waddr = Const(0, aw)
+            app_wdata = Const(0, self.data_width)
+
         m.d.comb += [
-            self.tmem_w.valid.eq(in_drain),
-            self.tmem_w.bits.addr.eq(r_base + (row * self.row_pad) +
-                                     (dbeat << lg)),
-            self.tmem_w.bits.data.eq(drain_sr[:self.data_width]),
+            self.tmem_w.valid.eq(in_drain | (in_sg1w & sg1_wr)
+                                 | (in_appw & app_ph)),
+            self.tmem_w.bits.addr.eq(
+                Mux(
+                    in_appw, app_waddr,
+                    Mux(in_sg1w, sg1_waddr,
+                        r_base + (row * self.row_pad) + (dbeat << lg)))),
+            self.tmem_w.bits.data.eq(
+                Mux(
+                    in_appw, app_wdata,
+                    Mux(in_sg1w, sg1_wdata[:self.data_width],
+                        drain_sr[:self.data_width]))),
         ]
 
         # ------------------------------------------------------------------
@@ -608,6 +1075,31 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             for k in range(17):
                 m.d.sync += rowwords[k].eq(0)
 
+        def advance_row():
+            """Next-row transition shared by the drain paths: bump the
+            row cursor, clear the row assembly, and enter the next
+            row's scale (prefetched) or gather."""
+            with m.If(row == last_row):
+                m.next = 'DONE'
+            with m.Else():
+                m.d.sync += [
+                    row.eq(row + 1),
+                    blk.eq(0),
+                    wbyte.eq(0),
+                    cur_bank.eq(~cur_bank),
+                ]
+                clear_row()
+                with m.If(drain_prefetched):
+                    m.d.sync += [
+                        xmax16.eq(pxmax16),
+                        xnan.eq(pxnan),
+                    ]
+                    start_scale()
+                    m.next = 'SCALE'
+                with m.Else():
+                    start_block()
+                    m.next = 'GATHER'
+
         with m.FSM(name='vbuild') as fsm:
             with m.State('IDLE'):
                 m.d.comb += [
@@ -622,13 +1114,29 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                     m.d.sync += [
                         a_base.eq(offer.a_base),
                         r_base.eq(offer.r_base),
-                        live.eq(offer.k[:7]),
-                        fill_word.eq(0),
-                        fill_total.eq(offer.k * VB_SLOT_WORDS),
+                        m_base.eq(offer.m_base),
+                        sg1.eq(offer_sg1),
+                        krow.eq(offer_krow | offer_va),
+                        part.eq(offer_part),
+                        live.eq(offer_live[:7]),
+                        pair_base.eq((offer.k - 1) & 14),
+                        vapp.eq(offer_va),
+                        app_blk.eq(offer_va1),
+                        app_pos.eq((offer.k - 1)[:5]),
+                        app_w.eq(0),
+                        app_ph.eq(0),
+                        app_rd.eq(0),
+                        fill_wlo.eq(Mux(offer_vb1, 32 * VB_SLOT_WORDS, 0)),
+                        fill_word.eq(Mux(offer_vb1, 32 * VB_SLOT_WORDS, 0)),
+                        fill_total.eq(
+                            Mux(offer_va, VB_SLOT_WORDS,
+                                offer_live * VB_SLOT_WORDS)),
                         fill_beat.eq(0),
                         fill_have.eq(0),
                         fill_wcnt.eq(0),
                         rd_pend.eq(0),
+                        pre_rd.eq(0),
+                        pre_cnt.eq(0),
                         row.eq(0),
                         blk.eq(0),
                         cur_bank.eq(0),
@@ -647,6 +1155,7 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                         s_wait.eq(0),
                         nrm_pend.eq(0),
                         nrm_iss.eq(0),
+                        sg1_widx.eq(0),
                     ]
                     m.next = 'FILL'
 
@@ -660,24 +1169,69 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
 
             with m.State('GATHER'):
                 m.d.comb += in_gather.eq(1)
-                with m.If((cur_live == 0)
-                          | (gather_valid & (gather_index == cur_live - 1))):
-                    # The last live slot folds this cycle (an empty
-                    # block skips straight through); the scale
-                    # sequencer arms on the next.
-                    start_scale()
-                    m.next = 'SCALE'
+                with m.If(cur_live == 0):
+                    with m.If(part_vb1 & (blk == 0)):
+                        # A block-1 partial never touches block 0: its
+                        # staging extents are the loaded previous
+                        # build's bytes, so skip straight past the
+                        # zero-amax scale round to the selected block
+                        # (realigning the byte cursor to block 1's
+                        # fixed 34-byte boundary, as the quant-path
+                        # transition does).
+                        m.d.sync += [
+                            blk.eq(1),
+                            wbyte.eq(34),
+                            cur_bank.eq(~cur_bank),
+                        ]
+                        start_block()
+                    with m.Else():
+                        # The last live slot folds this cycle (an
+                        # empty block skips straight through); the
+                        # scale sequencer arms on the next.
+                        start_scale()
+                        m.next = 'SCALE'
+                with m.Elif(gather_valid & (gather_index == cur_live - 1)):
+                    with m.If(vapp & (blk == 0)):
+                        # The append's second gather half: dims 32..63
+                        # of the same slot continue the SAME amax fold
+                        # (no xmax16/xnan reset, no scale yet) into the
+                        # other bank.
+                        m.d.sync += [
+                            blk.eq(1),
+                            gi.eq(0),
+                            cur_bank.eq(~cur_bank),
+                        ]
+                        m.next = 'GATHER'
+                    with m.Else():
+                        # The last live slot folds this cycle; the scale
+                        # sequencer arms on the next.
+                        start_scale()
+                        m.next = 'SCALE'
 
             with m.State('SCALE'):
                 m.d.comb += in_scale.eq(1)
                 with m.If(scale_done):
                     # The d16 pair is static per block: block 0 in
                     # word 0's low half (bytes 0-1), block 1 in word
-                    # 8's high half (bytes 34-35).
+                    # 8's high half (bytes 34-35). An append runs its
+                    # single scale at blk 1 and writes BOTH slots with
+                    # the one per-token d16.
                     with m.If(blk == 0):
                         m.d.sync += rowwords[0][:16].eq(d16)
                     with m.Else():
                         m.d.sync += rowwords[8][16:32].eq(d16)
+                    with m.If(vapp):
+                        m.d.sync += rowwords[0][:16].eq(d16)
+                        # Widen the token d16 into its F32 row word
+                        # now (the dedicated unit is idle in SCALE);
+                        # the drain patches it beats later.
+                        m.d.comb += [f16wa.inp_valid.eq(1), f16wa.inp.eq(d16)]
+                        # The single scale ran at blk 1 (the gather's
+                        # second half); re-arm the quant walk as the
+                        # blk-0 pass so chunk 0 quantizes dims 0..31
+                        # from bank 0 first, then the QUANT transition
+                        # above walks bank 1's dims 32..63.
+                        m.d.sync += [blk.eq(0), cur_bank.eq(0)]
                     m.d.sync += [
                         wbyte.eq(wbyte + 2),
                         q_iss.eq(0),
@@ -721,31 +1275,122 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                           & prefetch_done):
                     m.d.sync += [q_iss.eq(0), q_land.eq(0)]
                     with m.If(blk == 0):
-                        m.d.sync += [
-                            blk.eq(1),
-                            cur_bank.eq(~cur_bank),
-                            xmax16.eq(pxmax16),
-                            xnan.eq(pxnan),
-                            # Realign the byte cursor: a capped quant
-                            # stream stopped at 2 + cur_live, but the
-                            # next block's bytes start at its fixed
-                            # 34-byte slot boundary.
-                            wbyte.eq(34),
-                        ]
-                        start_scale()
-                        m.next = 'SCALE'
+                        with m.If(vapp):
+                            # The append's second quant half: dims
+                            # 32..63 from the other bank under the
+                            # SAME scale (no second scale pass), their
+                            # bytes at the fixed 36-byte boundary.
+                            m.d.sync += [
+                                blk.eq(1),
+                                cur_bank.eq(~cur_bank),
+                                wbyte.eq(36),
+                                drain_prefetched.eq(0),
+                            ]
+                            m.next = 'QUANT'
+                        with m.Elif(part_vb0):
+                            # A block-0 partial is done with this row
+                            # once block 0 lands: block 1's extents
+                            # stay loaded, so skip its zero-amax round
+                            # entirely (and re-enter GATHER -- no
+                            # prefetch is outstanding).
+                            m.d.sync += drain_prefetched.eq(0)
+                            m.next = 'DRAINLOAD'
+                        with m.Else():
+                            m.d.sync += [
+                                blk.eq(1),
+                                cur_bank.eq(~cur_bank),
+                                xmax16.eq(pxmax16),
+                                xnan.eq(pxnan),
+                                # Realign the byte cursor: a capped
+                                # quant stream stopped at 2 + cur_live,
+                                # but the next block's bytes start at
+                                # its fixed 34-byte slot boundary.
+                                wbyte.eq(34),
+                            ]
+                            start_scale()
+                            m.next = 'SCALE'
                     with m.Else():
-                        m.d.sync += drain_prefetched.eq(row != 63)
+                        # A partial run never prefetches the next row's
+                        # selected block (nxt_live is 0 on the exit
+                        # side), so its rows always re-enter GATHER; an
+                        # append never leaves its one row either.
+                        m.d.sync += drain_prefetched.eq((row != last_row)
+                                                        & (part == 0) & ~vapp)
                         m.next = 'DRAINLOAD'
 
             with m.State('DRAINLOAD'):
-                m.d.sync += [
-                    drain_sr.eq(
-                        Cat(rowbuf, Const(0,
-                                          8 * self.row_pad - 8 * VB_ROW_RAW))),
-                    dbeat.eq(0),
-                ]
-                m.next = 'DRAIN'
+                with m.If(vapp):
+                    # Append-mode drain: the row assembly is the token
+                    # row; APPW pre-reads, patches and writes back the
+                    # 32 payload beats and the four scale-row beats.
+                    m.d.sync += [
+                        self.rows.eq(self.rows + 1),
+                        app_w.eq(0),
+                        app_ph.eq(0),
+                        app_rd.eq(0),
+                    ]
+                    m.next = 'APPW'
+                with m.Elif(~sg1):
+                    m.d.sync += [
+                        drain_sr.eq(
+                            Cat(rowbuf,
+                                Const(0, 8 * self.row_pad - 8 * VB_ROW_RAW))),
+                        dbeat.eq(0),
+                    ]
+                    m.next = 'DRAIN'
+                with m.Elif(pre_rd):
+                    # A partial run's meta pre-read still outstanding:
+                    # hold the scatter one cycle so the loaded beat
+                    # lands first (see the pre-read comment above).
+                    pass
+                with m.Else():
+                    # Row assembly complete: scatter the row's two d16
+                    # cells into the meta beat accumulator, hold the
+                    # even lane's chunks, and (odd lane) emit the
+                    # payload beat pair in SG1W. The legacy shift-out
+                    # above is unused in this mode.
+                    m.d.sync += self.rows.eq(self.rows + 1)
+                    if self.beat_bytes == VB_SG1_BEAT:
+                        # Partial gating: a V block-extent run writes
+                        # only its block's cells; a K row-extent run
+                        # writes only rows < live (dead rows keep the
+                        # pre-read cells instead of today's zeros).
+                        meta_go0 = ~part_vb1 & ~part_k_row_dead
+                        meta_go1 = ~part_vb0 & ~part_k_row_dead
+                        with m.If(meta_go0):
+                            m.d.sync += meta_hw[meta_hw0].eq(rowwords[0][:16])
+                        with m.If(meta_go1):
+                            m.d.sync += meta_hw[meta_hw1].eq(
+                                rowwords[8][16:32])
+                        with m.If(~row[0]):
+                            m.d.sync += [
+                                hold_c0.eq(chunk0),
+                                hold_c1.eq(chunk1),
+                            ]
+                            advance_row()
+                        with m.Else():
+                            m.d.sync += sg1_widx.eq(0)
+                            m.next = 'SG1W'
+
+            with m.State('SG1W'):
+                # SG1 staging writes: payload beat pair (widx 0, 1)
+                # plus the meta beat on sixteenth rows (widx 2).
+                m.d.comb += in_sg1w.eq(1)
+                with m.If(sg1_last):
+                    advance_row()
+
+            with m.State('APPW'):
+                # Append-mode patch drain: each beat was pre-read into
+                # the accumulator with its two patch bytes (or the
+                # widened d16 word) scattered on the response; write
+                # the composed beat back, then advance to the next.
+                m.d.comb += in_appw.eq(1)
+                with m.If(app_ph & self.tmem_w.fire):
+                    m.d.sync += self.beats.eq(self.beats + 1)
+                    with m.If(app_w == 35):
+                        m.next = 'DONE'
+                    with m.Else():
+                        m.d.sync += [app_w.eq(app_w + 1), app_ph.eq(0)]
 
             with m.State('DRAIN'):
                 m.d.comb += in_drain.eq(1)
@@ -757,26 +1402,7 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                     ]
                     with m.If(dbeat + 1 == beats_per_row):
                         m.d.sync += self.rows.eq(self.rows + 1)
-                        with m.If(row == 63):
-                            m.next = 'DONE'
-                        with m.Else():
-                            m.d.sync += [
-                                row.eq(row + 1),
-                                blk.eq(0),
-                                wbyte.eq(0),
-                                cur_bank.eq(~cur_bank),
-                            ]
-                            clear_row()
-                            with m.If(drain_prefetched):
-                                m.d.sync += [
-                                    xmax16.eq(pxmax16),
-                                    xnan.eq(pxnan),
-                                ]
-                                start_scale()
-                                m.next = 'SCALE'
-                            with m.Else():
-                                start_block()
-                                m.next = 'GATHER'
+                        advance_row()
 
             with m.State('DONE'):
                 m.d.comb += [
@@ -796,7 +1422,7 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             m.d.sync += self.scale_cycles.eq(self.scale_cycles + 1)
         with m.If(in_quant):
             m.d.sync += self.quant_cycles.eq(self.quant_cycles + 1)
-        with m.If(in_drain):
+        with m.If(in_drain | in_sg1w | in_appw):
             m.d.sync += self.drain_cycles.eq(self.drain_cycles + 1)
         with m.If(running):
             m.d.sync += self.run_cycles.eq(self.run_cycles + 1)
