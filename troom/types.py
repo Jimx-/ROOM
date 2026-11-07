@@ -91,6 +91,18 @@ class HasTRoomParams:
         # free.
         self.lg_act_segs = log2_int(self.act_segs, need_pow2=True)
 
+        # P2a resource-contract slice (2026-11-03,
+        # plans/2026-11-02-troom-pipelined-batch-decode.md): banked
+        # ACT RAM. Two banks let the activation loader fill the bank
+        # no stream command is reading, removing the
+        # loader/stream mutual exclusion (a commit pulse at each
+        # stream accept latches the read bank and flips the write
+        # bank). One bank reproduces the historical single-RAM
+        # behavior bit for bit, including the ``pin`` backpressure.
+        self.act_banks = params.get('act_banks', 2)
+        if self.act_banks not in (1, 2):
+            raise ValueError(f'act_banks {self.act_banks} must be 1 or 2')
+
         #
         # Matrix unit queues
         #

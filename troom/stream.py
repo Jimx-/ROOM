@@ -1872,6 +1872,12 @@ class StreamGemv(HasTRoomParams, Elaboratable):
             # must not enable the walkers, matching the supply's
             # cycle view of the two-state FSM this replaces.
             self.supply.run.eq(fsm.ongoing('RUN')),
+            # P2a banked ACT RAM: the accept pulse commits the loaded
+            # bank for reading and rotates the write bank. The core's
+            # accept discipline (a stream command is offered only
+            # with the loader quiescent) keeps every commit off an
+            # in-flight fill; single-bank builds ignore the pulse.
+            self.actram.commit.eq(self.start_ok),
             # Registered one-cycle init pulse: high during RUN's
             # first cycle only (CHK sets it, RUN clears it). The
             # supply's start-edge samples read the cur_* registers --

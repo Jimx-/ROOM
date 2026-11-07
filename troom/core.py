@@ -650,13 +650,29 @@ class Core(HasTRoomParams, Elaboratable):
                 pass
 
         # Hold offers until accepted, after the prior stream and result drain.
-        act_offer_ok = ~self.stream.active
+        #
+        # P2a banked ACT (2026-11-03): with two ACT banks the loader
+        # fills the bank no stream command is reading, so the loader
+        # may be offered while a stream command runs and no longer
+        # needs the epilogue drained (it reads TMEM image regions and
+        # writes ACT RAM only -- no path couples it to the epilogue;
+        # the old terms were the phase-C single-RAM exclusions). The
+        # stream accept keeps both its terms: ``epi.ready`` (the
+        # epilogue stays a single tile context) and
+        # ``~actload.active`` (the bank-commit invariant -- an
+        # illegal list stalls rather than tearing a bank).
+        if self.act_banks == 1:
+            act_offer_ok = ~self.stream.active
+            act_epi_ok = epi.ready
+        else:
+            act_offer_ok = Const(1)
+            act_epi_ok = Const(1)
         m.d.comb += [
             dma.sink.valid.eq(fsm.ongoing('EXEC') & ~self.halt & is_dma),
             dma.sink.bits.store.eq(is_store),
             actload.sink.valid.eq(
                 fsm.ongoing('EXEC') & ~self.halt & is_actload
-                & act_offer_ok & epi.ready),
+                & act_offer_ok & act_epi_ok),
             actload.sink.bits.a_base.eq(cur_a_base),
             actload.sink.bits.m_base.eq(cur_m_base),
             actload.sink.bits.k.eq(cur_k),

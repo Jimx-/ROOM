@@ -207,11 +207,29 @@ class ActRAM(HasTRoomParams, Elaboratable):
     never observe a torn generation. The read side is private to the
     matrix unit: a transparent synchronous port addressed by segment
     index, whose one-cycle latency the ACT read-ahead accounts for.
+    P2a banked mode (``act_banks == 2``, 2026-11-03): two banks with
+    a write-bank / read-bank ownership pair. Writes always target
+    ``wr_bank`` and are always accepted; ``commit`` (the stream
+    unit's accept pulse) latches ``rd_bank := wr_bank`` and flips
+    ``wr_bank`` -- but only when a fill landed since the previous
+    commit, preserving the historical persistence contract (a
+    back-to-back SMATMUL pair with no SQUANTIZE between them reads
+    the same activation, the shared-x follower discipline). A loader
+    positioned before a stream command in the in-order issue stream
+    fills the bank that command will read, while a loader positioned
+    after it fills the bank the *next* command will read -- the two
+    never collide. ``pin`` is ignored (each bank's only reader is
+    the committed stream command, which by the single-context accept
+    discipline has finished before the next commit). The commit must
+    arrive with the loader quiescent; Core keeps ``~actload.active``
+    on the stream accept so an illegal list stalls instead of
+    tearing a bank.
     """
 
     def __init__(self, params):
         super().__init__(params)
 
+        self.banks = self.act_banks
         self.wr = Decoupled(Record, [
             ('seg', self.lg_act_segs, Direction.FANOUT),
             ('quants', self.seg_len * 8, Direction.FANOUT),
@@ -219,6 +237,9 @@ class ActRAM(HasTRoomParams, Elaboratable):
             ('sum_a', signed(16), Direction.FANOUT),
         ])
         self.pin = Signal()
+        # P2a: pulse to latch the read bank and rotate the write bank
+        # (banked mode only).
+        self.commit = Signal()
 
         self.rd_seg = Signal(self.lg_act_segs)
         self.rd_quants = Signal(self.seg_len * 8)
@@ -228,32 +249,89 @@ class ActRAM(HasTRoomParams, Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        quants = Memory(width=self.seg_len * 8,
-                        depth=self.act_segs,
-                        name='act_quants')
-        meta = Memory(width=48, depth=self.act_segs, name='act_meta')
+        quants = [
+            Memory(width=self.seg_len * 8,
+                   depth=self.act_segs,
+                   name='act_quants' if self.banks == 1 else f'act_quants{b}')
+            for b in range(self.banks)
+        ]
+        meta = [
+            Memory(width=48,
+                   depth=self.act_segs,
+                   name='act_meta' if self.banks == 1 else f'act_meta{b}')
+            for b in range(self.banks)
+        ]
 
-        qw = m.submodules.act_qw = quants.write_port()
-        mw = m.submodules.act_mw = meta.write_port()
-        qr = m.submodules.act_qr = quants.read_port(domain='sync',
-                                                    transparent=True)
-        mr = m.submodules.act_mr = meta.read_port(domain='sync',
-                                                  transparent=True)
+        for b in range(self.banks):
+            m.submodules[f'act_qw{b}'] = quants[b].write_port()
+            m.submodules[f'act_mw{b}'] = meta[b].write_port()
+            m.submodules[f'act_qr{b}'] = quants[b].read_port(domain='sync',
+                                                             transparent=True)
+            m.submodules[f'act_mr{b}'] = meta[b].read_port(domain='sync',
+                                                           transparent=True)
+        qw = [getattr(m.submodules, f'act_qw{b}') for b in range(self.banks)]
+        mw = [getattr(m.submodules, f'act_mw{b}') for b in range(self.banks)]
+        qr = [getattr(m.submodules, f'act_qr{b}') for b in range(self.banks)]
+        mr = [getattr(m.submodules, f'act_mr{b}') for b in range(self.banks)]
+
+        if self.banks == 1:
+            wr_bank = Const(0)
+            rd_bank = Const(0)
+            wr_ready = ~self.pin
+        else:
+            wr_bank = Signal()
+            rd_bank = Signal()
+            # Persistence: the historical single RAM served every
+            # stream command from the latest written content -- a
+            # back-to-back SMATMUL pair with no SQUANTIZE between
+            # them (the backend's shared-x follower nodes) reads the
+            # same activation twice. The commit therefore rotates
+            # banks only when a fill landed since the last commit;
+            # an unloaded commit is a no-op and the next SQUANTIZE
+            # still targets the bank no reader owns.
+            loaded = Signal()
+            with m.If(self.wr.fire):
+                m.d.sync += loaded.eq(1)
+            with m.If(self.commit & loaded):
+                m.d.sync += [
+                    rd_bank.eq(wr_bank),
+                    wr_bank.eq(~wr_bank),
+                    loaded.eq(0),
+                ]
+            wr_ready = Const(1)
+
+        rd_q = [
+            Signal.like(qr[b].data, name=f'act_rd_q{b}')
+            for b in range(self.banks)
+        ]
+        rd_m = [Signal(48, name=f'act_rd_m{b}') for b in range(self.banks)]
+
+        for b in range(self.banks):
+            m.d.comb += [
+                qw[b].addr.eq(self.wr.bits.seg),
+                qw[b].data.eq(self.wr.bits.quants),
+                qw[b].en.eq(self.wr.fire & (wr_bank == b)),
+                mw[b].addr.eq(self.wr.bits.seg),
+                mw[b].data.eq(
+                    Cat(self.wr.bits.s_act, self.wr.bits.sum_a.as_unsigned())),
+                mw[b].en.eq(self.wr.fire & (wr_bank == b)),
+                qr[b].addr.eq(self.rd_seg),
+                mr[b].addr.eq(self.rd_seg),
+                rd_q[b].eq(qr[b].data),
+                rd_m[b].eq(mr[b].data),
+            ]
+
+        rd_quants = rd_q[0]
+        rd_meta = rd_m[0]
+        for b in range(1, self.banks):
+            rd_quants = Mux(rd_bank == b, rd_q[b], rd_quants)
+            rd_meta = Mux(rd_bank == b, rd_m[b], rd_meta)
 
         m.d.comb += [
-            self.wr.ready.eq(~self.pin),
-            qw.addr.eq(self.wr.bits.seg),
-            qw.data.eq(self.wr.bits.quants),
-            qw.en.eq(self.wr.fire),
-            mw.addr.eq(self.wr.bits.seg),
-            mw.data.eq(
-                Cat(self.wr.bits.s_act, self.wr.bits.sum_a.as_unsigned())),
-            mw.en.eq(self.wr.fire),
-            qr.addr.eq(self.rd_seg),
-            mr.addr.eq(self.rd_seg),
-            self.rd_quants.eq(qr.data),
-            self.rd_s_act.eq(mr.data[:32]),
-            self.rd_sum_a.eq(mr.data[32:]),
+            self.wr.ready.eq(wr_ready),
+            self.rd_quants.eq(rd_quants),
+            self.rd_s_act.eq(rd_meta[:32]),
+            self.rd_sum_a.eq(rd_meta[32:]),
         ]
 
         return m

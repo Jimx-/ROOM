@@ -180,6 +180,14 @@ CAPS_VEC_PSWAP = 10
 # bit-identical by the E2-c interleaving argument. Images without the
 # bit keep the six-command chain.
 CAPS_VEC_SILU = 12
+# P2a resource-contract slice (2026-11-03,
+# plans/2026-11-02-troom-pipelined-batch-decode.md): banked ACT RAM.
+# The activation loader may fill the idle bank while a stream command
+# reads the committed one, and its accept no longer waits for the
+# epilogue's drain -- a staged SQUANTIZE runs under a running
+# SMATMUL. Pure relaxation: lists that never overlap the two observe
+# no change, and backends without the bit keep the standing emission.
+CAPS_ACT_BANK = 13
 # P2b-ii base RTL slice (2026-11-04,
 # plans/2026-11-02-troom-pipelined-batch-decode.md): VECTOR VEC_SMEXP
 # -- the FA softmax body fused into one bit-identical op (the RDC_MAX
