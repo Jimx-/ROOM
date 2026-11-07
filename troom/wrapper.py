@@ -133,6 +133,7 @@ class TroomWrapper(HasTRoomParams, Elaboratable):
         m.d.comb += [
             fetcher.cmd_base.eq(ctrl.active_cmd_base),
             fetcher.cmd_count.eq(ctrl.active_cmd_count),
+            fetcher.param_base.eq(ctrl.active_param_base),
             writer.comp_base.eq(ctrl.active_comp_base),
             writer.comp_count.eq(ctrl.active_cmd_count),
         ]

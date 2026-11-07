@@ -17,6 +17,7 @@ from troom.abi import (
     CAPS_ENGINE_COUNTERS,
     CAPS_MM_EPI_COUNTERS,
     CAPS_FMT0,
+    CAPS_PARAM_PAGE,
     CAPS_SGEMV,
     CAPS_VBUILD,
     CAPS_VEC_SILU,
@@ -32,6 +33,7 @@ from troom.abi import (
     CONTROL_CLEAR,
     CONTROL_START,
     ERROR_INDEX_NONE,
+    PARAM_PAGE_BYTES,
     REG_ABI_VERSION,
     REG_ACCEPTED_ID,
     REG_BEAT_BYTES,
@@ -56,6 +58,7 @@ from troom.abi import (
     REG_MAX_CYCLES,
     REG_MEM_BASE,
     REG_MEM_SIZE,
+    REG_PARAM_BASE,
     REG_STATUS,
     REG_SUBMIT_ID,
     REG_TMEM_BYTES,
@@ -137,6 +140,7 @@ def program_config(axil, **overrides):
         capacity=8,
         fmt=0,
         max_cycles=0,
+        param_base=0,
     )
     config.update(overrides)
     yield from cwrite(axil, REG_SUBMIT_ID, config['submit_id'])
@@ -149,6 +153,8 @@ def program_config(axil, **overrides):
     yield from cwrite(axil, REG_COMP_BASE_HI, config.get('comp_base_hi', 0))
     yield from cwrite(axil, REG_MAX_CYCLES, config['max_cycles'] & 0xffffffff)
     yield from cwrite(axil, REG_MAX_CYCLES + 4, config['max_cycles'] >> 32)
+    if 'param_base' in config:
+        yield from cwrite(axil, REG_PARAM_BASE, config['param_base'])
     return config
 
 
@@ -205,6 +211,7 @@ def test_identity_caps_and_parameters():
                 | (1 << CAPS_VBUILD_K)
                 | (1 << CAPS_VEC_F16)
                 | (1 << CAPS_VEC_PSWAP)
+                | (1 << CAPS_PARAM_PAGE)
                 | (1 << CAPS_VEC_SILU)
                 | (1 << CAPS_VEC_SMEXP)
                 | (1 << CAPS_VBUILD_PART)
@@ -269,7 +276,7 @@ def test_start_accepts_and_captures_configuration_atomically():
 
     def proc():
         yield dut.quiescent_i.eq(1)
-        config = yield from program_config(axil)
+        config = yield from program_config(axil, param_base=MEM_BASE + 0x800)
         yield from start(axil)
 
         status = yield from cread(axil, REG_STATUS)
@@ -281,6 +288,9 @@ def test_start_accepts_and_captures_configuration_atomically():
         assert (yield dut.active_cmd_count) == 4
         assert (yield dut.active_comp_base) == config['comp_base']
         assert (yield dut.active_max_cycles) == 0
+        # E3-d-e: the parameter-page base rides the atomic capture.
+        assert (yield dut.active_param_base) == MEM_BASE + 0x800
+        assert (yield from cread(axil, REG_PARAM_BASE)) == MEM_BASE + 0x800
 
         # Later staging writes do not disturb the captured launch.
         yield from cwrite(axil, REG_SUBMIT_ID, 0x99)
@@ -357,6 +367,12 @@ def test_start_rejected_while_busy_or_not_quiescent():
         (dict(capacity=3), WrapperError.BAD_CAPACITY),
         (dict(comp_base=MEM_BASE + 2 * CMD_DESC_BYTES - 8),
          WrapperError.BUF_OVERLAP),
+        # E3-d-e parameter page: nonzero bases must be beat-aligned
+        # and fit wholly inside the memory window.
+        (dict(param_base=MEM_BASE + 4), WrapperError.BAD_ALIGN),
+        (dict(param_base=MEM_BASE + MEM_SIZE - PARAM_PAGE_BYTES + 64),
+         WrapperError.BAD_RANGE),
+        (dict(param_base=0x8), WrapperError.BAD_RANGE),  # below window
     ])
 def test_configuration_faults_reject_the_launch(overrides, code):
     top = CtrlTop(PARAMS, mem_base=MEM_BASE, mem_size=MEM_SIZE)

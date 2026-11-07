@@ -17,6 +17,7 @@ import pytest
 from troom.abi import (
     CAPS_ENGINE_COUNTERS,
     CAPS_MM_EPI_COUNTERS,
+    CAPS_PARAM_PAGE,
     CONTROL_START,
     ERROR_INDEX_NONE,
     REG_ARRAY_STARVE,
@@ -46,6 +47,7 @@ from troom.abi import (
     REG_MM_CREDIT_STALLS,
     REG_MM_DRAIN_CYCLES,
     REG_MM_RUN_CYCLES,
+    REG_PARAM_BASE,
     REG_RUN_CYCLES,
     REG_STATUS,
     REG_SUBMIT_ID,
@@ -58,6 +60,7 @@ from troom.abi import (
     WrapperError,
     command_field_shapes,
     pack_buffer,
+    pack_indirect,
     pack_completion,
 )
 from troom.consts import Opcode, Status, VecOp
@@ -331,7 +334,8 @@ def program_launch(top,
                    count,
                    comp_base,
                    capacity,
-                   max_cycles=0):
+                   max_cycles=0,
+                   param_base=0):
     # Buffer bases are image offsets; the wrapper is programmed with
     # absolute device addresses.
     yield from mmio_write(top, REG_SUBMIT_ID, submit_id)
@@ -344,6 +348,8 @@ def program_launch(top,
     yield from mmio_write(top, REG_COMP_CAPACITY, capacity)
     yield from mmio_write(top, REG_MAX_CYCLES, max_cycles & 0xffffffff)
     yield from mmio_write(top, REG_MAX_CYCLES + 4, max_cycles >> 32)
+    yield from mmio_write(top, REG_PARAM_BASE,
+                          0 if param_base == 0 else top.mem_base + param_base)
 
 
 def wait_terminal(top, polls=8000):
@@ -375,7 +381,8 @@ def launch(top,
            comp_base,
            capacity,
            comp_count=None,
-           max_cycles=0):
+           max_cycles=0,
+           param_base=0):
     """Run one launch through the public interfaces and check its
     completions landed in memory."""
     yield from program_launch(top,
@@ -384,7 +391,8 @@ def launch(top,
                               count=count,
                               comp_base=comp_base,
                               capacity=capacity,
-                              max_cycles=max_cycles)
+                              max_cycles=max_cycles,
+                              param_base=param_base)
     yield from mmio_write(top, REG_CONTROL, 1 << CONTROL_START)
     status = yield from wait_terminal(top)
     finished = (yield from mmio_read(top, REG_FINISHED_ID))
@@ -931,6 +939,59 @@ def test_rdma_map_launch_and_mmio_region_rejected():
                                    capacity=16)
         assert result['status'] & (1 << STATUS_DONE)
         assert result['completed'] == 15
+        check_tensor_outputs(image, vec_n)
+        assert not (yield top.ram.protocol_error)
+
+    run_wrap(top, main, collect_writes(top, image))
+
+
+# ---------------------------------------------------------------------
+# E3-d-e parameter-page indirection (wrapper e2e)
+# ---------------------------------------------------------------------
+
+
+def test_param_page_launch_resolves_markers_e2e():
+    """A page-configured launch runs a marked good_program: the LOAD's
+    dram_addr and rows ride page slots, and the workload's outputs are
+    exactly the unmarked program's."""
+    vec_n = 32
+    page_base = 0x3000
+    prog = good_program(vec_n)
+    # Mark the LOAD_2D (program[0]): dram_addr -> slot 0, rows -> slot 1.
+    marked = [dict(cmd) for cmd in prog]
+    load_true = prog[0]
+    marked[0] = dict(load_true)
+    words = pack_buffer([load_true], SHAPES)
+    raw = bytearray(words)
+    raw[4 * 11:4 * 11 + 4] = pack_indirect(0).to_bytes(4, 'little')
+    raw[4 * 14:4 * 14 + 4] = pack_indirect(1).to_bytes(4, 'little')
+
+    image = make_image([(CMD_BASE, marked)])
+    # Patch the marked LOAD descriptor into the image and stage the
+    # page: slot 0 = the true dram address, slot 1 = the true rows.
+    image[CMD_BASE:CMD_BASE + len(raw)] = raw
+    image[page_base + 0:page_base + 4] = \
+        load_true['dram_addr'].to_bytes(4, 'little')
+    image[page_base + 4:page_base + 8] = \
+        load_true['rows'].to_bytes(4, 'little')
+    top = WrapperTop(WRAP_PARAMS, bytes(image))
+
+    def main():
+        assert (yield from mmio_read(top, REG_CAPS)) & (1 << CAPS_PARAM_PAGE)
+        result = yield from launch(top,
+                                   image,
+                                   submit_id=0x31,
+                                   cmd_base=CMD_BASE,
+                                   count=len(prog),
+                                   comp_base=COMP_BASE,
+                                   capacity=16,
+                                   param_base=page_base)
+        assert result['status'] & (1 << STATUS_DONE)
+        assert not result['status'] & (1 << STATUS_ERROR)
+        assert result['code'] == WrapperError.NONE
+        assert result['completed'] == len(prog)
+        assert result['records'] == [(1 + i, int(Status.OK))
+                                     for i in range(len(prog))]
         check_tensor_outputs(image, vec_n)
         assert not (yield top.ram.protocol_error)
 

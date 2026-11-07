@@ -57,6 +57,7 @@ from troom.abi import (
     CAPS_ENGINE_COUNTERS,
     CAPS_FMT0,
     CAPS_MM_EPI_COUNTERS,
+    CAPS_PARAM_PAGE,
     CAPS_SGEMV,
     CAPS_VBUILD,
     CAPS_VBUILD_SG1,
@@ -74,6 +75,7 @@ from troom.abi import (
     CONTROL_CLEAR,
     CONTROL_START,
     ERROR_INDEX_NONE,
+    PARAM_PAGE_BYTES,
     REG_ABI_VERSION,
     REG_ACCEPTED_ID,
     REG_ARRAY_STARVE,
@@ -110,6 +112,7 @@ from troom.abi import (
     REG_EPI_MUL_OPS,
     REG_EPI_RECORDS,
     REG_EPI_STALLS,
+    REG_PARAM_BASE,
     REG_RUN_CYCLES,
     REG_STATUS,
     REG_SUBMIT_ID,
@@ -175,6 +178,8 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
         self.active_cmd_count = Signal(32)
         self.active_comp_base = Signal(self.addr_width)
         self.active_max_cycles = Signal(64)
+        # E3-d-e: captured parameter-page base (0 = indirection off).
+        self.active_param_base = Signal(self.addr_width)
 
         # Run progress from the wrapper.
         self.busy_i = Signal()
@@ -284,6 +289,16 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                                     'rw',
                                     addr=REG_MAX_CYCLES,
                                     name='max_cycles')
+
+        # E3-d-e: parameter-page base. Zero disables indirection; a
+        # nonzero page must be beat-aligned and inside the memory
+        # window (checked at START alongside the other buffer checks).
+        # No command/completion overlap check: the page is read once at
+        # launch start, before any engine traffic can write it.
+        self._param_base = bank.csr(32,
+                                    'rw',
+                                    addr=REG_PARAM_BASE,
+                                    name='param_base')
 
         self._mem_base = bank.csr(64, 'r', addr=REG_MEM_BASE, name='mem_base')
         self._mem_size = bank.csr(64, 'r', addr=REG_MEM_SIZE, name='mem_size')
@@ -396,6 +411,7 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                 | (1 << CAPS_VBUILD_K)
                 | (1 << CAPS_VEC_F16)
                 | (1 << CAPS_VEC_PSWAP)
+                | (1 << CAPS_PARAM_PAGE)
                 | (1 << CAPS_VEC_SILU)
                 | (1 << CAPS_VEC_SMEXP)
                 | (1 << CAPS_VBUILD_PART)
@@ -429,6 +445,7 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
             self._comp_base_hi,
             self._comp_capacity,
             self._max_cycles,
+            self._param_base,
         ]
         for elem in staging:
             with m.If(elem.w_stb):
@@ -496,6 +513,20 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
 
         mem_end = self.mem_base + self.mem_size
 
+        # E3-d-e parameter page: staged base, one fixed-size page. A
+        # nonzero base must be beat-aligned (the prefetch reads whole
+        # beats) and the whole page must sit inside the memory window.
+        # No overlap check against the command/completion buffers: the
+        # page is read once at launch start, before the completion
+        # writer or any engine can touch DRAM.
+        param_base = self._param_base.r_data
+        param_end = Signal(self.addr_width + 1)
+        m.d.comb += param_end.eq(param_base + PARAM_PAGE_BYTES)
+        param_on = param_base != 0
+        param_misaligned = param_on & param_base[:lg_cmd].any()
+        param_oor = param_on & ((param_base < self.mem_base)
+                                | (param_end > mem_end))
+
         checks = [
             (self._cmd_format.r_data != CMD_FORMAT_0, WrapperError.BAD_FORMAT),
             (count == 0, WrapperError.BAD_COUNT),
@@ -503,9 +534,10 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
              | (self._comp_base_hi.r_data != 0), WrapperError.ADDR_OVERFLOW),
             (cmd_base[:lg_cmd].any() | comp_base[:lg_comp].any(),
              WrapperError.BAD_ALIGN),
+            (param_misaligned, WrapperError.BAD_ALIGN),
             ((cmd_base < self.mem_base) | (cmd_end > mem_end)
-             | (comp_base < self.mem_base) | (comp_end > mem_end),
-             WrapperError.BAD_RANGE),
+             | (comp_base < self.mem_base) | (comp_end > mem_end)
+             | param_oor, WrapperError.BAD_RANGE),
             (capacity < count, WrapperError.BAD_CAPACITY),
             (~((cmd_end <= comp_base) | (comp_end <= cmd_base)),
              WrapperError.BUF_OVERLAP),
@@ -595,6 +627,7 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                         self.active_cmd_count.eq(count),
                         self.active_comp_base.eq(self._comp_base_lo.r_data),
                         self.active_max_cycles.eq(self._max_cycles.r_data),
+                        self.active_param_base.eq(param_base),
                         wd_count.eq(0),
                         self.start.eq(1),
                     ]
@@ -668,7 +701,7 @@ class TroomAXILiteBridge(Elaboratable):
 
     def __init__(self, axil, ctrl, *, base_addr=0):
         if (base_addr < 0 or base_addr % 4
-                or base_addr + REG_EPI_ADD_OPS + 8 > 2**32):
+                or base_addr + REG_PARAM_BASE + 4 > 2**32):
             raise ValueError('MMIO window must be aligned and fit in 32 bits')
         self.axil = axil
         self.ctrl = ctrl
@@ -711,10 +744,10 @@ class TroomAXILiteBridge(Elaboratable):
         writable = (REG_CONTROL, REG_SUBMIT_ID, REG_CMD_BASE_LO,
                     REG_CMD_BASE_HI, REG_CMD_COUNT, REG_CMD_FORMAT,
                     REG_COMP_BASE_LO, REG_COMP_BASE_HI, REG_COMP_CAPACITY,
-                    REG_MAX_CYCLES, REG_MAX_CYCLES + 4)
+                    REG_MAX_CYCLES, REG_MAX_CYCLES + 4, REG_PARAM_BASE)
         readable = tuple(
             o for o in range(REG_MAX_CYCLES + 8)
-            if o % 4 == 0 and o != REG_CONTROL) + tuple(
+            if o % 4 == 0 and o != REG_CONTROL) + (REG_PARAM_BASE, ) + tuple(
                 range(REG_MEM_BASE, REG_CYCLES + 8, 4)) + tuple(
                     range(REG_CMDS_DONE, REG_ARRAY_STARVE + 8, 4)) + tuple(
                         range(REG_MM_CREDIT_STALLS, REG_EPI_ADD_OPS + 8, 4))

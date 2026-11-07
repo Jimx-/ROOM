@@ -119,6 +119,18 @@ REG_EPI_STALLS = 0x108  # r64  snapshot: epilogue sink stalls
 REG_EPI_CAST_OPS = 0x110  # r64  snapshot: epilogue conversion issues
 REG_EPI_MUL_OPS = 0x118  # r64  snapshot: epilogue multiply issues
 REG_EPI_ADD_OPS = 0x120  # r64  snapshot: epilogue add issues
+# E3-d-e parameter page (CAPS_PARAM_PAGE): device address of the page
+# a launch prefetches and substitutes indirect marker words from. Zero
+# disables indirection for the launch (markers then fault DECODE_ERROR
+# through the field-width check). Staged and captured like CMD_BASE_LO.
+REG_PARAM_BASE = 0x128  # rw   parameter-page device address
+
+# Parameter-page geometry: 1024 32-bit slots fetched as whole beats
+# (the page memory stores one bus beat per row). The marker word
+# carries the slot index in its low PARAM_SLOT_BITS bits.
+PARAM_PAGE_SLOTS = 1024
+PARAM_PAGE_BYTES = 4 * PARAM_PAGE_SLOTS
+PARAM_SLOT_BITS = 10
 
 # ---------------------------------------------------------------------
 # STATUS register bits
@@ -170,6 +182,13 @@ CAPS_VEC_F16 = 9  # VECTOR VEC_F16 narrow op (native SET_ROWS append)
 # The op is pure data movement (exact bit patterns); images without
 # the bit keep the CPU rope kernel.
 CAPS_VEC_PSWAP = 10
+# E3-d-e: a nonzero REG_PARAM_BASE prefetches a page before commands.
+# Selected descriptor words may carry PARAM_WORD_MARK | slot. The tag
+# lies below deployed DRAM; ordinary addresses at 0x80000000 stay direct.
+# Substitution precedes field-width validation and engine submission.
+# Without a page, tagged k/rows fail width validation, while tagged
+# dram_addr is a full-width value rejected by the engine's range check.
+CAPS_PARAM_PAGE = 11
 # Merged S1/S2 candidate (2026-10-30,
 # plans/2026-10-30-troom-fpu-silu-sizing.md): VECTOR VEC_SILU -- the
 # backend's SwiGLU sigmoid chain fused into one bit-identical unary op
@@ -284,6 +303,24 @@ CMD_FIELDS = (
 
 CMD_DESC_WORDS = len(CMD_FIELDS)
 CMD_DESC_BYTES = 4 * CMD_DESC_WORDS
+
+# Only k (5), dram_addr (11), and rows (14) may select a page slot.
+# The upper tag bits must match exactly; low PARAM_SLOT_BITS select it.
+PARAM_WORD_MARK = 0x7ffffc00  # below deployed DRAM; never aliases 0x80000000 + slot
+CMD_INDIRECT_WORDS = (5, 11, 14)
+
+
+def pack_indirect(slot):
+    """Marker word selecting parameter-page ``slot`` for substitution."""
+    if not 0 <= slot < PARAM_PAGE_SLOTS:
+        raise ValueError(f'parameter slot {slot} out of range')
+    return PARAM_WORD_MARK | slot
+
+
+def is_indirect_word(word_index):
+    """True when descriptor word ``word_index`` may carry the marker."""
+    return word_index in CMD_INDIRECT_WORDS
+
 
 # Completion records: two little-endian words, {seq, status}.
 COMP_RECORD_WORDS = 2
