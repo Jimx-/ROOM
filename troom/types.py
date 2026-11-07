@@ -101,6 +101,30 @@ class HasTRoomParams:
         self.mm_act_fifo = params.get('mm_act_fifo', 4)
         self.mm_out_depth = params.get('mm_out_depth', 16)
         self.mm_result_q = params.get('mm_result_q', 4)
+        # S4 short-row slice (2026-11-02): epilogue row-context depth.
+        # The historical epilogue admitted a row only while
+        # occupied-snapshots + pending-captures < 2, and folded on a
+        # single-context sequencer, so every row exposed the ~10-cycle
+        # capture/fold round-trip; at attention's nsegs == 2 a row
+        # turns over every two records and the record intake throttled
+        # to ~4.9 cycles/record (the FA epi_stalls/mm_credit class).
+        # epi_snap_bufs names the per-lane circular snapshot/row
+        # context queue depth (a power of two >= 2). The deployed
+        # default 16 admits fifteen rows in flight: at attention's
+        # nsegs == 2 a row turns over every two records, and a row
+        # holds a reservation from its last record's fire until its
+        # final fold lands -- the ~11-cycle capture latency of the FP
+        # pipeline plus the F1/F2/FF dependency chain -- about twenty
+        # cycles, so the queue must cover that latency at the
+        # two-cycle row period (10) with margin. No ABI or numerics
+        # change: rows still fold R(R(p0+p2)+R(p1+p3)) from per-row
+        # snapshots in row order.
+        self.epi_snap_bufs = params.get('epi_snap_bufs', 16)
+        if self.epi_snap_bufs < 2:
+            raise ValueError(
+                f'epi_snap_bufs {self.epi_snap_bufs} must be >= 2')
+        # Raises for a non-power-of-two, exactly like the bank counts.
+        log2_int(self.epi_snap_bufs, need_pow2=True)
 
         if not self.mm_formats:
             raise ValueError('mm_formats must name at least one format')

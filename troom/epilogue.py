@@ -37,13 +37,21 @@ record spacing), so the row-end capture (at the final landing) always
 reads the finished partials before the next row's first-touch landing
 writes any bank, and the next row's segment-4 accumulate reads a bank
 written by its own segment 0 exactly one cycle earlier.  Rows therefore
-turn over with zero gap and admission gates only on fold capacity: a
-row-start record (``seg_k == 0``) is accepted while occupied snapshots
-plus pending captures (``pend``, counted from the last record's fire
-through its capture) leave a buffer -- at most two rows per lane can be
-between their last record and their fold, and a capture always finds a
-free buffer.  Short rows (one segment) throttle naturally to fold rate
-instead of needing separate machinery.
+turn over with zero gap and admission gates only on row-context
+capacity: a row-start record (``seg_k == 0``) is accepted while occupied
+snapshot slots plus pending captures (``pend``, counted from the last
+record's fire through its capture) leave a slot of the lane's
+``epi_snap_bufs``-deep row queue -- every capture finds a free slot.
+Short rows (one segment) throttle naturally to fold rate instead of
+needing separate machinery.  (S4 short-row slice, 2026-11-02: the
+historical two-buffer cap admitted at most one row past its
+predecessor's capture, exposing the whole ~10-cycle capture/fold
+round-trip on every row; at attention's ``nsegs == 2`` a row turns over
+every two records and record intake throttled to ~4.9 cycles/record --
+the FA epi_stalls/mm_credit class measured on the board.  The
+row-context queue plus the pipelined fold scheduler hide that
+round-trip behind the record stream; the per-row arithmetic and its
+order are unchanged.)
 """
 
 from amaranth import *
@@ -189,27 +197,62 @@ class Epilogue(HasTRoomParams, Elaboratable):
         # Accumulator banks, fold snapshots and fold state per lane.
         bank = [[Signal(32, name=f'bank{l}{i}') for i in range(4)]
                 for l in range(n)]
+        # S4 short-row slice (2026-11-02): the fold side is a per-lane
+        # circular ROW-CONTEXT queue of epi_snap_bufs slots. The
+        # snapshot head is the next row to fold; captures append at
+        # the tail; admission keeps (snapshots + pending captures)
+        # below the queue depth so a capture always finds a free
+        # slot. The single-context fold FSM (two snapshot buffers,
+        # one row between its F1 and its final fold) exposed the whole
+        # capture/fold round-trip on every row: at attention's
+        # nsegs == 2 a row turns over every two records and record
+        # intake throttled to ~4.9 cycles/record. Here F1/F2/FF of
+        # consecutive rows pipeline on the lane's one fold adder
+        # (3 issue slots per row, results in row order).
+        E = self.epi_snap_bufs
+        lg_e = log2_int(E)
         snap = [[[Signal(32, name=f'snap{b}{l}{i}') for i in range(4)]
-                 for l in range(n)] for b in range(2)]
-        snap_avail = [[Signal(name=f'snap_avail{b}{l}') for l in range(n)]
-                      for b in range(2)]
+                 for l in range(n)] for b in range(E)]
         snap_row = [[
             Signal(self.rows_bits, name=f'snap_row{b}{l}') for l in range(n)
-        ] for b in range(2)]
-        snap_rd = [Signal(name=f'snap_rd{l}') for l in range(n)]
+        ] for b in range(E)]
+        snap_hd = [Signal(lg_e, name=f'snap_hd{l}') for l in range(n)]
+        snap_cnt = [
+            Signal(range(E + 1), name=f'snap_cnt{l}') for l in range(n)
+        ]
         # Rows whose last record has fired but whose capture has not
-        # landed yet (0..2); a capture always finds a free buffer.
-        pend = [Signal(2, name=f'pend{l}') for l in range(n)]
-        f1v = [Signal(name=f'f1v{l}') for l in range(n)]
-        f1val = [Signal(32, name=f'f1val{l}') for l in range(n)]
-        f2v = [Signal(name=f'f2v{l}') for l in range(n)]
-        f2val = [Signal(32, name=f'f2val{l}') for l in range(n)]
-        frow = [Signal(self.rows_bits, name=f'frow{l}') for l in range(n)]
-        # Fold FSM: 0 IDLE, 1 F2, 2 WAIT, 3 FIN.
-        fold_st = [Signal(2, name=f'fold_st{l}') for l in range(n)]
-        # Landing-kind tags delayed alongside the fold adder.
+        # landed yet (bounded by the admission cap); a capture always
+        # finds a free buffer.
+        pend = [Signal(range(E + 1), name=f'pend{l}') for l in range(n)]
+        # Fold contexts, one per in-flight fold, in row order:
+        # fphase 1 = F1 issued (F2 due), 2 = F2 issued (halves
+        # landing), 3 = both halves landed (final fold due),
+        # 4 = final fold issued (landing retires the context). The
+        # context queue is circular with the same depth as the
+        # snapshot queue; the head context is the final-fold
+        # candidate, so results enqueue in row order.
+        ctx_hd = [Signal(lg_e, name=f'ctx_hd{l}') for l in range(n)]
+        ctx_cnt = [Signal(range(E + 1), name=f'ctx_cnt{l}') for l in range(n)]
+        fphase = [[Signal(3, name=f'fph{k}{l}') for k in range(E)]
+                  for l in range(n)]
+        fh1v = [[Signal(name=f'fh1v{k}{l}') for k in range(E)]
+                for l in range(n)]
+        fh1val = [[Signal(32, name=f'fh1val{k}{l}') for k in range(E)]
+                  for l in range(n)]
+        fh2v = [[Signal(name=f'fh2v{k}{l}') for k in range(E)]
+                for l in range(n)]
+        fh2val = [[Signal(32, name=f'fh2val{k}{l}') for k in range(E)]
+                  for l in range(n)]
+        frow = [[Signal(self.rows_bits, name=f'frow{k}{l}') for k in range(E)]
+                for l in range(n)]
+        # Result-queue reservations: the final fold checks room at
+        # issue but enqueues at its landing three cycles later, so an
+        # in-flight count keeps the reservation exact.
+        enq_pend = [Signal(2, name=f'enq_pend{l}') for l in range(n)]
+        # Landing tags delayed alongside the fold adder: which kind of
+        # issue lands, and on which context slot.
         FC_NONE, FC_F1, FC_F2, FC_FF = 0, 1, 2, 3
-        ftag = [[Signal(2, name=f'ftag{l}{k}') for k in range(3)]
+        ftag = [[Signal(2 + lg_e, name=f'ftag{l}{k}') for k in range(3)]
                 for l in range(n)]
 
         # Context shift chain: pushed at cast issue, tapped by offset.
@@ -245,21 +288,20 @@ class Epilogue(HasTRoomParams, Elaboratable):
             cval.append(prod)
 
         #
-        # Row admission: snapshot capacity only.  ``tot`` counts
-        # occupied snapshots plus rows pending capture; a row-start
-        # record needs ``tot <= 1`` so the invariant ``tot <= 2`` holds
-        # and every capture finds a free buffer (its own pending entry
-        # guarantees ``occ <= 1`` at the landing).
+        # Row admission: row-context capacity only. ``occ`` counts
+        # occupied snapshot slots plus rows pending capture; a
+        # row-start record needs ``occ < epi_snap_bufs`` so the
+        # invariant ``occ <= epi_snap_bufs`` holds and every capture
+        # finds a free slot (its own pending entry guarantees the
+        # queue is not full at the landing).
         #
         new_row_ready = Signal()
-        occ_any = [Signal(3, name=f'occ{l}') for l in range(n)]
+        occ_any = [Signal(range(E + 2), name=f'occ{l}') for l in range(n)]
         for l in range(n):
-            m.d.comb += occ_any[l].eq(
-                (snap_avail[0][l].as_unsigned() +
-                 snap_avail[1][l].as_unsigned() + pend[l].as_unsigned()))
+            m.d.comb += occ_any[l].eq(snap_cnt[l] + pend[l])
         row_block = Signal(n)
         for l in range(n):
-            m.d.comb += row_block[l].eq(occ_any[l] >= 2)
+            m.d.comb += row_block[l].eq(occ_any[l] >= E)
         m.d.comb += new_row_ready.eq(
             (self.sink.bits.seg_k != 0)
             | ~(row_block & self.sink.bits.row_mask).any())
@@ -402,16 +444,22 @@ class Epilogue(HasTRoomParams, Elaboratable):
 
         # Per-lane capture facts (used by the fold retire logic).
         cap_now = [Signal(name=f'capnow{l}') for l in range(n)]
-        cap_buf = [Signal(name=f'capbuf{l}') for l in range(n)]
+        cap_buf = [Signal(lg_e, name=f'capbuf{l}') for l in range(n)]
         land_now = [Signal(name=f'landnow{l}') for l in range(n)]
         land_q4k = [Signal(name=f'landq{l}') for l in range(n)]
         for l in range(n):
             m.d.comb += [
                 land_now[l].eq(add_acc[l].out.valid),
-                land_q4k[l].eq(sh14[l].q4k),
-                cap_buf[l].eq(Mux(snap_avail[0][l], 1, 0)),
+                # Invalid shadows retain the preceding launch's format.
+                land_q4k[l].eq(sh14[l].v & sh14[l].q4k),
+                # Captures append at the snapshot queue's tail; the
+                # admission cap keeps the tail slot free.
+                cap_buf[l].eq((snap_hd[l] + snap_cnt[l])[:lg_e]),
             ]
 
+        # The fold reads the snapshot queue's head (the oldest row
+        # whose capture has landed); the head advances when the F2
+        # issue has consumed the slot's second half.
         rd_avail = [Signal(name=f'snap_rda{l}') for l in range(n)]
         rd_row = [
             Signal(self.rows_bits, name=f'snap_rdr{l}') for l in range(n)
@@ -420,25 +468,58 @@ class Epilogue(HasTRoomParams, Elaboratable):
                    for l in range(n)]
         for l in range(n):
             m.d.comb += [
-                rd_avail[l].eq(
-                    Mux(snap_rd[l], snap_avail[1][l], snap_avail[0][l])),
-                rd_row[l].eq(Mux(snap_rd[l], snap_row[1][l], snap_row[0][l])),
+                rd_avail[l].eq(snap_cnt[l] != 0),
+                rd_row[l].eq(
+                    Array(snap_row[b][l] for b in range(E))[snap_hd[l]]),
             ]
             for i in range(4):
                 m.d.comb += rd_snap[l][i].eq(
-                    Mux(snap_rd[l], snap[1][l][i], snap[0][l][i]))
+                    Array(snap[b][l][i] for b in range(E))[snap_hd[l]])
 
         # Fold launches per lane (used by the add_cnt accounting).
+        # One adder, three issue kinds, strictly row-ordered effects:
+        # the FINAL fold (FF) of the head context retires into the
+        # result queue; the second half (F2) of the one slot that has
+        # issued its first half releases that row's snapshot; the
+        # first half (F1) of the next snapshot allocates the next
+        # context. Priority FF > F2 > F1: FF unblocks the result queue
+        # and frees contexts, F2 frees snapshot slots, and F1 is the
+        # speculative one. Consecutive rows' folds pipeline at three
+        # issue slots per row; each row's arithmetic is unchanged
+        # (F1 = R(p0+p2), F2 = R(p1+p3), FF = R(F1+F2) from its own
+        # snapshot, RNE at every step, landing order = issue order =
+        # row order).
         fold_f1 = [Signal(name=f'ff1{l}') for l in range(n)]
         fold_f2 = [Signal(name=f'ff2{l}') for l in range(n)]
         fold_ff = [Signal(name=f'fff{l}') for l in range(n)]
+        ff_land = [Signal(name=f'ffland{l}') for l in range(n)]
+        f2_slot = [Signal(lg_e, name=f'f2slot{l}') for l in range(n)]
+        f1_slot = [Signal(lg_e, name=f'f1slot{l}') for l in range(n)]
 
         for l in range(n):
+            # The unique slot between its F1 and its F2 (F2 outranks
+            # F1, so at most one exists).
+            hit = Const(0)
+            sel = Const(0, lg_e)
+            for k in range(E):
+                hit = hit | Mux(fphase[l][k] == 1, 1, 0)
+                sel = Mux(fphase[l][k] == 1, k, sel)
+            hd_phase = Array(fphase[l])[ctx_hd[l]]
             m.d.comb += [
-                fold_f1[l].eq((fold_st[l] == 0) & rd_avail[l]),
-                fold_f2[l].eq(fold_st[l] == 1),
-                fold_ff[l].eq((fold_st[l] == 2) & f1v[l] & f2v[l]
-                              & res_q[l].enq.ready),
+                f2_slot[l].eq(sel),
+                f1_slot[l].eq((ctx_hd[l] + ctx_cnt[l])[:lg_e]),
+                fold_ff[l].eq((ctx_cnt[l] != 0) & (hd_phase == 3)
+                              & ((res_q[l].count +
+                                  enq_pend[l]) < self.mm_result_q)),
+                fold_f2[l].eq(~fold_ff[l] & hit),
+                fold_f1[l].eq(~fold_ff[l] & ~fold_f2[l] & rd_avail[l]
+                              & (ctx_cnt[l] != E)),
+                ff_land[l].eq(add_fold[l].out.valid
+                              & (ftag[l][2][:2] == FC_FF)),
+            ]
+            ff_h1 = Array(fh1val[l][k] for k in range(E))[ctx_hd[l]]
+            ff_h2 = Array(fh2val[l][k] for k in range(E))[ctx_hd[l]]
+            m.d.comb += [
                 add_fold[l].inp.valid.eq(fold_f1[l] | fold_f2[l]
                                          | fold_ff[l]),
                 add_fold[l].inp.bits.fn.eq(FPUOperator.ADD),
@@ -447,19 +528,22 @@ class Epilogue(HasTRoomParams, Elaboratable):
                 add_fold[l].inp.bits.in2.eq(0),
                 add_fold[l].inp.bits.in1.eq(
                     Mux(fold_f1[l], rd_snap[l][0],
-                        Mux(fold_f2[l], rd_snap[l][1], f1val[l]))),
+                        Mux(fold_f2[l], rd_snap[l][1], ff_h1))),
                 add_fold[l].inp.bits.in3.eq(
                     Mux(fold_f1[l], rd_snap[l][2],
-                        Mux(fold_f2[l], rd_snap[l][3], f2val[l]))),
+                        Mux(fold_f2[l], rd_snap[l][3], ff_h2))),
             ]
             add_terms.append(fold_f1[l] + fold_f2[l] + fold_ff[l])
-            # Fold adder tag advance: which landing is F1/F2/FF.
+            # Fold adder tag advance: which landing is F1/F2/FF, and
+            # on which context slot.
             code = Mux(
                 fold_ff[l], Const(FC_FF, 2),
                 Mux(fold_f2[l], Const(FC_F2, 2),
                     Mux(fold_f1[l], Const(FC_F1, 2), Const(FC_NONE, 2))))
+            slot_sel = Mux(fold_ff[l], ctx_hd[l],
+                           Mux(fold_f2[l], f2_slot[l], f1_slot[l]))
             m.d.sync += [
-                ftag[l][0].eq(code),
+                ftag[l][0].eq(Cat(code, slot_sel)),
                 ftag[l][1].eq(ftag[l][0]),
                 ftag[l][2].eq(ftag[l][1]),
             ]
@@ -502,18 +586,16 @@ class Epilogue(HasTRoomParams, Elaboratable):
                     for i in range(4):
                         word = Mux(idx == i, add_acc[l].out.bits.data,
                                    Mux(i > lseg_k, 0, bank[l][i]))
-                        with m.If(cap_buf[l] == 0):
-                            m.d.sync += snap[0][l][i].eq(word)
-                        with m.Else():
-                            m.d.sync += snap[1][l][i].eq(word)
-                    for b in range(2):
+                        for b in range(E):
+                            with m.If(cap_buf[l] == b):
+                                m.d.sync += snap[b][l][i].eq(word)
+                    for b in range(E):
                         with m.If(cap_buf[l] == b):
-                            m.d.sync += [
-                                snap_avail[b][l].eq(1),
-                                snap_row[b][l].eq(lrow),
-                            ]
-                            with m.If(~rd_avail[l]):
-                                m.d.sync += snap_rd[l].eq(b)
+                            m.d.sync += snap_row[b][l].eq(lrow)
+                    # Occupancy moves from ``pend`` to the snapshot
+                    # queue; the single combined update below also
+                    # folds the F2 release, so capture and release in
+                    # one cycle cannot drop either term.
 
         # Pending-capture accounting: the fire-side increment and the
         # capture-side decrement MUST combine in one assignment -- two
@@ -538,52 +620,88 @@ class Epilogue(HasTRoomParams, Elaboratable):
             m.d.sync += self.folds.eq(self.folds + cap_cnt)
 
         #
-        # Fold sequencing per lane: F1 then F2 on consecutive cycles
-        # (one adder), FF once both halves have landed and the result
-        # queue can take the value, and the enqueue at the FF landing.
-        # The snapshot retires when both halves have launched; the
-        # read pointer moves to the other buffer when it already holds
-        # the next row (including one captured this cycle).
+        # Fold sequencing per lane: F1 allocates the next context and
+        # latches its row, F2 releases the row's snapshot slot, and
+        # the FF landing enqueues the row's result and retires the
+        # context. Counter updates that can collide in one cycle are
+        # single combined assignments (capture append vs F2 release;
+        # F1 allocation vs FF-landing retirement; FF reservation vs FF
+        # landing) -- two separate ``.eq`` statements would override.
         #
         for l in range(n):
-            with m.If(fold_f1[l]):
-                m.d.sync += [
-                    fold_st[l].eq(1),
-                    frow[l].eq(rd_row[l]),
-                ]
+            # Snapshot queue: captures append (cap_now), F2 issues
+            # release (fold_f2).
+            m.d.sync += snap_cnt[l].eq(
+                Mux(cap_now[l] | fold_f2[l],
+                    snap_cnt[l] + cap_now[l] - fold_f2[l], snap_cnt[l]))
             with m.If(fold_f2[l]):
-                m.d.sync += fold_st[l].eq(2)
-                with m.If(snap_rd[l]):
-                    m.d.sync += snap_avail[1][l].eq(0)
-                with m.Else():
-                    m.d.sync += snap_avail[0][l].eq(0)
-                other = ~snap_rd[l]
-                other_pending = (Mux(other, snap_avail[1][l], snap_avail[0][l])
-                                 | (cap_now[l] & (cap_buf[l] == other)))
-                with m.If(other_pending):
-                    m.d.sync += snap_rd[l].eq(other)
+                m.d.sync += snap_hd[l].eq((snap_hd[l] + 1)[:lg_e])
+            # Context queue: F1 allocates (fold_f1), the FF landing
+            # retires (ff_land).
+            m.d.sync += ctx_cnt[l].eq(
+                Mux(fold_f1[l] | ff_land[l],
+                    ctx_cnt[l] + fold_f1[l] - ff_land[l], ctx_cnt[l]))
+            with m.If(ff_land[l]):
+                m.d.sync += ctx_hd[l].eq((ctx_hd[l] + 1)[:lg_e])
+            # Result-queue reservations: FF issues reserve a slot,
+            # FF landings release it.
+            m.d.sync += enq_pend[l].eq(
+                Mux(fold_ff[l] | ff_land[l],
+                    enq_pend[l] + fold_ff[l] - ff_land[l], enq_pend[l]))
+
+            with m.If(fold_f1[l]):
+                for k in range(E):
+                    with m.If(f1_slot[l] == k):
+                        m.d.sync += [
+                            fphase[l][k].eq(1),
+                            fh1v[l][k].eq(0),
+                            fh2v[l][k].eq(0),
+                            frow[l][k].eq(rd_row[l]),
+                        ]
+            with m.If(fold_f2[l]):
+                for k in range(E):
+                    with m.If(f2_slot[l] == k):
+                        m.d.sync += fphase[l][k].eq(2)
+            # The final fold moves its context to the in-flight state
+            # at ISSUE, so exactly one FF per context can exist (a
+            # re-issue while the landing is pending would duplicate
+            # the enqueue and underflow the context queue).
             with m.If(fold_ff[l]):
-                m.d.sync += [
-                    fold_st[l].eq(3),
-                    f1v[l].eq(0),
-                    f2v[l].eq(0),
-                ]
+                for k in range(E):
+                    with m.If(ctx_hd[l] == k):
+                        m.d.sync += fphase[l][k].eq(4)
+
             with m.If(add_fold[l].out.valid):
-                with m.If(ftag[l][2] == FC_F1):
-                    m.d.sync += [
-                        f1v[l].eq(1), f1val[l].eq(add_fold[l].out.bits.data)
-                    ]
-                with m.If(ftag[l][2] == FC_F2):
-                    m.d.sync += [
-                        f2v[l].eq(1), f2val[l].eq(add_fold[l].out.bits.data)
-                    ]
-                with m.If(ftag[l][2] == FC_FF):
-                    m.d.sync += fold_st[l].eq(0)
-                    m.d.comb += [
-                        res_q[l].enq.valid.eq(1),
-                        res_q[l].enq.bits.val.eq(add_fold[l].out.bits.data),
-                        res_q[l].enq.bits.row.eq(frow[l]),
-                    ]
+                kind = ftag[l][2][:2]
+                slot = ftag[l][2][2:]
+                for k in range(E):
+                    with m.If(slot == k):
+                        with m.If(kind == FC_F1):
+                            m.d.sync += [
+                                fh1v[l][k].eq(1),
+                                fh1val[l][k].eq(add_fold[l].out.bits.data),
+                            ]
+                        with m.If(kind == FC_F2):
+                            m.d.sync += [
+                                fh2v[l][k].eq(1),
+                                fh2val[l][k].eq(add_fold[l].out.bits.data),
+                            ]
+                            # F1 always lands first (one in-order
+                            # adder), so both halves are live now.
+                            with m.If(fh1v[l][k]):
+                                m.d.sync += fphase[l][k].eq(3)
+                        with m.If(kind == FC_FF):
+                            m.d.sync += [
+                                fphase[l][k].eq(0),
+                                fh1v[l][k].eq(0),
+                                fh2v[l][k].eq(0),
+                            ]
+                            m.d.comb += [
+                                res_q[l].enq.valid.eq(1),
+                                res_q[l].enq.bits.val.eq(
+                                    add_fold[l].out.bits.data),
+                                res_q[l].enq.bits.row.eq(frow[l][k]),
+                            ]
 
         #
         # Packer: results arrive in strict row order; shift them into
@@ -642,8 +760,8 @@ class Epilogue(HasTRoomParams, Elaboratable):
             quiet = Const(1)
             for k in range(_SH_DEPTH):
                 quiet = quiet & ~sh[l][k].v
-            quiet = quiet & ~f1v[l] & ~f2v[l] & (fold_st[l] == 0) \
-                & ~snap_avail[0][l] & ~snap_avail[1][l] & (pend[l] == 0) \
+            quiet = quiet & (snap_cnt[l] == 0) & (pend[l] == 0) \
+                & (ctx_cnt[l] == 0) & (enq_pend[l] == 0) \
                 & (res_q[l].count == 0)
             drained = drained & quiet
 
@@ -692,9 +810,10 @@ class Epilogue(HasTRoomParams, Elaboratable):
             sh8v=[sh[l][_TAP_MULB].v for l in range(n)],
             sh11v=[sh[l][_TAP_SUB].v for l in range(n)],
             sh14v=[sh[l][_TAP_ACC].v for l in range(n)],
-            fold_st=fold_st,
-            sav0=[snap_avail[0][l] for l in range(n)],
-            sav1=[snap_avail[1][l] for l in range(n)],
+            enq_pend=enq_pend,
+            fold_st=fphase,
+            snap_cnt=snap_cnt,
+            ctx_cnt=ctx_cnt,
             pend=pend,
             resq_count=[res_q[l].count for l in range(n)],
             prow=prow,

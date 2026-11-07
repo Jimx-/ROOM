@@ -365,6 +365,48 @@ def test_epilogue_wide_q8_acceptance_budget():
     check(writes, dict(WIDE), records, rows)
 
 
+def test_epilogue_wide_short_row_acceptance_budget():
+    """S4 short-row slice pin: attention's nsegs == 2 record rate.
+
+    The FA QK/PV lists feed the epilogue rows of two segments (head
+    dim 64), so a row turns over every two records and the row
+    machinery -- not the record pipeline -- sets the intake rate. The
+    two-buffer admission cap plus the single-context fold sequencer
+    throttled this shape to 4.87 cycles/record in the deployed-twin
+    probe (epi sink offered but not taken 68% of the run, the stream
+    stalling on output credits behind it -- the board's FA
+    epi_stalls/mm_credit census signature). The row-context queue
+    plus the pipelined fold scheduler must hold the always-fed rate
+    near the one-adder fold floor of 3 issue slots per row = 1.5
+    cycles/record, with boundary slack.
+    """
+    import random
+
+    fmt, k, rows = Format.Q8_0, 64, 96
+    rng = random.Random(20261102)
+    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
+    act = [dict(e, sum_a=sum(e['quants'])) for e in gen_act(rng, k // 32)]
+    records = mm_segments(fmt, k, rows, [
+        pack_row(fmt, wsegs[r * (k // 32):(r + 1) * (k // 32)])
+        for r in range(rows)
+    ], act)
+    assert len(records) == (rows // 2) * 2  # nsegs == 2, two lanes
+    writes, res = run_epilogue(dict(WIDE), records, rows, stream=True)
+    n = len(records)
+    assert res['records'] == n
+    assert res['folds'] == rows
+    assert res['add_ops'] == 2 * n + 3 * rows
+    # Measured here: the historical two-buffer cap (epi_snap_bufs=2)
+    # runs this shape at 4.15 cycles/record with 276 sink-stall
+    # cycles; the row-context queue (default 16) runs it at 2.23 with
+    # 4, within the one-adder fold floor (3 issue slots per row per
+    # lane = 1.5 cycles/record) plus the pipeline fill and the
+    # post-intake fold tail. The budget leaves slack below the
+    # historical number while pinning the slice's gain.
+    assert res['active_cycles'] / n < 2.4, res['active_cycles'] / n
+    check(writes, dict(WIDE), records, rows)
+
+
 # ---------------------------------------------------------------------------
 # Hand-built records: rounding-sensitive ordering and cancellation.
 # ---------------------------------------------------------------------------
@@ -474,6 +516,61 @@ def test_epilogue_q4_k_cancellation():
     # t = [0, 1, -50, 7]: p0 = 0, p1 = 1, p2 = -50, p3 = 7;
     # fold = R(R(0 + -50) + R(1 + 7)) = -42.
     assert words[0] == f32_bits(-42.0)
+
+
+@pytest.mark.parametrize('next_fmt', [Format.Q8_0, Format.Q5_0, Format.Q6_K])
+def test_epilogue_format_transition(next_fmt):
+    """Invalid Q4_K shadow entries must not tag the next launch's results."""
+    params = params_for(n_outputs=1)
+    dut = Epilogue(params)
+    launches = []
+    for fmt in (Format.Q4_K, next_fmt):
+        records = []
+        for row in range(2):
+            for seg in range(8):
+                rec = srec(3 + row + seg, seg, seg == 7, fmt=fmt)
+                rec['row0'] = row
+                records.append(rec)
+        launches.append(records)
+    writes = []
+
+    def tx():
+        for records in launches:
+            for _ in range(4):
+                yield
+            assert (yield dut.ready)
+            yield dut.rows.eq(2)
+            yield dut.r_base.eq(R_BASE)
+            yield dut.start.eq(1)
+            yield
+            yield dut.start.eq(0)
+            yield
+            start = len(writes)
+            yield from stream_records(dut, records, n_outputs=1)
+            for _ in range(500):
+                if (yield dut.done):
+                    yield
+                    check(writes[start:], params, records, 2)
+                    break
+                yield
+            else:
+                raise TimeoutError('epilogue format transition stalled')
+
+    def wr():
+        yield Passive()
+        yield dut.tmem_w.ready.eq(1)
+        while True:
+            if (yield dut.tmem_w.fire):
+                writes.append(((yield
+                                dut.tmem_w.bits.addr), (yield
+                                                        dut.tmem_w.bits.data)))
+            yield
+
+    sim = Simulator(dut)
+    sim.add_clock(1e-6)
+    sim.add_sync_process(tx)
+    sim.add_sync_process(wr)
+    sim.run()
 
 
 def test_epilogue_zero_rows_of_quants():
