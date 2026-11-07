@@ -38,6 +38,7 @@ from tests.troom.model import (
     fp32_add_bits,
     fp32_max_bits,
     fp32_mul_bits,
+    fp32_to_fp16_rne_bits,
     mm_row_results,
     mm_segments,
     pack_row,
@@ -480,6 +481,54 @@ def test_model_vector_command_regions_and_validation():
         assert model._vector(cmd) is status, cmd
 
 
+def f16_packed_bytes(words):
+    """Model VEC_F16 output image: the frozen narrow of every word,
+    packed LSB-first two per word, zero-padded to a whole beat."""
+    return b''.join(
+        fp32_to_fp16_rne_bits(w).to_bytes(2, 'little') for w in words)
+
+
+def test_model_vec_f16_regions_and_validation():
+    hp, model = make_model()
+    a = list(SPECIALS) + [0x38d1b717, 0x477fff00]
+    model.tmem[0x100:0x100 + 4 * len(a)] = words_to_bytes(a)
+
+    cmd = vec_cmd(Opcode.VECTOR, 1, VecOp.VEC_F16, len(a), 0x100, 0x200, 0x400)
+    assert model.run([cmd,
+                      dict(opcode=Opcode.END, seq=2, evt=0)]) \
+        == [(1, Status.OK), (2, Status.OK)]
+    blob = f16_packed_bytes(a)
+    blob += bytes((-len(blob)) % hp.beat_bytes)
+    assert model.tmem[0x400:0x400 + len(blob)] == blob
+
+    # The output region shrinks to n*2 (beat padded); B is never read,
+    # so a B alias with the output is accepted; the o/a overlap, zero
+    # count, misalignment, and range rejections keep the unit's
+    # precedence.
+    cases = [
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_F16, 8, 0x100, 0x200,
+                 0x110), Status.BAD_SHAPE),
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_F16, 0, 0x100, 0x200,
+                 0x400), Status.BAD_SHAPE),
+        (vec_cmd(Opcode.REDUCE, 3, VecOp.VEC_F16, 4, 0x100, 0x200,
+                 0x400), Status.BAD_SHAPE),
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_F16, 4, 0x100, 0x200,
+                 0x401), Status.BAD_ALIGN),
+        # The output extent is the packed 2n image, not 4n: an o region
+        # whose FP32 size would leave TMEM but whose packed size fits
+        # is accepted (and the converse is rejected below).
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_F16, 64, 0x100, 0x200,
+                 hp.tmem_bytes - 128), Status.OK),
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_F16, 64, 0x100, 0x200,
+                 hp.tmem_bytes - 64), Status.BAD_RANGE),
+        # B aliases the output: accepted, B is unread.
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_F16, 4, 0x100, 0x400,
+                 0x400), Status.OK),
+    ]
+    for cmd, status in cases:
+        assert model._vector(cmd) is status, cmd
+
+
 # ---------------------------------------------------------------------------
 # RTL unit against the model
 # ---------------------------------------------------------------------------
@@ -664,7 +713,9 @@ def run_unit(params,
             yield
             if len(results) == len(descs):
                 return
-        raise TimeoutError('vector unit did not finish')
+        raise TimeoutError(
+            f'vector unit did not finish descriptor {len(results)}: '
+            f'{descs[len(results)]}')
 
     sim = Simulator(dut)
     sim.add_clock(1e-6)
@@ -812,6 +863,238 @@ def test_unit_wide_beat():
     assert writes == [(O_BASE, rdc_result(VecOp.RDC_SUM, rwords))]
 
 
+def f16_expected_beats(params, words):
+    """The packed F16 output image as whole beats (zero-padded tail)."""
+    hp = HasTRoomParams(params)
+    bb = hp.beat_bytes
+    blob = f16_packed_bytes(words)
+    blob += bytes((-len(blob)) % bb)
+    return [
+        int.from_bytes(blob[off:off + bb], 'little')
+        for off in range(0, len(blob), bb)
+    ]
+
+
+def test_unit_vec_f16_specials():
+    """Every special pattern narrows bit for bit: NaN payloads
+    canonicalize to a quiet NaN with the sign kept, FP32 subnormals
+    round to signed zero, and the 2^-24/2^-23 ties exercise RNE."""
+    params = dict(PARAMS)
+    hp = HasTRoomParams(params)
+    a = SPECIALS * 5
+    writes, res = run_unit(params, dict(op=int(VecOp.VEC_F16), n=len(a)),
+                           words_to_bytes(a))
+    assert res['status'] is Status.OK
+    exp = f16_expected_beats(params, a)
+    assert writes == [(O_BASE + hp.beat_bytes * i, d)
+                      for i, d in enumerate(exp)]
+    assert res['elements'] == len(a)
+    assert res['write_beats'] == len(exp)
+
+
+@pytest.mark.parametrize('n', [1, 2, 3, 7, 16, 17, 31, 33, 64])
+def test_unit_vec_f16_lengths(n):
+    """Odd tails, beat boundaries, and multi-beat images."""
+    import random
+
+    rng = random.Random(1000 + n)
+    params = dict(PARAMS)
+    hp = HasTRoomParams(params)
+    a = [f32_bits(f32(rng.uniform(-6, 6))) for _ in range(n)]
+    a[0] = 0x7f800001  # sNaN in the first halfword of beat 0
+    writes, res = run_unit(params, dict(op=int(VecOp.VEC_F16), n=n),
+                           words_to_bytes(a))
+    assert res['status'] is Status.OK
+    exp = f16_expected_beats(params, a)
+    assert writes == [(O_BASE + hp.beat_bytes * i, d)
+                      for i, d in enumerate(exp)]
+    assert res['elements'] == n
+    assert res['write_beats'] == len(exp)
+
+
+def test_unit_vec_f16_write_backpressure():
+    """Packed beats survive a randomly stalled write port."""
+    import random
+
+    rng = random.Random(7)
+    params = dict(PARAMS)
+    hp = HasTRoomParams(params)
+    n = 37
+    a = [f32_bits(f32(rng.uniform(-2, 2))) for _ in range(n)]
+    writes, res = run_unit(params,
+                           dict(op=int(VecOp.VEC_F16), n=n),
+                           words_to_bytes(a),
+                           stall_wr=True)
+    assert res['status'] is Status.OK
+    exp = f16_expected_beats(params, a)
+    assert writes == [(O_BASE + hp.beat_bytes * i, d)
+                      for i, d in enumerate(exp)]
+
+
+def test_unit_vec_f16_wide_beat():
+    """The deployment beat: thirty-two halfwords per 512-bit beat."""
+    import random
+
+    rng = random.Random(8)
+    params = dict(PARAMS, data_width=512, n_tmem_banks=8, act_max_k=2048)
+    n = 192  # the KV pool row words: three full beats exactly
+    a = [f32_bits(f32(rng.uniform(-1, 1))) for _ in range(n)]
+    writes, res = run_unit(params, dict(op=int(VecOp.VEC_F16), n=n),
+                           words_to_bytes(a))
+    assert res['status'] is Status.OK
+    exp = f16_expected_beats(params, a)
+    assert writes == [(O_BASE + 64 * i, d) for i, d in enumerate(exp)]
+    assert res['write_beats'] == len(exp)
+
+
+def pswap_expected_beats(params, words):
+    """The pair-swapped FP32 output image as whole beats."""
+    return expected_beats(params, [words[i ^ 1] for i in range(len(words))])
+
+
+def test_unit_vec_pswap_specials():
+    """Every special pattern copies bit for bit under the pair swap:
+    signs, NaN payloads, and signed zeros survive the exchange."""
+    params = dict(PARAMS)
+    hp = HasTRoomParams(params)
+    a = SPECIALS * 6  # even count, whole beats
+    assert len(a) % 2 == 0
+    writes, res = run_unit(params, dict(op=int(VecOp.VEC_PSWAP), n=len(a)),
+                           words_to_bytes(a))
+    assert res['status'] is Status.OK
+    exp = pswap_expected_beats(params, a)
+    assert writes == [(O_BASE + hp.beat_bytes * i, d)
+                      for i, d in enumerate(exp)]
+    assert res['elements'] == len(a)
+    assert res['write_beats'] == len(exp)
+
+
+@pytest.mark.parametrize('n', [2, 4, 8, 16, 34, 64])
+def test_unit_vec_pswap_lengths(n):
+    """Pairs, beat boundaries, and multi-beat images."""
+    import random
+
+    rng = random.Random(2000 + n)
+    params = dict(PARAMS)
+    hp = HasTRoomParams(params)
+    a = [f32_bits(f32(rng.uniform(-6, 6))) for _ in range(n)]
+    a[0] = 0x7f800001  # sNaN: payload must survive the swap
+    a[1] = 0xffc00001
+    writes, res = run_unit(params, dict(op=int(VecOp.VEC_PSWAP), n=n),
+                           words_to_bytes(a))
+    assert res['status'] is Status.OK
+    exp = pswap_expected_beats(params, a)
+    assert writes == [(O_BASE + hp.beat_bytes * i, d)
+                      for i, d in enumerate(exp)]
+    assert res['elements'] == n
+    assert res['write_beats'] == len(exp)
+
+
+def test_unit_vec_pswap_odd_n_rejected():
+    """An odd element count cannot express whole pairs."""
+    params = dict(PARAMS)
+    _, res = run_unit(params, dict(op=int(VecOp.VEC_PSWAP), n=7),
+                      words_to_bytes([0x3f800000] * 8))
+    assert res['status'] is Status.BAD_SHAPE
+
+
+def test_unit_vec_pswap_write_backpressure():
+    """Swapped beats survive a randomly stalled write port."""
+    import random
+
+    rng = random.Random(11)
+    params = dict(PARAMS)
+    hp = HasTRoomParams(params)
+    n = 40  # two full beats plus a partial
+    a = [f32_bits(f32(rng.uniform(-3, 3))) for _ in range(n)]
+    writes, res = run_unit(params,
+                           dict(op=int(VecOp.VEC_PSWAP), n=n),
+                           words_to_bytes(a),
+                           stall_wr=True)
+    assert res['status'] is Status.OK
+    exp = pswap_expected_beats(params, a)
+    assert writes == [(O_BASE + hp.beat_bytes * i, d)
+                      for i, d in enumerate(exp)]
+
+
+def test_unit_vec_pswap_wide_beat():
+    """The deployment beat: sixteen swapped words per 512-bit beat."""
+    import random
+
+    rng = random.Random(12)
+    params = dict(PARAMS, data_width=512, n_tmem_banks=8, act_max_k=2048)
+    n = 576  # the decode q-row words of nine 64-dim heads
+    a = [f32_bits(f32(rng.uniform(-1, 1))) for _ in range(n)]
+    writes, res = run_unit(params, dict(op=int(VecOp.VEC_PSWAP), n=n),
+                           words_to_bytes(a))
+    assert res['status'] is Status.OK
+    exp = pswap_expected_beats(params, a)
+    assert writes == [(O_BASE + 64 * i, d) for i, d in enumerate(exp)]
+    assert res['write_beats'] == len(exp)
+
+
+def test_model_vec_pswap_regions_and_validation():
+    hp, model = make_model()
+    a = list(SPECIALS) + [0x38d1b717, 0x477fff00]
+    model.tmem[0x100:0x100 + 4 * len(a)] = words_to_bytes(a)
+
+    cmd = vec_cmd(Opcode.VECTOR, 1, VecOp.VEC_PSWAP, len(a), 0x100, 0x200,
+                  0x400)
+    assert model.run([cmd,
+                      dict(opcode=Opcode.END, seq=2, evt=0)]) \
+        == [(1, Status.OK), (2, Status.OK)]
+    blob = b''.join(a[i ^ 1].to_bytes(4, 'little') for i in range(len(a)))
+    blob += bytes((-len(blob)) % hp.beat_bytes)
+    assert model.tmem[0x400:0x400 + len(blob)] == blob
+
+    # B is never read (alias accepted); odd n, o/a overlap, zero count,
+    # and misalignment keep the unit's precedence.
+    cases = [
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_PSWAP, 7, 0x100, 0x200,
+                 0x400), Status.BAD_SHAPE),
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_PSWAP, 8, 0x100, 0x200,
+                 0x110), Status.BAD_SHAPE),
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_PSWAP, 0, 0x100, 0x200,
+                 0x400), Status.BAD_SHAPE),
+        (vec_cmd(Opcode.REDUCE, 3, VecOp.VEC_PSWAP, 4, 0x100, 0x200,
+                 0x400), Status.BAD_SHAPE),
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_PSWAP, 4, 0x100, 0x200,
+                 0x401), Status.BAD_ALIGN),
+        (vec_cmd(Opcode.VECTOR, 3, VecOp.VEC_PSWAP, 4, 0x100, 0x400,
+                 0x400), Status.OK),
+    ]
+    for cmd, status in cases:
+        assert model._vector(cmd) is status, cmd
+
+
+def test_unit_vec_f16_then_elementwise_chain():
+    """An f16 command's o region is reusable by the next command
+    (the sequential-reuse discipline of the batched chains)."""
+    import random
+
+    rng = random.Random(9)
+    params = dict(PARAMS)
+    hp = HasTRoomParams(params)
+    n = 12
+    a = [f32_bits(f32(rng.uniform(-3, 3))) for _ in range(n)]
+    b = [f32_bits(f32(rng.uniform(-3, 3))) for _ in range(n)]
+    d1 = dict(op=int(VecOp.VEC_F16), n=n)
+    d2 = dict(op=int(VecOp.VEC_ADD), n=n)
+    writes, res = run_unit(params, [d1, d2], words_to_bytes(a),
+                           words_to_bytes(b))
+    assert res[0]['status'] is Status.OK
+    assert res[1]['status'] is Status.OK
+    exp_f16 = f16_expected_beats(params, a)
+    exp_add = expected_beats(
+        params, [vec_word(VecOp.VEC_ADD, x, y) for x, y in zip(a, b)])
+    got_f16 = writes[:len(exp_f16)]
+    got_add = writes[len(exp_f16):]
+    assert got_f16 == [(O_BASE + hp.beat_bytes * i, d)
+                       for i, d in enumerate(exp_f16)]
+    assert got_add == [(O_BASE + hp.beat_bytes * i, d)
+                       for i, d in enumerate(exp_add)]
+
+
 @pytest.mark.parametrize('desc,status,why', [
     (dict(op=int(VecOp.VEC_ADD), n=0), Status.BAD_SHAPE, 'zero elements'),
     (dict(op=int(VecOp.VEC_ADD), n=8,
@@ -830,7 +1113,14 @@ def test_unit_wide_beat():
           b_base=B_BASE + 4), Status.BAD_ALIGN, 'B misaligned'),
     (dict(op=int(VecOp.VEC_ADD), n=8,
           a_base=0x3ff0), Status.BAD_RANGE, 'regions beyond TMEM'),
-    (dict(op=11, n=8), Status.BAD_SHAPE, 'reserved sub-op encoding'),
+    (dict(op=int(VecOp.VEC_F16), n=0), Status.BAD_SHAPE, 'f16 zero elements'),
+    (dict(op=int(VecOp.VEC_F16), n=16,
+          o_base=A_BASE + 16), Status.BAD_SHAPE, 'f16 output inside A'),
+    (dict(op=int(VecOp.VEC_F16), n=16,
+          o_base=O_BASE + 1), Status.BAD_ALIGN, 'f16 output misaligned'),
+    (dict(op=int(VecOp.VEC_F16), n=16,
+          a_base=0x3ff0), Status.BAD_RANGE, 'f16 regions beyond TMEM'),
+    (dict(op=15, n=8), Status.BAD_SHAPE, 'reserved sub-op encoding'),
 ])
 def test_unit_rejects_bad_descriptors(desc, status, why):
     """Rejection leaves the unit inert: no latched state executes.
@@ -1085,6 +1375,100 @@ def test_core_vector_deployment_width():
                       [vec_word(VecOp.VEC_MUL, x, y) for x, y in zip(a, b)])
 
 
+def test_core_vec_f16_append_shape():
+    """The E1 native-append command shape end to end: a strided F32
+    load (the SET_ROWS vals tensor), the packed narrow (chunked when
+    the word count exceeds act_max_k), and a strided scatter store
+    into an F16 pool at the slot stride -- the pool rows must hold
+    exactly the model's packed halves, and untouched slots keep their
+    bytes."""
+    import random
+
+    rng = random.Random(41)
+    params = dict(PARAMS,
+                  data_width=512,
+                  id_width=6,
+                  n_tmem_banks=8,
+                  act_max_k=2048)
+    hp = HasTRoomParams(params)
+    bb = hp.beat_bytes
+
+    words, rows = 192, 12  # 2304 words: one full 2048 chunk + tail
+    stride = 512  # pool slot stride (wider than the 384-byte row)
+    slot0 = 3
+    vals = [[f32_bits(f32(rng.uniform(-4, 4))) for _ in range(words)]
+            for _ in range(rows)]
+    vals[0][0] = 0x7fc00000  # NaN halfword in the stored image
+    vals[rows - 1][words - 1] = 0x00800000  # smallest normal
+
+    a_tmem, o_tmem = 0x0000, 0x2400  # o sits just above the 9216-byte A image
+    vals_dram, pool_dram = 0x4000, 0x7000  # disjoint: the vals image ends at 0x6400
+    image = bytearray(DRAM_SIZE)
+    blob = b''.join(words_to_bytes(r) for r in vals)
+    image[vals_dram:vals_dram + len(blob)] = blob
+    pool_end = pool_dram + (slot0 + rows + 1) * stride
+    for off in range(pool_dram, pool_end, 16):
+        image[off:off + 16] = b'\xab\xcd\xef\x01' * 4  # poison fill
+
+    program = [
+        dict(opcode=Opcode.LOAD_2D,
+             seq=1,
+             evt=1,
+             dram_addr=vals_dram,
+             tmem_addr=a_tmem,
+             row_bytes=words * 4,
+             rows=rows,
+             dram_stride=words * 4,
+             tmem_stride=words * 4),
+        dict(opcode=Opcode.WAIT, seq=2, evt=1),
+    ]
+    seq = 3
+    total = words * rows
+    off = 0
+    while off < total:
+        chunk = min(total - off, hp.act_max_k)
+        program.append(
+            dict(opcode=Opcode.VECTOR,
+                 seq=seq,
+                 evt=4,
+                 vec_op=int(VecOp.VEC_F16),
+                 k=chunk,
+                 a_base=a_tmem + 4 * off,
+                 r_base=o_tmem + 2 * off))
+        seq += 1
+        program.append(dict(opcode=Opcode.WAIT, seq=seq, evt=4))
+        seq += 1
+        off += chunk
+    program += [
+        dict(opcode=Opcode.STORE_2D,
+             seq=seq,
+             evt=5,
+             dram_addr=pool_dram + slot0 * stride,
+             tmem_addr=o_tmem,
+             row_bytes=words * 2,
+             rows=rows,
+             dram_stride=stride,
+             tmem_stride=words * 2),
+        dict(opcode=Opcode.WAIT, seq=seq + 1, evt=5),
+        dict(opcode=Opcode.END, seq=seq + 2),
+    ]
+
+    results, image, _ = run_program(params, program, image, deadline=40000)
+    assert all(s is Status.OK for s in results.values()), results
+
+    for r in range(rows):
+        want = f16_packed_bytes(vals[r])
+        got = image[pool_dram + (slot0 + r) * stride:pool_dram +
+                    (slot0 + r) * stride + len(want)]
+        assert got == want, f'row {r}'
+    # the poisoned slots before and after the written run are intact
+    poison = b'\xab\xcd\xef\x01' * 4
+    assert image[pool_dram + (slot0 - 1) * stride:pool_dram +
+                 (slot0 - 1) * stride + 16] == poison
+    assert image[pool_dram + (slot0 + rows) * stride:pool_dram +
+                 (slot0 + rows) * stride + 16] == poison
+
+
 def test_core_vector_back_to_back_and_queued():
     """Two vector commands without an intervening WAIT; the second
     consumes the first command's live result region."""
@@ -1294,7 +1678,7 @@ def test_core_vector_overlap_rejected(opcode, op, o_base, why):
 @pytest.mark.parametrize('opcode,op', [
     (Opcode.REDUCE, VecOp.VEC_ADD),
     (Opcode.VECTOR, VecOp.RDC_SUM),
-    (Opcode.VECTOR, 11),
+    (Opcode.VECTOR, 15),
     (Opcode.REDUCE, VecOp.VEC_EXP2),
 ])
 def test_core_vector_bad_op_class(opcode, op):

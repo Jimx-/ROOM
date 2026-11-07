@@ -193,9 +193,13 @@ class TRoomModel:
         # Only operations that read the B region check it: the binary
         # elementwise ops and VEC_SCALE's scalar beat. The unary
         # transcendentals and the reductions ignore ``b_base``
-        # entirely; VEC_QUANT instead writes its meta there.
+        # entirely; VEC_QUANT and VEC_SMEXP instead write their
+        # second output there.
         reads_b = op in VEC_READS_B
         quant = op is VecOp.VEC_QUANT
+        f16 = op is VecOp.VEC_F16
+        pswap = op is VecOp.VEC_PSWAP
+        smexp = op is VecOp.VEC_SMEXP
 
         a_bytes = pad(4 * n)
         b_bytes = bb if op is VecOp.VEC_SCALE else a_bytes
@@ -204,6 +208,10 @@ class TRoomModel:
             nsegs = -(-n // 32)
             o_bytes = pad(32 * nsegs)
             b_bytes = pad(8 * nsegs)
+        if f16:
+            o_bytes = pad(2 * n)
+        if smexp:
+            b_bytes = bb
 
         def overlap(x_base, x_bytes, y_base, y_bytes):
             return (x_base < y_base + y_bytes and y_base < x_base + x_bytes)
@@ -215,14 +223,20 @@ class TRoomModel:
             or (quant and (overlap(cmd['o_base'], o_bytes,
                                    cmd['b_base'], b_bytes)
                            or overlap(cmd['b_base'], b_bytes,
-                                      cmd['a_base'], a_bytes)))
+                                      cmd['a_base'], a_bytes))) \
+            or (smexp and (overlap(cmd['o_base'], o_bytes,
+                                   cmd['b_base'], b_bytes)
+                           or overlap(cmd['b_base'], b_bytes,
+                                      cmd['a_base'], a_bytes))) \
+            or (pswap and n % 2)
         align_bad = (cmd['a_base'] % bb or cmd['o_base'] % bb
                      or (reads_b and cmd['b_base'] % bb)
-                     or (quant and cmd['b_base'] % bb))
+                     or ((quant or smexp) and cmd['b_base'] % bb))
         range_bad = (cmd['a_base'] + a_bytes > hp.tmem_bytes
                      or cmd['o_base'] + o_bytes > hp.tmem_bytes
                      or (reads_b and cmd['b_base'] + b_bytes > hp.tmem_bytes)
-                     or (quant and cmd['b_base'] + b_bytes > hp.tmem_bytes))
+                     or (quant and cmd['b_base'] + b_bytes > hp.tmem_bytes)
+                     or (smexp and cmd['b_base'] + b_bytes > hp.tmem_bytes))
         if shape_bad:
             return Status.BAD_SHAPE
         if align_bad:
@@ -239,6 +253,40 @@ class TRoomModel:
                 [word(cmd['a_base'], i) for i in range(n)], bb)
             self.tmem[cmd['o_base']:cmd['o_base'] + o_bytes] = qblob
             self.tmem[cmd['b_base']:cmd['b_base'] + b_bytes] = mblob
+            return Status.OK
+
+        if f16:
+            # The frozen narrow (fp32_to_fp16_rne_bits == the RTL's
+            # Fp32To16 == ggml's compute conversion), packed two
+            # halfwords per word with a zero-padded final partial beat.
+            blob = b''.join(
+                fp32_to_fp16_rne_bits(word(cmd['a_base'], i)).to_bytes(
+                    2, 'little') for i in range(n))
+            self.tmem[cmd['o_base']:cmd['o_base'] + o_bytes] = \
+                blob + bytes(o_bytes - len(blob))
+            return Status.OK
+
+        if pswap:
+            # Pure data movement: adjacent element pairs exchanged,
+            # exact bit patterns, zero-padded final partial beat.
+            a = [word(cmd['a_base'], i) for i in range(n)]
+            out = [a[i ^ 1] for i in range(n)]
+            blob = b''.join(w.to_bytes(4, 'little') for w in out)
+            self.tmem[cmd['o_base']:cmd['o_base'] + o_bytes] = \
+                blob + bytes(o_bytes - len(blob))
+            return Status.OK
+
+        if smexp:
+            # The fused softmax body: the composed five-op chain
+            # (RDC_MAX -> VEC_SCALE/VEC_SUB shift -> VEC_EXP2 ->
+            # RDC_SUM) over the masked-score region, both products
+            # emitted. Every rounding point is the standing ops'.
+            words = [word(cmd['a_base'], i) for i in range(n)]
+            out, result = smexp_regions(words)
+            self.tmem[cmd['o_base']:cmd['o_base'] + o_bytes] = \
+                out + bytes(o_bytes - len(out))
+            self.tmem[cmd['b_base']:cmd['b_base'] + bb] = \
+                result.to_bytes(4, 'little') + bytes(bb - 4)
             return Status.OK
 
         if opcode is Opcode.VECTOR:
@@ -948,6 +996,33 @@ def vec_exp2_bits(x):
     return _scale_pow2_bits(p, i)
 
 
+# The VEC_SILU embedded scalars, bit-identical to the scalar beat the
+# backend uploaded for the standalone chain's VEC_SCALE (ggml-troom's
+# ``-1.4426950408889634f``) and to troom/vector.py's
+# SILU_NLOG2E_BITS/SILU_ONE_BITS, so the fused op and the six-command
+# chain round identically at every step.
+SILU_NLOG2E_BITS = f32_bits(-math.log2(math.e))
+SILU_ONE_BITS = 0x3f800000  # fp32(1.0)
+
+
+def vec_silu_bits(x):
+    """o = x * sigmoid(x), sigmoid(x) = recip(exp2(x*-log2 e) + 1).
+
+    The composed sequence of the frozen VEC_EXP2 and VEC_RECIP
+    contracts above -- every rounding point of the backend's
+    six-command SwiGLU chain (VEC_SCALE -> VEC_EXP2 -> VEC_ADD ->
+    VEC_RECIP -> VEC_MUL) in one op, with the scalar and the +1 as
+    the embedded constants. The recip argument w3 = 1 + exp2(...) is
+    >= 1 or non-finite, so its sign fold is the identity; it is
+    applied exactly as the RTL's final-product operand does.
+    """
+    m0 = fp32_mul_bits(x, SILU_NLOG2E_BITS)
+    w2 = vec_exp2_bits(m0)
+    w3 = fp32_add_bits(w2, SILU_ONE_BITS)
+    w4 = vec_recip_bits(w3)
+    return fp32_mul_bits(x, w4)
+
+
 # ---------------------------------------------------------------------------
 # Device-side activation quantization contract (VEC_QUANT)
 # ---------------------------------------------------------------------------
@@ -1058,6 +1133,23 @@ def vec_quant_regions(words, beat_bytes):
                  (s['sum_a'] & 0xffff).to_bytes(2, 'little') + b'\x00\x00'
                  for s in segs))
     return qblob, mblob
+
+
+def smexp_regions(words):
+    """The VEC_SMEXP products: the numerator words and the denominator.
+
+    The composition of the frozen standing ops over the region --
+    ``RDC_MAX``'s fmax fold, the ``VEC_SCALE``/``VEC_SUB`` shift
+    collapsed to one rounded subtract (the broadcast of ``m`` was
+    exact), ``VEC_EXP2``'s sequence on the shifted operand, and
+    ``RDC_SUM``'s isum_4 placement and fold over the result words in
+    element order. Bit for bit the five-op chain.
+    """
+    m = rdc_result(VecOp.RDC_MAX, words)
+    nm = fp32_neg_bits(m)
+    e = [vec_exp2_bits(fp32_add_bits(w, nm)) for w in words]
+    out = b''.join(w.to_bytes(4, 'little') for w in e)
+    return out, rdc_result(VecOp.RDC_SUM, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1205,6 +1297,8 @@ def vec_word(op, a, b):
         return vec_recip_bits(a)
     if op is VecOp.VEC_RSQRT:
         return vec_rsqrt_bits(a)
+    if op is VecOp.VEC_SILU:
+        return vec_silu_bits(a)
     assert op in (VecOp.VEC_MUL, VecOp.VEC_SCALE), op
     return fp32_mul_bits(a, b)
 

@@ -84,6 +84,59 @@ class VecOp(IntEnum):
     ``r_base`` and per-segment ``s_act``/sum meta at ``b_base`` (an
     output for this op; B is never read). The sequence, scale pair,
     and clamps are frozen in ``tests/troom/model.py`` the same way.
+
+    ``VEC_F16`` narrows the FP32 A region to packed FP16 halfwords
+    at ``o_base`` (two elements per 32-bit word, zero-padded final
+    partial beat; B is never read). The conversion is the frozen
+    ``Fp32To16`` sequence (troom.convert), bit for bit the model's
+    ``fp32_to_fp16_rne_bits`` -- RNE for every bit pattern including
+    the FP16 subnormal range, NaNs canonicalized to a quiet NaN with
+    the sign kept -- which ggml's ``ggml_compute_fp32_to_fp16``
+    matches bit for bit, so a device-converted KV pool row is
+    byte-identical to the host conversion (E1's native append).
+
+    ``VEC_PSWAP`` copies the FP32 A region to ``o_base`` with
+    adjacent element pairs exchanged: ``o[2j] = a[2j+1]``,
+    ``o[2j+1] = a[2j]`` (n must be even; zero-padded final partial
+    beat; B is never read). Pure data movement -- no FPU, exact bit
+    patterns, signs and NaNs included. E3-c's device RoPE composes
+    it with VEC_MUL/VEC_ADD to express the interleaved (NORMAL) pair
+    rotation; the DMA engine's whole-beat rows cannot deinterleave
+    sub-beat strides, so the pairing has to come from the vector
+    unit.
+
+    ``VEC_SILU`` fuses the backend's SwiGLU/SILU sigmoid chain into
+    one unary op: ``o[i] = R(a[i] * sigmoid(a[i]))`` where
+    ``sigmoid(x) = recip(exp2(x * -log2(e)) + 1)``, with the
+    ``-log2(e)`` scalar and the ``+1`` embedded as constants (the
+    standalone chain uploaded them as TMEM beats). Every rounding
+    point is the composed sequence of the frozen VEC_EXP2/VEC_RECIP
+    contracts -- ``m0 = R(a*-log2 e)``; exp2's classification, range
+    reduction and Horner on ``m0``; ``w3 = R(w2 + 1)``; recip's
+    classification of ``w3`` and its seed/Newton sequence with the
+    sign of ``w3``; ``R(a * w4)`` -- so the op is bit-identical to
+    the six-command chain by construction (the S0 sizing record:
+    results/troom-silu-sizing-20261030). B is never read.
+
+    ``VEC_SMEXP`` fuses the softmax body the FA chain emits between
+    the mask add and the reciprocal (P2b-ii base slice,
+    plans/2026-11-02-troom-pipelined-batch-decode.md): one op over
+    the masked-score region at ``a_base`` produces both softmax
+    products -- ``e[i] = VEC_EXP2(R(a[i] - m))`` packed at
+    ``o_base`` (the standard elementwise image) and the denominator
+    ``sum`` in the first word of one zero-padded beat at ``b_base``
+    (an output for this op; B is never read). The maximum uses the
+    ``RDC_MAX`` fold semantics (RISC-V fmax, order-free: NaNs dropped,
+    +0 beating -0, canonical NaN when nothing survives); the subtract
+    is VEC_SUB's single rounded operation (the chain's
+    SCALE-broadcast of ``m`` is exact and disappears); the exponential
+    is the frozen VEC_EXP2 sequence on that operand; the sum keeps
+    RDC_SUM's exact ``isum_4`` placement and final fold over the
+    result words in element order. Every rounding point is the
+    composed five-op chain (RDC_MAX/VEC_SCALE/VEC_SUB/VEC_EXP2/
+    RDC_SUM), unchanged. The op reads ``a`` twice (a max fold pass,
+    then the streaming exp2 pass); the descriptor's three regions
+    must be pairwise disjoint like VEC_QUANT's.
     """
 
     VEC_ADD = 0
@@ -97,6 +150,10 @@ class VecOp(IntEnum):
     VEC_RECIP = 8
     VEC_RSQRT = 9
     VEC_QUANT = 10
+    VEC_F16 = 11
+    VEC_PSWAP = 12
+    VEC_SILU = 13
+    VEC_SMEXP = 14
 
 
 VEC_ELEMENTWISE = (
@@ -108,6 +165,10 @@ VEC_ELEMENTWISE = (
     VecOp.VEC_RECIP,
     VecOp.VEC_RSQRT,
     VecOp.VEC_QUANT,
+    VecOp.VEC_F16,
+    VecOp.VEC_PSWAP,
+    VecOp.VEC_SILU,
+    VecOp.VEC_SMEXP,
 )
 
 VEC_REDUCTIONS = (
@@ -123,6 +184,7 @@ VEC_UNARY = (
     VecOp.VEC_EXP2,
     VecOp.VEC_RECIP,
     VecOp.VEC_RSQRT,
+    VecOp.VEC_SILU,
 )
 
 # Operations that read the B region: the binary elementwise ops and

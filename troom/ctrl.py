@@ -55,7 +55,12 @@ from troom.abi import (
     CAPS_ENGINE_COUNTERS,
     CAPS_FMT0,
     CAPS_MM_EPI_COUNTERS,
+    CAPS_SGEMV,
     CAPS_VBUILD,
+    CAPS_VEC_F16,
+    CAPS_VEC_PSWAP,
+    CAPS_VEC_SILU,
+    CAPS_VEC_SMEXP,
     CAPS_WATCHDOG,
     CMD_DESC_BYTES,
     CMD_FORMAT_0,
@@ -375,10 +380,16 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
         m.d.comb += [
             self._id.r_data.eq(TROOM_ID),
             self._abi_version.r_data.eq(TROOM_ABI_VERSION),
-            self._caps.r_data.eq((1 << CAPS_FMT0) | (1 << CAPS_WATCHDOG)
-                                 | (1 << CAPS_ENGINE_COUNTERS)
-                                 | (1 << CAPS_MM_EPI_COUNTERS)
-                                 | (1 << CAPS_VBUILD)),
+            self._caps.r_data.eq(
+                (1 << CAPS_FMT0) | (1 << CAPS_WATCHDOG)
+                | (1 << CAPS_ENGINE_COUNTERS)
+                | (1 << CAPS_MM_EPI_COUNTERS)
+                | (1 << CAPS_SGEMV)
+                | (1 << CAPS_VBUILD)
+                | (1 << CAPS_VEC_F16)
+                | (1 << CAPS_VEC_PSWAP)
+                | (1 << CAPS_VEC_SILU)
+                | (1 << CAPS_VEC_SMEXP)),
             self._mem_base.r_data.eq(self.mem_base),
             self._mem_size.r_data.eq(self.mem_size),
             self._beat_bytes.r_data.eq(self.beat_bytes),

@@ -327,6 +327,73 @@ def test_unit_quant_shared_ports():
         region_writes(BIN_BASE, words_to_bytes(mul_words), params))
 
 
+@pytest.mark.parametrize('depth', [1, 2])
+def test_pipelined_quant_reserved_word_survives_write_stall(depth):
+    """Four elements share one credit across both unstallable FPUs."""
+    params = dict(PARAMS,
+                  data_width=512,
+                  n_tmem_banks=8,
+                  vec_result_q=depth,
+                  vec_quant_pipe=True)
+    rng = random.Random(911)
+    # More than two segments, with a partial tail and arbitrary FP bits.
+    # Every NaN, clamp and subnormal goes through the frozen oracle.
+    words = [rng.getrandbits(32) for _ in range(101)]
+    words[:32] = [f32_bits(rng.uniform(-5, 5)) for _ in range(32)]
+    writes, result = run_quant(params, words, hold_writes=180, stall_wr=True)
+    assert result['blocked'] >= 180
+    check_quant(params, words, result, writes)
+
+
+@pytest.mark.parametrize('multipliers,pipeline', [(1, True), (2, False),
+                                                  (2, True), (4, False),
+                                                  (4, True)])
+def test_quant_unary_multiplier_handoff(multipliers, pipeline):
+    """QUANT drains group 1 before EXP2/RECIP reuse its issue/tag path."""
+    from tests.troom.model import vec_word
+
+    params = dict(PARAMS,
+                  vec_mul_units=multipliers,
+                  vec_quant_pipe=pipeline,
+                  vec_result_q=2)
+    rng = random.Random(23)
+    words = [f32_bits(rng.uniform(0.25, 2)) for _ in range(33)]
+    descs, expected = [], []
+    for op in (VecOp.VEC_QUANT, VecOp.VEC_EXP2, VecOp.VEC_RECIP,
+               VecOp.VEC_QUANT):
+        descs.append(
+            dict(op=int(op), n=len(words), o_base=O_BASE, b_base=M_BASE))
+        if op is VecOp.VEC_QUANT:
+            expected += expected_quant_writes(params, words, O_BASE, M_BASE)
+        else:
+            result = [vec_word(op, word, 0) for word in words]
+            blob = words_to_bytes(result)
+            bb = HasTRoomParams(params).beat_bytes
+            blob += bytes((-len(blob)) % bb)
+            expected += region_writes(O_BASE, blob, params)
+    writes, results = run_unit(params,
+                               descs,
+                               words_to_bytes(words),
+                               stall_wr=True)
+    assert all(result['status'] is Status.OK for result in results)
+    assert writes == expected
+
+
+def test_pipelined_quant_rate_and_serial_identity():
+    """Pin useful throughput rather than only testing implementation details."""
+    rng = random.Random(17)
+    words = [f32_bits(rng.uniform(-2, 2)) for _ in range(576)]
+    params = dict(PARAMS, data_width=512, n_tmem_banks=8, act_max_k=2048)
+    cycles = {}
+    for pipeline in (False, True):
+        writes, result = run_quant(dict(params, vec_quant_pipe=pipeline),
+                                   words)
+        check_quant(params, words, result, writes)
+        cycles[pipeline] = result['execution_cycles']
+    assert cycles[True] < 4 * len(words)
+    assert cycles[True] * 3 < cycles[False]
+
+
 def test_unit_quant_wide_beat():
     rng = random.Random(13)
     params = dict(PARAMS,
@@ -351,7 +418,7 @@ def test_unit_quant_wide_beat():
           b_base=M_BASE + 4), Status.BAD_ALIGN, 'unaligned meta base'),
     (dict(op=int(VecOp.VEC_QUANT), n=64,
           b_base=0x3ff8), Status.BAD_RANGE, 'meta past TMEM'),
-    (dict(op=11, n=8), Status.BAD_SHAPE, 'reserved sub-op encoding'),
+    (dict(op=15, n=8), Status.BAD_SHAPE, 'reserved sub-op encoding'),
 ])
 def test_unit_quant_rejected(desc, status, why):
     params = dict(PARAMS)
@@ -521,3 +588,257 @@ def test_core_quant_feeds_matmul(k, rows):
         got = int.from_bytes(image[off:off + 4], 'little')
         assert got == f32_bits(exp[r]), (r, hex(got), exp[r])
     assert counters['useful_macs'] == rows * k
+
+
+@pytest.mark.parametrize('k,rows', [(576, 8), (1536, 4)])
+def test_core_quant_feeds_matmul_decode(k, rows):
+    """E3-b's exact chain at the decode shapes: LOAD the FP32
+    activation, VEC_QUANT it, SQUANTIZE the image, SMATMUL the SG1
+    weights. The fixed small-k fixture bases would overlap at these
+    sizes, so the TMEM plan is derived from k like the backend's
+    (source, quants, meta, then results above them)."""
+    rng = random.Random(31 + k)
+    fmt = Format.Q8_0
+    # decode shapes run on the deployed geometry (act_max_k 2048);
+    # the shared full-path fixture caps it at 1024 for TMEM economy
+    params = dict(PARAMS, act_max_k=2048)
+    bb = HasTRoomParams(params).beat_bytes
+    words = [f32_bits(f32(rng.uniform(-1, 1))) for _ in range(k)]
+    act = vec_quant_segments(words)
+
+    def pad(b):
+        return -(-b // bb) * bb
+
+    va = 0x2000  # FP32 source
+    vq = va + pad(4 * k)  # quants image
+    vm = vq + pad(k)  # meta image
+    rt = vm + pad(k // 8)  # matmul results
+    assert rt + pad(rows * 4) <= params['tmem_bytes'], \
+        'decode-shape fixture exceeds TMEM capacity'
+
+    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
+    rstride = pad(rows * 4)
+
+    image = bytearray(DRAM_SIZE)
+    payload, meta = pack_stream_q8_0(wsegs, k, rows, params['n_outputs'])
+    image[W_DRAM:W_DRAM + len(payload)] = payload
+    image[WM_DRAM:WM_DRAM + len(meta)] = meta
+    image[VFP_DRAM:VFP_DRAM + 4 * k] = words_to_bytes(words)
+
+    program = [
+        dict(opcode=Opcode.LOAD_2D,
+             seq=2,
+             evt=2,
+             dram_addr=VFP_DRAM,
+             tmem_addr=va,
+             row_bytes=pad(4 * k),
+             rows=1,
+             dram_stride=0,
+             tmem_stride=0),
+        dict(opcode=Opcode.WAIT, seq=4, evt=2),
+        dict(opcode=Opcode.VECTOR,
+             seq=5,
+             evt=6,
+             vec_op=int(VecOp.VEC_QUANT),
+             k=k,
+             a_base=va,
+             r_base=vq,
+             m_base=vm),
+        dict(opcode=Opcode.WAIT, seq=6, evt=6),
+        dict(opcode=Opcode.SQUANTIZE, seq=7, evt=4, a_base=vq, m_base=vm, k=k),
+        dict(opcode=Opcode.WAIT, seq=8, evt=4),
+        dict(opcode=Opcode.SMATMUL,
+             seq=9,
+             evt=5,
+             fmt=int(fmt),
+             k=k,
+             rows=rows,
+             dram_addr=W_DRAM,
+             dram_stride=WM_DRAM,
+             r_base=rt),
+        dict(opcode=Opcode.WAIT, seq=10, evt=5),
+        dict(opcode=Opcode.STORE_2D,
+             seq=11,
+             evt=7,
+             dram_addr=R_DRAM,
+             tmem_addr=rt,
+             row_bytes=rstride,
+             rows=1,
+             dram_stride=0,
+             tmem_stride=0),
+        dict(opcode=Opcode.WAIT, seq=12, evt=7),
+        dict(opcode=Opcode.END, seq=13),
+    ]
+    results, image, counters = run_program(params,
+                                           program,
+                                           image,
+                                           deadline=120000)
+    assert all(s is Status.OK for s in results.values()), results
+
+    records = mm_segments(fmt, k, rows, [
+        pack_row(fmt, wsegs[r * (k // 32):(r + 1) * (k // 32)])
+        for r in range(rows)
+    ], act)
+    exp = mm_row_results(records)
+    for r in range(rows):
+        off = R_DRAM + 4 * r
+        got = int.from_bytes(image[off:off + 4], 'little')
+        assert got == f32_bits(exp[r]), (r, hex(got), exp[r])
+    assert counters['useful_macs'] == rows * k
+
+
+def fp32_add_bits_(a, b):
+    from tests.troom.model import fp32_add_bits
+
+    return fp32_add_bits(a, b)
+
+
+@pytest.mark.parametrize('heads', [9, 3])
+def test_core_rope_normal_decode(heads):
+    """E3-c's exact chain at the decode shapes: LOAD the FP32 q/k row,
+    VEC_PSWAP the pair-swapped image, and rotate with two VEC_MULs and
+    a VEC_ADD against the per-head-replicated sign-folded tables --
+    ggml's rotate_pairs expression grouping
+    (R(R(x*cos) - R(x'*sin)) / R(R(x*sin) + R(x'*cos))) realized as
+    sign-folded addition, bit for bit. The tables are arbitrary here
+    (the cos/sin values themselves are a host contract, not a
+    composition one); the reference applies the same Python FP32
+    rounding per operation."""
+    rng = random.Random(77 + heads)
+    params = dict(PARAMS, act_max_k=2048, tmem_bytes=256 * 1024)
+    hp = HasTRoomParams(params)
+    bb = hp.beat_bytes
+    ne0 = 64
+    n = heads * ne0
+    words = [f32_bits(f32(rng.uniform(-2, 2))) for _ in range(n)]
+
+    def pad(b):
+        return -(-b // bb) * bb
+
+    # per-head-replicated tables matching ggml's pairing: C[i] =
+    # cos[i//2 mod 32] per head, S[i] carries the parity sign so one
+    # add covers both rotate_pairs outputs.
+    cos_j = [f32_bits(f32(rng.uniform(-1, 1))) for _ in range(32)]
+    sin_j = [f32_bits(f32(rng.uniform(-1, 1))) for _ in range(32)]
+    c_tab, s_tab = [], []
+    for h in range(heads):
+        for i in range(ne0):
+            j = (i // 2) % 32
+            c_tab.append(cos_j[j])
+            # even i: -sin (out[i] = x*cos - x'*sin); odd i: +sin
+            s = sin_j[j]
+            s_tab.append(s if i % 2 else s ^ 0x80000000)
+
+    X = 0x2000  # the FP32 row (and PSWAP source)
+    XS = X + pad(4 * n)  # pair-swapped image
+    C = XS + pad(4 * n)  # sign-folded tables
+    S = C + pad(4 * n)
+    TA = S + pad(4 * n)  # products
+    TB = TA + pad(4 * n)
+    OUT = TB + pad(4 * n)
+    assert OUT + pad(4 * n) <= params['tmem_bytes'], \
+        'rope fixture exceeds TMEM capacity'
+
+    X_DRAM = 0x9000
+    C_DRAM = X_DRAM + pad(4 * n)
+    S_DRAM = C_DRAM + pad(4 * n)
+    OUT_DRAM = 0x20000
+
+    image = bytearray(DRAM_SIZE)
+    image[X_DRAM:X_DRAM + 4 * n] = words_to_bytes(words)
+    image[C_DRAM:C_DRAM + 4 * n] = words_to_bytes(c_tab)
+    image[S_DRAM:S_DRAM + 4 * n] = words_to_bytes(s_tab)
+
+    program = [
+        dict(opcode=Opcode.LOAD_2D,
+             seq=2,
+             evt=2,
+             dram_addr=X_DRAM,
+             tmem_addr=X,
+             row_bytes=pad(4 * n),
+             rows=1,
+             dram_stride=0,
+             tmem_stride=0),
+        dict(opcode=Opcode.LOAD_2D,
+             seq=3,
+             evt=3,
+             dram_addr=C_DRAM,
+             tmem_addr=C,
+             row_bytes=pad(4 * n),
+             rows=1,
+             dram_stride=0,
+             tmem_stride=0),
+        dict(opcode=Opcode.LOAD_2D,
+             seq=4,
+             evt=6,
+             dram_addr=S_DRAM,
+             tmem_addr=S,
+             row_bytes=pad(4 * n),
+             rows=1,
+             dram_stride=0,
+             tmem_stride=0),
+        dict(opcode=Opcode.WAIT, seq=5, evt=2),
+        dict(opcode=Opcode.WAIT, seq=6, evt=3),
+        dict(opcode=Opcode.WAIT, seq=7, evt=6),
+        dict(opcode=Opcode.VECTOR,
+             seq=8,
+             evt=4,
+             vec_op=int(VecOp.VEC_PSWAP),
+             k=n,
+             a_base=X,
+             m_base=0,
+             r_base=XS),
+        dict(opcode=Opcode.WAIT, seq=9, evt=4),
+        dict(opcode=Opcode.VECTOR,
+             seq=10,
+             evt=4,
+             vec_op=int(VecOp.VEC_MUL),
+             k=n,
+             a_base=X,
+             m_base=C,
+             r_base=TA),
+        dict(opcode=Opcode.WAIT, seq=11, evt=4),
+        dict(opcode=Opcode.VECTOR,
+             seq=12,
+             evt=4,
+             vec_op=int(VecOp.VEC_MUL),
+             k=n,
+             a_base=XS,
+             m_base=S,
+             r_base=TB),
+        dict(opcode=Opcode.WAIT, seq=13, evt=4),
+        dict(opcode=Opcode.VECTOR,
+             seq=14,
+             evt=4,
+             vec_op=int(VecOp.VEC_ADD),
+             k=n,
+             a_base=TA,
+             m_base=TB,
+             r_base=OUT),
+        dict(opcode=Opcode.WAIT, seq=15, evt=4),
+        dict(opcode=Opcode.STORE_2D,
+             seq=16,
+             evt=7,
+             dram_addr=OUT_DRAM,
+             tmem_addr=OUT,
+             row_bytes=pad(4 * n),
+             rows=1,
+             dram_stride=0,
+             tmem_stride=0),
+        dict(opcode=Opcode.WAIT, seq=17, evt=7),
+        dict(opcode=Opcode.END, seq=18),
+    ]
+    results, image, counters = run_program(params,
+                                           program,
+                                           image,
+                                           deadline=120000)
+    assert all(s is Status.OK for s in results.values()), results
+
+    for i in range(n):
+        x = words[i]
+        xs = words[i ^ 1]
+        exp = fp32_add_bits_(fp32_mul_bits(x, c_tab[i]),
+                             fp32_mul_bits(xs, s_tab[i]))
+        off = OUT_DRAM + 4 * i
+        got = int.from_bytes(image[off:off + 4], 'little')
+        assert got == exp, (heads, i, hex(got), hex(exp))

@@ -1,5 +1,5 @@
 """RTL tests for the troom unary transcendental ops (VEC_EXP2,
-VEC_RECIP, VEC_RSQRT).
+VEC_RECIP, VEC_RSQRT) and the fused VEC_SILU chain.
 
 Layers, following ``test_vector.py``:
 
@@ -61,7 +61,7 @@ from tests.troom.test_vector import (
     vector_program,
 )
 
-UNARY_OPS = (VecOp.VEC_EXP2, VecOp.VEC_RECIP, VecOp.VEC_RSQRT)
+UNARY_OPS = (VecOp.VEC_EXP2, VecOp.VEC_RECIP, VecOp.VEC_RSQRT, VecOp.VEC_SILU)
 
 
 def un_word(op, x):
@@ -231,13 +231,17 @@ def test_unit_unary_ignores_b_region(op, b_base):
     assert writes == [(O_BASE + 8 * i, d) for i, d in enumerate(exp)]
 
 
-def test_unit_unary_back_to_back_and_ports_shared():
+@pytest.mark.parametrize('units', [2, 4])
+def test_unit_unary_back_to_back_and_ports_shared(units):
     """Unary then binary then reduction commands share the add/mul
     ports and the credit accounting across command boundaries."""
     import random
 
     rng = random.Random(34)
-    params = dict(PARAMS)
+    params = dict(PARAMS,
+                  vec_unary_ctx=32,
+                  vec_add_units=units,
+                  vec_mul_units=units)
     n = 9
     a = [f32_bits(f32(rng.uniform(-20, 20))) for _ in range(n)]
     b = [f32_bits(f32(rng.uniform(-20, 20))) for _ in range(n)]
@@ -280,7 +284,7 @@ def test_unit_unary_back_to_back_and_ports_shared():
 
 @pytest.mark.parametrize('desc,status,why', [
     (dict(op=int(VecOp.VEC_EXP2), n=0), Status.BAD_SHAPE, 'zero elements'),
-    (dict(op=11, n=8), Status.BAD_SHAPE, 'reserved sub-op encoding'),
+    (dict(op=15, n=8), Status.BAD_SHAPE, 'reserved sub-op encoding'),
     (dict(op=int(VecOp.VEC_RECIP), n=8,
           o_base=A_BASE + 4), Status.BAD_SHAPE, 'output inside A'),
     (dict(op=int(VecOp.VEC_RSQRT), n=8,
@@ -319,18 +323,17 @@ def test_unit_unary_rejects_bad_descriptors(desc, status, why):
 
 
 def test_unit_unary_cycles_per_element():
-    """Document the interleaved sequencer's cost (M4): with four
-    contexts the per-element floor is the op count times the
-    four-cycle capture loop divided by four -- recip (seed + 8 ops)
-    < 10 cycles, rsqrt (seed + 10) < 14, exp2 (16 ops) < 20. These
-    upper bounds double as regression alarms against a return to
-    serialization (61/29/41 pre-interleave), not as tight numbers."""
+    """Bound eight-context throughput while retaining startup allowance.
+
+    These bounds distinguish the E2 geometry from the four-context
+    baseline, especially for EXP2's sixteen dependent rounded ops.
+    """
     params = dict(PARAMS)
     # Every input executes the complete arithmetic sequence for all ops.
     seq = [f32_bits(1.25)] * 40
     fast = [0x7fc00000, 0x00000000, 0x7f800000, 0x00000001] * 10
-    for op, bound in ((VecOp.VEC_RECIP, 10), (VecOp.VEC_RSQRT, 14),
-                      (VecOp.VEC_EXP2, 20)):
+    for op, bound in ((VecOp.VEC_RECIP, 7), (VecOp.VEC_RSQRT, 10),
+                      (VecOp.VEC_EXP2, 12)):
         _, res0 = run_unit(params,
                            dict(op=int(op), n=2),
                            words_to_bytes(seq[:2]),
@@ -351,7 +354,7 @@ def test_unit_unary_cycles_per_element():
 
 
 @pytest.mark.parametrize('op', UNARY_OPS)
-@pytest.mark.parametrize('ctx', [1, 2, 4])
+@pytest.mark.parametrize('ctx', [1, 2, 4, 8])
 def test_unit_unary_interleave_equivalence(op, ctx):
     """The interleaved sequencer is result-identical to a single
     context: the per-element op sequence is untouched, so every
@@ -375,6 +378,96 @@ def test_unit_unary_interleave_equivalence(op, ctx):
     assert writes == [(O_BASE + 8 * i, d) for i, d in enumerate(exp)]
 
 
+def test_unit_silu_equals_chain():
+    """The fused VEC_SILU op is bit-identical to the standalone
+    five-command sigmoid chain it replaces (the S1 identity gate):
+    same operands, the backend's own ``-log2(e)`` scalar beat and
+    ones vector, every element of a pool that exercises both bypass
+    tables (exp2's clamps on m0 and recip's near-overflow on w3)."""
+    import random
+
+    from tests.troom.model import SILU_NLOG2E_BITS, SILU_ONE_BITS
+
+    rng = random.Random(77)
+    words = unary_pool(rng)[:30]
+    words += [
+        0x7f800000, 0xff800000, 0x00000000, 0x80000000, 0x7fc00000,
+        f32_bits(-89.5),
+        f32_bits(89.5),
+        f32_bits(-2000.0),
+        f32_bits(2000.0),
+        f32_bits(-0.5)
+    ]
+    words += [f32_bits(rng.uniform(-70.0, 70.0)) for _ in range(32)]
+    n = len(words)
+    params = dict(PARAMS)
+    bb = params['data_width'] // 8
+
+    # The fused op.
+    writes, res = run_unit(params,
+                           dict(op=int(VecOp.VEC_SILU), n=n),
+                           words_to_bytes(words),
+                           deadline=400000)
+    assert res['status'] is Status.OK
+    assert res['elements'] == n
+    fused = expected_beats(params, [un_word(VecOp.VEC_SILU, w) for w in words])
+    assert writes == [(O_BASE + bb * i, d) for i, d in enumerate(fused)]
+
+    # The chain, exactly as the backend emits it: the scalar beat at
+    # B_BASE, the ones vector above it, four scratch regions spaced
+    # clear of the inputs.
+    npad = ((n * 4 + bb - 1) // bb) * bb
+    r0, r1, r2, r3 = (O_BASE + 0x400, O_BASE + 0x600, O_BASE + 0x800,
+                      O_BASE + 0xa00)
+    assert B_BASE + bb + npad <= r0
+    b_bytes = words_to_bytes([SILU_NLOG2E_BITS]) + bytes(bb - 4)
+    b_bytes += words_to_bytes([SILU_ONE_BITS] * n)
+    b_bytes += bytes(npad - n * 4)
+    descs = [
+        dict(op=int(VecOp.VEC_SCALE), n=n, o_base=r0, b_base=B_BASE),
+        dict(op=int(VecOp.VEC_EXP2), n=n, a_base=r0, o_base=r1),
+        dict(op=int(VecOp.VEC_ADD),
+             n=n,
+             a_base=r1,
+             o_base=r2,
+             b_base=B_BASE + bb),
+        dict(op=int(VecOp.VEC_RECIP), n=n, a_base=r2, o_base=r3),
+        dict(op=int(VecOp.VEC_MUL),
+             n=n,
+             a_base=A_BASE,
+             o_base=O_BASE,
+             b_base=r3),
+    ]
+    cwrites, cres = run_unit(params,
+                             descs,
+                             words_to_bytes(words),
+                             b_bytes,
+                             commit_writes=True,
+                             deadline=600000)
+    assert all(r['status'] is Status.OK for r in cres)
+    by_addr = {a: d for a, d in cwrites}
+    chain = [by_addr.get(O_BASE + bb * i) for i in range(len(fused))]
+    assert chain == fused, 'fused VEC_SILU differs from the chain'
+
+
+def test_unit_silu_cycles_per_element():
+    """The fused op's whole-element issue demand is 11 add + 13 mul +
+    1 seed; on the standing two-group fabric the steady rate must
+    approach the 6.5 cy/elem multiply floor, well under the six-op
+    chain's serialized 16."""
+    params = dict(PARAMS)
+    seq = [0x3fa00000] * 48
+    _, res = run_unit(params,
+                      dict(op=int(VecOp.VEC_SILU), n=len(seq)),
+                      words_to_bytes(seq),
+                      deadline=400000)
+    per = res['execution_cycles'] / len(seq)
+    assert per <= 10, per
+    assert res['mul_issues'] == 13 * len(seq)
+    assert res['add_issues'] == 11 * len(seq)
+    assert res['rec_issues'] == len(seq)
+
+
 @pytest.mark.parametrize('wide', [False, True])
 def test_unit_unary_interleave_write_backpressure(wide):
     """Interleaved completions must drain in order under a held,
@@ -383,7 +476,7 @@ def test_unit_unary_interleave_write_backpressure(wide):
     import random
 
     rng = random.Random(42)
-    params = dict(PARAMS, vec_unary_ctx=4)
+    params = dict(PARAMS, vec_unary_ctx=8)
     if wide:
         params.update(data_width=512, n_tmem_banks=8)
     bb = params['data_width'] // 8
@@ -541,3 +634,75 @@ def test_core_unary_rmsnorm_chain():
     inv = vec_rsqrt_bits(fp32_add_bits(mean, eps))
     exp = [fp32_mul_bits(w, inv) for w in a]
     check_dram_vector(image, exp)
+
+
+@pytest.mark.parametrize('add_units,mul_units', [(2, 4), (4, 2), (4, 4)])
+@pytest.mark.parametrize('op', UNARY_OPS)
+def test_unit_unary_four_issue_groups(op, add_units, mul_units):
+    """Wider asymmetric partitions retain special values and retire order."""
+    import random
+    rng = random.Random(106)
+    words = list(SPECIALS) + unary_pool(rng)[:33]
+    words += [f32_bits(rng.uniform(-8, 8)) for _ in range(65)]
+    params = dict(PARAMS,
+                  data_width=512,
+                  n_tmem_banks=8,
+                  vec_unary_ctx=32,
+                  vec_result_q=4,
+                  vec_add_units=add_units,
+                  vec_mul_units=mul_units)
+    writes, res = run_unit(params,
+                           dict(op=int(op), n=len(words)),
+                           words_to_bytes(words),
+                           stall_wr=True,
+                           hold_writes=10,
+                           deadline=400000)
+    assert res['status'] == Status.OK
+    expected = expected_beats(params, [un_word(op, word) for word in words])
+    assert writes == [(O_BASE + i * 64, beat)
+                      for i, beat in enumerate(expected)]
+
+
+@pytest.mark.parametrize('contexts', [4, 5, 17, 24])
+def test_unit_silu_banked_tags_uneven_contexts(contexts):
+    """Single-slot and uneven banks preserve tags under write backpressure."""
+    import random
+    rng = random.Random(107)
+    words = list(SPECIALS) + [
+        f32_bits(rng.uniform(-40, 40)) for _ in range(65)
+    ]
+    params = dict(PARAMS,
+                  data_width=512,
+                  n_tmem_banks=8,
+                  vec_unary_ctx=contexts,
+                  vec_result_q=2,
+                  vec_add_units=4,
+                  vec_mul_units=4)
+    writes, result = run_unit(params,
+                              dict(op=int(VecOp.VEC_SILU), n=len(words)),
+                              words_to_bytes(words),
+                              stall_wr=True,
+                              hold_writes=20,
+                              deadline=400000)
+    assert result['status'] == Status.OK
+    expected = expected_beats(
+        params, [un_word(VecOp.VEC_SILU, word) for word in words])
+    assert writes == [(O_BASE + i * 64, beat)
+                      for i, beat in enumerate(expected)]
+
+
+@pytest.mark.parametrize('add_units,mul_units', [(2, 4), (4, 2), (4, 4)])
+def test_unit_silu_wide_issue_accounting(add_units, mul_units):
+    """Issue-rate worksheets must count every arithmetic pipeline."""
+    words = [0x3fa00000] * 96
+    params = dict(PARAMS,
+                  vec_unary_ctx=32,
+                  vec_add_units=add_units,
+                  vec_mul_units=mul_units)
+    writes, result = run_unit(params, dict(op=int(VecOp.VEC_SILU),
+                                           n=len(words)),
+                              words_to_bytes(words))
+    assert result['status'] == Status.OK
+    assert result['add_issues'] == 11 * len(words)
+    assert result['mul_issues'] == 13 * len(words)
+    assert result['rec_issues'] == len(words)

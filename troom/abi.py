@@ -151,6 +151,41 @@ CAPS_WATCHDOG = 1  # MAX_CYCLES hardware watchdog implemented
 CAPS_ENGINE_COUNTERS = 2  # observation-counter window implemented
 CAPS_MM_EPI_COUNTERS = 3  # matrix/epilogue cycle-breakdown window
 CAPS_VBUILD = 4  # device-side V-window tile builder (VBUILD opcode)
+# E2 ABI rider (decided 2026-10-28, resident-decode follow-up): GEMV
+# engine presence is discovered from this word instead of the
+# reject-only probe launch. This source generation always carries the
+# streaming engine and never the legacy MatrixUnit (the build selects
+# are retired -- ``types.py`` rejects ``sg_enable=0``/``sg_only=0``),
+# so images built from it advertise CAPS_SGEMV unconditionally and
+# never CAPS_LEGACY_MM. Pre-E2 images (D2, E1-V, E1-K, E1-A) leave
+# both clear and keep the probe fallback.
+CAPS_SGEMV = 7  # streaming GEMV engine present (SMATMUL/SQUANTIZE)
+CAPS_LEGACY_MM = 8  # legacy MatrixUnit present (MATMUL)
+CAPS_VEC_F16 = 9  # VECTOR VEC_F16 narrow op (native SET_ROWS append)
+# E3-c: VECTOR VEC_PSWAP pair-swap copy (adjacent elements exchanged).
+# The whole-beat DMA rows cannot deinterleave sub-beat strides, so the
+# interleaved (NORMAL) RoPE pairing needs this vector-unit primitive.
+# The op is pure data movement (exact bit patterns); images without
+# the bit keep the CPU rope kernel.
+CAPS_VEC_PSWAP = 10
+# Merged S1/S2 candidate (2026-10-30,
+# plans/2026-10-30-troom-fpu-silu-sizing.md): VECTOR VEC_SILU -- the
+# backend's SwiGLU sigmoid chain fused into one bit-identical unary op
+# (same rounded ops in the same order; the -log2(e) scalar and the +1
+# are embedded constants). The image also doubles the unary issue
+# fabric (two adder/multiplier groups, sixteen contexts), which needs
+# no capability bit: it changes no op set, and every op's result is
+# bit-identical by the E2-c interleaving argument. Images without the
+# bit keep the six-command chain.
+CAPS_VEC_SILU = 12
+# P2b-ii base RTL slice (2026-11-04,
+# plans/2026-11-02-troom-pipelined-batch-decode.md): VECTOR VEC_SMEXP
+# -- the FA softmax body fused into one bit-identical op (the RDC_MAX
+# fold, the VEC_SCALE/VEC_SUB shift collapsed to one rounded
+# subtract, the frozen VEC_EXP2 sequence, and RDC_SUM's isum_4 fold),
+# emitting the numerator region at o_base and the denominator beat at
+# b_base. Images without the bit keep the five-op emission.
+CAPS_VEC_SMEXP = 15
 
 
 class WrapperError(IntEnum):

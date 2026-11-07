@@ -165,13 +165,28 @@ class HasTRoomParams:
 
         # Vector/reduction unit
         #
-        self.vec_result_q = params.get('vec_result_q', 4)
+        self.vec_result_q = params.get('vec_result_q', 16)
         self.vec_sq_q = params.get('vec_sq_q', 4)
+        # E2: eight contexts and matching result credits hide the unary
+        # dependency/capture bubbles without changing any FP operation.
         # Interleaved unary-transcendental contexts (M4): independent
         # per-context dependency chains sharing the FPU blocks, with
         # in-order result retirement. One context degenerates to the
         # historical serialized sequencer (plus its classify stage).
-        self.vec_unary_ctx = params.get('vec_unary_ctx', 4)
+        # The merged S1/S2 candidate (2026-10-30,
+        # plans/2026-10-30-troom-fpu-silu-sizing.md) raises the
+        # geometry to sixteen contexts over TWO adder/multiplier issue
+        # groups (even contexts on the shared units, odd contexts on
+        # the second pair) and adds the fused VEC_SILU op; the sizing
+        # probe measured EXP2 at 99.6% of its add-slot floor at eight
+        # contexts, so only issue capacity can go faster.
+        self.vec_unary_ctx = params.get('vec_unary_ctx', 16)
+        self.vec_add_units = params.get('vec_add_units', 2)
+        self.vec_mul_units = params.get('vec_mul_units', 2)
+        # Reuse the two multiplier groups as consecutive rounded
+        # quantization stages. Single-multiplier builds keep the
+        # historical sequencer; the flag provides an exact A/B arm.
+        self.vec_quant_pipe = params.get('vec_quant_pipe', True)
 
         if self.vec_result_q < 1:
             raise ValueError('vec_result_q must be at least 1')
@@ -182,9 +197,19 @@ class HasTRoomParams:
         if self.vec_unary_ctx < 1:
             raise ValueError('vec_unary_ctx must be at least 1')
 
+        for name in ('vec_add_units', 'vec_mul_units'):
+            if getattr(self, name) not in (1, 2, 4):
+                raise ValueError(f'{name} must be 1, 2 or 4')
+
         #
         # Tensor memory
         #
+        if (max(self.vec_add_units, self.vec_mul_units) > 2
+                and self.vec_unary_ctx < max(self.vec_add_units,
+                                             self.vec_mul_units)):
+            raise ValueError(
+                'vec_unary_ctx must cover every arithmetic issue group')
+
         self.tmem_bytes = params.get('tmem_bytes', 256 * 1024)
         self.n_tmem_banks = params.get('n_tmem_banks', 4)
 
