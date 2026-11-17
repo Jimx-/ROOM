@@ -79,6 +79,13 @@ def test_pack_unpack_roundtrip():
     assert unpack_command(words, shapes()) == cmd
 
 
+def test_g4_fifth_vec_op_bit_preserves_descriptor_geometry():
+    cmd = dict(sample_command(), opcode=4, vec_op=16)
+    words = pack_command(cmd, shapes())
+    assert len(words) == 17
+    assert unpack_command(words, shapes()) == cmd
+
+
 def test_pack_buffer_is_little_endian_word_stream():
     cmd = sample_command()
     data = pack_buffer([cmd], shapes())

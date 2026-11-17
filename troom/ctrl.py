@@ -69,6 +69,8 @@ from troom.abi import (
     CAPS_VBUILD_VAPP,
     CAPS_VBUILD_K4,
     CAPS_VB_COUNTERS,
+    CAPS_VEC_QUANT_ACT,
+    CAPS_VEC_MUL_QUANT_ACT,
     CAPS_VEC_F16,
     CAPS_VEC_PSWAP,
     CAPS_VEC_SILU,
@@ -483,7 +485,9 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                       0)
                 | Mux(self.act_banks == 2, 1 << CAPS_ACT_BANK, 0)
                 | Mux(self.tmem_clusters == 2, 1 << CAPS_TMEM_SPLIT, 0)
-                | (1 << CAPS_VB_COUNTERS)),
+                | (1 << CAPS_VB_COUNTERS)
+                | (1 << CAPS_VEC_QUANT_ACT)
+                | (1 << CAPS_VEC_MUL_QUANT_ACT)),
             self._mem_base.r_data.eq(self.mem_base),
             self._mem_size.r_data.eq(self.mem_size),
             self._beat_bytes.r_data.eq(self.beat_bytes),

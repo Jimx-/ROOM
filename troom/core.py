@@ -145,6 +145,12 @@ class Core(HasTRoomParams, Elaboratable):
         self.tmem_conflicts = Signal(48)
         self.useful_macs = Signal(48)
         self.array_starve = Signal(48)
+        # G3 observation hook: both ACT RAM writers valid at once --
+        # an illegal state under the serialized emission (each source
+        # sits behind its own WAIT) that the priority mux nevertheless
+        # handles (ActLoader first). Timing-cold; the core-level tests
+        # watch it never pulse.
+        self.act_wr_conflict = Signal()
         # Cycle-breakdown window (M3b): the matrix unit's launch/drain
         # split with its output-credit stalls, and the FP32 epilogue's
         # activity, sink backpressure, record acceptance, and per-lane
@@ -218,7 +224,33 @@ class Core(HasTRoomParams, Elaboratable):
         ]
 
         # Activation loading and streaming compute never overlap.
-        m.d.comb += actload.act_wr.connect(self.stream.act_wr)
+        # G3 (2026-11-15): two writers share the ACT RAM port -- the
+        # ActLoader (staged SQUANTIZE) and the vector unit's direct
+        # per-segment record (VEC_QUANT_ACT). Under the serialized
+        # emission each sits behind its own WAIT, so both valid at
+        # once is an illegal state; the mux is nevertheless a
+        # priority mux (ActLoader first) with the ready routed to the
+        # granted source, not an assumption -- the core tests watch
+        # the exclusion.
+        m.d.comb += [
+            self.stream.act_wr.valid.eq(actload.act_wr.valid
+                                        | vector.act_wr.valid),
+            self.stream.act_wr.bits.seg.eq(
+                Mux(actload.act_wr.valid, actload.act_wr.bits.seg,
+                    vector.act_wr.bits.seg)),
+            self.stream.act_wr.bits.quants.eq(
+                Mux(actload.act_wr.valid, actload.act_wr.bits.quants,
+                    vector.act_wr.bits.quants)),
+            self.stream.act_wr.bits.s_act.eq(
+                Mux(actload.act_wr.valid, actload.act_wr.bits.s_act,
+                    vector.act_wr.bits.s_act)),
+            self.stream.act_wr.bits.sum_a.eq(
+                Mux(actload.act_wr.valid, actload.act_wr.bits.sum_a,
+                    vector.act_wr.bits.sum_a)),
+            actload.act_wr.ready.eq(self.stream.act_wr.ready),
+            vector.act_wr.ready.eq(self.stream.act_wr.ready
+                                   & ~actload.act_wr.valid),
+        ]
 
         cur_rows = Signal(self.rows_bits)
         cur_r_base = Signal(self.tmem_addr_width)
@@ -831,6 +863,22 @@ class Core(HasTRoomParams, Elaboratable):
         else:
             act_offer_ok = Const(1)
             act_epi_ok = Const(1)
+        # G3: the direct-quant (VEC_QUANT_ACT) fill's ownership of the
+        # ACT port, latched at the vector command's accept from the
+        # offered op (a later non-quant vector command clears it; a
+        # rejected one never activates the unit, so the stale bit is
+        # inert). The stream accept's bank-commit invariant extends to
+        # this second writer: a direct fill still in flight at accept
+        # stalls the accept instead of tearing a bank, exactly like an
+        # ActLoader fill.
+        vec_act_direct = Signal()
+        with m.If(vector.sink.fire):
+            m.d.sync += vec_act_direct.eq(
+                (cur_vec_op == VecOp.VEC_QUANT_ACT)
+                | (cur_vec_op == VecOp.VEC_MUL_QUANT_ACT))
+        act_fill_busy = actload.active | (vector.active & vec_act_direct)
+        m.d.comb += self.act_wr_conflict.eq(actload.act_wr.valid
+                                            & vector.act_wr.valid)
         m.d.comb += [
             dma.sink.valid.eq(fsm.ongoing('EXEC') & ~self.halt & is_dma),
             dma.sink.bits.store.eq(is_store),
@@ -858,7 +906,7 @@ class Core(HasTRoomParams, Elaboratable):
         m.d.comb += [
             self.stream.sink.valid.eq(
                 fsm.ongoing('EXEC') & ~self.halt & is_smatmul
-                & r_ok & epi.ready & ~actload.active),
+                & r_ok & epi.ready & ~act_fill_busy),
             self.stream.sink.bits.fmt.eq(cur_fmt),
             self.stream.sink.bits.k.eq(cur_k),
             self.stream.sink.bits.rows.eq(cur_rows),

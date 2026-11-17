@@ -339,6 +339,22 @@ CAPS_VB_COUNTERS = 21
 # re-derives the whole state after fallback rebuilds. Backends without
 # the bit keep the installed rebuild emission everywhere.
 CAPS_VBUILD_K4 = 22
+# G3 direct-activation quantization (2026-11-15,
+# plans/2026-11-09-troom-qwen3-hill-climb.md): VECTOR VEC_QUANT_ACT --
+# the quantizer's frozen per-segment results written straight into the
+# activation bank as the per-segment record SQUANTIZE would have
+# copied there, removing the TMEM staging image and the copy from the
+# GEMV head chain (the measured 43.3 cyc/segment ActLoader pass).
+# Byte-identical to the staged chain; k coverage is SQUANTIZE's
+# (nonzero multiples of 32 up to act_max_k). Always implemented in
+# this source generation and gated only by host emission (the
+# TROOM_GEMV_ACT_DIRECT knob); images advertising the bit accept the
+# op, and bit-less backends keep the standing 11-command chain.
+CAPS_VEC_QUANT_ACT = 23
+
+# G4: RNE FP32 MUL -> the frozen activation quantizer -> ACT, no TMEM
+# product image. Format-0 still assigns a whole word to vec_op (now 5 bits).
+CAPS_VEC_MUL_QUANT_ACT = 24
 
 
 class WrapperError(IntEnum):

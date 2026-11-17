@@ -30,6 +30,8 @@ from troom.abi import (
     CAPS_VB_COUNTERS,
     CAPS_VEC_F16,
     CAPS_VEC_PSWAP,
+    CAPS_VEC_QUANT_ACT,
+    CAPS_VEC_MUL_QUANT_ACT,
     CAPS_WATCHDOG,
     CMD_DESC_BYTES,
     CONTROL_CLEAR,
@@ -221,7 +223,9 @@ def test_identity_caps_and_parameters():
                 | (1 << CAPS_VBUILD_DAPP)
                 | (1 << CAPS_ACT_BANK)
                 | (1 << CAPS_TMEM_SPLIT)
-                | (1 << CAPS_VB_COUNTERS))
+                | (1 << CAPS_VB_COUNTERS)
+                | (1 << CAPS_VEC_QUANT_ACT)
+                | (1 << CAPS_VEC_MUL_QUANT_ACT))
         assert (yield from cread(axil, REG_CAPS)) == caps
         assert (yield from cread(axil, REG_MEM_BASE)) == MEM_BASE
         assert (yield from cread(axil, REG_MEM_SIZE)) == MEM_SIZE

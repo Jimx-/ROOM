@@ -406,20 +406,25 @@ def test_unit_quant_wide_beat():
     check_quant(params, words, res, writes)
 
 
-@pytest.mark.parametrize('desc, status, why', [
-    (dict(op=int(VecOp.VEC_QUANT), n=0), Status.BAD_SHAPE, 'zero count'),
-    (dict(op=int(VecOp.VEC_QUANT), n=8,
-          o_base=A_BASE), Status.BAD_SHAPE, 'output inside A'),
-    (dict(op=int(VecOp.VEC_QUANT), n=8,
-          b_base=A_BASE), Status.BAD_SHAPE, 'meta inside A'),
-    (dict(op=int(VecOp.VEC_QUANT), n=8,
-          b_base=O_BASE), Status.BAD_SHAPE, 'meta inside output'),
-    (dict(op=int(VecOp.VEC_QUANT), n=8,
-          b_base=M_BASE + 4), Status.BAD_ALIGN, 'unaligned meta base'),
-    (dict(op=int(VecOp.VEC_QUANT), n=64,
-          b_base=0x3ff8), Status.BAD_RANGE, 'meta past TMEM'),
-    (dict(op=15, n=8), Status.BAD_SHAPE, 'reserved sub-op encoding'),
-])
+@pytest.mark.parametrize(
+    'desc, status, why',
+    [
+        (dict(op=int(VecOp.VEC_QUANT), n=0), Status.BAD_SHAPE, 'zero count'),
+        (dict(op=int(VecOp.VEC_QUANT), n=8,
+              o_base=A_BASE), Status.BAD_SHAPE, 'output inside A'),
+        (dict(op=int(VecOp.VEC_QUANT), n=8,
+              b_base=A_BASE), Status.BAD_SHAPE, 'meta inside A'),
+        (dict(op=int(VecOp.VEC_QUANT), n=8,
+              b_base=O_BASE), Status.BAD_SHAPE, 'meta inside output'),
+        (dict(op=int(VecOp.VEC_QUANT), n=8,
+              b_base=M_BASE + 4), Status.BAD_ALIGN, 'unaligned meta base'),
+        (dict(op=int(VecOp.VEC_QUANT), n=64,
+              b_base=0x3ff8), Status.BAD_RANGE, 'meta past TMEM'),
+        # op 15 is VEC_QUANT_ACT since G3: an accepted encoding whose
+        # shape coverage is checked (n must be a nonzero multiple of 32).
+        (dict(op=int(VecOp.VEC_QUANT_ACT),
+              n=8), Status.BAD_SHAPE, 'count not a multiple of 32'),
+    ])
 def test_unit_quant_rejected(desc, status, why):
     params = dict(PARAMS)
     d = dict(desc)

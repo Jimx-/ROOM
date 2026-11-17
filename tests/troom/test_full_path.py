@@ -141,8 +141,19 @@ def send_cmd(cmd, opcode, seq, evt=0, **fields):
     yield
 
 
-def run_program(params, program, image, deadline=20000, *, stall_resp=False):
-    """Issue commands; return (completions, DRAM image, counters)."""
+def run_program(params,
+                program,
+                image,
+                deadline=20000,
+                *,
+                stall_resp=False,
+                watch=None):
+    """Issue commands; return (completions, DRAM image, counters).
+
+    ``watch`` (optional) receives the harness and returns a sync
+    process generator, added alongside the stimulus; core-level tests
+    use it to observe internal signals per cycle.
+    """
     dut = Harness(params, image)
     results = {}
     counters = {}
@@ -203,6 +214,8 @@ def run_program(params, program, image, deadline=20000, *, stall_resp=False):
     sim.add_sync_process(tx)
     sim.add_sync_process(rx)
     sim.add_sync_process(collector)
+    if watch is not None:
+        sim.add_sync_process(watch(dut))
     sim.run()
     assert list(results) == [entry['seq'] for entry in program]
     return results, image, counters

@@ -21,11 +21,20 @@ name:
   (``plans/2026-10-10-troom-vector-transcendentals.md``).
 * ``VEC_QUANT`` -- device-side activation quantization: per 32-word
   segment, an fmax fold of ``|x|``, the scale pair
-  ``sc = R(amax/127)`` and ``inv = R(127*recip(amax))`` (the frozen
-  recip sequence), and RNE INT8 rounding of ``R(x*inv)``, emitted as
+  ``sc = R(amax * fp32(1/127))`` and ``r = frozen_recip(amax)``,
+  and RNE INT8 rounding of ``R(R(x*r)*127)``, emitted as
   the packed-quants region at ``o_base`` and the per-segment
   ``s_act``/sum meta region at ``b_base`` -- the image the
   ``QUANTIZE`` copy consumes, per the same frozen contract.
+* ``VEC_QUANT_ACT`` -- G3's direct-activation quantization: the
+  frozen ``VEC_QUANT`` arithmetic with the per-segment results
+  emitted as ACT RAM records (exactly the image the ``QUANTIZE``
+  copy produces) instead of the packed TMEM staging regions.
+  ``o_base``/``b_base`` are don't-care, ``k`` keeps SQUANTIZE's
+  coverage (nonzero multiples of 32 up to ``act_max_k``), and the
+  staged chain's records and the direct op's are byte-identical by
+  construction -- the quantizer sequence is untouched and only the
+  result routing differs.
 * ``VEC_F16`` -- FP32 -> FP16 narrowing: the frozen ``Fp32To16``
   sequence (RNE for every bit pattern including the FP16 subnormal
   range, NaNs canonicalized to a quiet NaN with the sign kept),
@@ -113,6 +122,15 @@ is unchanged by the interleaving and by the partition; with four
 contexts the per-element cost is the op count (exp2's sixteen
 dependent rounded ops) times the four-cycle capture loop, divided by
 four -- roughly sixteen cycles per element instead of sixty-one.
+
+``VEC_MUL_QUANT_ACT`` (G4) consumes two FP32 input regions and fills
+the segment buffer with separately rounded ``R(a[i]*b[i])`` products.
+It folds their magnitudes at retirement, then uses the unchanged scale,
+reciprocal and quantization sequence and G3 ACT writer. The product has
+no TMEM/DRAM image. B is a checked input, O is unused; input aliasing is
+legal. SCALE waits for every product, including exceptional values, to
+retire before reusing the multiplier. No SiLU or norm rounding is fused
+into the final product.
 
 ``VEC_QUANT`` reuses both multiplier groups when ``vec_quant_pipe``
 is enabled: consecutive elements flow through ``R(x*r)`` and then
@@ -233,6 +251,16 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             Record, [('addr', self.tmem_addr_width, Direction.FANOUT),
                      ('data', self.data_width, Direction.FANOUT)])
 
+        # G3 direct-activation output: the per-segment ACT RAM record
+        # (the same layout as the ActLoader's upload port), driven only
+        # by VEC_QUANT_ACT. One record per segment, in segment order.
+        self.act_wr = Decoupled(Record, [
+            ('seg', self.lg_act_segs, Direction.FANOUT),
+            ('quants', self.seg_len * 8, Direction.FANOUT),
+            ('s_act', 32, Direction.FANOUT),
+            ('sum_a', signed(16), Direction.FANOUT),
+        ])
+
         self.done = Signal()
         self.status = Signal(Status)
         self.active = Signal()
@@ -317,6 +345,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         o_reduce = Cat(offer.op == op for op in VEC_REDUCTIONS).any()
         o_scale = offer.op == VecOp.VEC_SCALE
         o_quant = offer.op == VecOp.VEC_QUANT
+        o_q_mul = offer.op == VecOp.VEC_MUL_QUANT_ACT
+        o_q_act = (offer.op == VecOp.VEC_QUANT_ACT) | o_q_mul
         o_f16 = offer.op == VecOp.VEC_F16
         o_pswap = offer.op == VecOp.VEC_PSWAP
         o_smexp = offer.op == VecOp.VEC_SMEXP
@@ -346,12 +376,21 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         o_end = offer.o_base + o_pad
 
         overlap_a = (offer.o_base < a_end) & (offer.a_base < o_end)
+        # VEC_QUANT_ACT writes no TMEM region: o_base/b_base are
+        # don't-care, so every o/b overlap, alignment, and range term
+        # is suppressed for it. Its own coverage check is
+        # SQUANTIZE's: nonzero multiples of 32 up to act_max_k (the
+        # bound keeps the record's segment index inside lg_act_segs;
+        # k == 0 falls to the generic n == 0 rejection).
+        q_act_shape_bad = o_q_act & (offer.n[:5].any()
+                                     | (offer.n > self.act_max_k))
+        overlap_a = ~o_q_act & overlap_a
         # Only operations that read the B region check it: the binary
         # elementwise ops and VEC_SCALE's scalar beat. Reductions and
         # the unary transcendentals never touch B, so a B alias with
         # the output must not reject them. VEC_QUANT writes its meta
         # there, so its B region is checked as a second output.
-        overlap_b = o_reads_b & (offer.o_base < b_end) \
+        overlap_b = ~o_q_act & o_reads_b & (offer.o_base < b_end) \
             & (offer.b_base < o_end)
         quant_overlap = o_quant \
             & ((offer.o_base < b_end) & (offer.b_base < o_end)
@@ -363,14 +402,20 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             & ((offer.o_base < b_end) & (offer.b_base < o_end)
                | (offer.b_base < a_end) & (offer.a_base < b_end))
         shape_bad = op_bad | (offer.n == 0) | overlap_a | overlap_b \
-            | quant_overlap | smexp_overlap | (o_pswap & offer.n[0])
-        align_bad = offer.a_base[:lg].any() | offer.o_base[:lg].any() \
-            | (o_reads_b & offer.b_base[:lg].any()) \
-            | ((o_quant | o_smexp) & offer.b_base[:lg].any())
-        range_bad = (a_end > self.tmem_bytes) | (o_end > self.tmem_bytes) \
-            | (o_reads_b & (b_end > self.tmem_bytes)) \
-            | (o_quant & (b_end > self.tmem_bytes)) \
-            | (o_smexp & (b_end > self.tmem_bytes))
+            | quant_overlap | smexp_overlap | (o_pswap & offer.n[0]) \
+            | q_act_shape_bad
+        align_bad = offer.a_base[:lg].any() \
+            | (o_q_mul & offer.b_base[:lg].any()) \
+            | (~o_q_act & (offer.o_base[:lg].any()
+                           | (o_reads_b & offer.b_base[:lg].any())
+                           | ((o_quant | o_smexp)
+                              & offer.b_base[:lg].any())))
+        range_bad = (a_end > self.tmem_bytes) \
+            | (o_q_mul & (b_end > self.tmem_bytes)) \
+            | (~o_q_act & ((o_end > self.tmem_bytes)
+                           | (o_reads_b & (b_end > self.tmem_bytes))
+                           | (o_quant & (b_end > self.tmem_bytes))
+                           | (o_smexp & (b_end > self.tmem_bytes))))
         bad = shape_bad | align_bad | range_bad
 
         q_qbeats = (q_nsegs * 32 + (bb - 1)) >> lg
@@ -379,8 +424,10 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             o_reduce, 1,
             Mux(
                 o_quant, q_qbeats + q_mbeats,
-                Mux(o_f16, ((offer.n << 1) + (bb - 1)) >> lg,
-                    (eb + (bb - 1)) >> lg)))
+                Mux(
+                    o_q_act, 0,
+                    Mux(o_f16, ((offer.n << 1) + (bb - 1)) >> lg,
+                        (eb + (bb - 1)) >> lg))))
         # The input regions always span ceil(n * 4 / beat) beats; only
         # the output region shrinks to one beat for a reduction.
         ibeats_o = (eb + (bb - 1)) >> lg
@@ -388,7 +435,6 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         #
         # Latched run state.
         #
-        op = Signal(VecOp)
         n_l = Signal(self.lg_act_k + 1)
         a_base = Signal(aw)
         b_base = Signal(aw)
@@ -407,45 +453,54 @@ class VectorUnit(HasTRoomParams, Elaboratable):
 
         # Explicit combinational signals keep shared decode expressions from
         # being expanded independently at every consumer during RTL lowering.
-        op_add = Signal()
-        m.d.comb += op_add.eq(op == VecOp.VEC_ADD)
-        op_sub = Signal()
-        m.d.comb += op_sub.eq(op == VecOp.VEC_SUB)
-        op_mul = Signal()
-        m.d.comb += op_mul.eq(op == VecOp.VEC_MUL)
-        op_scale = Signal()
-        m.d.comb += op_scale.eq(op == VecOp.VEC_SCALE)
-        op_sum = Signal()
-        m.d.comb += op_sum.eq(op == VecOp.RDC_SUM)
-        op_max = Signal()
-        m.d.comb += op_max.eq(op == VecOp.RDC_MAX)
-        op_sumsq = Signal()
-        m.d.comb += op_sumsq.eq(op == VecOp.RDC_SUMSQ)
-        op_exp2 = Signal()
-        m.d.comb += op_exp2.eq(op == VecOp.VEC_EXP2)
-        op_recip = Signal()
-        m.d.comb += op_recip.eq(op == VecOp.VEC_RECIP)
-        op_rsqrt = Signal()
-        m.d.comb += op_rsqrt.eq(op == VecOp.VEC_RSQRT)
-        op_quant = Signal()
-        m.d.comb += op_quant.eq(op == VecOp.VEC_QUANT)
-        op_f16 = Signal()
-        m.d.comb += op_f16.eq(op == VecOp.VEC_F16)
-        op_pswap = Signal()
-        m.d.comb += op_pswap.eq(op == VecOp.VEC_PSWAP)
-        op_silu = Signal()
-        m.d.comb += op_silu.eq(op == VecOp.VEC_SILU)
-        op_smexp = Signal()
-        m.d.comb += op_smexp.eq(op == VecOp.VEC_SMEXP)
+        op_add = Signal(reset=int(VecOp.VEC_ADD) == 0,
+                        attrs={'max_fanout': 64})
+        op_sub = Signal(reset=int(VecOp.VEC_SUB) == 0,
+                        attrs={'max_fanout': 64})
+        op_mul = Signal(reset=int(VecOp.VEC_MUL) == 0,
+                        attrs={'max_fanout': 64})
+        op_scale = Signal(reset=int(VecOp.VEC_SCALE) == 0,
+                          attrs={'max_fanout': 64})
+        op_sum = Signal(reset=int(VecOp.RDC_SUM) == 0,
+                        attrs={'max_fanout': 64})
+        op_max = Signal(reset=int(VecOp.RDC_MAX) == 0,
+                        attrs={'max_fanout': 64})
+        op_sumsq = Signal(reset=int(VecOp.RDC_SUMSQ) == 0,
+                          attrs={'max_fanout': 64})
+        op_exp2 = Signal(reset=int(VecOp.VEC_EXP2) == 0,
+                         attrs={'max_fanout': 64})
+        op_recip = Signal(reset=int(VecOp.VEC_RECIP) == 0,
+                          attrs={'max_fanout': 64})
+        op_rsqrt = Signal(reset=int(VecOp.VEC_RSQRT) == 0,
+                          attrs={'max_fanout': 64})
+        op_quant = Signal(reset=int(VecOp.VEC_QUANT) == 0,
+                          attrs={'max_fanout': 64})
+        op_q_act = Signal(reset=int(VecOp.VEC_QUANT_ACT) == 0,
+                          attrs={'max_fanout': 64})
+        op_q_mul = Signal()
+        op_f16 = Signal(reset=int(VecOp.VEC_F16) == 0,
+                        attrs={'max_fanout': 64})
+        op_pswap = Signal(reset=int(VecOp.VEC_PSWAP) == 0,
+                          attrs={'max_fanout': 64})
+        op_silu = Signal(reset=int(VecOp.VEC_SILU) == 0,
+                         attrs={'max_fanout': 64})
+        op_smexp = Signal(reset=int(VecOp.VEC_SMEXP) == 0,
+                          attrs={'max_fanout': 64})
         is_add_op = Signal()
         m.d.comb += is_add_op.eq(op_add | op_sub)
         is_mul_op = Signal()
         m.d.comb += is_mul_op.eq(op_mul | op_scale)
         binary_b = Signal()
-        m.d.comb += binary_b.eq(op_add | op_sub | op_mul)
+        m.d.comb += binary_b.eq(op_add | op_sub | op_mul | op_q_mul)
         is_unary = Signal()
         m.d.comb += is_unary.eq(op_exp2 | op_recip | op_rsqrt | op_silu
                                 | op_smexp)
+        # The staged (VEC_QUANT) and direct (VEC_QUANT_ACT) ops share
+        # the quant sequencer; q_any marks the shared datapath, while
+        # op_quant alone keeps the staged-only plumbing (res_q and
+        # packer traffic, the meta memory and its drain).
+        q_any = Signal()
+        m.d.comb += q_any.eq(op_quant | op_q_act)
 
         # VEC_SMEXP phase membership (driven from the smexp FSM below,
         # like the quant sequencer's phase signals): pass 1 folds the
@@ -679,6 +734,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # bypass value directly instead of the 2^i-scaled polynomial.
         un_bp = Array(Signal(name=f'un_bp{i}') for i in range(ctx_n))
         un_step = Array(Signal(6, name=f'un_step{i}') for i in range(ctx_n))
+        un_cls_pending = Array(
+            Signal(name=f'un_cls_pending{i}') for i in range(ctx_n))
         done_val = Array(Signal(name=f'un_done{i}') for i in range(ctx_n))
         done_word = Array(
             Signal(32, name=f'un_dword{i}') for i in range(ctx_n))
@@ -758,30 +815,38 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # subtract lands); the standing ops classify before arming,
         # exactly as before.
         cls_req = [
-            un_busy[i] & ~done_val[i]
+            un_busy[i] & ~done_val[i] & ~un_cls_pending[i]
             & (op_silu & step_in((2, 34), un_step[i])
                | (op_smexp & (un_step[i] == 2))
                | (~op_silu & ~op_smexp & ~un_arm[i])) for i in range(ctx_n)
         ]
         cls_go = Cat(*cls_req).any()
-        cls_sel = Signal(ctx_w)
-        m.d.comb += cls_sel.eq(ctx_n - 1)
+        cls_pick = Signal(ctx_w)
+        m.d.comb += cls_pick.eq(ctx_n - 1)
         for i in range(ctx_n - 1, -1, -1):
             with m.If(cls_req[i]):
-                m.d.comb += cls_sel.eq(i)
-        cls_s = Signal(6)
-        m.d.comb += cls_s.eq(un_step[cls_sel])
-        # The classify operand: the context's input for the standing
-        # ops and SILU's/SMEXP's first (exp2) classify; the
-        # intermediate for SILU's second (recip) classify.
-        # Materialize the selected operand once before classification fans out.
-        cls_x = Signal(32)
-        m.d.comb += cls_x.eq(
-            Mux(
-                op_silu & (cls_s == 34), un_acc[cls_sel],
-                Mux((op_silu | op_smexp) & (cls_s == 2), un_tmp[cls_sel],
-                    un_x[cls_sel])))
+                m.d.comb += cls_pick.eq(i)
+        cls_pick_s = Signal(6)
+        m.d.comb += cls_pick_s.eq(un_step[cls_pick])
 
+        # Cut arbitration/operand selection from classification and writeback.
+        # The pending bit prevents selecting the same context twice.
+        cls_valid = Signal()
+        cls_sel = Signal(ctx_w)
+        cls_s = Signal(6)
+        cls_x = Signal(32)
+        m.d.sync += cls_valid.eq(cls_go)
+        with m.If(cls_go):
+            m.d.sync += [
+                cls_sel.eq(cls_pick),
+                cls_s.eq(cls_pick_s),
+                cls_x.eq(
+                    Mux(
+                        op_silu & (cls_pick_s == 34), un_acc[cls_pick],
+                        Mux((op_silu | op_smexp) & (cls_pick_s == 2),
+                            un_tmp[cls_pick], un_x[cls_pick]))),
+                un_cls_pending[cls_pick].eq(1),
+            ]
         # Classification of the selected operand: the frozen
         # special-value table of tests/troom/model.py. exp2's clamps
         # are bit comparisons: x >= 128 is exponent field >= 134
@@ -883,7 +948,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # consumes the bypass value) and a w3 bypass skips recip's
         # seed/Newton (the final product consumes it); the non-bypass
         # w3 classify just advances to the seed step.
-        with m.If(cls_go):
+        with m.If(cls_valid):
+            m.d.sync += un_cls_pending[cls_sel].eq(0)
             with m.If(un_bypass):
                 with m.If(op_silu):
                     with m.If(cls_s == 2):
@@ -1045,7 +1111,52 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # so the popped tag owns the completing result; a context
         # holds at most one outstanding request, so depth ctx_n
         # suffices.
-        def tag_fifo(prefix, issue_go, issue_sel, out_valid, group=None):
+        # The destination and successor state are invariant while a
+        # context waits for its arithmetic result. Decode them at issue and
+        # carry them in the existing bank-local completion FIFO, rather than
+        # re-reading the context step and global opcode on the writeback path.
+        # This adds no stage, changes no arbitration or arithmetic, and keeps
+        # the old shift/pop ordering for simultaneous issue and completion.
+        def capture_plan(kind, step):
+            if kind == 'mul':
+                cap_mul_t = (op_recip & step_in((3, 9), step)) \
+                    | (op_rsqrt & step_in((5, 13, 7, 15), step)) \
+                    | (op_exp2 & step_in((3, 7, 11, 15, 19, 23, 27), step)) \
+                    | (op_silu & step_in((1, 5, 9, 13, 17, 21, 25, 29,
+                                          39, 45), step)) \
+                    | (op_smexp & step_in((5, 9, 13, 17, 21, 25, 29), step))
+                cap_mul_h = op_rsqrt & (step == 3)
+                cap_mul_a = (op_recip & (step == 7)) \
+                    | (op_rsqrt & (step == 11))
+                # SILU's Newton quotients land in the seed register.
+                cap_mul_f = op_silu & step_in((43, 49), step)
+                fin_mul = (op_recip & (step == 13)) \
+                    | (op_rsqrt & (step == 19)) \
+                    | (op_silu & (step == 51))
+
+                return Cat(cap_mul_t, cap_mul_h, cap_mul_a, cap_mul_f, fin_mul)
+            else:
+                cap_add_t = (op_recip & step_in((5, 11), step)) \
+                    | (op_rsqrt & step_in((9, 17), step)) \
+                    | (op_silu & step_in((41, 47), step)) \
+                    | (op_smexp & (step == 1))
+                cap_add_f = (op_exp2 & (step == 1)) | (op_silu & (step == 3)) \
+                    | (op_smexp & (step == 3))
+                cap_add_a = (op_exp2 & step_in((5, 9, 13, 17, 21, 25), step)) \
+                    | (op_silu & step_in((7, 11, 15, 19, 23, 27, 31, 33),
+                                         step)) \
+                    | (op_smexp & step_in((7, 11, 15, 19, 23, 27), step))
+                fin_add = (op_exp2 & (step == 29)) \
+                    | (op_smexp & (step == 31))
+
+                return Cat(cap_add_t, Const(0), cap_add_a, cap_add_f, fin_add)
+
+        def tag_fifo(prefix,
+                     issue_go,
+                     issue_sel,
+                     out_valid,
+                     group=None,
+                     kind=None):
             # Four-way issue has static ownership: group g only issues
             # contexts i % 4 == g. Store a bank-local tag and restore the
             # constant low bits at capture. Otherwise reset/unfilled tags
@@ -1056,10 +1167,31 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             bank_bits = 2 if group is not None else 0
             depth = len(range(group, ctx_n, 4)) if group is not None else ctx_n
             tag_w = max(1, ctx_w - bank_bits)
-            issue_tag = issue_sel[bank_bits:] if ctx_w > bank_bits else Const(
+            owner_tag = issue_sel[bank_bits:] if ctx_w > bank_bits else Const(
                 0, 1)
+            payload_w = 12 if kind is not None else 0
+            issue_tag = Signal(tag_w + payload_w, name=f'{prefix}_issue')
+            if kind is not None:
+                # Inline ArrayProxy reads multiply through every decode and
+                # every indexed FIFO write. Share each combinational value.
+                step = Signal(6, name=f'{prefix}_step')
+                await_step = Signal(6, name=f'{prefix}_await')
+                next_step = Signal(6, name=f'{prefix}_next')
+                plan = Signal(5, name=f'{prefix}_plan')
+                sign = Signal(name=f'{prefix}_sign')
+                m.d.comb += [
+                    step.eq(un_step[issue_sel]),
+                    await_step.eq(step + 1),
+                    next_step.eq(step + 2),
+                    plan.eq(capture_plan(kind, await_step)),
+                    sign.eq(op_recip & un_x[issue_sel][31]),
+                    issue_tag.eq(Cat(owner_tag, plan, sign, next_step)),
+                ]
+            else:
+                m.d.comb += issue_tag.eq(owner_tag)
             tags = [
-                Signal(tag_w, name=f'{prefix}_tag{i}') for i in range(depth)
+                Signal(tag_w + payload_w, name=f'{prefix}_tag{i}')
+                for i in range(depth)
             ]
             tarr = Array(tags)
             cnt = Signal(range(depth + 1), name=f'{prefix}_tagcnt')
@@ -1073,24 +1205,28 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 with m.Else():
                     m.d.sync += tarr[cnt].eq(issue_tag)
             m.d.sync += cnt.eq(cnt + Mux(issue_go, 1, 0) - Mux(pop, 1, 0))
-            owner = tags[0]
+            owner = tags[0][:tag_w]
             if group is not None:
                 owner = Cat(Const(group, bank_bits),
-                            tags[0][:ctx_w - bank_bits])
+                            tags[0][:tag_w][:max(0, ctx_w - bank_bits)])
+            if kind is not None:
+                return owner, cnt, tags[0][tag_w:]
             return owner, cnt
 
-        add_owner, add_tcnt = tag_fifo(
+        add_owner, add_tcnt, add_owner_capture = tag_fifo(
             'unfadd',
             un_add_go0,
             sel_add0,
             fadd.out.valid,
-            group=0 if self.vec_add_units == 4 else None)
-        mul_owner, mul_tcnt = tag_fifo(
+            group=0 if self.vec_add_units == 4 else None,
+            kind='add')
+        mul_owner, mul_tcnt, mul_owner_capture = tag_fifo(
             'unfmul',
             un_mul_go0,
             sel_mul0,
             fmul.out.valid,
-            group=0 if self.vec_mul_units == 4 else None)
+            group=0 if self.vec_mul_units == 4 else None,
+            kind='mul')
         rec_owner, rec_tcnt = tag_fifo('unfrec', un_rec_go, sel_rec,
                                        frec.out.valid)
 
@@ -1101,24 +1237,13 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # (the new p) in un_acc. The decode is identical for every
         # unit of a class (the operand order is the context's, not
         # the unit's), so one function serves both issue groups.
-        def mul_capture(unit, owner, tcnt):
+        def mul_capture(unit, owner, tcnt, meta):
             mul_cap = unit.out.valid & (tcnt != 0)
-            s_mul = un_step[owner]
-            cap_mul_t = (op_recip & step_in((3, 9), s_mul)) \
-                | (op_rsqrt & step_in((5, 13, 7, 15), s_mul)) \
-                | (op_exp2 & step_in((3, 7, 11, 15, 19, 23, 27), s_mul)) \
-                | (op_silu & step_in((1, 5, 9, 13, 17, 21, 25, 29,
-                                      39, 45), s_mul)) \
-                | (op_smexp & step_in((5, 9, 13, 17, 21, 25, 29), s_mul))
-            cap_mul_h = op_rsqrt & (s_mul == 3)
-            cap_mul_a = (op_recip & (s_mul == 7)) \
-                | (op_rsqrt & (s_mul == 11))
-            # SILU's Newton quotients land in the seed register.
-            cap_mul_f = op_silu & step_in((43, 49), s_mul)
-            fin_mul = (op_recip & (s_mul == 13)) \
-                | (op_rsqrt & (s_mul == 19)) \
-                | (op_silu & (s_mul == 51))
-
+            cap_mul_t, cap_mul_h, cap_mul_a, cap_mul_f, fin_mul = (meta[0],
+                                                                   meta[1],
+                                                                   meta[2],
+                                                                   meta[3],
+                                                                   meta[4])
             with m.If(mul_cap):
                 with m.If(fin_mul):
                     # Final word: recip applies the sign of x; rsqrt's
@@ -1126,11 +1251,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     # a*sigmoid already carries the (identity) sign
                     # fold on its operand.
                     m.d.sync += [
-                        done_word[owner].eq(
-                            Mux(
-                                op_recip, unit.out.bits.data
-                                ^ Cat(Const(0, 31), un_x[owner][31]),
-                                unit.out.bits.data)),
+                        done_word[owner].eq(unit.out.bits.data
+                                            ^ Cat(Const(0, 31), meta[5])),
                         done_val[owner].eq(1),
                         un_wait[owner].eq(0),
                     ]
@@ -1144,25 +1266,13 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     with m.If(cap_mul_f):
                         m.d.sync += un_f[owner].eq(unit.out.bits.data)
                     m.d.sync += [
-                        un_step[owner].eq(s_mul + 1), un_wait[owner].eq(0)
+                        un_step[owner].eq(meta[6:12]), un_wait[owner].eq(0)
                     ]
 
-        def add_capture(unit, owner, tcnt):
+        def add_capture(unit, owner, tcnt, meta):
             add_cap = unit.out.valid & (tcnt != 0)
-            s_add = un_step[owner]
-            cap_add_t = (op_recip & step_in((5, 11), s_add)) \
-                | (op_rsqrt & step_in((9, 17), s_add)) \
-                | (op_silu & step_in((41, 47), s_add)) \
-                | (op_smexp & (s_add == 1))
-            cap_add_f = (op_exp2 & (s_add == 1)) | (op_silu & (s_add == 3)) \
-                | (op_smexp & (s_add == 3))
-            cap_add_a = (op_exp2 & step_in((5, 9, 13, 17, 21, 25), s_add)) \
-                | (op_silu & step_in((7, 11, 15, 19, 23, 27, 31, 33),
-                                     s_add)) \
-                | (op_smexp & step_in((7, 11, 15, 19, 23, 27), s_add))
-            fin_add = (op_exp2 & (s_add == 29)) \
-                | (op_smexp & (s_add == 31))
-
+            cap_add_t, cap_add_a, cap_add_f, fin_add = (meta[0], meta[2],
+                                                        meta[3], meta[4])
             with m.If(add_cap):
                 with m.If(fin_add):
                     # exp2 final scaling: add the latched floor i to the
@@ -1190,38 +1300,41 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     with m.If(cap_add_a):
                         m.d.sync += un_acc[owner].eq(unit.out.bits.data)
                     m.d.sync += [
-                        un_step[owner].eq(s_add + 1), un_wait[owner].eq(0)
+                        un_step[owner].eq(meta[6:12]), un_wait[owner].eq(0)
                     ]
 
-        mul_capture(fmul, mul_owner, mul_tcnt)
-        add_capture(fadd, add_owner, add_tcnt)
+        mul_capture(fmul, mul_owner, mul_tcnt, mul_owner_capture)
+        add_capture(fadd, add_owner, add_tcnt, add_owner_capture)
         if fmul1 is not None:
-            mul_owner1, mul_tcnt1 = tag_fifo(
+            mul_owner1, mul_tcnt1, mul_owner1_capture = tag_fifo(
                 'unfmul1',
                 un_mul_go1,
                 sel_mul1,
                 fmul1.out.valid,
-                group=1 if self.vec_mul_units == 4 else None)
-            mul_capture(fmul1, mul_owner1, mul_tcnt1)
+                group=1 if self.vec_mul_units == 4 else None,
+                kind='mul')
+            mul_capture(fmul1, mul_owner1, mul_tcnt1, mul_owner1_capture)
         if fadd1 is not None:
-            add_owner1, add_tcnt1 = tag_fifo(
+            add_owner1, add_tcnt1, add_owner1_capture = tag_fifo(
                 'unfadd1',
                 un_add_go1,
                 sel_add1,
                 fadd1.out.valid,
-                group=1 if self.vec_add_units == 4 else None)
-            add_capture(fadd1, add_owner1, add_tcnt1)
+                group=1 if self.vec_add_units == 4 else None,
+                kind='add')
+            add_capture(fadd1, add_owner1, add_tcnt1, add_owner1_capture)
 
         for kind, g, unit, sel, go in extra_issues:
-            owner, tcnt = tag_fifo(f'unf{kind}{g}',
-                                   go,
-                                   sel,
-                                   unit.out.valid,
-                                   group=g)
+            owner, tcnt, owner_capture = tag_fifo(f'unf{kind}{g}',
+                                                  go,
+                                                  sel,
+                                                  unit.out.valid,
+                                                  group=g,
+                                                  kind=kind)
             if kind == 'add':
-                add_capture(unit, owner, tcnt)
+                add_capture(unit, owner, tcnt, owner_capture)
             else:
-                mul_capture(unit, owner, tcnt)
+                mul_capture(unit, owner, tcnt, owner_capture)
 
         with m.If(frec.out.valid & (rec_tcnt != 0)):
             # RECIP/RSQRT start the seed at y in un_acc; SILU keeps
@@ -1626,6 +1739,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         q_wait = Signal()
         q_valid = Signal(6)  # words of this segment read from A
         q_idx = Signal(6)  # amax/quant index within the segment
+        q_pissued = Signal(6)  # G4 products issued; q_idx counts retirements
         q_ccnt = Signal(6)  # captured bytes this segment
         q_bcnt = Signal(2)
         q_bytes = Signal(32)
@@ -1633,6 +1747,13 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         q_mstep = Signal(2)
         q_seg = Signal(7)  # segment index (meta buffer address)
         q_didx = Signal(self.lg_act_k + 2)  # meta drain index
+        # Direct-mode (VEC_QUANT_ACT) record capture: each completed
+        # quant word shifts in at the top, so after the segment's last
+        # q_word_done byte i sits at bits [8i+7:8i] -- the ActLoader's
+        # record layout exactly. q_act_done marks the final segment's
+        # act_wr fire, the direct path's completion term.
+        q_actbuf = Signal(self.seg_len * 8)
+        q_act_done = Signal()
         q_pe = Signal()  # element product step: 0 x*r, 1 *127
         q_pewait = Signal()
         q_pipe_valid = Signal()
@@ -1659,9 +1780,17 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         q_st_meta = Signal()
         q_st_drain = Signal()
 
-        q_max_go = in_elem & op_quant & q_st_amax & elem_a_ok \
+        q_max_go = in_elem & q_any & ~op_q_mul & q_st_amax & elem_a_ok \
             & (q_idx < q_valid) & (Const(1) if q_pipeline else ~q_maxbusy)
-        q_maxcap = in_elem & op_quant & q_st_amax & fcomp.out.valid
+        # G4 folds the *rounded* final MUL result while filling qbuf. The
+        # segment does not enter SCALE until all products have retired, so
+        # the shared multiplier never mixes producer and quantizer results.
+        q_pgo = in_elem & op_q_mul & q_st_amax & elem_a_ok & elem_b_ok \
+            & (q_pissued < q_valid)
+        q_pcap = in_elem & op_q_mul & q_st_amax & fmul.out.valid
+        q_fill = q_max_go | q_pcap
+        q_fill_word = Mux(op_q_mul, fmul.out.bits.data, a_word)
+        q_maxcap = in_elem & q_any & q_st_amax & fcomp.out.valid
 
         # Scale classification of q_amax: zero or subnormal (every
         # |x| < 2^-126, or an all-NaN fold) zeroes the segment;
@@ -1685,24 +1814,27 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # then p = R(t*127)): the unscaled multiplier r ~ 1/amax
         # never lets an intermediate exceed ~1, so the smallest
         # normal amax cannot overflow the way 127*recip(amax) would.
+        # Direct mode never touches res_q, so it needs no credit --
+        # the room reservation is the staged path's alone.
+        q_room = (op_quant & room) | op_q_act
         q_grp_new = q_idx[:2] == 0
         if q_pipeline:
-            q_m1_go = in_elem & op_quant & q_st_quant & (q_idx < 32) \
-                & (q_grp_new & room | ~q_grp_new)
-            q_cap1 = in_elem & op_quant & q_st_quant & fmul.out.valid
-            q_m2_go = in_elem & op_quant & q_st_quant & q_pipe_valid
-            q_cap2 = in_elem & op_quant & q_st_quant & fmul1.out.valid
+            q_m1_go = in_elem & q_any & q_st_quant & (q_idx < 32) \
+                & (q_grp_new & q_room | ~q_grp_new)
+            q_cap1 = in_elem & q_any & q_st_quant & fmul.out.valid
+            q_m2_go = in_elem & q_any & q_st_quant & q_pipe_valid
+            q_cap2 = in_elem & q_any & q_st_quant & fmul1.out.valid
             q_product = fmul1.out.bits.data
             m.d.sync += q_pipe_valid.eq(q_cap1)
             with m.If(q_cap1):
                 m.d.sync += q_pipe_data.eq(fmul.out.bits.data)
         else:
-            q_m1_go = in_elem & op_quant & q_st_quant & (q_idx < 32) \
-                & ~q_pe & ~q_pewait & (q_grp_new & room | ~q_grp_new)
-            q_m2_go = in_elem & op_quant & q_st_quant & q_pe & ~q_pewait
-            q_cap1 = in_elem & op_quant & q_st_quant & ~q_pe & q_pewait \
+            q_m1_go = in_elem & q_any & q_st_quant & (q_idx < 32) \
+                & ~q_pe & ~q_pewait & (q_grp_new & q_room | ~q_grp_new)
+            q_m2_go = in_elem & q_any & q_st_quant & q_pe & ~q_pewait
+            q_cap1 = in_elem & q_any & q_st_quant & ~q_pe & q_pewait \
                 & fmul.out.valid
-            q_cap2 = in_elem & op_quant & q_st_quant & q_pe & q_pewait \
+            q_cap2 = in_elem & q_any & q_st_quant & q_pe & q_pewait \
                 & fmul.out.valid
             q_product = fmul.out.bits.data
         q_word_done = q_cap2 & (q_bcnt == 3)
@@ -1754,16 +1886,20 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             m.d.sync += [
                 q_valid.eq(q_nvalid),
                 q_idx.eq(0),
+                q_pissued.eq(0),
                 q_ccnt.eq(0),
                 q_bcnt.eq(0),
                 q_sum.eq(0),
                 q_amax.eq(0),
                 q_maxbusy.eq(0),
+                q_actbuf.eq(0),
             ]
 
-        with m.If(q_max_go):
+        with m.If(q_pgo):
+            m.d.sync += q_pissued.eq(q_pissued + 1)
+        with m.If(q_fill):
             m.d.sync += [
-                qbuf[q_idx].eq(a_word),
+                qbuf[q_idx].eq(q_fill_word),
                 q_idx.eq(q_idx + 1),
             ]
             if q_pipeline:
@@ -1772,13 +1908,20 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 q_abs = Signal(31)
                 q_nan = Signal()
                 m.d.comb += [
-                    q_abs.eq(a_word[:31]),
-                    q_nan.eq((a_word[23:31] == 255) & a_word[:23].any()),
+                    q_abs.eq(q_fill_word[:31]),
+                    q_nan.eq((q_fill_word[23:31] == 255)
+                             & q_fill_word[:23].any()),
                 ]
                 with m.If(~q_nan & (q_abs > q_amax)):
                     m.d.sync += q_amax.eq(q_abs)
             else:
-                m.d.sync += q_maxbusy.eq(1)
+                with m.If(op_q_mul):
+                    with m.If(~((q_fill_word[23:31] == 255)
+                                & q_fill_word[:23].any())
+                              & (q_fill_word[:31] > q_amax)):
+                        m.d.sync += q_amax.eq(q_fill_word[:31])
+                with m.Else():
+                    m.d.sync += q_maxbusy.eq(1)
         if not q_pipeline:
             with m.If(q_maxcap):
                 m.d.sync += [q_amax.eq(fcomp.out.bits.data), q_maxbusy.eq(0)]
@@ -1831,6 +1974,10 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             ]
             if not q_pipeline:
                 m.d.sync += q_idx.eq(q_idx + 1)
+        # Direct-mode record capture: the completed word shifts in at
+        # the top of the segment buffer (dead state in staged mode).
+        with m.If(q_word_done):
+            m.d.sync += q_actbuf.eq(Cat(q_actbuf[32:], q_next_bytes))
         with m.If(in_elem & op_quant & q_st_meta & (q_mstep < 2)):
             m.d.sync += q_mstep.eq(q_mstep + 1)
         with m.If(q_drain_go):
@@ -1842,7 +1989,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # not re-read the exhausted A window.
         with m.FSM(name='quant') as qfsm:
             with m.State('QIDLE'):
-                with m.If(in_elem & op_quant & q_arm):
+                with m.If(in_elem & q_any & q_arm):
                     q_start_segment()
                     m.d.sync += [q_arm.eq(0), q_seg.eq(0), q_didx.eq(0)]
                     m.next = 'AMAX'
@@ -1875,7 +2022,13 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 m.d.comb += q_st_quant.eq(1)
                 with m.If(q_ccnt == 32):
                     m.d.sync += q_mstep.eq(0)
-                    m.next = 'META'
+                    # Staged mode latches the meta pair and drains it
+                    # through res_q after the last segment; direct
+                    # mode emits the per-segment record instead.
+                    with m.If(op_q_act):
+                        m.next = 'EMIT'
+                    with m.Else():
+                        m.next = 'META'
             with m.State('META'):
                 m.d.comb += q_st_meta.eq(1)
                 with m.If(q_mstep == 2):
@@ -1883,6 +2036,30 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     with m.If(consumed == n_l):
                         m.next = 'DRAIN'
                     with m.Else():
+                        q_start_segment()
+                        m.next = 'AMAX'
+            with m.State('EMIT'):
+                # Direct mode (VEC_QUANT_ACT): the completed segment's
+                # record -- the same per-segment fields SQUANTIZE's
+                # copy would have written, in the same order -- offered
+                # on the act_wr port. The port is always-ready in
+                # banked mode and back-pressured by the matmul pin in
+                # single-bank mode, so this state holds until the
+                # record lands; the fields are all registers, stable
+                # while the offer waits.
+                m.d.comb += [
+                    self.act_wr.valid.eq(1),
+                    self.act_wr.bits.seg.eq(q_seg[:self.lg_act_segs]),
+                    self.act_wr.bits.quants.eq(q_actbuf),
+                    self.act_wr.bits.s_act.eq(q_sc),
+                    self.act_wr.bits.sum_a.eq(q_sum),
+                ]
+                with m.If(self.act_wr.fire):
+                    with m.If(consumed == n_l):
+                        m.d.sync += q_act_done.eq(1)
+                        m.next = 'QIDLE'
+                    with m.Else():
+                        m.d.sync += q_seg.eq(q_seg + 1)
                         q_start_segment()
                         m.next = 'AMAX'
             with m.State('DRAIN'):
@@ -2051,6 +2228,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             ]
 
         m.d.comb += fmul.inp.valid.eq(elem_mul_go | sq_mul_go | un_mul_go0
+                                      | q_pgo
                                       | q_it_go | q_upd_go | q_sc_go | q_m1_go
                                       | (Const(0) if q_pipeline else q_m2_go))
         if fmul1 is not None:
@@ -2070,10 +2248,16 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     fmul1.inp.bits.in1.eq(unary_mul_in1(view_mul1)),
                     fmul1.inp.bits.in2.eq(unary_mul_in2(view_mul1)),
                 ]
-        with m.Elif(op_quant):
+        with m.Elif(q_any):
             # The scale products t = amax*y, y = y*t, sc = amax*(1/127),
-            # and the element products t = x*r then p = t*127.
-            with m.If(q_st_quant):
+            # and the element products t = x*r then p = t*127 -- the
+            # staged and direct quant ops share them unchanged.
+            with m.If(op_q_mul & q_st_amax):
+                m.d.comb += [
+                    fmul.inp.bits.in1.eq(a_word),
+                    fmul.inp.bits.in2.eq(b_word),
+                ]
+            with m.Elif(q_st_quant):
                 if q_pipeline:
                     m.d.comb += [
                         fmul.inp.bits.in1.eq(qbuf[q_idx]),
@@ -2110,8 +2294,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         m.d.comb += [
             fcomp.inp.valid.eq(max_comp_go
                                | (Const(0) if q_pipeline else q_max_go)),
-            fcomp.inp.bits.in1.eq(Mux(op_quant, q_amax, acc)),
-            fcomp.inp.bits.in2.eq(Mux(op_quant, a_word & 0x7fffffff, a_word)),
+            fcomp.inp.bits.in1.eq(Mux(q_any, q_amax, acc)),
+            fcomp.inp.bits.in2.eq(Mux(q_any, a_word & 0x7fffffff, a_word)),
         ]
 
         # The seed block: reciprocal reads |x|, rsqrt reads x; the
@@ -2124,7 +2308,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             frec.inp.bits.rm.eq(RoundingMode.RNE),
             frec.inp.bits.in1.eq(
                 Mux(
-                    op_quant, q_amax,
+                    q_any, q_amax,
                     Mux(
                         op_silu, un_acc[sel_rec] & 0x7fffffff,
                         Mux(op_rsqrt, un_x[sel_rec],
@@ -2173,7 +2357,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # other.
         #
         consume_a = elem_add_go | elem_mul_go | sum_add_go | sq_mul_go \
-            | max_go | un_go | q_max_go | f16_go | pswap_go | sm_max_go
+            | max_go | un_go | q_max_go | q_pgo | f16_go | pswap_go | sm_max_go
         with m.If(consume_a):
             m.d.sync += [
                 awin.eq(awin >> 32),
@@ -2181,7 +2365,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 consumed.eq(consumed + 1),
                 self.elements.eq(self.elements + 1),
             ]
-        with m.If(binary_b & (elem_add_go | elem_mul_go)):
+        with m.If(binary_b & (elem_add_go | elem_mul_go | q_pgo)):
             m.d.sync += [bwin.eq(bwin >> 32), bhave.eq(bhave - 4)]
 
         m.d.sync += issued.eq(
@@ -2191,7 +2375,12 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             res_inflight +
             Mux(elem_add_go | elem_mul_go
                 | un_go | f16_go | pswap_go, 1, 0) +
-            Mux(q_m1_go & q_grp_new, 1, 0) + Mux(q_drain_go, 1, 0) -
+            # The credit is the staged path's reservation for the four
+            # quant words about to enter res_q; the direct path's
+            # records never enter res_q, and with nothing ever
+            # dequeueing in direct mode an ungated increment would
+            # saturate the counter and stall the second segment.
+            (q_m1_go & q_grp_new & op_quant) + Mux(q_drain_go, 1, 0) -
             Mux(res_q.enq.fire, 1, 0))
         m.d.sync += add_iss.eq(add_iss + Mux(acc_go, 1, 0))
         m.d.sync += pend_cnt.eq(pend_cnt + Mux(acc_go, 1, 0) -
@@ -2269,7 +2458,24 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 with m.If(self.sink.fire & ~bad):
                     q_nsegs_l = (offer.n + 31) >> 5
                     m.d.sync += [
-                        op.eq(offer.op),
+                        op_add.eq(offer.op == VecOp.VEC_ADD),
+                        op_sub.eq(offer.op == VecOp.VEC_SUB),
+                        op_mul.eq(offer.op == VecOp.VEC_MUL),
+                        op_scale.eq(offer.op == VecOp.VEC_SCALE),
+                        op_sum.eq(offer.op == VecOp.RDC_SUM),
+                        op_max.eq(offer.op == VecOp.RDC_MAX),
+                        op_sumsq.eq(offer.op == VecOp.RDC_SUMSQ),
+                        op_exp2.eq(offer.op == VecOp.VEC_EXP2),
+                        op_recip.eq(offer.op == VecOp.VEC_RECIP),
+                        op_rsqrt.eq(offer.op == VecOp.VEC_RSQRT),
+                        op_quant.eq(offer.op == VecOp.VEC_QUANT),
+                        op_q_act.eq((offer.op == VecOp.VEC_QUANT_ACT)
+                                    | o_q_mul),
+                        op_q_mul.eq(o_q_mul),
+                        op_f16.eq(offer.op == VecOp.VEC_F16),
+                        op_pswap.eq(offer.op == VecOp.VEC_PSWAP),
+                        op_silu.eq(offer.op == VecOp.VEC_SILU),
+                        op_smexp.eq(offer.op == VecOp.VEC_SMEXP),
                         n_l.eq(offer.n),
                         a_base.eq(offer.a_base),
                         b_base.eq(offer.b_base),
@@ -2316,6 +2522,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                         q_pe.eq(0),
                         q_pewait.eq(0),
                         q_arm.eq(1),
+                        q_actbuf.eq(0),
+                        q_act_done.eq(0),
                         q_pipe_valid.eq(0),
                         q_amax.eq(0),
                         q_maxbusy.eq(0),
@@ -2341,12 +2549,14 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     for i in range(4):
                         m.d.sync += part[i].eq(0)
                         m.d.sync += sm_p[i].eq(0)
+                    m.d.sync += cls_valid.eq(0)
                     # Unary contexts: control state resets; the data
                     # registers are dead state, re-latched at accept
                     # and classify before any use.
                     for i in range(ctx_n):
                         m.d.sync += [
                             un_busy[i].eq(0),
+                            un_cls_pending[i].eq(0),
                             un_wait[i].eq(0),
                             un_arm[i].eq(0),
                             un_bp[i].eq(0),
@@ -2359,7 +2569,11 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                         m.next = 'ELEM'
 
             with m.State('ELEM'):
-                with m.If(elem_last_beat & ~op_smexp):
+                # The direct quant op completes on its final record's
+                # act_wr fire (nbeats is zero, so no TMEM beat ever
+                # lands and elem_last_beat cannot fire).
+                with m.If((elem_last_beat & ~op_smexp)
+                          | (op_q_act & q_act_done)):
                     m.next = 'DONE'
                 # VEC_SMEXP completes only after its denominator beat
                 # lands (the folds can finish before or after the

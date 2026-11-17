@@ -105,6 +105,19 @@ class VecOp(IntEnum):
     sub-beat strides, so the pairing has to come from the vector
     unit.
 
+    ``VEC_QUANT_ACT`` is G3's direct-activation variant
+    (plans/2026-11-09-troom-qwen3-hill-climb.md): the same frozen
+    per-segment arithmetic as ``VEC_QUANT``, but the results are
+    emitted as per-segment ACT RAM records instead of the packed
+    TMEM image -- the record the SQUANTIZE copy would have produced
+    (``quants``, FP32 ``s_act``, int16 ``sum_a``, segment index in
+    launch order) lands straight in the matrix unit's activation
+    bank. The staging ``r_base``/``m_base`` become don't-care (the
+    offer checks skip them); ``k`` keeps SQUANTIZE's coverage --
+    nonzero multiples of 32 up to ``act_max_k``. Byte-identical to
+    the staged chain by construction: the quantizer sequence is
+    untouched and the record fields are the same per-segment values.
+
     ``VEC_SILU`` fuses the backend's SwiGLU/SILU sigmoid chain into
     one unary op: ``o[i] = R(a[i] * sigmoid(a[i]))`` where
     ``sigmoid(x) = recip(exp2(x * -log2(e)) + 1)``, with the
@@ -154,6 +167,9 @@ class VecOp(IntEnum):
     VEC_PSWAP = 12
     VEC_SILU = 13
     VEC_SMEXP = 14
+    VEC_QUANT_ACT = 15
+    # G4: finalized FP32 MUL products feed the existing quantizer directly.
+    VEC_MUL_QUANT_ACT = 16
 
 
 VEC_ELEMENTWISE = (
@@ -169,6 +185,8 @@ VEC_ELEMENTWISE = (
     VecOp.VEC_PSWAP,
     VecOp.VEC_SILU,
     VecOp.VEC_SMEXP,
+    VecOp.VEC_QUANT_ACT,
+    VecOp.VEC_MUL_QUANT_ACT,
 )
 
 VEC_REDUCTIONS = (
@@ -192,6 +210,7 @@ VEC_UNARY = (
 # (rather than ordinal ranges) so validation, dispatch, and the
 # model agree as the op set grows.
 VEC_READS_B = (
+    VecOp.VEC_MUL_QUANT_ACT,
     VecOp.VEC_ADD,
     VecOp.VEC_SUB,
     VecOp.VEC_MUL,
