@@ -30,23 +30,28 @@ model gates.
 """
 
 from amaranth import *
+from amaranth.hdl.rec import Direction, Record
 from amaranth.sim import Passive, Simulator
+from amaranth.utils import log2_int
 
 import pytest
 import random
 import struct
 
+from troom.abi import VBUILD_ROWS_HD128
 from troom.consts import Status
 from troom.tmem import TMEM
 from troom.types import HasTRoomParams
-from troom.vbuild import VBuildUnit
+from troom.vbuild import VB_ROWS_K_APP, VBuildUnit
 
-from tests.troom.model import (VB_OPEN_META_BITS, f32_bits, fp16_to_f32,
-                               vbuild_pfold_bits, vbuild_sg1,
-                               vbuild_sg1_append, vbuild_sg1_append_mask,
-                               vbuild_sg1_block_mask, vbuild_sg1_k,
-                               vbuild_sg1_k_mask, vbuild_quant_row,
-                               vbuild_quant_row_token, vbuild_tile)
+from roomsoc.interconnect.stream import Decoupled
+
+from tests.troom.model import (
+    VB_OPEN_META_BITS, f32_bits, fp16_to_f32, vbuild_pfold_bits, vbuild_sg1,
+    vbuild_sg1_append, vbuild_sg1_append_mask, vbuild_sg1_block_mask,
+    vbuild_sg1_k, vbuild_sg1_k_append, vbuild_sg1_k_append_mask,
+    vbuild_sg1_k_mask, vbuild_quant_row, vbuild_quant_row_token, vbuild_tile,
+    vbuild_sg1_wide, vbuild_sg1_k4_append, vbuild_sg1_k4_state)
 
 PARAMS = dict(
     addr_width=32,
@@ -110,22 +115,78 @@ def gen_group(rng, live, specials=True):
 
 
 class Harness(Elaboratable):
-    """VBuildUnit reading from banked TMEM; tile beats captured."""
+    """VBuildUnit reading from banked TMEM; tile beats captured.
+
+    With split TMEM (the default) the unit's ports route to the
+    cluster each address names, exactly as core.py routes the shared
+    ports -- the plain cluster-A-only wiring aliases any address at
+    or above the half boundary into the wrong cluster's rows (the
+    top word bit is dropped in the row decode), silently corrupting
+    images that live across the boundary.
+    """
 
     def __init__(self, params):
         self.params = params
         self.tmem = TMEM(params)
         self.dut = VBuildUnit(params)
+        self.write_ready = Signal(reset=1)
+        self.write_hold_enable = Signal()
+        self.write_hold_base = Signal.like(self.dut.tmem_w.bits.addr)
 
     def elaborate(self, platform):
         m = Module()
         m.submodules.tmem = self.tmem
         m.submodules.dut = self.dut
-        m.d.comb += [
-            self.dut.tmem_rreq.connect(self.tmem.rreq),
-            self.tmem.rresp.connect(self.dut.tmem_rresp),
-            self.dut.tmem_w.ready.eq(1),
-        ]
+        write_ready = Signal()
+        wr = self.dut.tmem_w
+        m.d.comb += write_ready.eq(
+            self.write_ready
+            & ~(self.write_hold_enable
+                & (wr.bits.addr >= self.write_hold_base)
+                & (wr.bits.addr < self.write_hold_base + 1024)))
+        if self.tmem.tmem_clusters == 2:
+            half = log2_int(self.tmem.tmem_bytes // 2)
+            rq = self.dut.tmem_rreq
+            rhi = rq.bits.addr[half]
+            b_owner = Signal()
+            with m.If(rq.fire):
+                m.d.sync += b_owner.eq(rhi)
+            m.d.comb += [
+                self.tmem.rreq.valid.eq(rq.valid & ~rhi),
+                self.tmem.rreq_b.valid.eq(rq.valid & rhi),
+                self.tmem.rreq.bits.addr.eq(rq.bits.addr),
+                self.tmem.rreq_b.bits.addr.eq(rq.bits.addr),
+                rq.ready.eq(
+                    Mux(rhi, self.tmem.rreq_b.ready, self.tmem.rreq.ready)),
+                self.dut.tmem_rresp.valid.eq(
+                    Mux(b_owner, self.tmem.rresp_b.valid,
+                        self.tmem.rresp.valid)),
+                self.dut.tmem_rresp.bits.data.eq(
+                    Mux(b_owner, self.tmem.rresp_b.bits.data,
+                        self.tmem.rresp.bits.data)),
+                self.tmem.rresp.ready.eq(~b_owner
+                                         & self.dut.tmem_rresp.ready),
+                self.tmem.rresp_b.ready.eq(b_owner
+                                           & self.dut.tmem_rresp.ready),
+            ]
+            whi = self.dut.tmem_w.bits.addr[half]
+            m.d.comb += [
+                self.tmem.write.valid.eq(self.dut.tmem_w.valid & ~whi
+                                         & write_ready),
+                self.tmem.write_b.valid.eq(self.dut.tmem_w.valid & whi
+                                           & write_ready),
+                self.tmem.write.bits.addr.eq(self.dut.tmem_w.bits.addr),
+                self.tmem.write_b.bits.addr.eq(self.dut.tmem_w.bits.addr),
+                self.tmem.write.bits.data.eq(self.dut.tmem_w.bits.data),
+                self.tmem.write_b.bits.data.eq(self.dut.tmem_w.bits.data),
+                self.dut.tmem_w.ready.eq(write_ready),
+            ]
+        else:
+            m.d.comb += [
+                self.dut.tmem_rreq.connect(self.tmem.rreq),
+                self.tmem.rresp.connect(self.dut.tmem_rresp),
+                self.dut.tmem_w.ready.eq(write_ready),
+            ]
         return m
 
 
@@ -138,11 +199,13 @@ def run_build(params,
               rows=0,
               retain=False,
               retain_images=None,
-              deadline=400000):
+              deadline=400000,
+              write_stalls=False):
     hp = HasTRoomParams(params)
     dut = Harness(params)
     beats = []
     result = {'status': None, 'counters': None}
+    stall_injected = []
 
     def tx():
         # Fill TMEM with the window image (the LOAD_2D rows).
@@ -150,7 +213,7 @@ def run_build(params,
         img += bytes((-len(img)) % hp.beat_bytes)
         for off in range(0, len(img), hp.beat_bytes):
             word = int.from_bytes(img[off:off + hp.beat_bytes], 'little')
-            yield from tmem_write(dut.tmem.write, a_base + off, word)
+            yield from tmem_write_routed(dut.tmem, a_base + off, word)
         if retain_images is not None:
             # Explicit prior staging images (e.g. a previous append's
             # output): the load-modify-store half of the contract.
@@ -158,7 +221,7 @@ def run_build(params,
                 for off in range(0, len(blob), hp.beat_bytes):
                     word = int.from_bytes(blob[off:off + hp.beat_bytes],
                                           'little')
-                    yield from tmem_write(dut.tmem.write, base + off, word)
+                    yield from tmem_write_routed(dut.tmem, base + off, word)
         elif retain:
             # The host's meta/payload LOAD ahead of a partial run: the
             # staging extents the run does not rebuild keep these
@@ -168,7 +231,7 @@ def run_build(params,
                 for off in range(0, n, hp.beat_bytes):
                     word = int.from_bytes(pat[off:off + hp.beat_bytes],
                                           'little')
-                    yield from tmem_write(dut.tmem.write, base + off, word)
+                    yield from tmem_write_routed(dut.tmem, base + off, word)
 
         sink = dut.dut.sink
         yield sink.bits.a_base.eq(a_base)
@@ -192,6 +255,10 @@ def run_build(params,
                 yield
                 if (yield dut.dut.done):
                     result['status'] = Status((yield dut.dut.status))
+                    # One more edge before the snapshot: the DONE state
+                    # increments `tiles` (and nothing else) on its exit
+                    # edge, so reading in the done cycle reads it low.
+                    yield
                     result['counters'] = {
                         'run': (yield dut.dut.run_cycles),
                         'fill': (yield dut.dut.fill_cycles),
@@ -201,26 +268,84 @@ def run_build(params,
                         'drain': (yield dut.dut.drain_cycles),
                         'dead_blocks': (yield dut.dut.dead_blocks),
                         'zero_blocks': (yield dut.dut.zero_blocks),
+                        # D1 phase-split riders (register window at
+                        # REG_VB_*): dispatch, the TMEM wait subsets
+                        # and the gather/quant prefetch overlap, with
+                        # the occupancy total.
+                        'active': (yield dut.dut.active_cycles),
+                        'dispatch': (yield dut.dut.dispatch_cycles),
+                        'fill_wait': (yield dut.dut.fill_wait_cycles),
+                        'drain_wait': (yield dut.dut.drain_wait_cycles),
+                        'prefetch': (yield dut.dut.prefetch_cycles),
+                        'tiles': (yield dut.dut.tiles),
+                        'rows': (yield dut.dut.rows),
+                        'beats': (yield dut.dut.beats),
                     }
                     break
             else:
-                raise TimeoutError('vbuild did not finish')
+                progress = {
+                    'run': (yield dut.dut.run_cycles),
+                    'rows': (yield dut.dut.rows),
+                    'beats': (yield dut.dut.beats),
+                    'scale': (yield dut.dut.scale_cycles),
+                    'quant': (yield dut.dut.quant_cycles),
+                }
+                raise TimeoutError(f'vbuild did not finish: {progress}')
 
     def watch():
         yield Passive()
         wr = dut.dut.tmem_w
+        held = None
         while True:
+            if held is not None:
+                assert (yield
+                        wr.valid), 'write valid dropped under backpressure'
+                assert ((yield wr.bits.addr), (yield wr.bits.data)) == held
+            held = (((yield wr.bits.addr), (yield wr.bits.data)) if
+                    (yield wr.valid) and not (yield wr.ready) else None)
             if (yield wr.fire):
                 addr = (yield wr.bits.addr)
                 data = (yield wr.bits.data)
                 beats.append((addr, data))
             yield
 
+    def stall_writes():
+        yield Passive()
+        # The tx coroutine owns TMEM write signals while loading the
+        # input images. Start backpressure only after descriptor accept.
+        while not (yield dut.dut.active):
+            yield
+        if write_stalls == 'state':
+            state_base = m_base + 512 + (int((live & 0x7f) > 32) * 1024)
+            yield dut.write_hold_base.eq(state_base)
+            yield dut.write_hold_enable.eq(1)
+            while True:
+                wr = dut.dut.tmem_w
+                addr = (yield wr.bits.addr)
+                if (yield wr.valid) and state_base <= addr < state_base + 1024:
+                    stall_injected.append(True)
+                    assert not (yield wr.ready)
+                    for _ in range(47):
+                        yield
+                    yield dut.write_hold_enable.eq(0)
+                    yield
+                    return
+                yield
+        cycle = 0
+        while True:
+            yield dut.write_ready.eq(cycle % 53 >= 47)
+            cycle += 1
+            yield
+
     sim = Simulator(dut)
     sim.add_clock(1e-6)
     sim.add_sync_process(tx)
     sim.add_sync_process(watch)
+    if write_stalls:
+        sim.add_sync_process(stall_writes)
     sim.run()
+    if write_stalls == 'state':
+        assert stall_injected, 'targeted state-write stall was not exercised'
     return beats, result
 
 
@@ -233,6 +358,17 @@ def tmem_write(write, addr, word):
         yield
     yield write.valid.eq(0)
     yield
+
+
+def tmem_write_routed(tmem, addr, word):
+    """tmem_write against the cluster the address names (the plain
+    harness's TMEM exposes both write ports; the address half picks
+    the one core.py would route to)."""
+    port = tmem.write
+    if getattr(tmem, 'tmem_clusters', 1) == 2 \
+            and (addr >> (tmem.tmem_addr_width - 1)) & 1:
+        port = tmem.write_b
+    yield from tmem_write(port, addr, word)
 
 
 def first_diff(got, ref):
@@ -1228,4 +1364,1163 @@ def test_vbuild_rejects(k, a_base, r_base, want):
                            r_base=r_base,
                            deadline=100)
     assert res['status'] is want
+    assert beats == []
+
+
+# ---------------------------------------------------------------------
+# Q3c direct-append gates (2026-11-10,
+# plans/2026-11-09-troom-qwen3-hill-climb.md): the wide per-token V
+# append (candidate A of the frozen contract: one FP16 scale per token
+# over all 128 dims, quantized once at append) and the K append (rows
+# 20), against the generalized model twins. The RTL byte contracts are
+# results/troom-qwen3-append-q3c-20261110/DESIGN.md.
+# ---------------------------------------------------------------------
+
+WIDE_PARAMS = dict(PARAMS,
+                   data_width=512,
+                   act_max_k=4096,
+                   vbuild_max_head_dim=128)
+
+
+def gen_slot128(rng, specials=True):
+    """One appended slot's 128 FP16 dim patterns."""
+    return [
+        rng.choice(SPECIAL_16) if specials and rng.random() < 0.05 else
+        (rng.randint(0, 1) << 15) | (rng.randint(1, 30) << 10)
+        | rng.randint(0, 0x3ff) for _ in range(128)
+    ]
+
+
+def images_over_bases(beats, hp, pay0, met0, r_base, m_base, skip=()):
+    """images_over with explicit staging bases (placement variants).
+
+    ``skip`` names address ranges handled by the caller (e.g. the K4
+    state staging at m_base + 512) -- their beats are tolerated here.
+    """
+    pay = bytearray(pay0)
+    met = bytearray(met0)
+    for addr, data in beats:
+        for i in range(hp.data_width // 8):
+            if r_base <= addr < r_base + len(pay):
+                pay[addr - r_base + i] = (data >> (8 * i)) & 0xff
+            elif m_base <= addr < m_base + len(met):
+                met[addr - m_base + i] = (data >> (8 * i)) & 0xff
+            elif any(lo <= addr < hi for lo, hi in skip):
+                continue
+            else:
+                raise AssertionError(hex(addr))
+    return bytes(pay), bytes(met)
+
+
+class SplitHarness(Elaboratable):
+    """VBuildUnit against split TMEM with the core's cluster routing.
+
+    Each beat -- the unit's and the test setup's -- goes to the
+    cluster its address names, exactly as core.py routes the shared
+    ports, so staging images may live in either TMEM half (the
+    backend's TROOM_TMEM_SPLIT placement choice).
+    """
+
+    def __init__(self, params):
+        self.params = params
+        self.tmem = TMEM(params)
+        self.dut = VBuildUnit(params)
+        hp = self.dut
+        self.write = Decoupled(Record,
+                               [('addr', hp.tmem_addr_width, Direction.FANOUT),
+                                ('data', hp.data_width, Direction.FANOUT)])
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.tmem = self.tmem
+        m.submodules.dut = self.dut
+        hp = HasTRoomParams(self.params)
+        half = log2_int(hp.tmem_bytes // 2)
+
+        # One merged write source: the test setup's beats strictly
+        # precede the run (the descriptor is offered only after the
+        # images land), so setup wins any overlap by construction.
+        # TMEM's write port is always ready.
+        sw = self.write
+        dw = self.dut.tmem_w
+        wsel = Signal()
+        m.d.comb += wsel.eq(sw.valid)
+        w_valid = Signal()
+        w_addr = Signal.like(sw.bits.addr)
+        w_data = Signal.like(sw.bits.data)
+        m.d.comb += [
+            w_valid.eq(sw.valid | dw.valid),
+            w_addr.eq(Mux(wsel, sw.bits.addr, dw.bits.addr)),
+            w_data.eq(Mux(wsel, sw.bits.data, dw.bits.data)),
+            sw.ready.eq(wsel),
+            dw.ready.eq(~wsel),
+        ]
+        whi = w_addr[half]
+        m.d.comb += [
+            self.tmem.write.valid.eq(w_valid & ~whi),
+            self.tmem.write_b.valid.eq(w_valid & whi),
+            self.tmem.write.bits.addr.eq(w_addr),
+            self.tmem.write_b.bits.addr.eq(w_addr),
+            self.tmem.write.bits.data.eq(w_data),
+            self.tmem.write_b.bits.data.eq(w_data),
+        ]
+
+        rq = self.dut.tmem_rreq
+        rhi = rq.bits.addr[half]
+        b_owner = Signal()
+        with m.If(rq.fire):
+            m.d.sync += b_owner.eq(rhi)
+        m.d.comb += [
+            self.tmem.rreq.valid.eq(rq.valid & ~rhi),
+            self.tmem.rreq_b.valid.eq(rq.valid & rhi),
+            self.tmem.rreq.bits.addr.eq(rq.bits.addr),
+            self.tmem.rreq_b.bits.addr.eq(rq.bits.addr),
+            rq.ready.eq(Mux(rhi, self.tmem.rreq_b.ready,
+                            self.tmem.rreq.ready)),
+            self.dut.tmem_rresp.valid.eq(
+                Mux(b_owner, self.tmem.rresp_b.valid, self.tmem.rresp.valid)),
+            self.dut.tmem_rresp.bits.data.eq(
+                Mux(b_owner, self.tmem.rresp_b.bits.data,
+                    self.tmem.rresp.bits.data)),
+            self.tmem.rresp.ready.eq(~b_owner
+                                     & self.dut.tmem_rresp.ready),
+            self.tmem.rresp_b.ready.eq(b_owner
+                                       & self.dut.tmem_rresp.ready),
+        ]
+        return m
+
+
+def run_split_build(params,
+                    window,
+                    live,
+                    a_base,
+                    r_base,
+                    m_base,
+                    rows,
+                    retain_images,
+                    deadline=400000):
+    """run_build over the cluster-routing harness (either half)."""
+    dut = SplitHarness(params)
+    beats = []
+    result = {'status': None, 'counters': None}
+
+    def tx():
+        img = b''.join(p.to_bytes(2, 'little') for p in window)
+        img += bytes((-len(img)) % dut.dut.beat_bytes)
+        for off in range(0, len(img), dut.dut.beat_bytes):
+            word = int.from_bytes(img[off:off + dut.dut.beat_bytes], 'little')
+            yield from tmem_write(dut.write, a_base + off, word)
+        for base, blob in retain_images:
+            for off in range(0, len(blob), dut.dut.beat_bytes):
+                word = int.from_bytes(blob[off:off + dut.dut.beat_bytes],
+                                      'little')
+                yield from tmem_write(dut.write, base + off, word)
+        sink = dut.dut.sink
+        yield sink.bits.a_base.eq(a_base)
+        yield sink.bits.r_base.eq(r_base)
+        yield sink.bits.m_base.eq(m_base)
+        yield sink.bits.k.eq(live)
+        yield sink.bits.rows.eq(rows)
+        yield sink.valid.eq(1)
+        yield
+        while not (yield sink.fire):
+            yield
+        if (yield dut.dut.done):
+            result['status'] = Status((yield dut.dut.status))
+        yield sink.valid.eq(0)
+        yield
+        if result['status'] is None:
+            for _ in range(deadline):
+                yield
+                if (yield dut.dut.done):
+                    result['status'] = Status((yield dut.dut.status))
+                    result['counters'] = {
+                        'run': (yield dut.dut.run_cycles),
+                    }
+                    break
+            else:
+                raise TimeoutError('vbuild did not finish')
+
+    def watch():
+        yield Passive()
+        wr = dut.dut.tmem_w
+        while True:
+            if (yield wr.fire):
+                beats.append(((yield wr.bits.addr), (yield wr.bits.data)))
+            yield
+
+    sim = Simulator(dut)
+    sim.add_clock(1e-6)
+    sim.add_sync_process(tx)
+    sim.add_sync_process(watch)
+    sim.run()
+    return beats, result
+
+
+def test_vbuild_wide_token_row_matches_independent():
+    """The 128-dim token row against an independent reconstruction:
+    one scale over all four blocks, every d16 slot equal, quants the
+    RNE int8 of 127 * x / amax, and equal-amax quads agree with the
+    per-block sequence."""
+    rng = random.Random(6100)
+    for t in range(40):
+        if t < 38:
+            slot = gen_slot128(rng, specials=False)
+        elif t == 38:
+            slot = [0x0000] * 128  # the all-zero slot
+        else:
+            slot = [0x8000] * 3 + [0x0000] * 61 + [0x03ff] * 64
+        row = vbuild_quant_row_token(slot)
+        assert len(row) == 136
+        for j in range(4):
+            assert row[34 * j:34 * j + 2] == row[0:2]
+        vals = [widen16(h) for h in slot]
+        amax = max((abs(v) for v in vals), default=0.0)
+        for i, v in enumerate(vals):
+            got = row[34 * (i >> 5) + 2 + (i & 31)]
+            got = got - 256 if got > 127 else got
+            want = 127.0 * v / amax if amax else 0.0
+            assert abs(got - want) <= 1.0 + 1e-3, (t, i, got, want)
+    # Equal-amax quads: the per-token and per-block sequences agree.
+    for _ in range(15):
+        quad = gen_slot128(rng, specials=False)[:32]
+        slot = quad + [q ^ 0x8000 for q in quad] + list(quad) \
+            + [q ^ 0x8000 for q in quad]
+        assert vbuild_quant_row_token(slot) == vbuild_quant_row(slot)
+    zero = [0x0000] * 128
+    assert vbuild_quant_row_token(zero) == vbuild_quant_row(zero) \
+        == bytes(136)
+
+
+def test_vbuild_wide_token_row_nan_and_special_slots():
+    """NaN patterns never win the fold but saturate their own bytes;
+    an all-zero-plus-NaN slot still emits the zero-amax d16."""
+    slot = [0x0000] * 128
+    slot[7] = 0x7e00
+    slot[100] = 0xfd00
+    row = vbuild_quant_row_token(slot)
+    assert row[0:2] == (0).to_bytes(2, 'little')
+    assert row[2 + 7] == 0x7f and row[34 * 3 + 2 + 4] == 0x7f
+    assert sum(sum(row[34 * j + 2:34 * j + 34]) for j in range(4)) \
+        == 0x7f + 0x7f
+    # A largest-finite slot rounds its max bytes to 127.
+    slot = [0x7bff] * 128
+    row = vbuild_quant_row_token(slot)
+    assert row[2 + 0] == 0x7f and row[34 * 3 + 2 + 31] == 0x7f
+
+
+def test_vbuild_wide_sg1_append_compose_and_mask():
+    """The wide append composes only its masked bytes over the prior
+    image, and appending every position in order builds the whole
+    block from per-slot token columns."""
+    rng = random.Random(6101)
+    pay0 = retain_pattern(128 * 64)
+    srow0 = retain_pattern(64 * 4)
+    slots = [gen_slot128(rng) for _ in range(32)]
+    blk, p = 1, 17
+    pay, srow = vbuild_sg1_append(slots[p], blk, p, pay0, srow0)
+    mpay, msrow = vbuild_sg1_append_mask(blk, p, dims=128)
+    diff = [i for i in range(128 * 64) if pay[i] != pay0[i]]
+    mdiff = [i for i in range(64 * 4) if srow[i] != srow0[i]]
+    assert diff == [i for i in range(128 * 64) if mpay[i]]
+    assert mdiff == [i for i in range(64 * 4) if msrow[i]]
+    row = vbuild_quant_row_token(slots[p])
+    for d in range(128):
+        off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32 + p
+        assert pay[off] == row[34 * (d >> 5) + 2 + (d & 31)]
+    d16 = int.from_bytes(row[0:2], 'little')
+    wo = 4 * (blk * 32 + p)
+    assert srow[wo:wo + 4] == f32_bits(fp16_to_f32(d16)).to_bytes(4, 'little')
+    # Appending every position in order builds the whole block.
+    pay, srow = bytes(128 * 64), bytes(64 * 4)
+    for p in range(32):
+        pay, srow = vbuild_sg1_append(slots[p], blk, p, pay, srow)
+    for p in range(32):
+        row = vbuild_quant_row_token(slots[p])
+        for d in range(128):
+            off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32 + p
+            assert pay[off] == row[34 * (d >> 5) + 2 + (d & 31)]
+        d16 = int.from_bytes(row[0:2], 'little')
+        wo = 4 * (blk * 32 + p)
+        assert srow[wo:wo + 4] == f32_bits(fp16_to_f32(d16)).to_bytes(
+            4, 'little')
+
+
+@pytest.mark.parametrize('dims', [64, 128])
+def test_vbuild_k_append_compose_and_mask(dims):
+    """The K append patches exactly its token's chunks and cells over
+    the prior group image, and appending all sixteen tokens in order
+    builds the image a direct per-token placement produces."""
+    rng = random.Random(6102 + dims)
+    blocks = dims // 32
+    pay0 = retain_pattern(16 * dims)
+    met0 = retain_pattern(16 * blocks * 2)
+    slot = gen_slot128(rng) if dims == 128 else gen_slot(rng)
+    for k in (1, 2, 5, 9, 16):
+        pay, met = vbuild_sg1_k_append(slot, k, pay0, met0)
+        mpay, mmet = vbuild_sg1_k_append_mask(k, dims=dims)
+        assert [i for i in range(16 * dims) if pay[i] != pay0[i]] == \
+            [i for i in range(16 * dims) if mpay[i]]
+        assert [i for i in range(16 * blocks * 2) if met[i] != met0[i]] == \
+            [i for i in range(16 * blocks * 2) if mmet[i]]
+        row = vbuild_quant_row(slot)
+        r = k - 1
+        for b in range(blocks):
+            off = ((r >> 2) * (blocks * 4) + b * 4 + (r & 3)) * 32
+            assert pay[off:off + 32] == row[34 * b + 2:34 * b + 34]
+            moff = (r >> 2) * (blocks * 8) + b * 8 + (r & 3) * 2
+            assert met[moff:moff + 2] == row[34 * b:34 * b + 2]
+    # Appending every token in order equals direct placement.
+    slots = [
+        gen_slot128(rng) if dims == 128 else gen_slot(rng) for _ in range(16)
+    ]
+    pay, met = bytes(16 * dims), bytes(16 * blocks * 2)
+    for k in range(1, 17):
+        pay, met = vbuild_sg1_k_append(slots[k - 1], k, pay, met)
+    for r in range(16):
+        row = vbuild_quant_row(slots[r])
+        for b in range(blocks):
+            off = ((r >> 2) * (blocks * 4) + b * 4 + (r & 3)) * 32
+            assert pay[off:off + 32] == row[34 * b + 2:34 * b + 34]
+            moff = (r >> 2) * (blocks * 8) + b * 8 + (r & 3) * 2
+            assert met[moff:moff + 2] == row[34 * b:34 * b + 2]
+
+
+@pytest.mark.parametrize('rows,blk', [(18, 0), (19, 1)])
+@pytest.mark.parametrize('p', [0, 1, 15, 16, 31])
+def test_vbuild_wide_sg1_append_matches_model(rows, blk, p):
+    """rows == 18/19 with bit 15 (the wide V append): one 256-B slot
+    row, ONE per-token scale over all 128 dims, the drain patching
+    block blk's 64 payload beats (two bytes each, pre-read composed)
+    plus the four scale-row beats. No meta staging write anywhere."""
+    rng = random.Random(6200 + rows * 40 + p)
+    slot = gen_slot128(rng)
+    params = dict(WIDE_PARAMS)
+    beats, res = run_build(params,
+                           slot,
+                           p + 1 + 32 * blk,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=VBUILD_ROWS_HD128 | rows,
+                           retain_images=((R_BASE, retain_pattern(128 * 64)),
+                                          (M_BASE, retain_pattern(64 * 4))))
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, srow = images_over(beats, hp, retain_pattern(128 * 64),
+                            retain_pattern(64 * 4))
+    ref_pay, ref_srow = vbuild_sg1_append(slot, blk, p,
+                                          retain_pattern(128 * 64),
+                                          retain_pattern(64 * 4))
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert srow == ref_srow, first_diff(srow, ref_srow)
+    # 64 patched payload beats + the four scale-row beats.
+    assert len(beats) == 68
+    # Rate guard: the append stays the patch class, not a rebuild.
+    assert res['counters']['run'] < 5000, res['counters']
+    assert res['counters']['quant'] <= 200
+
+
+def test_vbuild_wide_sg1_append_zero_slot():
+    """A fully zero appended slot: the widened d16 0 lands in the scale
+    row's word and 128 zero bytes in the patch positions; the retained
+    bytes are untouched and the quant stream is skipped."""
+    slot = [0x0000] * 128
+    params = dict(WIDE_PARAMS)
+    beats, res = run_build(params,
+                           slot,
+                           20,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=VBUILD_ROWS_HD128 | 18,
+                           retain_images=((R_BASE, retain_pattern(128 * 64)),
+                                          (M_BASE, retain_pattern(64 * 4))))
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, srow = images_over(beats, hp, retain_pattern(128 * 64),
+                            retain_pattern(64 * 4))
+    ref_pay, ref_srow = vbuild_sg1_append(slot, 0, 19,
+                                          retain_pattern(128 * 64),
+                                          retain_pattern(64 * 4))
+    assert pay == ref_pay
+    assert srow == ref_srow
+    assert res['counters']['quant'] < 8
+
+
+def test_vbuild_wide_sg1_append_nan_slot():
+    """NaN dims saturate to the model's bytes on the patched
+    positions; the retained cells never see them."""
+    rng = random.Random(6251)
+    slot = gen_slot128(rng, specials=False)
+    slot[3] = 0x7e00
+    slot[70] = 0xfd00
+    params = dict(WIDE_PARAMS)
+    beats, res = run_build(params,
+                           slot,
+                           40,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=VBUILD_ROWS_HD128 | 19,
+                           retain_images=((R_BASE, retain_pattern(128 * 64)),
+                                          (M_BASE, retain_pattern(64 * 4))))
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, srow = images_over(beats, hp, retain_pattern(128 * 64),
+                            retain_pattern(64 * 4))
+    ref_pay, ref_srow = vbuild_sg1_append(slot, 1, 7, retain_pattern(128 * 64),
+                                          retain_pattern(64 * 4))
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert srow == ref_srow, first_diff(srow, ref_srow)
+
+
+def test_vbuild_wide_sg1_append_then_append():
+    """The deployment shape at 128 dims: consecutive appends compose
+    over the previous output images, across the block-0/1 boundary
+    (live 32 -> 33) and within a block."""
+    rng = random.Random(6252)
+    params = dict(WIDE_PARAMS)
+    hp = HasTRoomParams(params)
+    pay0, srow0 = retain_pattern(128 * 64), retain_pattern(64 * 4)
+    for rows, p in ((VBUILD_ROWS_HD128 | 18, 31), (VBUILD_ROWS_HD128 | 19, 0),
+                    (VBUILD_ROWS_HD128 | 19, 1)):
+        slot = gen_slot128(rng)
+        beats, res = run_build(params,
+                               slot,
+                               p + 1 + 32 * (rows & 1),
+                               a_base=P_BASE,
+                               r_base=R_BASE,
+                               m_base=M_BASE,
+                               rows=rows,
+                               retain_images=((R_BASE, pay0), (M_BASE, srow0)))
+        assert res['status'] is Status.OK
+        pay, srow = images_over(beats, hp, pay0, srow0)
+        ref_pay, ref_srow = vbuild_sg1_append(slot, rows & 1, p, pay0, srow0)
+        assert pay == ref_pay, (p, first_diff(pay, ref_pay))
+        assert srow == ref_srow, (p, first_diff(srow, ref_srow))
+        pay0, srow0 = ref_pay, ref_srow
+
+
+@pytest.mark.parametrize('wide', [False, True])
+@pytest.mark.parametrize('k', [1, 2, 5, 8, 15, 16])
+def test_vbuild_k_append_matches_model(wide, k):
+    """rows == 20 (the K append): the token's row quantizes with the
+    frozen per-block K sequence and patches its chunks and meta cells
+    into the group image beat-composed; every neighboring byte keeps
+    the host-loaded value."""
+    dims = 128 if wide else 64
+    rng = random.Random(6300 + k + dims)
+    slot = gen_slot128(rng) if wide else gen_slot(rng)
+    params = dict(PARAMS, data_width=512)
+    if wide:
+        params.update(vbuild_max_head_dim=128, act_max_k=4096)
+    pay0 = retain_pattern(16 * dims)
+    met0 = retain_pattern(16 * (dims // 32) * 2)
+    beats, res = run_build(params,
+                           slot,
+                           k,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=VB_ROWS_K_APP
+                           | (VBUILD_ROWS_HD128 if wide else 0),
+                           retain_images=((R_BASE, pay0), (M_BASE, met0)))
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, met = images_over(beats, hp, pay0, met0)
+    ref_pay, ref_met = vbuild_sg1_k_append(slot, k, pay0, met0)
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert met == ref_met, first_diff(met, ref_met)
+    # One beat per 32-dim block plus the meta beat.
+    assert len(beats) == dims // 32 + 1
+    # Rate guard: quantize one row, patch a handful of beats.
+    assert res['counters']['run'] < 1600, res['counters']
+
+
+def test_vbuild_k_append_then_append_and_overwrite():
+    """Consecutive K appends compose (each token's extents disjoint),
+    and re-appending the same k re-quantizes exactly that token's
+    bytes while every other cell is byte-identical -- the lifecycle's
+    overwrite primitive."""
+    rng = random.Random(6350)
+    params = dict(WIDE_PARAMS)
+    hp = HasTRoomParams(params)
+    pay0, met0 = retain_pattern(16 * 128), retain_pattern(16 * 4 * 2)
+    for k in (3, 4, 12):
+        pay, met = pay0, met0
+        for _rep in range(2):
+            slot = gen_slot128(rng)
+            beats, res = run_build(params,
+                                   slot,
+                                   k,
+                                   a_base=P_BASE,
+                                   r_base=R_BASE,
+                                   m_base=M_BASE,
+                                   rows=VB_ROWS_K_APP | VBUILD_ROWS_HD128,
+                                   retain_images=((R_BASE, pay), (M_BASE,
+                                                                  met)))
+            assert res['status'] is Status.OK
+            ref_pay, ref_met = vbuild_sg1_k_append(slot, k, pay, met)
+            got_pay, got_met = images_over(beats, hp, pay, met)
+            assert got_pay == ref_pay, (k, first_diff(got_pay, ref_pay))
+            assert got_met == ref_met, (k, first_diff(got_met, ref_met))
+            pay, met = ref_pay, ref_met
+        # Only the token's extents ever moved from the retained image.
+        mpay, mmet = vbuild_sg1_k_append_mask(k, dims=128)
+        for i in range(len(pay0)):
+            assert bool(mpay[i]) or pay[i] == pay0[i], (k, i)
+        for i in range(len(met0)):
+            assert bool(mmet[i]) or met[i] == met0[i], (k, i)
+
+
+@pytest.mark.parametrize('placement', ['lower', 'upper'])
+def test_vbuild_append_both_tmem_placements(placement):
+    """The wide V append and the K append compose identically with
+    their staging in either TMEM half -- the backend's two staging
+    placements (TROOM_TMEM_SPLIT 0/1) at the unit level."""
+    upper = placement == 'upper'
+    a_base = 0x8100 if upper else P_BASE
+    r_base = 0x8200 if upper else R_BASE
+    m_base = 0xA400 if upper else M_BASE
+    params = dict(WIDE_PARAMS)
+    hp = HasTRoomParams(params)
+    rng = random.Random(6400 if upper else 6401)
+
+    slot = gen_slot128(rng)
+    pay0, srow0 = retain_pattern(128 * 64), retain_pattern(64 * 4)
+    beats, res = run_split_build(params, slot, 18, a_base, r_base, m_base,
+                                 VBUILD_ROWS_HD128 | 18,
+                                 ((r_base, pay0), (m_base, srow0)))
+    assert res['status'] is Status.OK
+    pay, srow = images_over_bases(beats, hp, pay0, srow0, r_base, m_base)
+    ref_pay, ref_srow = vbuild_sg1_append(slot, 0, 17, pay0, srow0)
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert srow == ref_srow, first_diff(srow, ref_srow)
+
+    kslot = gen_slot128(rng)
+    kpay0, kmet0 = retain_pattern(16 * 128), retain_pattern(16 * 4 * 2)
+    beats, res = run_split_build(params, kslot, 6, a_base, r_base, m_base,
+                                 VB_ROWS_K_APP | VBUILD_ROWS_HD128,
+                                 ((r_base, kpay0), (m_base, kmet0)))
+    assert res['status'] is Status.OK
+    kpay, kmet = images_over_bases(beats, hp, kpay0, kmet0, r_base, m_base)
+    ref_kpay, ref_kmet = vbuild_sg1_k_append(kslot, 6, kpay0, kmet0)
+    assert kpay == ref_kpay, first_diff(kpay, ref_kpay)
+    assert kmet == ref_kmet, first_diff(kmet, ref_kmet)
+
+
+@pytest.mark.parametrize(
+    'rows,k,m_base,params_over,want',
+    [
+        # The K append code is SG1-only with the group's k range.
+        (VB_ROWS_K_APP, 0, M_BASE, {}, Status.BAD_SHAPE),
+        (VB_ROWS_K_APP, 17, M_BASE, {}, Status.BAD_SHAPE),
+        (VB_ROWS_K_APP, 5, 0, {}, Status.BAD_SHAPE),
+        (VB_ROWS_K_APP, 5, M_BASE + 4, {}, Status.BAD_ALIGN),
+        # Append codes are rejected on production builds with native
+        # append disabled, and the wide V append needs the wide build.
+        (VB_ROWS_K_APP, 5, M_BASE, dict(vbuild_native_append=False),
+         Status.BAD_SHAPE),
+        (VBUILD_ROWS_HD128 | 18, 5, M_BASE,
+         dict(vbuild_native_append=False,
+              vbuild_max_head_dim=128,
+              act_max_k=4096), Status.BAD_SHAPE),
+        (VBUILD_ROWS_HD128 | 18, 5, M_BASE, {}, Status.BAD_SHAPE),
+    ])
+def test_vbuild_q3c_append_rejects(rows, k, m_base, params_over, want):
+    window = [0x0000] * 128
+    params = dict(PARAMS, data_width=512, **params_over)
+    beats, res = run_build(params,
+                           window,
+                           k,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=m_base,
+                           rows=rows,
+                           deadline=100)
+    assert res['status'] is want
+    assert beats == []
+
+
+# ---------------------------------------------------------------------
+# D2 K4 selective same-contract requant (2026-11-12,
+# plans/2026-11-09-troom-qwen3-hill-climb.md; VBUILD rows 3|WIDE):
+# one slot appended to the open block with only risen-max rows
+# re-quantized; byte-identical to the temporal rebuild at every live
+# prefix. results/troom-qwen3-kv-k4-20261112/DESIGN.md.
+# ---------------------------------------------------------------------
+
+K4_PARAMS = dict(WIDE_PARAMS, vbuild_k4_selective=True)
+K4_ROWS = 3 | VBUILD_ROWS_HD128
+K4_HEAL_BIT = 1 << 7
+ST_BASE = M_BASE + 512  # the state staging follows the wide meta image
+
+
+def k4_images_over(beats, hp, pay0, met0, st0, blk):
+    """The three composed staging images of a K4 run: the full
+    payload tile (the open block's beats at g*256 + blk*128), the meta
+    image, and the open block's state at M_BASE + 512 + blk*1024."""
+    pay = bytearray(pay0)
+    met = bytearray(met0)
+    st = bytearray(st0)
+    st_base = ST_BASE + blk * 1024
+    for addr, data in beats:
+        for i in range(hp.data_width // 8):
+            if R_BASE <= addr < R_BASE + len(pay):
+                pay[addr - R_BASE + i] = (data >> (8 * i)) & 0xff
+            elif M_BASE <= addr < M_BASE + len(met):
+                met[addr - M_BASE + i] = (data >> (8 * i)) & 0xff
+            elif st_base <= addr < st_base + len(st):
+                st[addr - st_base + i] = (data >> (8 * i)) & 0xff
+            else:
+                raise AssertionError(hex(addr))
+    return bytes(pay), bytes(met), bytes(st)
+
+
+def k4_chain(rng, kmax, specials=True):
+    """Run a full K4 chain k = 1..kmax from zero images; yield each
+    (k, beats, result) with the model's expected images."""
+    import tests.troom.model as M
+    from troom.vbuild import VB_ROWS_V_K4
+    assert VB_ROWS_V_K4 == 3
+    win = []
+    for j in range(64):
+        row = gen_slot128(rng, specials) if j < kmax else [0] * 128
+        win.extend(row)
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    sts = [bytes(128 * 8), bytes(128 * 8)]
+    for k in range(1, kmax + 1):
+        blk = 1 if k > 32 else 0
+        beats, res = run_build(dict(K4_PARAMS),
+                               win[:k * 128],
+                               k,
+                               a_base=P_BASE,
+                               r_base=R_BASE,
+                               m_base=M_BASE,
+                               rows=K4_ROWS,
+                               retain_images=((R_BASE, pay), (M_BASE, met),
+                                              (ST_BASE + blk * 1024,
+                                               sts[blk])))
+        exp_pay, exp_met, exp_st = vbuild_sg1_k4_append(
+            win, k, pay, met, sts[blk])
+        yield k, beats, res, (exp_pay, exp_met, exp_st)
+        pay, met = exp_pay, exp_met
+        sts[blk] = exp_st
+
+
+@pytest.mark.parametrize('k', [1, 2, 5, 17, 32, 33, 40, 64])
+def test_vbuild_k4_append_matches_model(k):
+    """One K4 append over random prior images equals the model's
+    composed images, writes exactly 64+8+16 beats, and the counters
+    hold the D1 partition identity."""
+    rng = random.Random(7100 + k)
+    win = []
+    for j in range(64):
+        win.extend(gen_slot128(rng) if j < k else [0] * 128)
+    blk = 1 if k > 32 else 0
+    pay0 = retain_pattern(128 * 64)
+    met0 = retain_pattern(128 * 4)
+    # a prior state from the temporal extraction (the honest case);
+    # at a block boundary (k == 33) the new block's state is zero
+    st0 = vbuild_sg1_k4_state(win, k - 1) \
+        if k > 1 and k != 33 else bytes(128 * 8)
+    beats, res = run_build(dict(K4_PARAMS),
+                           win[:k * 128],
+                           k,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=K4_ROWS,
+                           retain_images=((R_BASE, pay0), (M_BASE, met0),
+                                          (ST_BASE + blk * 1024, st0)))
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(K4_PARAMS)
+    pay, met, st = k4_images_over(beats, hp, pay0, met0, st0, blk)
+    exp = vbuild_sg1_k4_append(win, k, pay0, met0, st0)
+    assert pay == exp[0], first_diff(pay, exp[0])
+    assert met == exp[1], first_diff(met, exp[1])
+    assert st == exp[2], first_diff(st, exp[2])
+    assert len(beats) == 64 + 8 + 16
+    c = res['counters']
+    assert c['active'] == c['fill'] + (c['gather'] - c['prefetch']) \
+        + c['scale'] + c['quant'] + c['drain'] + c['dispatch'] \
+        + c['tiles'], c
+    assert c['rows'] == 128 and c['tiles'] == 1
+
+
+def k4_run(params, win, k, pay, met, st, heal=False):
+    """One K4 run over the given prior full images; the payload
+    staging carries the open block's slice. Returns (beats, res)."""
+    blk = 1 if k > 32 else 0
+    # The heal flag rides k bit 7 (VB_K4_HEAL), not rows.
+    return run_build(params,
+                     win[:k * 128],
+                     k | (128 if heal else 0),
+                     a_base=P_BASE,
+                     r_base=R_BASE,
+                     m_base=M_BASE,
+                     rows=K4_ROWS,
+                     retain_images=((R_BASE, pay), (M_BASE, met),
+                                    (ST_BASE + blk * 1024, st)))
+
+
+def k4_temporal(win, k):
+    """The temporal full rebuild's images at live prefix k."""
+    w = list(win[:k * 128]) + [0] * ((64 - k) * 128)
+    return vbuild_sg1_wide(w)
+
+
+@pytest.mark.parametrize('k,pattern', [
+    (2, 'all'),
+    (2, 'quick'),
+    (2, 'alternating'),
+    (17, 'boundaries'),
+    (33, 'all'),
+    (34, 'alternating'),
+])
+def test_vbuild_k4_interleaved_chains_progress(k, pattern):
+    """Exhaust/reuse chain contexts and wrap the dispatch FIFO with
+    deterministic quick/risen mixes, including state/meta bank edges.
+    A bounded launch catches repeated grants to an in-flight Newton op.
+    """
+    win = [0x3800 + d * 8 for _ in range(64) for d in range(128)]
+    for d in range(128):
+        risen = (pattern == 'all' or (pattern == 'alternating' and d % 2 == 0)
+                 or (pattern == 'boundaries' and d % 16 in (0, 7, 8, 15)))
+        win[(k - 1) * 128 + d] = (0x4000 + d * 8 if risen else 0x3400 + d * 4)
+    # Distinct row arithmetic also exercises the shared unit grants;
+    # infinity takes the reciprocal short circuit and NaN never rises.
+    if pattern != 'quick':
+        win[(k - 1) * 128 + 3] = 0x7c00
+        win[(k - 1) * 128 + 9] = 0x7e00
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    states = [bytes(128 * 8), bytes(128 * 8)]
+    for step in range(1, k):
+        blk = int(step > 32)
+        pay, met, states[blk] = vbuild_sg1_k4_append(win, step, pay, met,
+                                                     states[blk])
+    blk = int(k > 32)
+    st = states[blk]
+    beats, res = run_build(dict(K4_PARAMS),
+                           win[:k * 128],
+                           k,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=K4_ROWS,
+                           retain_images=((R_BASE, pay), (M_BASE, met),
+                                          (ST_BASE + blk * 1024, st)),
+                           deadline=12000,
+                           write_stalls=pattern != 'all')
+    assert res['status'] is Status.OK
+    expected = vbuild_sg1_k4_append(win, k, pay, met, st)
+    got = k4_images_over(beats, HasTRoomParams(K4_PARAMS), pay, met, st, blk)
+    for actual, reference in zip(got, expected):
+        assert actual == reference, first_diff(actual, reference)
+    assert len(beats) == 64 + 8 + 16
+    c = res['counters']
+    assert c['active'] == (c['fill'] + c['gather'] - c['prefetch'] +
+                           c['scale'] + c['quant'] + c['drain'] +
+                           c['dispatch'] + c['tiles']), c
+
+
+@pytest.mark.parametrize('k', [1, 5, 32, 33, 64])
+def test_vbuild_k4_temporal_identity_at_k(k):
+    """A K4-maintained window equals the temporal full rebuild at
+    live prefix k (the chain from zero images, including the birth
+    append and the block-1 boundary), and the state equals the
+    temporal extraction."""
+    rng = random.Random(7200 + k)
+    win = []
+    for j in range(64):
+        win.extend(gen_slot128(rng) if j < k else [0] * 128)
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    sts = [bytes(128 * 8), bytes(128 * 8)]
+    hp = HasTRoomParams(K4_PARAMS)
+    for step in range(1, k + 1):
+        blk = 1 if step > 32 else 0
+        beats, res = k4_run(K4_PARAMS, win, step, pay, met, sts[blk])
+        assert res['status'] is Status.OK, step
+        pay, met, st_new = vbuild_sg1_k4_append(win, step, pay, met, sts[blk])
+        got = k4_images_over(beats, hp, pay, met, st_new, blk)
+        assert got == (pay, met, st_new), step
+        sts[blk] = st_new
+    ref_pay, ref_met = k4_temporal(win, k)
+    assert pay == ref_pay, (k, first_diff(pay, ref_pay))
+    assert met == ref_met, (k, first_diff(met, ref_met))
+    blk = 1 if k > 32 else 0
+    assert sts[blk] == vbuild_sg1_k4_state(win, k)
+
+
+@pytest.mark.parametrize('heal_k', [8, 40])
+def test_vbuild_k4_heal_after_corrupt_state(heal_k):
+    """A stale state (a fallback rebuild happened) is re-derived by
+    the heal flag: every row requantizes and the images equal the
+    temporal rebuild regardless of the prior state bytes."""
+    rng = random.Random(7300 + heal_k)
+    win = []
+    for j in range(64):
+        win.extend(gen_slot128(rng) if j < heal_k else [0] * 128)
+    # an honest chain up to heal_k-1, then a corrupted state
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    sts = [bytes(128 * 8), bytes(128 * 8)]
+    hp = HasTRoomParams(K4_PARAMS)
+    for step in range(1, heal_k):
+        blk = 1 if step > 32 else 0
+        beats, res = k4_run(K4_PARAMS, win, step, pay, met, sts[blk])
+        pay, met, sts[blk] = vbuild_sg1_k4_append(win, step, pay, met,
+                                                  sts[blk])
+    blk = 1 if heal_k > 32 else 0
+    stale = retain_pattern(128 * 8)
+    beats, res = k4_run(K4_PARAMS, win, heal_k, pay, met, stale, heal=True)
+    assert res['status'] is Status.OK
+    got = k4_images_over(beats, hp, pay, met, stale, blk)
+    ref_pay, ref_met = k4_temporal(win, heal_k)
+    # The state is beat-RMW: heal re-derives every row's pattern and r
+    # (the temporal extraction's values) while the reserved halfword
+    # keeps the staged image's bytes, exactly like the append model.
+    ref_st = vbuild_sg1_k4_append(win, heal_k, pay, met, stale, heal=True)[2]
+    assert got[0] == ref_pay, first_diff(got[0], ref_pay)
+    assert got[1] == ref_met, first_diff(got[1], ref_met)
+    assert got[2] == ref_st, first_diff(got[2], ref_st)
+    for d in range(128):
+        row = got[2][d * 8:d * 8 + 8]
+        exp_row = vbuild_sg1_k4_state(win, heal_k)[d * 8:d * 8 + 8]
+        assert row[:2] == exp_row[:2], d
+        assert row[4:] == exp_row[4:], d
+
+
+@pytest.mark.parametrize('k,write_stalls', [
+    (1, False),
+    (2, True),
+    (16, False),
+    (32, False),
+    (33, False),
+    (40, True),
+    (64, True),
+    (2, 'state'),
+])
+def test_vbuild_k4_heal_prefetch_banks(k, write_stalls):
+    """Heal ignores stale maxima/r, preserves reserved state, and folds
+    every live element before publishing a bank to the scale engine.
+    Adjacent rows differ, including zero-amax/NaN and a last-slot winner.
+    """
+    rng = random.Random(7900 + k)
+    win = [0] * (64 * 128)
+    blk = int(k > 32)
+    first = blk * 32
+    live = k - first
+    for j in range(first, k):
+        for d in range(128):
+            bits = 0x3400 + d * 8 + (j - first) * 4
+            kind = d % 8
+            if kind == 0:
+                bits = 0x8000 if j % 2 else 0  # signed-zero amax
+            elif kind == 1:
+                bits = 0x7e00  # all-NaN: amax 0, quant still sees NaNs
+            elif kind == 2:
+                bits = 0x7c00 if j == first else 0x3c00
+            elif kind == 3:
+                bits = 1 + (j - first)  # subnormal reciprocal chain
+            elif kind == 4:
+                bits = 0x4000 + d * 8 if j == k - 1 else 0x3000
+            elif kind == 5:
+                bits |= 0x8000
+            elif kind == 6:
+                bits = 0x7e00 if j == first else bits
+            win[j * 128 + d] = bits
+    pay = bytes(rng.randrange(256) for _ in range(128 * 64))
+    met = bytes(rng.randrange(256) for _ in range(128 * 4))
+    st = bytes(rng.randrange(256) for _ in range(128 * 8))
+    placement = 0x8000 if k >= 40 else 0
+    params = dict(K4_PARAMS, tmem_bytes=128 * 1024)
+    base_p, base_r, base_m = (P_BASE + placement, R_BASE + placement,
+                              M_BASE + placement)
+    beats, res = run_build(params,
+                           win[:k * 128],
+                           k | K4_HEAL_BIT,
+                           a_base=base_p,
+                           r_base=base_r,
+                           m_base=base_m,
+                           rows=K4_ROWS,
+                           retain_images=((base_r, pay), (base_m, met),
+                                          (base_m + 512 + blk * 1024, st)),
+                           deadline=16000,
+                           write_stalls=write_stalls)
+    assert res['status'] is Status.OK
+    normalized = [(addr - placement, data) for addr, data in beats]
+    got = k4_images_over(normalized, HasTRoomParams(params), pay, met, st, blk)
+    expected = vbuild_sg1_k4_append(win, k, pay, met, st, heal=True)
+    for actual, reference in zip(got, expected):
+        assert actual == reference, first_diff(actual, reference)
+    assert len(beats) == 88
+    c = res['counters']
+    assert c['active'] == (c['fill'] + c['gather'] - c['prefetch'] +
+                           c['scale'] + c['quant'] + c['drain'] +
+                           c['dispatch'] + c['tiles']), c
+    assert c['rows'] == 128 and c['tiles'] == 1
+    # Require useful overlap, relative to the serial chain alone. This
+    # includes bank backpressure at live=1 and the longest live=32 rows.
+    assert c['run'] < 128 * (39 + live + 9), c
+
+
+def test_vbuild_k4_heal_and_append_relaunch():
+    """Switch prongs and blocks on one DUT, including live-count shrink.
+    Prefetch bank ownership, contexts and landing tags must reset per run.
+    """
+    hp = HasTRoomParams(K4_PARAMS)
+    dut = Harness(K4_PARAMS)
+    beats = []
+    rng = random.Random(7980)
+    win = [p for _ in range(64) for p in gen_slot128(rng)]
+
+    def tx():
+        pay, met = bytes(128 * 64), bytes(128 * 4)
+        states = [bytes(128 * 8), bytes(128 * 8)]
+        for launch, (k, heal) in enumerate(
+            ((2, True), (3, False), (33, True), (34, False), (1, True),
+             (2, False)),
+                start=1):
+            blk = int(k > 32)
+            st = states[blk]
+            image = b''.join(p.to_bytes(2, 'little') for p in win[:k * 128])
+            for base, blob in ((P_BASE, image), (R_BASE, pay), (M_BASE, met),
+                               (ST_BASE + blk * 1024, st)):
+                for off in range(0, len(blob), hp.beat_bytes):
+                    word = int.from_bytes(blob[off:off + hp.beat_bytes],
+                                          'little')
+                    yield from tmem_write_routed(dut.tmem, base + off, word)
+            begin = len(beats)
+            sink = dut.dut.sink
+            yield sink.bits.a_base.eq(P_BASE)
+            yield sink.bits.r_base.eq(R_BASE)
+            yield sink.bits.m_base.eq(M_BASE)
+            yield sink.bits.k.eq(k | (K4_HEAL_BIT if heal else 0))
+            yield sink.bits.rows.eq(K4_ROWS)
+            yield sink.valid.eq(1)
+            yield
+            for _ in range(100):
+                if (yield sink.fire):
+                    break
+                yield
+            else:
+                raise TimeoutError('K4 relaunch was not accepted')
+            yield sink.valid.eq(0)
+            yield
+            for _ in range(16000):
+                if (yield dut.dut.done):
+                    assert Status((yield dut.dut.status)) is Status.OK
+                    yield
+                    break
+                yield
+            else:
+                raise TimeoutError(f'K4 relaunch did not finish: {k}, {heal}')
+            emitted = beats[begin:]
+            assert len(emitted) == 88, (k, heal, len(emitted))
+            expected = vbuild_sg1_k4_append(win, k, pay, met, st, heal=heal)
+            got = k4_images_over(emitted, hp, pay, met, st, blk)
+            for actual, reference in zip(got, expected):
+                assert actual == reference, (k, heal,
+                                             first_diff(actual, reference))
+            assert (yield dut.dut.rows) == 128 * launch
+            assert (yield dut.dut.tiles) == launch
+            pay, met, states[blk] = expected
+            yield
+
+    def watch():
+        yield Passive()
+        while True:
+            if (yield dut.dut.tmem_w.fire):
+                beats.append(
+                    ((yield
+                      dut.dut.tmem_w.bits.addr), (yield
+                                                  dut.dut.tmem_w.bits.data)))
+            yield
+
+    sim = Simulator(dut)
+    sim.add_clock(1e-6)
+    sim.add_sync_process(tx)
+    sim.add_sync_process(watch)
+    sim.run()
+
+
+def test_vbuild_k4_special_pool():
+    """NaN/inf/zero-heavy pools: NaN never rises but its column byte
+    saturates under the retained r; inf wins and is sticky; zeros
+    never rise; subnormal rises work. Identity against the temporal
+    rebuild at every prefix of a 6-slot block-0 chain."""
+    rng = random.Random(7400)
+    win = []
+    for j in range(64):
+        if j < 6:
+            row = gen_slot128(rng, specials=False)
+            if j == 0:
+                row[3] = 0x7e00  # NaN (never wins)
+                row[9] = 0x7c00  # +inf (wins, sticky)
+                row[80] = 0x0001  # smallest subnormal
+            if j == 2:
+                row[9] = 0x7bff  # below inf: must NOT re-rise row 9
+                row[3] = 0x7e00
+                row[1] = 0x0000  # zero column under a live state
+            win.extend(row)
+        else:
+            win.extend([0] * 128)
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    st = bytes(128 * 8)
+    hp = HasTRoomParams(K4_PARAMS)
+    for k in range(1, 7):
+        beats, res = k4_run(K4_PARAMS, win, k, pay, met, st)
+        assert res['status'] is Status.OK, k
+        pay, met, st = vbuild_sg1_k4_append(win, k, pay, met, st)
+        got = k4_images_over(beats, hp, pay, met, st, 0)
+        assert got == (pay, met, st), k
+        ref_pay, ref_met = k4_temporal(win, k)
+        assert pay == ref_pay, (k, first_diff(pay, ref_pay))
+        assert met == ref_met, (k, first_diff(met, ref_met))
+
+
+def test_vbuild_k4_rate_beats_partial():
+    """The unit-level win: at the same live count, a steady-state K4
+    append (a real prior state, ~10% rows rising) runs materially
+    fewer cycles than the block-1 partial rebuild of the same block,
+    and the partition identity holds."""
+    rng = random.Random(7500)
+    k = 45  # block 1, e = 13 (past the early-rise surge)
+    win = []
+    for j in range(64):
+        win.extend(gen_slot128(rng) if j < k else [0] * 128)
+    blk = 1
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    st = vbuild_sg1_k4_state(win, k - 1)
+    beats, res = k4_run(K4_PARAMS, win, k, pay, met, st)
+    assert res['status'] is Status.OK
+    c_k4 = res['counters']
+    # the partial rebuild of the same block over the same window
+    beats, res = run_build(dict(WIDE_PARAMS),
+                           win[:k * 128],
+                           k,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=2 | VBUILD_ROWS_HD128,
+                           retain=True)
+    assert res['status'] is Status.OK
+    c_part = res['counters']
+    assert c_k4['run'] < 0.6 * c_part['run'], (c_k4, c_part)
+    assert c_k4['scale'] < 0.2 * c_part['scale'], (c_k4, scale_of(c_part))
+
+
+def scale_of(c):
+    return c['scale']
+
+
+@pytest.mark.parametrize(
+    'rows,k,m_base,params_over,want',
+    [
+        (K4_ROWS, 0, M_BASE, {}, Status.BAD_SHAPE),
+        (K4_ROWS, 65, M_BASE, {}, Status.BAD_SHAPE),
+        (K4_ROWS, 300, M_BASE, {}, Status.BAD_SHAPE),  # bits above heal
+        (K4_ROWS, 5, 0, {}, Status.BAD_SHAPE),
+        (K4_ROWS, 5, M_BASE + 4, {}, Status.BAD_ALIGN),
+        (K4_ROWS & ~VBUILD_ROWS_HD128, 5, M_BASE, {}, Status.BAD_SHAPE),
+        (K4_ROWS, 5, M_BASE, dict(vbuild_k4_selective=False),
+         Status.BAD_SHAPE),
+        (K4_ROWS, 5, M_BASE, {}, Status.BAD_RANGE),
+    ])
+def test_vbuild_k4_rejects(rows, k, m_base, params_over, want):
+    """Shape/align/range/param rejections complete at accept."""
+    params = dict(K4_PARAMS, tmem_bytes=32 * 1024, **params_over)
+    a_base, r_base = P_BASE, R_BASE
+    if want is Status.BAD_RANGE:
+        params = dict(K4_PARAMS)  # r/m extents past a small TMEM
+        params.update(tmem_bytes=8 * 1024)
+        # Bases that FIT the small TMEM's address width: the stale
+        # P_BASE/R_BASE/M_BASE values truncate to zero (and a zero
+        # m_base rejects BAD_SHAPE before the range check runs).
+        a_base, r_base, m_base = 0x100, 0x200, 0x400
+    rng = random.Random(7600 + k)
+    slot = gen_slot128(rng)
+    beats, res = run_build(params,
+                           slot,
+                           k,
+                           a_base=a_base,
+                           r_base=r_base,
+                           m_base=m_base,
+                           rows=rows,
+                           retain_images=((r_base, bytes(128 * 64)), ))
+    assert res['status'] is want, res['status']
+    assert beats == []
+
+
+@pytest.mark.parametrize('placement', [0, 1])
+def test_vbuild_k4_both_tmem_placements(placement):
+    """The K4 chain runs identically with the staging images in
+    either TMEM half (the split-TMEM placement choice)."""
+    rng = random.Random(7700 + placement)
+    k = 20
+    win = []
+    for j in range(64):
+        win.extend(gen_slot128(rng) if j < k else [0] * 128)
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    st = bytes(128 * 8)
+    hp = HasTRoomParams(K4_PARAMS)
+    for step in range(1, k + 1):
+        exp_pay, exp_met, exp_st = vbuild_sg1_k4_append(
+            win, step, pay, met, st)
+        blk = 0
+        base_r = R_BASE + placement * 0x8000
+        base_m = M_BASE + placement * 0x8000
+        st_base = base_m + 512
+        beats, res = run_split_build(dict(K4_PARAMS, tmem_bytes=128 * 1024),
+                                     win, step, P_BASE + placement * 0x8000,
+                                     base_r, base_m, K4_ROWS, [(base_r, pay),
+                                                               (base_m, met),
+                                                               (st_base, st)])
+        assert res['status'] is Status.OK, step
+        pay_got, met_got = images_over_bases(beats,
+                                             hp,
+                                             pay,
+                                             met,
+                                             base_r,
+                                             base_m,
+                                             skip=[
+                                                 (st_base + b * 1024,
+                                                  st_base + b * 1024 + 128 * 8)
+                                                 for b in range(2)
+                                             ])
+        st_got = bytearray(st)
+        for addr, data in beats:
+            for i in range(hp.data_width // 8):
+                if st_base <= addr < st_base + len(st_got):
+                    st_got[addr - st_base + i] = (data >> (8 * i)) & 0xff
+                elif not (base_r <= addr < base_r + len(pay_got)
+                          or base_m <= addr < base_m + len(met_got)):
+                    raise AssertionError(hex(addr))
+        assert bytes(pay_got) == exp_pay, step
+        assert bytes(met_got) == exp_met, step
+        assert bytes(st_got) == exp_st, step
+        pay, met, st = exp_pay, exp_met, exp_st
+
+
+@pytest.mark.parametrize('overrides', [dict(rows_bits=8), dict(act_max_k=64)])
+def test_vbuild_narrow_descriptor_elaborates(overrides):
+    from amaranth.hdl import Fragment
+
+    Fragment.get(VBuildUnit(dict(PARAMS, **overrides)), None)
+
+
+@pytest.mark.parametrize('overrides, message', [
+    (dict(vbuild_max_head_dim=128, rows_bits=8), 'rows_bits'),
+    (dict(vbuild_k4_selective=True, act_max_k=64), 'act_max_k'),
+])
+def test_vbuild_feature_descriptor_width_validation(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        HasTRoomParams(dict(PARAMS, **overrides))
+
+
+@pytest.mark.parametrize('rows', [0x10000, 0x10001, 0x80000000])
+def test_vbuild_reserved_rows_rejected_without_writes(rows):
+    beats, result = run_build(dict(PARAMS, rows_bits=32), [], 1, rows=rows)
+    assert result['status'] == Status.BAD_SHAPE
     assert beats == []

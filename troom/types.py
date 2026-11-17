@@ -77,6 +77,20 @@ class HasTRoomParams:
         # Activation RAM
         #
         self.act_max_k = params.get('act_max_k', 2048)
+        self.vbuild_max_head_dim = params.get('vbuild_max_head_dim', 64)
+        if self.vbuild_max_head_dim not in (64, 128):
+            raise ValueError('vbuild_max_head_dim must be 64 or 128')
+        self.vbuild_native_append = params.get('vbuild_native_append', True)
+        # D2 K4 selective requant (2026-11-12,
+        # plans/2026-11-09-troom-qwen3-hill-climb.md): the rows-3 wide
+        # VBUILD mode that appends one slot maintaining the temporal
+        # block contract selectively -- only rows whose exact winning
+        # magnitude pattern rises re-quantize; every other row writes
+        # its new column byte under the retained reciprocal from the
+        # per-(head, window, block) state image at m_base+dims*4.
+        # Default off: elaborations without the param keep the exact
+        # historical rejection behavior (BAD_SHAPE at accept).
+        self.vbuild_k4_selective = params.get('vbuild_k4_selective', False)
 
         log2_int(self.act_max_k, need_pow2=True)
         if self.act_max_k % self.seg_len:
@@ -291,6 +305,10 @@ class HasTRoomParams:
 
         if self.rows_bits < 1:
             raise ValueError('rows_bits must be at least 1')
+        if self.vbuild_max_head_dim == 128 and self.rows_bits < 16:
+            raise ValueError('wide VBUILD requires rows_bits >= 16')
+        if self.vbuild_k4_selective and self.lg_act_k < 7:
+            raise ValueError('K4 VBUILD requires act_max_k >= 128')
 
         #
         # DMA engine sizing

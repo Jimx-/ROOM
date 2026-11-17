@@ -125,6 +125,60 @@ REG_EPI_ADD_OPS = 0x120  # r64  snapshot: epilogue add issues
 # through the field-width check). Staged and captured like CMD_BASE_LO.
 REG_PARAM_BASE = 0x128  # rw   parameter-page device address
 
+# D1 VBUILD phase-counter window (2026-11-12,
+# plans/2026-11-09-troom-qwen3-hill-climb.md): one snapshot register
+# per launch with the same freeze/reset semantics as the windows
+# above, holding the V-window builder unit's observation counters --
+# the amax/quant/drain/staging/wait split Q1 left open. Units:
+# - tiles: VBUILD descriptors completed;
+# - rows: quantizer output rows retired;
+# - beats: TMEM beats the unit wrote;
+# - active cycles: every non-IDLE cycle of the unit (occupancy);
+# - run cycles: cycles in a functional phase state (fill/gather/
+#   scale/quant/drain), excluding the DRAINLOAD dispatch state;
+# - fill cycles: TMEM pool-image staging into the local buffer, of
+#   which fill wait is the non-absorbing subset (request issue/grant
+#   plus response latency);
+# - gather cycles: the per-element amax fold, including the next
+#   block's gather prefetch -- which also runs inside quant, so
+#   gather and quant overlap by exactly the prefetch counter;
+# - scale cycles: the amax->scale/reciprocal micro-sequencer;
+# - quant cycles: the per-element quantization stream;
+# - drain cycles: the SG1 staging/tile/append-patch write states, of
+#   which drain wait is the TMEM-write backpressure plus the append
+#   drain's beat pre-read issue/latency;
+# - dispatch cycles: the row-dispatch/pre-read-hold state between
+#   quant and the write states (the visible per-row bubble run_cycles
+#   never counted);
+# - dead/zero blocks: dead-tail and zero-amax block skips.
+# D3b K4ROW uses an exclusive attribution: unfinished scale contexts
+# take priority, then exposed heal gather, then quant for remaining cycles.
+# These are mode-dependent occupancy buckets, not independent engine-service
+# counters. K4 writes also occur in K4ROW, outside legacy drain states;
+# drain/wait alone cannot attribute arithmetic versus write backpressure.
+# Exact partition:
+#   active = fill + (gather - prefetch) + scale + quant + drain
+#            + dispatch + tiles.
+# All zero-extended from 48-bit counters. Advertised by
+# CAPS_VB_COUNTERS; images without the bit must report zeros here,
+# not fabricate values.
+REG_VB_TILES = 0x130  # r64  snapshot: VBUILD descriptors completed
+REG_VB_ROWS = 0x138  # r64  snapshot: builder rows retired
+REG_VB_BEATS = 0x140  # r64  snapshot: builder TMEM beats written
+REG_VB_ACTIVE_CYCLES = 0x148  # r64  snapshot: unit non-IDLE cycles
+REG_VB_RUN_CYCLES = 0x150  # r64  snapshot: unit phase-state cycles
+REG_VB_FILL_CYCLES = 0x158  # r64  snapshot: pool-image fill cycles
+REG_VB_FILL_WAIT = 0x160  # r64  snapshot: fill request/latency waits
+REG_VB_GATHER_CYCLES = 0x168  # r64  snapshot: amax-fold cycles
+REG_VB_PREFETCH_CYCLES = 0x170  # r64  snapshot: gather-prefetch cycles
+REG_VB_SCALE_CYCLES = 0x178  # r64  snapshot: scale sequencer cycles
+REG_VB_QUANT_CYCLES = 0x180  # r64  snapshot: quant stream cycles
+REG_VB_DRAIN_CYCLES = 0x188  # r64  snapshot: write-state cycles
+REG_VB_DRAIN_WAIT = 0x190  # r64  snapshot: write/prefetch stall cycles
+REG_VB_DISPATCH_CYCLES = 0x198  # r64  snapshot: dispatch-state cycles
+REG_VB_DEAD_BLOCKS = 0x1a0  # r64  snapshot: dead-tail block skips
+REG_VB_ZERO_BLOCKS = 0x1a8  # r64  snapshot: zero-amax block skips
+
 # Parameter-page geometry: 1024 32-bit slots fetched as whole beats
 # (the page memory stores one bus beat per row). The marker word
 # carries the slot index in its low PARAM_SLOT_BITS bits.
@@ -244,6 +298,47 @@ CAPS_VBUILD_PART = 16
 # rows 1/2 partial. The backend's native open-tail emission keys on
 # this bit; a bit-less image keeps the adopted P2d-a partial path.
 CAPS_VBUILD_VAPP = 17
+
+# Backward-compatible geometry extensions. VBUILD rows bit 15 selects
+# 128 dimensions only when CAPS_VBUILD_HD128 is advertised; low mode bits
+# retain their existing meaning. Without that flag the geometry is 64.
+CAPS_ACT_K4096 = 18
+CAPS_VBUILD_HD128 = 19
+VBUILD_ROWS_HD128 = 1 << 15
+# Q3c direct-append slice (2026-11-10,
+# plans/2026-11-09-troom-qwen3-hill-climb.md): the final-format append
+# writer family of the frozen candidate-A contract
+# (results/troom-qwen3-append-contract-20261110/CONTRACT.md). With the
+# bit, VBUILD rows 18/19 accept bit 15 -- one 128-dim token under a
+# SINGLE per-token scale (amax over all 128 dims), patching 64 payload
+# beats plus the four-beat scale row and writing no meta cell anywhere
+# (the reader keeps the birth-seeded 1.0s) -- and rows 20 (VB_ROWS_K_APP,
+# either width) appends one K token's final bytes into its group image:
+# per-block frozen K quantization, whole 32-B chunks and meta cells
+# patched beat-composed in place. Ordinary append never rebuilds
+# historical extents. Backends without the bit keep the P2d-b 64-dim
+# append and the rebuild paths.
+CAPS_VBUILD_DAPP = 20
+# D1 counter window (2026-11-12,
+# plans/2026-11-09-troom-qwen3-hill-climb.md): the VBUILD
+# phase-counter snapshot window at REG_VB_TILES..REG_VB_ZERO_BLOCKS
+# (see there for the units and the exact partition identity). Pure
+# observation: no functional path changes, and images without the bit
+# report zeros in the window. This source generation always carries
+# the window.
+CAPS_VB_COUNTERS = 21
+# D2 K4 selective same-contract requant (2026-11-12,
+# plans/2026-11-09-troom-qwen3-hill-climb.md): VBUILD rows 3 with bit 15
+# appends one 128-dim slot to a window's open block maintaining the
+# temporal Q8_0 block contract byte-identically while re-quantizing
+# only the rows whose exact winning magnitude pattern rose (the D2
+# max-change gate measured ~10% of dims per append). The retained
+# state -- per (head, window, block) 1 KiB of [pattern:16 | r:32] rows
+# -- lives in the shadow beside payload/meta, staged per launch at
+# m_base + dims*4; the descriptor's k bit 7 is the heal flag that
+# re-derives the whole state after fallback rebuilds. Backends without
+# the bit keep the installed rebuild emission everywhere.
+CAPS_VBUILD_K4 = 22
 
 
 class WrapperError(IntEnum):

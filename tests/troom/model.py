@@ -1238,11 +1238,13 @@ def vbuild_amax_bits(xh):
 
 
 def vbuild_quant_row(xh):
-    """One V tile row (64 FP16 patterns, live slots first, the tail
-    already zeroed) -> its 68 Q8_0 bytes (two blocks)."""
-    assert len(xh) == 64
-    out = bytearray(68)
-    for b in range(2):
+    """One V tile row / K slot row (64 or 128 FP16 patterns, live slots
+    first, the tail already zeroed) -> its Q8_0 bytes (two or four
+    independent 32-dim blocks)."""
+    assert len(xh) in (64, 128)
+    blocks = len(xh) // 32
+    out = bytearray(34 * blocks)
+    for b in range(blocks):
         seg = list(xh[32 * b:32 * b + 32])
         a = vbuild_amax_bits(seg)
         e = (a >> 23) & 0xff
@@ -1398,22 +1400,27 @@ VB_OPEN_META_BITS = 0x3C00
 
 
 def vbuild_quant_row_token(xh):
-    """One appended slot's V row (its 64 FP16 dim patterns) -> the
-    68-byte two-block assembly under ONE per-token scale.
+    """One appended slot's V row (its 64 or 128 FP16 dim patterns) ->
+    the two/four-block assembly under ONE per-token scale.
 
-    The frozen VEC_QUANT sequence re-expressed over the whole 64-element
-    row -- exactly the K-mode gather direction with the two 32-element
-    segments sharing a single amax: one classify (``vbuild_amax_bits``
-    over all 64), one ``sc = R(a * 1/127)`` -> ``d16``, one frozen recip
-    ``r``, 64 RNE int8 quants. The assembly keeps the K layout (chunk b
-    holds dims ``32b..32b+31``) with the single d16 written to BOTH
-    block slots, so the drain patches payload chunks from the assembly's
-    bytes and the scale row from either d16 slot. A fully zero row
-    yields d16 0 and 64 zero bytes (the frozen a == 0 branch); NaN
+    The frozen VEC_QUANT sequence re-expressed over the whole row --
+    exactly the K-mode gather direction with the 32-element segments
+    sharing a single amax: one classify (``vbuild_amax_bits`` over all
+    dims), one ``sc = R(a * 1/127)`` -> ``d16``, one frozen recip
+    ``r``, the RNE int8 quants. The assembly keeps the K layout (chunk
+    b holds dims ``32b..32b+31``) with the single d16 written to EVERY
+    block slot, so the drain patches payload chunks from the assembly's
+    bytes and the scale row from any d16 slot. A fully zero row
+    yields d16 0 and all-zero bytes (the frozen a == 0 branch); NaN
     patterns never win the fold but saturate their own bytes.
+
+    The 128-dim form is the Q3c candidate-A writer contract
+    (``vbuild_max_head_dim=128`` append, one FP16 scale per token over
+    all 128 dims); the 64-dim form is the P2d-b ancestor.
     """
-    assert len(xh) == 64
-    out = bytearray(68)
+    assert len(xh) in (64, 128)
+    blocks = len(xh) // 32
+    out = bytearray(34 * blocks)
     a = vbuild_amax_bits(xh)
     e = (a >> 23) & 0xff
     if e == 0:
@@ -1428,8 +1435,8 @@ def vbuild_quant_row_token(xh):
             y = fp32_mul_bits(y, t)
         sc, r = fp32_mul_bits(a, INV127_BITS), y
     d16 = fp32_to_fp16_rne_bits(sc)
-    out[0:2] = d16.to_bytes(2, 'little')
-    out[34:36] = d16.to_bytes(2, 'little')
+    for j in range(blocks):
+        out[34 * j:34 * j + 2] = d16.to_bytes(2, 'little')
     for i, h in enumerate(xh):
         x = f32_bits(fp16_to_f32(h))
         q = q8_rne_bits(fp32_mul_bits(fp32_mul_bits(x, r), F127_BITS))
@@ -1453,7 +1460,7 @@ def vbuild_pfold_bits(p_bits, d16):
 def vbuild_sg1_append(slot, blk, p, pay0, srow0):
     """The composed staging images of one append run (rows 18/19).
 
-    ``pay0``/``srow0`` are the host-loaded prior images (the 4096-B
+    ``pay0``/``srow0`` are the host-loaded prior images (the dims*64-B
     payload staging and the 256-B per-window F32 scale row at
     ``m_base`` -- the previous appends' words over the host-seeded
     1.0s). The run patches block ``blk``'s payload chunk byte ``p``
@@ -1463,16 +1470,21 @@ def vbuild_sg1_append(slot, blk, p, pay0, srow0):
     VEC_MUL fold multiplies P by; 1.0 words are the fold's exact
     identity, which is why sealed/unappended slots seed 1.0); every
     other byte keeps its loaded value, so the returned images are
-    the run's byte contract. The meta staging is not touched: the
-    open block's cells stay the uploaded 1.0s until the seal.
+    the run's byte contract. The meta staging is not touched: under
+    the Q3c candidate-A contract the cells stay the birth-seeded 1.0s
+    for the window's whole lifetime (A-keep reader).
+
+    The slot is 64 or 128 patterns (the appended token's dims); the
+    payload image is dims*64 bytes either way.
     """
-    assert len(slot) == 64
+    dims = len(slot)
+    assert dims in (64, 128)
     assert blk in (0, 1) and 0 <= p < 32
-    assert len(pay0) == 64 * 64 and len(srow0) == 64 * 4
+    assert len(pay0) == dims * 64 and len(srow0) == 64 * 4
     row = vbuild_quant_row_token(slot)
     pay = bytearray(pay0)
     srow = bytearray(srow0)
-    for d in range(64):
+    for d in range(dims):
         off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32 + p
         pay[off] = row[34 * (d >> 5) + 2 + (d & 31)]
     d16 = int.from_bytes(row[0:2], 'little')
@@ -1481,14 +1493,15 @@ def vbuild_sg1_append(slot, blk, p, pay0, srow0):
     return bytes(pay), bytes(srow)
 
 
-def vbuild_sg1_append_mask(blk, p):
+def vbuild_sg1_append_mask(blk, p, dims=64):
     """Byte masks of one append run's staging writes: block ``blk``'s
     chunk byte ``p`` per dim row (payload) and the scale row's word
     ``blk*32 + p``. The unmarked extents are the host-loaded previous
     appends' bytes and are never written."""
-    pay = bytearray(64 * 64)
+    assert dims in (64, 128)
+    pay = bytearray(dims * 64)
     srow = bytearray(64 * 4)
-    for d in range(64):
+    for d in range(dims):
         off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32 + p
         pay[off] = 1
     wo = 4 * (blk * 32 + p)
@@ -1497,6 +1510,57 @@ def vbuild_sg1_append_mask(blk, p):
     srow[wo + 2] = 1
     srow[wo + 3] = 1
     return bytes(pay), bytes(srow)
+
+
+def vbuild_sg1_k_append(slot, k, pay0, met0):
+    """The composed staging images of one K append run (rows 20).
+
+    ``pay0``/``met0`` are the host-loaded prior group images (16*dims
+    payload bytes and 16*(dims//16) meta bytes). The run quantizes the
+    token's row with the frozen PER-BLOCK K sequence
+    (:func:`vbuild_quant_row` -- numerically the installed K contract)
+    and patches token ``k-1``'s extents in place: each block's whole
+    32-B payload chunk at ``((r>>2)*(4*blocks) + b*4 + (r&3))*32`` and
+    its 2-B meta cell at ``(r>>2)*(8*blocks) + b*8 + (r&3)*2``; every
+    other byte keeps the loaded value. A lane's chunk is half a beat
+    and the meta cells sub-beat, so the drain composes whole beats
+    from the pre-read image; neighboring packed tokens are preserved
+    byte-identically. Overwrite (same k) re-quantizes through the same
+    primitive."""
+    dims = len(slot)
+    blocks = dims // 32
+    assert dims in (64, 128)
+    assert 1 <= k <= 16
+    assert len(pay0) == 16 * dims and len(met0) == 16 * blocks * 2
+    r = k - 1
+    row = vbuild_quant_row(slot)
+    pay = bytearray(pay0)
+    met = bytearray(met0)
+    for b in range(blocks):
+        off = ((r >> 2) * (blocks * 4) + b * 4 + (r & 3)) * 32
+        pay[off:off + 32] = row[34 * b + 2:34 * b + 34]
+        moff = (r >> 2) * (blocks * 8) + b * 8 + (r & 3) * 2
+        met[moff:moff + 2] = row[34 * b:34 * b + 2]
+    return bytes(pay), bytes(met)
+
+
+def vbuild_sg1_k_append_mask(k, dims=64):
+    """Byte masks of one K append run's staging writes: token ``k-1``'s
+    per-block 32-B payload chunks and meta cells. The unmarked extents
+    are the host-loaded neighboring tokens' bytes and are never
+    written."""
+    assert dims in (64, 128)
+    blocks = dims // 32
+    assert 1 <= k <= 16
+    r = k - 1
+    pay = bytearray(16 * dims)
+    met = bytearray(16 * blocks * 2)
+    for b in range(blocks):
+        off = ((r >> 2) * (blocks * 4) + b * 4 + (r & 3)) * 32
+        pay[off:off + 32] = b'\x01' * 32
+        moff = (r >> 2) * (blocks * 8) + b * 8 + (r & 3) * 2
+        met[moff:moff + 2] = b'\x01\x01'
+    return bytes(pay), bytes(met)
 
 
 def vec_word(op, a, b):
@@ -1536,3 +1600,120 @@ def rdc_result(op, words):
         x = fp32_mul_bits(w, w) if op is VecOp.RDC_SUMSQ else w
         p[i % 4] = fp32_add_bits(p[i % 4], x)
     return fp32_add_bits(fp32_add_bits(p[0], p[2]), fp32_add_bits(p[1], p[3]))
+
+
+# ---------------------------------------------------------------------
+# D2 K4 selective same-contract requant (2026-11-12,
+# plans/2026-11-09-troom-qwen3-hill-climb.md; the VBUILD rows-3|WIDE
+# writer): the wide tile's temporal reference images, the per-block
+# state extraction, and the selective append's composed images.
+# ---------------------------------------------------------------------
+
+
+def _vbuild_block_state(seg):
+    """One 32-element block's frozen sequence, split out.
+
+    Returns ``(pattern, d16, r, qs)`` -- the exact winning magnitude
+    pattern, the FP16 d16, the frozen reciprocal bits and the live
+    quant bytes -- exactly the quantities the K4 state image retains
+    and the temporal rebuild recomputes."""
+    a = vbuild_amax_bits(seg)
+    # the winning pattern itself (pre-widen), NaN patterns excluded
+    best = 0
+    for h in seg:
+        mag = h & 0x7fff
+        if mag < 0x7c01 and mag > best:
+            best = mag
+    e = (a >> 23) & 0xFF
+    if e == 0:
+        sc, r = 0, 0
+    elif e >= 253:
+        sc, r = fp32_mul_bits(a, INV127_BITS), 0
+    else:
+        y = fp32_rec_seed_bits(a)
+        for _ in range(2):
+            t = fp32_mul_bits(a, y)
+            t = fp32_add_bits(0x40000000, fp32_neg_bits(t))
+            y = fp32_mul_bits(y, t)
+        sc, r = fp32_mul_bits(a, INV127_BITS), y
+    d16 = fp32_to_fp16_rne_bits(sc)
+    qs = bytes(
+        q8_rne_bits(
+            fp32_mul_bits(fp32_mul_bits(f32_bits(fp16_to_f32(h)), r),
+                          F127_BITS)) for h in seg)
+    return best, d16, r, qs
+
+
+def vbuild_sg1_wide(window):
+    """The wide (128-dim) V tile's SG1 images -- the temporal
+    full-rebuild reference. ``window`` is the 64-slot slot-major image
+    (slots at or above the live count already zero)."""
+    assert len(window) == 64 * 128
+    rows = [
+        vbuild_quant_row([window[j * 128 + d] for j in range(64)])
+        for d in range(128)
+    ]
+    payload = bytearray(128 * 64)
+    meta = bytearray(128 * 4)
+    for r in range(128):
+        for j in range(2):
+            off = ((r >> 2) * 8 + j * 4 + (r & 3)) * 32
+            payload[off:off + 32] = rows[r][34 * j + 2:34 * j + 34]
+            moff = (r >> 4) * 64 + ((r >> 2) & 3) * 16 + j * 8 + (r & 3) * 2
+            meta[moff:moff + 2] = rows[r][34 * j:34 * j + 2]
+    return bytes(payload), bytes(meta)
+
+
+def vbuild_sg1_k4_state(window, k):
+    """The open block's state image (128 x 8 B) after the temporal
+    rebuild at live prefix ``k`` -- pattern | reserved | r per row."""
+    blk = 1 if k > 32 else 0
+    e = ((k - 1) & 31) + 1
+    st = bytearray(128 * 8)
+    for d in range(128):
+        seg = [window[(32 * blk + j) * 128 + d] for j in range(e)]
+        pat, _, r, _ = _vbuild_block_state(seg)
+        st[d * 8:d * 8 + 2] = pat.to_bytes(2, 'little')
+        st[d * 8 + 4:d * 8 + 8] = r.to_bytes(4, 'little')
+    return bytes(st)
+
+
+def vbuild_sg1_k4_append(window, k, pay0, met0, st0, heal=False):
+    """One K4 selective append's composed staging images (rows 3|WIDE).
+
+    ``window`` is the full 64-slot pool image (the open block's live
+    prefix including the appended slot is read); ``k`` the live count
+    after the append; ``pay0``/``met0``/``st0`` the host-loaded prior
+    payload/meta/state images of the open block's extents. Rows whose
+    retained exact pattern strictly rises (or every row under heal)
+    re-quantize through the frozen per-block sequence -- chunk, d16
+    cell and state row all rewritten; every other row writes only its
+    new column byte quantized under the state's stored r bits."""
+    assert len(window) == 64 * 128
+    assert len(pay0) == 128 * 64 and len(met0) == 128 * 4
+    assert len(st0) == 128 * 8
+    blk = 1 if k > 32 else 0
+    pos = (k - 1) & 31
+    e = pos + 1
+    pay, met, st = bytearray(pay0), bytearray(met0), bytearray(st0)
+    for d in range(128):
+        xh = window[(k - 1) * 128 + d]
+        mag = xh & 0x7FFF
+        pat = int.from_bytes(st0[d * 8:d * 8 + 2], 'little')
+        r = int.from_bytes(st0[d * 8 + 4:d * 8 + 8], 'little')
+        if heal or (mag < 0x7C01 and mag > pat):
+            seg = [window[(32 * blk + j) * 128 + d] for j in range(e)]
+            npat, d16, nr, qs = _vbuild_block_state(seg)
+            off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32
+            pay[off:off + 32] = bytes(qs) + bytes(32 - e)
+            moff = ((d >> 4) * 32 + ((d >> 2) & 3) * 8 + blk * 4 + (d & 3)) * 2
+            met[moff:moff + 2] = d16.to_bytes(2, 'little')
+            st[d * 8:d * 8 + 2] = npat.to_bytes(2, 'little')
+            st[d * 8 + 4:d * 8 + 8] = nr.to_bytes(4, 'little')
+        else:
+            q = q8_rne_bits(
+                fp32_mul_bits(fp32_mul_bits(f32_bits(fp16_to_f32(xh)), r),
+                              F127_BITS))
+            off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32 + pos
+            pay[off] = q
+    return bytes(pay), bytes(met), bytes(st)

@@ -158,6 +158,26 @@ class Core(HasTRoomParams, Elaboratable):
         self.epi_cast_ops = Signal(48)
         self.epi_mul_ops = Signal(48)
         self.epi_add_ops = Signal(48)
+        # D1 VBUILD phase-counter window (2026-11-12): the builder
+        # unit's observation counters, snapshotted per launch like the
+        # windows above. Nothing but the counters is attached; the
+        # builder's functional paths are untouched.
+        self.vb_tiles = Signal(48)
+        self.vb_rows = Signal(48)
+        self.vb_beats = Signal(48)
+        self.vb_active_cycles = Signal(48)
+        self.vb_run_cycles = Signal(48)
+        self.vb_fill_cycles = Signal(48)
+        self.vb_fill_wait_cycles = Signal(48)
+        self.vb_gather_cycles = Signal(48)
+        self.vb_prefetch_cycles = Signal(48)
+        self.vb_scale_cycles = Signal(48)
+        self.vb_quant_cycles = Signal(48)
+        self.vb_drain_cycles = Signal(48)
+        self.vb_drain_wait_cycles = Signal(48)
+        self.vb_dispatch_cycles = Signal(48)
+        self.vb_dead_blocks = Signal(48)
+        self.vb_zero_blocks = Signal(48)
 
     def elaborate(self, platform):
         m = Module()
@@ -877,6 +897,22 @@ class Core(HasTRoomParams, Elaboratable):
             self.epi_cast_ops.eq(epi.cast_ops),
             self.epi_mul_ops.eq(epi.mul_ops),
             self.epi_add_ops.eq(epi.add_ops),
+            self.vb_tiles.eq(vbuild.tiles),
+            self.vb_rows.eq(vbuild.rows),
+            self.vb_beats.eq(vbuild.beats),
+            self.vb_active_cycles.eq(vbuild.active_cycles),
+            self.vb_run_cycles.eq(vbuild.run_cycles),
+            self.vb_fill_cycles.eq(vbuild.fill_cycles),
+            self.vb_fill_wait_cycles.eq(vbuild.fill_wait_cycles),
+            self.vb_gather_cycles.eq(vbuild.gather_cycles),
+            self.vb_prefetch_cycles.eq(vbuild.prefetch_cycles),
+            self.vb_scale_cycles.eq(vbuild.scale_cycles),
+            self.vb_quant_cycles.eq(vbuild.quant_cycles),
+            self.vb_drain_cycles.eq(vbuild.drain_cycles),
+            self.vb_drain_wait_cycles.eq(vbuild.drain_wait_cycles),
+            self.vb_dispatch_cycles.eq(vbuild.dispatch_cycles),
+            self.vb_dead_blocks.eq(vbuild.dead_blocks),
+            self.vb_zero_blocks.eq(vbuild.zero_blocks),
         ]
 
         return m

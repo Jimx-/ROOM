@@ -18,6 +18,7 @@ from troom.abi import (
     CAPS_ENGINE_COUNTERS,
     CAPS_MM_EPI_COUNTERS,
     CAPS_PARAM_PAGE,
+    CAPS_VB_COUNTERS,
     CONTROL_START,
     ERROR_INDEX_NONE,
     REG_ARRAY_STARVE,
@@ -53,6 +54,22 @@ from troom.abi import (
     REG_SUBMIT_ID,
     REG_TMEM_CONFLICTS,
     REG_USEFUL_MACS,
+    REG_VB_ACTIVE_CYCLES,
+    REG_VB_BEATS,
+    REG_VB_DEAD_BLOCKS,
+    REG_VB_DISPATCH_CYCLES,
+    REG_VB_DRAIN_CYCLES,
+    REG_VB_DRAIN_WAIT,
+    REG_VB_FILL_CYCLES,
+    REG_VB_FILL_WAIT,
+    REG_VB_GATHER_CYCLES,
+    REG_VB_PREFETCH_CYCLES,
+    REG_VB_QUANT_CYCLES,
+    REG_VB_ROWS,
+    REG_VB_RUN_CYCLES,
+    REG_VB_SCALE_CYCLES,
+    REG_VB_TILES,
+    REG_VB_ZERO_BLOCKS,
     STATUS_BUSY,
     STATUS_DONE,
     STATUS_ERROR,
@@ -844,6 +861,122 @@ def test_engine_counter_snapshot():
         assert counters['cmds_done'] == 15
         assert counters['dram_bytes'] == 2 * 4 * 64 + 4 * vec_n + BEAT
         assert counters['run_cycles'] == first_cycles
+
+    run_wrap(top, main, collect_writes(top, image))
+
+
+VB_WINDOW = [
+    ('tiles', REG_VB_TILES),
+    ('rows', REG_VB_ROWS),
+    ('beats', REG_VB_BEATS),
+    ('active_cycles', REG_VB_ACTIVE_CYCLES),
+    ('run_cycles', REG_VB_RUN_CYCLES),
+    ('fill_cycles', REG_VB_FILL_CYCLES),
+    ('fill_wait_cycles', REG_VB_FILL_WAIT),
+    ('gather_cycles', REG_VB_GATHER_CYCLES),
+    ('prefetch_cycles', REG_VB_PREFETCH_CYCLES),
+    ('scale_cycles', REG_VB_SCALE_CYCLES),
+    ('quant_cycles', REG_VB_QUANT_CYCLES),
+    ('drain_cycles', REG_VB_DRAIN_CYCLES),
+    ('drain_wait_cycles', REG_VB_DRAIN_WAIT),
+    ('dispatch_cycles', REG_VB_DISPATCH_CYCLES),
+    ('dead_blocks', REG_VB_DEAD_BLOCKS),
+    ('zero_blocks', REG_VB_ZERO_BLOCKS),
+]
+
+
+def read_vb_counters(top):
+    """D1 VBUILD phase-counter window, 64-bit registers read low
+    word first."""
+    values = {}
+    for name, off in VB_WINDOW:
+        lo = yield from mmio_read(top, off)
+        hi = yield from mmio_read(top, off + 4)
+        values[name] = lo | (hi << 32)
+    return values
+
+
+def vbuild_program():
+    """Load a 64-slot FP16 V pool window into TMEM and build its
+    legacy tile (the D1 counter workload)."""
+    load = dict(dram_addr=0x4000,
+                tmem_addr=0x0000,
+                row_bytes=128,
+                rows=64,
+                dram_stride=128,
+                tmem_stride=128)
+    return [
+        wrap_cmd(Opcode.LOAD_2D, 1, evt=1, **load),
+        wrap_cmd(Opcode.WAIT, 2, evt=1),
+        wrap_cmd(Opcode.VBUILD, 3, evt=2, r_base=0x2000, a_base=0x0000, k=64),
+        wrap_cmd(Opcode.WAIT, 4, evt=2),
+        wrap_cmd(Opcode.END, 5),
+    ]
+
+
+def test_vbuild_counter_snapshot():
+    """D1: the VBUILD phase-counter window snapshots the builder's
+    per-launch phases with an exact partition.
+
+    One all-live 64-dim window build must report one tile, 64 rows,
+    the tile's whole beat count, nonzero work in every phase, and
+    active = fill + (gather - prefetch) + scale + quant + drain +
+    dispatch + tiles exactly. The fill/drain wait subsets stay
+    subsets, and the prefetch overlap stays inside both gather and
+    quant."""
+    image = bytearray(make_image([(CMD_BASE, vbuild_program())]))
+    # Deterministic nonzero FP16 pool patterns at the LOAD_2D source
+    # (the image's default beat-address fill leaves every odd
+    # halfword zero, which would exercise the zero-amax skip instead
+    # of the full phase walk). Placed beyond every fixed buffer the
+    # wrapper tests use.
+    POOL_DRAM = 0x4000
+    pool = bytearray(8192)
+    for off in range(0, len(pool), 2):
+        pool[off:off + 2] = ((0x0800 + (off % 0x3000))
+                             | (0x8000 if (off >> 5) & 1 else 0)) \
+            .to_bytes(2, 'little')
+    if len(image) < POOL_DRAM + len(pool):
+        image.extend(bytes((POOL_DRAM + len(pool)) - len(image)))
+    image[POOL_DRAM:POOL_DRAM + len(pool)] = pool
+    top = WrapperTop(WRAP_PARAMS, bytes(image), read_latency=2, b_latency=2)
+
+    def main():
+        assert (yield from mmio_read(top, REG_CAPS)) \
+            & (1 << CAPS_VB_COUNTERS)
+
+        result = yield from launch(top,
+                                   image,
+                                   submit_id=0xa1,
+                                   cmd_base=CMD_BASE,
+                                   count=5,
+                                   comp_base=COMP_BASE,
+                                   capacity=8)
+        assert result['status'] & (1 << STATUS_DONE)
+
+        vb = yield from read_vb_counters(top)
+        hp = HasTRoomParams(WRAP_PARAMS)
+        row_pad = -(-68 // hp.beat_bytes) * hp.beat_bytes
+        assert vb['tiles'] == 1
+        assert vb['rows'] == 64
+        assert vb['beats'] == 64 * row_pad // hp.beat_bytes
+        assert vb['active_cycles'] > 0
+        assert vb['run_cycles'] > 0
+        for phase in ('fill_cycles', 'gather_cycles', 'scale_cycles',
+                      'quant_cycles', 'drain_cycles', 'dispatch_cycles'):
+            assert vb[phase] > 0, phase
+        assert vb['dead_blocks'] == 0
+        assert vb['zero_blocks'] == 0
+        # Wait subsets and the gather/quant overlap.
+        assert vb['fill_wait_cycles'] <= vb['fill_cycles']
+        assert vb['drain_wait_cycles'] <= vb['drain_cycles']
+        assert vb['prefetch_cycles'] <= vb['gather_cycles']
+        assert vb['prefetch_cycles'] <= vb['quant_cycles']
+        # Exact occupancy partition.
+        assert vb['active_cycles'] == (
+            vb['fill_cycles'] + (vb['gather_cycles'] - vb['prefetch_cycles']) +
+            vb['scale_cycles'] + vb['quant_cycles'] + vb['drain_cycles'] +
+            vb['dispatch_cycles'] + vb['tiles']), vb
 
     run_wrap(top, main, collect_writes(top, image))
 

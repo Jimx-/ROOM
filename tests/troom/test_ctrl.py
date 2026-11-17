@@ -26,6 +26,8 @@ from troom.abi import (
     CAPS_VBUILD_K,
     CAPS_VBUILD_PART,
     CAPS_VBUILD_VAPP,
+    CAPS_VBUILD_DAPP,
+    CAPS_VB_COUNTERS,
     CAPS_VEC_F16,
     CAPS_VEC_PSWAP,
     CAPS_WATCHDOG,
@@ -216,8 +218,10 @@ def test_identity_caps_and_parameters():
                 | (1 << CAPS_VEC_SMEXP)
                 | (1 << CAPS_VBUILD_PART)
                 | (1 << CAPS_VBUILD_VAPP)
+                | (1 << CAPS_VBUILD_DAPP)
                 | (1 << CAPS_ACT_BANK)
-                | (1 << CAPS_TMEM_SPLIT))
+                | (1 << CAPS_TMEM_SPLIT)
+                | (1 << CAPS_VB_COUNTERS))
         assert (yield from cread(axil, REG_CAPS)) == caps
         assert (yield from cread(axil, REG_MEM_BASE)) == MEM_BASE
         assert (yield from cread(axil, REG_MEM_SIZE)) == MEM_SIZE
@@ -642,7 +646,7 @@ def test_write_zero_does_not_start_and_independent_aw_w():
     run_ctrl(top, proc, monitor)
 
 
-@pytest.mark.parametrize('offset', [REG_CONTROL + 1, 0x50, 0x130, 0x40000010])
+@pytest.mark.parametrize('offset', [REG_CONTROL + 1, 0x50, 0x1b0, 0x40000010])
 def test_invalid_write_does_not_alias_control(offset):
     top = CtrlTop(PARAMS, mem_base=MEM_BASE, mem_size=MEM_SIZE)
 

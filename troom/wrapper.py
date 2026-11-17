@@ -261,6 +261,26 @@ class TroomWrapper(HasTRoomParams, Elaboratable):
             ctrl.counters_i.epi_cast_ops.eq(self.core.epi_cast_ops),
             ctrl.counters_i.epi_mul_ops.eq(self.core.epi_mul_ops),
             ctrl.counters_i.epi_add_ops.eq(self.core.epi_add_ops),
+            ctrl.counters_i.vb_tiles.eq(self.core.vb_tiles),
+            ctrl.counters_i.vb_rows.eq(self.core.vb_rows),
+            ctrl.counters_i.vb_beats.eq(self.core.vb_beats),
+            ctrl.counters_i.vb_active_cycles.eq(self.core.vb_active_cycles),
+            ctrl.counters_i.vb_run_cycles.eq(self.core.vb_run_cycles),
+            ctrl.counters_i.vb_fill_cycles.eq(self.core.vb_fill_cycles),
+            ctrl.counters_i.vb_fill_wait_cycles.eq(
+                self.core.vb_fill_wait_cycles),
+            ctrl.counters_i.vb_gather_cycles.eq(self.core.vb_gather_cycles),
+            ctrl.counters_i.vb_prefetch_cycles.eq(
+                self.core.vb_prefetch_cycles),
+            ctrl.counters_i.vb_scale_cycles.eq(self.core.vb_scale_cycles),
+            ctrl.counters_i.vb_quant_cycles.eq(self.core.vb_quant_cycles),
+            ctrl.counters_i.vb_drain_cycles.eq(self.core.vb_drain_cycles),
+            ctrl.counters_i.vb_drain_wait_cycles.eq(
+                self.core.vb_drain_wait_cycles),
+            ctrl.counters_i.vb_dispatch_cycles.eq(
+                self.core.vb_dispatch_cycles),
+            ctrl.counters_i.vb_dead_blocks.eq(self.core.vb_dead_blocks),
+            ctrl.counters_i.vb_zero_blocks.eq(self.core.vb_zero_blocks),
             self.core_reset.eq(core_rst),
         ]
 

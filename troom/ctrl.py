@@ -53,6 +53,8 @@ from amaranth.utils import log2_int
 
 from troom.abi import (
     CAPS_ACT_BANK,
+    CAPS_ACT_K4096,
+    CAPS_VBUILD_HD128,
     CAPS_TMEM_SPLIT,
     CAPS_ENGINE_COUNTERS,
     CAPS_FMT0,
@@ -63,7 +65,10 @@ from troom.abi import (
     CAPS_VBUILD_SG1,
     CAPS_VBUILD_K,
     CAPS_VBUILD_PART,
+    CAPS_VBUILD_DAPP,
     CAPS_VBUILD_VAPP,
+    CAPS_VBUILD_K4,
+    CAPS_VB_COUNTERS,
     CAPS_VEC_F16,
     CAPS_VEC_PSWAP,
     CAPS_VEC_SILU,
@@ -119,6 +124,22 @@ from troom.abi import (
     REG_TMEM_BYTES,
     REG_TMEM_CONFLICTS,
     REG_USEFUL_MACS,
+    REG_VB_TILES,
+    REG_VB_ROWS,
+    REG_VB_BEATS,
+    REG_VB_ACTIVE_CYCLES,
+    REG_VB_RUN_CYCLES,
+    REG_VB_FILL_CYCLES,
+    REG_VB_FILL_WAIT,
+    REG_VB_GATHER_CYCLES,
+    REG_VB_PREFETCH_CYCLES,
+    REG_VB_SCALE_CYCLES,
+    REG_VB_QUANT_CYCLES,
+    REG_VB_DRAIN_CYCLES,
+    REG_VB_DRAIN_WAIT,
+    REG_VB_DISPATCH_CYCLES,
+    REG_VB_DEAD_BLOCKS,
+    REG_VB_ZERO_BLOCKS,
     STATUS_BUSY,
     STATUS_DONE,
     STATUS_ERROR,
@@ -218,6 +239,22 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
             ('epi_cast_ops', 48, Direction.FANOUT),
             ('epi_mul_ops', 48, Direction.FANOUT),
             ('epi_add_ops', 48, Direction.FANOUT),
+            ('vb_tiles', 48, Direction.FANOUT),
+            ('vb_rows', 48, Direction.FANOUT),
+            ('vb_beats', 48, Direction.FANOUT),
+            ('vb_active_cycles', 48, Direction.FANOUT),
+            ('vb_run_cycles', 48, Direction.FANOUT),
+            ('vb_fill_cycles', 48, Direction.FANOUT),
+            ('vb_fill_wait_cycles', 48, Direction.FANOUT),
+            ('vb_gather_cycles', 48, Direction.FANOUT),
+            ('vb_prefetch_cycles', 48, Direction.FANOUT),
+            ('vb_scale_cycles', 48, Direction.FANOUT),
+            ('vb_quant_cycles', 48, Direction.FANOUT),
+            ('vb_drain_cycles', 48, Direction.FANOUT),
+            ('vb_drain_wait_cycles', 48, Direction.FANOUT),
+            ('vb_dispatch_cycles', 48, Direction.FANOUT),
+            ('vb_dead_blocks', 48, Direction.FANOUT),
+            ('vb_zero_blocks', 48, Direction.FANOUT),
         ])
 
         bank = self.csr_bank()
@@ -388,6 +425,29 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                                       addr=REG_EPI_ADD_OPS,
                                       name='epi_add_ops')
 
+        # D1 VBUILD phase-counter snapshot window (see troom/abi.py
+        # for the per-counter units and the partition identity).
+        self._snap_vb = [
+            bank.csr(64, 'r', addr=off, name=name) for off, name in [
+                (REG_VB_TILES, 'vb_tiles'),
+                (REG_VB_ROWS, 'vb_rows'),
+                (REG_VB_BEATS, 'vb_beats'),
+                (REG_VB_ACTIVE_CYCLES, 'vb_active_cycles'),
+                (REG_VB_RUN_CYCLES, 'vb_run_cycles'),
+                (REG_VB_FILL_CYCLES, 'vb_fill_cycles'),
+                (REG_VB_FILL_WAIT, 'vb_fill_wait_cycles'),
+                (REG_VB_GATHER_CYCLES, 'vb_gather_cycles'),
+                (REG_VB_PREFETCH_CYCLES, 'vb_prefetch_cycles'),
+                (REG_VB_SCALE_CYCLES, 'vb_scale_cycles'),
+                (REG_VB_QUANT_CYCLES, 'vb_quant_cycles'),
+                (REG_VB_DRAIN_CYCLES, 'vb_drain_cycles'),
+                (REG_VB_DRAIN_WAIT, 'vb_drain_wait_cycles'),
+                (REG_VB_DISPATCH_CYCLES, 'vb_dispatch_cycles'),
+                (REG_VB_DEAD_BLOCKS, 'vb_dead_blocks'),
+                (REG_VB_ZERO_BLOCKS, 'vb_zero_blocks'),
+            ]
+        ]
+
         self._bridge = self.bridge(data_width=32, granularity=8, alignment=2)
         self.bus = self._bridge.bus
 
@@ -415,9 +475,15 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                 | (1 << CAPS_VEC_SILU)
                 | (1 << CAPS_VEC_SMEXP)
                 | (1 << CAPS_VBUILD_PART)
-                | (1 << CAPS_VBUILD_VAPP)
+                | Mux(self.vbuild_native_append, 1 << CAPS_VBUILD_VAPP, 0)
+                | Mux(self.vbuild_native_append, 1 << CAPS_VBUILD_DAPP, 0)
+                | Mux(self.vbuild_k4_selective, 1 << CAPS_VBUILD_K4, 0)
+                | Mux(self.act_max_k >= 4096, 1 << CAPS_ACT_K4096, 0)
+                | Mux(self.vbuild_max_head_dim == 128, 1 << CAPS_VBUILD_HD128,
+                      0)
                 | Mux(self.act_banks == 2, 1 << CAPS_ACT_BANK, 0)
-                | Mux(self.tmem_clusters == 2, 1 << CAPS_TMEM_SPLIT, 0)),
+                | Mux(self.tmem_clusters == 2, 1 << CAPS_TMEM_SPLIT, 0)
+                | (1 << CAPS_VB_COUNTERS)),
             self._mem_base.r_data.eq(self.mem_base),
             self._mem_size.r_data.eq(self.mem_size),
             self._beat_bytes.r_data.eq(self.beat_bytes),
@@ -685,6 +751,14 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                 self._snap_epi_mul.r_data.eq(self.counters_i.epi_mul_ops),
                 self._snap_epi_add.r_data.eq(self.counters_i.epi_add_ops),
             ]
+            for csr, field in zip(
+                    self._snap_vb,
+                ('vb_tiles', 'vb_rows', 'vb_beats', 'vb_active_cycles',
+                 'vb_run_cycles', 'vb_fill_cycles', 'vb_fill_wait_cycles',
+                 'vb_gather_cycles', 'vb_prefetch_cycles', 'vb_scale_cycles',
+                 'vb_quant_cycles', 'vb_drain_cycles', 'vb_drain_wait_cycles',
+                 'vb_dispatch_cycles', 'vb_dead_blocks', 'vb_zero_blocks')):
+                m.d.sync += csr.r_data.eq(self.counters_i[field])
 
         m.d.comb += self.abort.eq(run_active & fatal_sticky)
 
@@ -750,7 +824,8 @@ class TroomAXILiteBridge(Elaboratable):
             if o % 4 == 0 and o != REG_CONTROL) + (REG_PARAM_BASE, ) + tuple(
                 range(REG_MEM_BASE, REG_CYCLES + 8, 4)) + tuple(
                     range(REG_CMDS_DONE, REG_ARRAY_STARVE + 8, 4)) + tuple(
-                        range(REG_MM_CREDIT_STALLS, REG_EPI_ADD_OPS + 8, 4))
+                        range(REG_MM_CREDIT_STALLS, REG_EPI_ADD_OPS + 8, 4)) \
+            + tuple(range(REG_VB_TILES, REG_VB_ZERO_BLOCKS + 8, 4))
 
         def mapped(addr, offsets):
             result = Const(0)
