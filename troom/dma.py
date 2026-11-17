@@ -137,12 +137,13 @@ class TensorLoader(HasTRoomParams, Elaboratable):
         ext_bits = self.rows_bits + self.addr_width + 2
         dram_lo = Signal(ext_bits)
         dram_span = Signal(ext_bits)
-        m.d.comb += [
-            dram_lo.eq(self.sink.bits.dram_addr),
-            dram_span.eq((self.sink.bits.rows - 1) *
-                         self.sink.bits.dram_stride +
-                         self.sink.bits.row_bytes),
-        ]
+        # Register the extent product separately from its final bounds
+        # comparison. A queued descriptor must not drive FIFO selection,
+        # a wide multiply and the address-range check in one clock.
+        extent_rows = Signal(self.rows_bits + 1)
+        extent_row_bytes = Signal(self.row_bytes_bits)
+        dram_product = Signal(ext_bits)
+        m.d.comb += dram_span.eq(dram_product + extent_row_bytes)
         dram_oob = (dram_lo < self.mem_base) | (
             (dram_lo + dram_span) > self.mem_base + self.mem_size)
 
@@ -188,12 +189,26 @@ class TensorLoader(HasTRoomParams, Elaboratable):
                         tmem_stride.eq(self.sink.bits.tmem_stride),
                         fill_beat.eq(0),
                         in_flight.eq(0),
-                        push_halt.eq(misaligned | dram_oob),
+                        dram_lo.eq(self.sink.bits.dram_addr),
+                        extent_rows.eq(self.sink.bits.rows - 1),
+                        extent_row_bytes.eq(self.sink.bits.row_bytes),
+                        push_halt.eq(misaligned),
                         err_align.eq(misaligned),
-                        err_range.eq(dram_oob),
+                        err_range.eq(0),
                         err_bus.eq(0),
                     ]
-                    m.next = 'RUN'
+                    m.next = 'RANGE_MUL'
+
+            with m.State('RANGE_MUL'):
+                m.d.sync += dram_product.eq(extent_rows * dram_stride)
+                m.next = 'RANGE_CHECK'
+
+            with m.State('RANGE_CHECK'):
+                m.d.sync += [
+                    push_halt.eq(err_align | dram_oob),
+                    err_range.eq(dram_oob),
+                ]
+                m.next = 'RUN'
 
             with m.State('RUN'):
                 # Push side: expand one row per accepted descriptor.
@@ -316,12 +331,13 @@ class TensorWriter(HasTRoomParams, Elaboratable):
         ext_bits = self.rows_bits + self.addr_width + 2
         dram_lo = Signal(ext_bits)
         dram_span = Signal(ext_bits)
-        m.d.comb += [
-            dram_lo.eq(self.sink.bits.dram_addr),
-            dram_span.eq((self.sink.bits.rows - 1) *
-                         self.sink.bits.dram_stride +
-                         self.sink.bits.row_bytes),
-        ]
+        # Register the extent product separately from its final bounds
+        # comparison. A queued descriptor must not drive FIFO selection,
+        # a wide multiply and the address-range check in one clock.
+        extent_rows = Signal(self.rows_bits + 1)
+        extent_row_bytes = Signal(self.row_bytes_bits)
+        dram_product = Signal(ext_bits)
+        m.d.comb += dram_span.eq(dram_product + extent_row_bytes)
         dram_oob = (dram_lo < self.mem_base) | (
             (dram_lo + dram_span) > self.mem_base + self.mem_size)
 
@@ -367,12 +383,26 @@ class TensorWriter(HasTRoomParams, Elaboratable):
                         tmem_stride.eq(self.sink.bits.tmem_stride),
                         read_beat.eq(0),
                         issue_row.eq(0),
-                        push_halt.eq(misaligned | dram_oob),
+                        dram_lo.eq(self.sink.bits.dram_addr),
+                        extent_rows.eq(self.sink.bits.rows - 1),
+                        extent_row_bytes.eq(self.sink.bits.row_bytes),
+                        push_halt.eq(misaligned),
                         err_align.eq(misaligned),
-                        err_range.eq(dram_oob),
+                        err_range.eq(0),
                         err_bus.eq(0),
                     ]
-                    m.next = 'RUN'
+                    m.next = 'RANGE_MUL'
+
+            with m.State('RANGE_MUL'):
+                m.d.sync += dram_product.eq(extent_rows * dram_stride)
+                m.next = 'RANGE_CHECK'
+
+            with m.State('RANGE_CHECK'):
+                m.d.sync += [
+                    push_halt.eq(err_align | dram_oob),
+                    err_range.eq(dram_oob),
+                ]
+                m.next = 'RUN'
 
             with m.State('RUN'):
                 # Push side: expand one row per accepted descriptor,
