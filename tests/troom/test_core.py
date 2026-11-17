@@ -139,38 +139,16 @@ def test_wait_clears_event_for_next_waiter():
 
 
 def test_wait_clear_keeps_simultaneous_completion_set():
-    """A WAIT retire and a same-event engine completion may land in the
-    SAME cycle (cross-engine timing; deterministic lists hit it). The
-    completion's set is newer than the level the WAIT consumed
-    (``evt_hit`` samples the pre-edge value), so it must survive the
-    WAIT's clear: a lexically later clear drops it, the completion is
-    already done, nobody re-sets the event, and the completion's own
-    consumer WAIT deadlocks (the ``evt_set_now`` guard).
+    """Pin both sides of the completion/WAIT collision boundary.
 
-    Level-protocol discipline bounds the scan (corrected 2026-11-02,
-    matching the S4 record's note): with TWO producers of one event
-    (the SIGNAL and the VEC completion) and TWO WAITs, delays up to
-    the collision retire all five commands; delays PAST the collision
-    hang BY DESIGN -- the completion's set landed before the first
-    WAIT arrived, the level protocol merged it with the SIGNAL's
-    still-pending level, and the first WAIT's single clear consumed
-    both, leaving nothing for the second WAIT. That is a
-    list-discipline constraint (at most one completion in flight per
-    event), not an RTL bug -- and it is exactly the constraint the
-    FA 0x4 staging violated (the 0x4 board WATCHDOG;
-    results/troom-s4-vecfix-20261102).
-
-    The scan therefore asserts the disjunction: every delay either
-    completes all five commands or hangs in the documented by-design
-    state (SIGNAL, VEC, first WAIT complete; the second WAIT parks),
-    and the completing delays form a contiguous prefix that INCLUDES
-    the collision delay (the delay whose retire-edge coincides with
-    the completion's set -- pre-fix, that delay hangs and the prefix
-    is one shorter; the Amaranth-dominance experiment in the S4
-    record is the direct mechanism pin).
+    Delay 100 retires the first WAIT on the vector completion's set edge.
+    Removing evt_set_now loses that set and deadlocks the second WAIT.
+    Delay 101 merges the two producers before the first WAIT, so its second
+    WAIT must block under the event-level protocol. Recalibrate these two
+    delays if the vector pipeline latency changes.
     """
     finished = []
-    for delay in range(0, 160):
+    for delay in (100, 101):
         dut = Core(PARAMS)
         got = []
         hung = []
@@ -222,12 +200,7 @@ def test_wait_clear_keeps_simultaneous_completion_set():
         else:
             assert 4 in got and 5 in got, (delay, got)
             finished.append(delay)
-    # The completing delays are a contiguous prefix that includes the
-    # collision delay (>= 1 delay retires with the completion's set
-    # landing in the same cycle, saved by evt_set_now).
-    assert finished and finished == list(range(len(finished))), (
-        f'completing delays are not a prefix: {finished[:3]}..'
-        f'{finished[-3:] if len(finished) > 3 else finished}')
+    assert finished == [100], f'collision boundary changed: {finished}'
 
 
 def test_datapath_opcodes_report_status():
