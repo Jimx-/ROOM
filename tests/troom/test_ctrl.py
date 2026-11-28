@@ -6,10 +6,10 @@ test drives independent AW/W arrival, byte strobes, and CSR read
 synchronization exactly as the FPGA host would.
 """
 
+import pytest
+
 from amaranth import *
 from amaranth.sim import Passive, Simulator
-
-import pytest
 
 from troom.abi import (
     CAPS_ACT_BANK,
@@ -32,6 +32,8 @@ from troom.abi import (
     CAPS_VEC_PSWAP,
     CAPS_VEC_QUANT_ACT,
     CAPS_VEC_MUL_QUANT_ACT,
+    CAPS_VEC_NORM_QUANT_ACT,
+    CAPS_VEC_SILU_GLU,
     CAPS_WATCHDOG,
     CMD_DESC_BYTES,
     CONTROL_CLEAR,
@@ -197,9 +199,12 @@ def split_write(axil, addr, data, strb, gap=3):
     return resp
 
 
-def test_identity_caps_and_parameters():
-    top = CtrlTop(PARAMS, mem_base=MEM_BASE, mem_size=MEM_SIZE)
-    hp = HasTRoomParams(PARAMS)
+@pytest.mark.parametrize('mul_units,quant_pipe', [(2, True), (4, True),
+                                                  (4, False)])
+def test_identity_caps_and_parameters(mul_units, quant_pipe):
+    params = dict(PARAMS, vec_mul_units=mul_units, vec_quant_pipe=quant_pipe)
+    top = CtrlTop(params, mem_base=MEM_BASE, mem_size=MEM_SIZE)
+    hp = HasTRoomParams(params)
     axil = top.axil
 
     def proc():
@@ -225,7 +230,10 @@ def test_identity_caps_and_parameters():
                 | (1 << CAPS_TMEM_SPLIT)
                 | (1 << CAPS_VB_COUNTERS)
                 | (1 << CAPS_VEC_QUANT_ACT)
-                | (1 << CAPS_VEC_MUL_QUANT_ACT))
+                | (1 << CAPS_VEC_MUL_QUANT_ACT)
+                | (1 << CAPS_VEC_SILU_GLU))
+        if mul_units == 4 and quant_pipe:
+            caps |= 1 << CAPS_VEC_NORM_QUANT_ACT
         assert (yield from cread(axil, REG_CAPS)) == caps
         assert (yield from cread(axil, REG_MEM_BASE)) == MEM_BASE
         assert (yield from cread(axil, REG_MEM_SIZE)) == MEM_SIZE

@@ -546,6 +546,7 @@ class UnitHarness(Elaboratable):
     def __init__(self, params, commit=False):
         self.params = params
         self.tmem = TMEM(params)
+        self.preload = self.tmem.write.clone(name="preload")
         self.vec = VectorUnit(params)
         # Committing result beats into the TMEM model lets a chain's
         # later commands read what earlier ones wrote (the probe uses
@@ -558,16 +559,60 @@ class UnitHarness(Elaboratable):
         m = Module()
         m.submodules.tmem = self.tmem
         m.submodules.vec = self.vec
-        m.d.comb += [
-            self.vec.tmem_rreq.connect(self.tmem.rreq),
-            self.tmem.rresp.connect(self.vec.tmem_rresp),
-        ]
-        if self.commit:
+        rreq = self.vec.tmem_rreq
+        rresp = self.vec.tmem_rresp
+        vw = self.vec.tmem_w
+        preload = self.preload
+        write_addr = Mux(preload.valid, preload.bits.addr, vw.bits.addr)
+        write_data = Mux(preload.valid, preload.bits.data, vw.bits.data)
+        write_valid = preload.valid | (Const(self.commit) & vw.fire)
+
+        def connect_write(port, selected):
             m.d.comb += [
-                self.tmem.write.valid.eq(self.vec.tmem_w.valid
-                                         & self.vec.tmem_w.ready),
-                self.tmem.write.bits.addr.eq(self.vec.tmem_w.bits.addr),
-                self.tmem.write.bits.data.eq(self.vec.tmem_w.bits.data),
+                port.valid.eq(write_valid & selected),
+                port.bits.addr.eq(write_addr),
+                port.bits.data.eq(write_data),
+            ]
+
+        if self.tmem.tmem_clusters == 1:
+            m.d.comb += [
+                rreq.connect(self.tmem.rreq),
+                self.tmem.rresp.connect(rresp),
+                preload.ready.eq(self.tmem.write.ready),
+            ]
+            connect_write(self.tmem.write, Const(1))
+        else:
+            # TMEM drops the cluster bit within each port. Route by that
+            # bit and retain it until the corresponding response returns.
+            read_b = rreq.bits.addr[-1]
+            response_b = Signal()
+            with m.If(rreq.fire):
+                m.d.sync += response_b.eq(read_b)
+            for selected, req in (
+                (~read_b, self.tmem.rreq),
+                (read_b, self.tmem.rreq_b),
+            ):
+                m.d.comb += [
+                    req.valid.eq(rreq.valid & selected),
+                    req.bits.addr.eq(rreq.bits.addr),
+                ]
+            write_b = write_addr[-1]
+            connect_write(self.tmem.write, ~write_b)
+            connect_write(self.tmem.write_b, write_b)
+            m.d.comb += [
+                preload.ready.eq(
+                    Mux(write_b, self.tmem.write_b.ready,
+                        self.tmem.write.ready)),
+                rreq.ready.eq(
+                    Mux(read_b, self.tmem.rreq_b.ready, self.tmem.rreq.ready)),
+                self.tmem.rresp.ready.eq(rresp.ready & ~response_b),
+                self.tmem.rresp_b.ready.eq(rresp.ready & response_b),
+                rresp.valid.eq(
+                    Mux(response_b, self.tmem.rresp_b.valid,
+                        self.tmem.rresp.valid)),
+                rresp.bits.data.eq(
+                    Mux(response_b, self.tmem.rresp_b.bits.data,
+                        self.tmem.rresp.bits.data)),
             ]
         return m
 
@@ -617,10 +662,10 @@ def run_unit(params,
     def tx():
         for off in range(0, len(a_bytes), bb):
             word = int.from_bytes(a_bytes[off:off + bb], 'little')
-            yield from tmem_write(dut.tmem.write, A_BASE + off, word)
+            yield from tmem_write(dut.preload, A_BASE + off, word)
         for off in range(0, len(b_bytes), bb):
             word = int.from_bytes(b_bytes[off:off + bb], 'little')
-            yield from tmem_write(dut.tmem.write, b_base + off, word)
+            yield from tmem_write(dut.preload, b_base + off, word)
 
         sink = dut.vec.sink
         for desc in descs:

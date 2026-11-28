@@ -169,7 +169,20 @@ class VecOp(IntEnum):
     VEC_SMEXP = 14
     VEC_QUANT_ACT = 15
     # G4: finalized FP32 MUL products feed the existing quantizer directly.
-    VEC_MUL_QUANT_ACT = 16
+    VEC_MUL_QUANT_ACT = 16  # RMS fold: a scalar-scaled row times a gain vector feeds the
+    # quantizer directly (y_i = R(R(x_i*s)*w_i), s from the r_base
+    # beat) -- the VEC_SCALE -> VEC_MUL -> VEC_QUANT_ACT chain's every
+    # rounding point, one pass over the activation.
+    VEC_NORM_QUANT_ACT = 17
+    # GLU fold (the S3-deferred B-reading VEC_SILU form):
+    # o[i] = R(R(a[i]*sigmoid(a[i])) * b[i]) -- the fused VEC_SILU
+    # op's every rounding point plus the gate*up product's one rounded
+    # multiply, issued inside the same unary contexts. A is the gate
+    # row, B the up row; B is a checked input read once in element
+    # order (latched per context at accept), so the trailing VEC_MUL
+    # command, its TMEM round trip, and its serialized issue
+    # disappear from the GLU node.
+    VEC_SILU_GLU = 18
 
 
 VEC_ELEMENTWISE = (
@@ -187,6 +200,8 @@ VEC_ELEMENTWISE = (
     VecOp.VEC_SMEXP,
     VecOp.VEC_QUANT_ACT,
     VecOp.VEC_MUL_QUANT_ACT,
+    VecOp.VEC_NORM_QUANT_ACT,
+    VecOp.VEC_SILU_GLU,
 )
 
 VEC_REDUCTIONS = (
@@ -205,12 +220,14 @@ VEC_UNARY = (
     VecOp.VEC_SILU,
 )
 
-# Operations that read the B region: the binary elementwise ops and
-# ``VEC_SCALE``'s scalar beat. Kept as an explicit predicate set
-# (rather than ordinal ranges) so validation, dispatch, and the
-# model agree as the op set grows.
+# Operations that read the B region: the binary elementwise ops,
+# ``VEC_SCALE``'s scalar beat, and ``VEC_SILU_GLU``'s up row. Kept as
+# an explicit predicate set (rather than ordinal ranges) so
+# validation, dispatch, and the model agree as the op set grows.
 VEC_READS_B = (
     VecOp.VEC_MUL_QUANT_ACT,
+    VecOp.VEC_NORM_QUANT_ACT,
+    VecOp.VEC_SILU_GLU,
     VecOp.VEC_ADD,
     VecOp.VEC_SUB,
     VecOp.VEC_MUL,

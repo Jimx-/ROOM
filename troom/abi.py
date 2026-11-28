@@ -523,3 +523,18 @@ def fetch_length(count, beat_bytes):
 def pack_completion(seq, status):
     """Serialize one completion record as little-endian bytes."""
     return int(seq).to_bytes(4, 'little') + int(status).to_bytes(4, 'little')
+
+
+# Fused RMS quantization requires the pipelined quantizer and four
+# vector multiplier groups. The scalar is read from the r_base beat.
+CAPS_VEC_NORM_QUANT_ACT = 28
+
+# GLU fold Phase B (2026-11-22, results/troom-qwen3-silu-glu-fusion):
+# VEC_SILU_GLU implemented (VecOp 18 -- o_i = R(R(a_i*sigmoid(a_i)) *
+# b_i), the fused VEC_SILU plus the gate*up product's one rounded
+# multiply inside the same unary contexts; B is the up row, latched
+# per context at accept). Always implemented in this source
+# generation; the bit lets the host fused emission distinguish this
+# image family from images whose vector unit rejects the opcode at
+# accept.
+CAPS_VEC_SILU_GLU = 29

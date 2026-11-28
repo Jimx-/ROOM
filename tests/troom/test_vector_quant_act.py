@@ -43,6 +43,7 @@ from troom.vector import VectorUnit
 from tests.troom.model import (
     f32,
     f32_bits,
+    fp32_mul_bits,
     mm_row_results,
     mm_segments,
     pack_row,
@@ -289,6 +290,32 @@ def test_unit_q_act_matches_model(n):
     # Direct mode writes no TMEM beat at all.
     assert writes == []
     assert records == model_records(words)
+
+
+def test_unit_norm_quant_act_matches_rounded_chain():
+    rng = random.Random(429)
+    n = 128
+    params = dict(PARAMS, vec_mul_units=4, vec_quant_pipe=True)
+    values, gains = [[f32_bits(rng.uniform(-5, 5)) for _ in range(n)]
+                     for _ in range(2)]
+    scalar = f32_bits(0.71)
+    gain_image = words_to_bytes(gains).ljust(O_BASE - B_BASE, b'\0')
+    gain_image += words_to_bytes([scalar])
+    normalized = [
+        fp32_mul_bits(fp32_mul_bits(value, scalar), gain)
+        for value, gain in zip(values, gains)
+    ]
+
+    records, writes, result, _ = run_q_act(params,
+                                           dict(op=VecOp.VEC_NORM_QUANT_ACT,
+                                                n=n),
+                                           words_to_bytes(values),
+                                           b_bytes=gain_image)
+
+    assert result['status'] == Status.OK
+    assert result['elements'] == n
+    assert writes == []
+    assert records == model_records(normalized)
 
 
 @pytest.mark.parametrize('n', [96, 256])

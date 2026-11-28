@@ -875,7 +875,8 @@ class Core(HasTRoomParams, Elaboratable):
         with m.If(vector.sink.fire):
             m.d.sync += vec_act_direct.eq(
                 (cur_vec_op == VecOp.VEC_QUANT_ACT)
-                | (cur_vec_op == VecOp.VEC_MUL_QUANT_ACT))
+                | (cur_vec_op == VecOp.VEC_MUL_QUANT_ACT)
+                | (cur_vec_op == VecOp.VEC_NORM_QUANT_ACT))
         act_fill_busy = actload.active | (vector.active & vec_act_direct)
         m.d.comb += self.act_wr_conflict.eq(actload.act_wr.valid
                                             & vector.act_wr.valid)

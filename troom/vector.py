@@ -73,6 +73,13 @@ Numerical contract (``R`` is FP32 round-to-nearest-even, matching
               bits the standalone chain's VEC_SCALE scalar beat and
               ones vector carried -- so the op is bit-identical to
               the six-command backend chain (SwiGLU) by construction.
+    VEC_SILU_GLU the gate*up GLU product: VEC_SILU's every rounding
+              point, then o[i] = R(silu(a[i]) * b[i]) as one more
+              rounded multiply inside the same unary contexts (the
+              chain's trailing VEC_MUL, folded in). B is the up row:
+              a checked input read once in element order and latched
+              per context at accept, so the op is bit-identical to
+              the VEC_SILU -> VEC_MUL composition by construction.
     VEC_QUANT per 32-word segment: a = fmax fold of |x| from +0;
               sc = R(a * (1/127)); r = recip(a);
               q_i = q8(R(R(x_i * r) * 127)) (RNE INT8, saturating;
@@ -97,9 +104,10 @@ results match the frozen table. Accuracy is ulp-bounded, not
 correctly rounded; the model records the measured maxima (2/2/13 ulp
 for recip/rsqrt/exp2 over the tested domains).
 
-The arithmetic reuses the CPU floating-point blocks (``FPUFMA`` for
-add/subtract/multiply, ``FPUComp`` for the maximum, ``FPURec`` for
-the reciprocal/rsqrt seeds). They use valid protocol interfaces
+The arithmetic uses the dedicated fixed-role FP32 units of
+``troom.fpu`` for add/subtract/multiply, the generic ``FPUFMA`` only
+where one unit switches operator (the SMEXP sum), ``FPUComp`` for
+the maximum and ``FPURec`` for the reciprocal/rsqrt seeds. They use valid protocol interfaces
 without backpressure, so the unit is self-timed: elementwise results
 flow through a credit-accounted FIFO into the beat packer, reductions
 track partial-busy and in-flight counts, and every consumer is gated
@@ -131,6 +139,24 @@ no TMEM/DRAM image. B is a checked input, O is unused; input aliasing is
 legal. SCALE waits for every product, including exceptional values, to
 retire before reusing the multiplier. No SiLU or norm rounding is fused
 into the final product.
+
+``VEC_NORM_QUANT_ACT`` extends that producer to the RMS fold: A is the
+raw activation row, B the gain vector, and the rsqrt scalar s lives in
+the first word of the ``r_base`` beat (read once before any issue).
+Each element is the chain's exact pair of separately rounded
+multiplies, ``t = R(x[i]*s)`` then ``y = R(t*w[i])``, and the y words
+feed the unchanged quantizer -- bit-identical to the
+VEC_SCALE -> VEC_MUL -> VEC_QUANT_ACT composition by construction. The
+chain runs on the last extra multiplier group (``vec_mul_units >= 4``
+with ``vec_quant_pipe``; other builds reject the op at accept), issuing
+the t multiplies ahead as A-window words arrive and the y multiplies as
+results surface: one word per cycle after the three-cycle fill, in
+order, with a small t FIFO absorbing the multiplier latency. Every scan
+stage of the three-segment lookahead (AMAX, the first segment's next
+scan, and the pre-active scan) folds the rounded products' magnitudes
+this way while scale and quantize keep their own groups. A and B are
+checked inputs read once each in element order; the r_base beat is
+checked for alignment and range.
 
 ``VEC_QUANT`` reuses both multiplier groups when ``vec_quant_pipe``
 is enabled: consecutive elements flow through ``R(x*r)`` and then
@@ -170,6 +196,7 @@ from troom.consts import (
     VEC_READS_B,
     VEC_REDUCTIONS,
 )
+from troom.fpu import FPAdd32, FPMul32
 from troom.convert import Fp32To16
 from troom.types import HasTRoomParams
 
@@ -298,8 +325,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # elementwise paths, and each group is the proven E2-c
         # structure (one add slot, one multiply slot per cycle) -- the
         # fabric is two of them in parallel, parity partitioned.
-        fadd = m.submodules.fadd = FPUFMA(32, FPFormat.S, latency=3)
-        fmul = m.submodules.fmul = FPUFMA(32, FPFormat.S, latency=3)
+        fadd = m.submodules.fadd = FPAdd32()
+        fmul = m.submodules.fmul = FPMul32()
         fcomp = m.submodules.fcomp = FPUComp(32, FPFormat.S, latency=2)
         frec = m.submodules.frec = FPURec(32, FPFormat.S, latency=3)
         # VEC_SMEXP's denominator fold runs on a dedicated adder: the
@@ -313,9 +340,9 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         fsum = m.submodules.fsum = FPUFMA(32, FPFormat.S, latency=3)
         fadd1 = fmul1 = None
         if self.vec_add_units >= 2:
-            fadd1 = m.submodules.fadd1 = FPUFMA(32, FPFormat.S, latency=3)
+            fadd1 = m.submodules.fadd1 = FPAdd32()
         if self.vec_mul_units >= 2:
-            fmul1 = m.submodules.fmul1 = FPUFMA(32, FPFormat.S, latency=3)
+            fmul1 = m.submodules.fmul1 = FPMul32()
         # Optional extra issue groups preserve the same per-context sequence.
         # Group zero still shares the ordinary vector datapath.
         extra_add = []
@@ -323,7 +350,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         for kind, count, units in (('add', self.vec_add_units, extra_add),
                                    ('mul', self.vec_mul_units, extra_mul)):
             for g in range(2, count):
-                unit = FPUFMA(32, FPFormat.S, latency=3)
+                unit = FPAdd32() if kind == 'add' else FPMul32()
                 setattr(m.submodules, f'f{kind}{g}', unit)
                 units.append(unit)
 
@@ -346,10 +373,12 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         o_scale = offer.op == VecOp.VEC_SCALE
         o_quant = offer.op == VecOp.VEC_QUANT
         o_q_mul = offer.op == VecOp.VEC_MUL_QUANT_ACT
-        o_q_act = (offer.op == VecOp.VEC_QUANT_ACT) | o_q_mul
+        o_q_norm = offer.op == VecOp.VEC_NORM_QUANT_ACT
+        o_q_act = (offer.op == VecOp.VEC_QUANT_ACT) | o_q_mul | o_q_norm
         o_f16 = offer.op == VecOp.VEC_F16
         o_pswap = offer.op == VecOp.VEC_PSWAP
         o_smexp = offer.op == VecOp.VEC_SMEXP
+        o_silu_glu = offer.op == VecOp.VEC_SILU_GLU
         o_reads_b = Cat(offer.op == op for op in VEC_READS_B).any()
         op_bad = ~(o_elem | o_reduce)
 
@@ -403,15 +432,23 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                | (offer.b_base < a_end) & (offer.a_base < b_end))
         shape_bad = op_bad | (offer.n == 0) | overlap_a | overlap_b \
             | quant_overlap | smexp_overlap | (o_pswap & offer.n[0]) \
-            | q_act_shape_bad
+            | q_act_shape_bad \
+            | (o_q_norm & ~Const(self.vec_quant_pipe
+                                and self.vec_mul_units >= 4))
+        # VEC_NORM_QUANT_ACT reads its rsqrt scalar from the r_base
+        # beat (B carries the gain vector), so both B and the scalar
+        # beat are checked inputs; the o/b suppression above is the
+        # don't-care rule for the older direct ops alone.
         align_bad = offer.a_base[:lg].any() \
-            | (o_q_mul & offer.b_base[:lg].any()) \
+            | ((o_q_mul | o_q_norm) & offer.b_base[:lg].any()) \
+            | (o_q_norm & offer.o_base[:lg].any()) \
             | (~o_q_act & (offer.o_base[:lg].any()
                            | (o_reads_b & offer.b_base[:lg].any())
                            | ((o_quant | o_smexp)
                               & offer.b_base[:lg].any())))
         range_bad = (a_end > self.tmem_bytes) \
-            | (o_q_mul & (b_end > self.tmem_bytes)) \
+            | ((o_q_mul | o_q_norm) & (b_end > self.tmem_bytes)) \
+            | (o_q_norm & ((offer.o_base + bb) > self.tmem_bytes)) \
             | (~o_q_act & ((o_end > self.tmem_bytes)
                            | (o_reads_b & (b_end > self.tmem_bytes))
                            | (o_quant & (b_end > self.tmem_bytes))
@@ -478,12 +515,15 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         op_q_act = Signal(reset=int(VecOp.VEC_QUANT_ACT) == 0,
                           attrs={'max_fanout': 64})
         op_q_mul = Signal()
+        op_q_norm = Signal()
         op_f16 = Signal(reset=int(VecOp.VEC_F16) == 0,
                         attrs={'max_fanout': 64})
         op_pswap = Signal(reset=int(VecOp.VEC_PSWAP) == 0,
                           attrs={'max_fanout': 64})
         op_silu = Signal(reset=int(VecOp.VEC_SILU) == 0,
                          attrs={'max_fanout': 64})
+        op_silu_glu = Signal(reset=int(VecOp.VEC_SILU_GLU) == 0,
+                             attrs={'max_fanout': 64})
         op_smexp = Signal(reset=int(VecOp.VEC_SMEXP) == 0,
                           attrs={'max_fanout': 64})
         is_add_op = Signal()
@@ -491,10 +531,11 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         is_mul_op = Signal()
         m.d.comb += is_mul_op.eq(op_mul | op_scale)
         binary_b = Signal()
-        m.d.comb += binary_b.eq(op_add | op_sub | op_mul | op_q_mul)
+        m.d.comb += binary_b.eq(op_add | op_sub | op_mul | op_q_mul
+                                | op_q_norm)
         is_unary = Signal()
         m.d.comb += is_unary.eq(op_exp2 | op_recip | op_rsqrt | op_silu
-                                | op_smexp)
+                                | op_silu_glu | op_smexp)
         # The staged (VEC_QUANT) and direct (VEC_QUANT_ACT) ops share
         # the quant sequencer; q_any marks the shared datapath, while
         # op_quant alone keeps the staged-only plumbing (res_q and
@@ -540,30 +581,51 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         bbeat = Signal(range(max_beats + 1))
         bscalar = Signal(32)
         bscal_ok = Signal()
+        # VEC_NORM_QUANT_ACT's rsqrt scalar, read once from the r_base
+        # beat before any producer issue (B carries the gain vector).
+        oscalar = Signal(32)
+        oscal_ok = Signal()
         a_turn = Signal()
         rd_pend = Signal()
         rd_b = Signal()
+        rd_o = Signal()
 
-        # B is read only by the ops that use it (binary elementwise
-        # and VEC_SCALE's scalar beat); reductions and the unary
-        # transcendentals never request it.
-        reads_b = binary_b | op_scale
+        # B is read only by the ops that use it (binary elementwise,
+        # VEC_SCALE's scalar beat, and VEC_SILU_GLU's up row);
+        # reductions and the unary transcendentals never request it.
+        reads_b = binary_b | op_scale | op_silu_glu
         a_need = (ahave == 0) & (abeat < ibeats)
         b_need = reads_b & (bhave == 0) \
             & (bbeat < Mux(op_scale, 1, ibeats))
-        rd_to_b = b_need & (~a_need | a_turn)
+        o_need = op_q_norm & ~oscal_ok
+        rd_to_o = o_need
+        rd_to_b = ~rd_to_o & b_need & (~a_need | a_turn)
 
         m.d.comb += [
-            self.tmem_rreq.valid.eq(running & (a_need | b_need) & ~rd_pend),
+            self.tmem_rreq.valid.eq(running & (a_need | b_need | o_need)
+                                    & ~rd_pend),
             self.tmem_rreq.bits.addr.eq(
-                Mux(rd_to_b, b_base + (bbeat << lg), a_base + (abeat << lg))),
+                Mux(
+                    rd_to_o, o_base,
+                    Mux(rd_to_b, b_base + (bbeat << lg),
+                        a_base + (abeat << lg)))),
             self.tmem_rresp.ready.eq(1),
         ]
         with m.If(self.tmem_rreq.fire):
-            m.d.sync += [rd_pend.eq(1), rd_b.eq(rd_to_b), a_turn.eq(~rd_to_b)]
+            m.d.sync += [
+                rd_pend.eq(1),
+                rd_o.eq(rd_to_o),
+                rd_b.eq(rd_to_b),
+                a_turn.eq(~rd_to_b)
+            ]
         with m.If(rd_pend & self.tmem_rresp.fire):
             m.d.sync += rd_pend.eq(0)
-            with m.If(rd_b):
+            with m.If(rd_o):
+                m.d.sync += [
+                    oscalar.eq(self.tmem_rresp.bits.data[:32]),
+                    oscal_ok.eq(1)
+                ]
+            with m.Elif(rd_b):
                 m.d.sync += [
                     bwin.eq(self.tmem_rresp.bits.data),
                     bhave.eq(bb),
@@ -733,6 +795,10 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # bypassed the Horner evaluation, so the +1 add consumes the
         # bypass value directly instead of the 2^i-scaled polynomial.
         un_bp = Array(Signal(name=f'un_bp{i}') for i in range(ctx_n))
+        # VEC_SILU_GLU only: the element's up-row word b[i], latched
+        # at accept (the A and B windows advance together, one word
+        # per accept), read once at the op's final product issue.
+        un_b = Array(Signal(32, name=f'un_b{i}') for i in range(ctx_n))
         un_step = Array(Signal(6, name=f'un_step{i}') for i in range(ctx_n))
         un_cls_pending = Array(
             Signal(name=f'un_cls_pending{i}') for i in range(ctx_n))
@@ -783,6 +849,14 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # the identity in domain; it is applied for contract fidelity.)
         silu_mul = (0, ) + tuple(range(4, 29, 4)) + (38, 42, 44, 48, 50)
         silu_add = (2, ) + tuple(range(6, 31, 4)) + (32, 40, 46)
+        # VEC_SILU_GLU keeps every VEC_SILU step, but the step-50
+        # product is no longer the element's final word -- it lands in
+        # un_f at 51 and one more rounded multiply consumes it:
+        #   52 issue R(silu * b[i])            -> done at 53
+        # All bypass jumps converge at 50 exactly as VEC_SILU's do.
+        silu_glu_mul = (0, ) + tuple(range(4, 29, 4)) \
+            + (38, 42, 44, 48, 50, 52)
+        silu_glu_add = silu_add
         # VEC_SMEXP composes the frozen VEC_SUB and VEC_EXP2
         # sequences around them (exp2's schedule shifted +2, the
         # SILU precedent), all rounding points identical to the
@@ -816,9 +890,10 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # exactly as before.
         cls_req = [
             un_busy[i] & ~done_val[i] & ~un_cls_pending[i]
-            & (op_silu & step_in((2, 34), un_step[i])
+            & ((op_silu | op_silu_glu) & step_in((2, 34), un_step[i])
                | (op_smexp & (un_step[i] == 2))
-               | (~op_silu & ~op_smexp & ~un_arm[i])) for i in range(ctx_n)
+               | (~op_silu & ~op_silu_glu & ~op_smexp & ~un_arm[i]))
+            for i in range(ctx_n)
         ]
         cls_go = Cat(*cls_req).any()
         cls_pick = Signal(ctx_w)
@@ -841,10 +916,11 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 cls_sel.eq(cls_pick),
                 cls_s.eq(cls_pick_s),
                 cls_x.eq(
-                    Mux(
-                        op_silu & (cls_pick_s == 34), un_acc[cls_pick],
-                        Mux((op_silu | op_smexp) & (cls_pick_s == 2),
-                            un_tmp[cls_pick], un_x[cls_pick]))),
+                    Mux((op_silu | op_silu_glu) & (cls_pick_s == 34),
+                        un_acc[cls_pick],
+                        Mux((op_silu | op_silu_glu | op_smexp)
+                            & (cls_pick_s == 2), un_tmp[cls_pick],
+                            un_x[cls_pick]))),
                 un_cls_pending[cls_pick].eq(1),
             ]
         # Classification of the selected operand: the frozen
@@ -881,16 +957,17 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         m.d.comb += exp2_bypass.eq(ux_nan | ux_ge128 | ux_lt_m126)
         # SILU's two classifications select their own tables: the
         # exp2 tests on m0 (step 2) and the recip tests on w3
-        # (step 34).
+        # (step 34). VEC_SILU_GLU shares them verbatim.
         cls_bypass_sel = Signal()
         m.d.comb += cls_bypass_sel.eq(
-            Mux(op_silu & (cls_s == 34), recip_bypass, exp2_bypass))
+            Mux((op_silu | op_silu_glu) & (cls_s == 34), recip_bypass,
+                exp2_bypass))
         un_bypass = Signal()
         m.d.comb += un_bypass.eq(
             Mux(
                 op_recip, recip_bypass,
                 Mux(op_rsqrt, rsqrt_bypass,
-                    Mux(op_silu, cls_bypass_sel, exp2_bypass))))
+                    Mux(op_silu | op_silu_glu, cls_bypass_sel, exp2_bypass))))
 
         QNAN = Const(0x7fc00000, 32)
         PINF = Const(0x7f800000, 32)
@@ -904,10 +981,12 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             ux_nan, QNAN,
             Mux(ux_sign, Mux(ux_zero, NINF, QNAN), Mux(ux_inf, PZERO, PINF)))
         exp2_val = Mux(ux_nan, QNAN, Mux(ux_ge128, PINF, PZERO))
-        cls_bypass_val = Mux(op_silu & (cls_s == 34), recip_val, exp2_val)
+        cls_bypass_val = Mux((op_silu | op_silu_glu) & (cls_s == 34),
+                             recip_val, exp2_val)
         un_bypass_val = Mux(
             op_recip, recip_val,
-            Mux(op_rsqrt, rsqrt_val, Mux(op_silu, cls_bypass_val, exp2_val)))
+            Mux(op_rsqrt, rsqrt_val,
+                Mux(op_silu | op_silu_glu, cls_bypass_val, exp2_val)))
 
         # exp2 range reduction, the bounded bit helper: in-sequence
         # inputs have field <= 133 (|x| < 128), so floor's magnitude
@@ -951,7 +1030,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         with m.If(cls_valid):
             m.d.sync += un_cls_pending[cls_sel].eq(0)
             with m.If(un_bypass):
-                with m.If(op_silu):
+                with m.If(op_silu | op_silu_glu):
                     with m.If(cls_s == 2):
                         m.d.sync += [
                             un_bp[cls_sel].eq(1),
@@ -975,7 +1054,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     un_i2f[cls_sel].eq(ux_i2f),
                     un_ci[cls_sel].eq(ux_i),
                 ]
-                with m.If(op_silu & (cls_s == 34)):
+                with m.If((op_silu | op_silu_glu) & (cls_s == 34)):
                     m.d.sync += un_step[cls_sel].eq(36)
 
         # Unit issue requests and arbiters. A context requests the
@@ -1001,6 +1080,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 | (op_recip & step_in(rec_sub, s)) \
                 | (op_rsqrt & step_in(rs_sub, s)) \
                 | (op_silu & step_in(silu_add, s)) \
+                | (op_silu_glu & step_in(silu_glu_add, s)) \
                 | (op_smexp & (step_in(sm_sub, s) | step_in(sm_add, s)))
 
         def un_mul_step(s):
@@ -1011,6 +1091,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                                | step_in(rs_ty, s)
                                | step_in(rs_update, s))) \
                 | (op_silu & step_in(silu_mul, s)) \
+                | (op_silu_glu & step_in(silu_glu_mul, s)) \
                 | (op_smexp & step_in(sm_mul, s))
 
         add_req = [
@@ -1030,12 +1111,14 @@ class VectorUnit(HasTRoomParams, Elaboratable):
              # classification (the exp2 table reads m0), so it
              # issues at step 0 unarmed; no other op requests a
              # multiply at step 0.
-             | (op_silu & (un_step[i] == 0))) for i in range(ctx_n)
+             | ((op_silu | op_silu_glu) & (un_step[i] == 0)))
+            for i in range(ctx_n)
         ]
         rec_req = [
             un_busy[i] & un_arm[i] & ~un_wait[i] & ~done_val[i]
             & (((un_step[i] == 0) & (op_recip | op_rsqrt))
-               | (op_silu & (un_step[i] == 36))) for i in range(ctx_n)
+               | ((op_silu | op_silu_glu) & (un_step[i] == 36)))
+            for i in range(ctx_n)
         ]
 
         def pri_sel(reqs):
@@ -1124,27 +1207,37 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     | (op_exp2 & step_in((3, 7, 11, 15, 19, 23, 27), step)) \
                     | (op_silu & step_in((1, 5, 9, 13, 17, 21, 25, 29,
                                           39, 45), step)) \
+                    | (op_silu_glu & step_in((1, 5, 9, 13, 17, 21, 25,
+                                              29, 39, 45), step)) \
                     | (op_smexp & step_in((5, 9, 13, 17, 21, 25, 29), step))
                 cap_mul_h = op_rsqrt & (step == 3)
                 cap_mul_a = (op_recip & (step == 7)) \
                     | (op_rsqrt & (step == 11))
                 # SILU's Newton quotients land in the seed register.
-                cap_mul_f = op_silu & step_in((43, 49), step)
+                # SILU_GLU's step-51 capture parks the silu product
+                # there for the final b[i] multiply.
+                cap_mul_f = op_silu & step_in((43, 49), step) \
+                    | op_silu_glu & step_in((43, 49, 51), step)
                 fin_mul = (op_recip & (step == 13)) \
                     | (op_rsqrt & (step == 19)) \
-                    | (op_silu & (step == 51))
+                    | (op_silu & (step == 51)) \
+                    | (op_silu_glu & (step == 53))
 
                 return Cat(cap_mul_t, cap_mul_h, cap_mul_a, cap_mul_f, fin_mul)
             else:
                 cap_add_t = (op_recip & step_in((5, 11), step)) \
                     | (op_rsqrt & step_in((9, 17), step)) \
                     | (op_silu & step_in((41, 47), step)) \
+                    | (op_silu_glu & step_in((41, 47), step)) \
                     | (op_smexp & (step == 1))
                 cap_add_f = (op_exp2 & (step == 1)) | (op_silu & (step == 3)) \
+                    | (op_silu_glu & (step == 3)) \
                     | (op_smexp & (step == 3))
                 cap_add_a = (op_exp2 & step_in((5, 9, 13, 17, 21, 25), step)) \
                     | (op_silu & step_in((7, 11, 15, 19, 23, 27, 31, 33),
                                          step)) \
+                    | (op_silu_glu & step_in((7, 11, 15, 19, 23, 27, 31,
+                                              33), step)) \
                     | (op_smexp & step_in((7, 11, 15, 19, 23, 27), step))
                 fin_add = (op_exp2 & (step == 29)) \
                     | (op_smexp & (step == 31))
@@ -1337,10 +1430,10 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 mul_capture(unit, owner, tcnt, owner_capture)
 
         with m.If(frec.out.valid & (rec_tcnt != 0)):
-            # RECIP/RSQRT start the seed at y in un_acc; SILU keeps
-            # w3 (the recip argument) in un_acc for the Newton
-            # products, so its seed lands in un_f.
-            with m.If(op_silu):
+            # RECIP/RSQRT start the seed at y in un_acc; SILU and
+            # SILU_GLU keep w3 (the recip argument) in un_acc for the
+            # Newton products, so their seed lands in un_f.
+            with m.If(op_silu | op_silu_glu):
                 m.d.sync += un_f[rec_owner].eq(frec.out.bits.data)
             with m.Else():
                 m.d.sync += un_acc[rec_owner].eq(frec.out.bits.data)
@@ -1356,8 +1449,12 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # VEC_SMEXP accepts only in pass 2 (its pass 1 consumes the
         # region folding the maximum the pass-2 subtract reads).
         sel_free, have_free = pri_sel([~un_busy[i] for i in range(ctx_n)])
+        # VEC_SILU_GLU also needs the element's B word in the window;
+        # both windows then shift together on the accept (below), so
+        # context i always holds a[i] and b[i].
         un_go = in_elem & is_unary & elem_a_ok & (issued < n_l) & room \
-            & have_free & (ord_cnt < ctx_n) & (~op_smexp | sm_st_exp)
+            & have_free & (ord_cnt < ctx_n) & (~op_smexp | sm_st_exp) \
+            & (~op_silu_glu | elem_b_ok)
         with m.If(un_go):
             m.d.sync += [
                 un_busy[sel_free].eq(1),
@@ -1366,6 +1463,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 un_bp[sel_free].eq(0),
                 un_step[sel_free].eq(0),
                 un_x[sel_free].eq(a_word),
+                un_b[sel_free].eq(b_word),
                 ord_arr[ord_tail].eq(sel_free),
                 ord_tail.eq(Mux(ord_tail == ctx_n - 1, 0, ord_tail + 1)),
             ]
@@ -1572,6 +1670,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             v.acc = Signal(32, name='un_viewacc')
             v.tmp = Signal(32, name='un_viewtmp')
             v.f = Signal(32, name='un_viewf')
+            v.b = Signal(32, name='un_viewb')
             v.i2f = Signal(32, name='un_viewi2f')
             v.ci = Signal(8, name='un_viewci')
             v.bp = Signal(name='un_viewbp')
@@ -1581,6 +1680,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 v.acc.eq(un_acc[sel]),
                 v.tmp.eq(un_tmp[sel]),
                 v.f.eq(un_f[sel]),
+                v.b.eq(un_b[sel]),
                 v.i2f.eq(un_i2f[sel]),
                 v.ci.eq(un_ci[sel]),
                 v.bp.eq(un_bp[sel]),
@@ -1590,52 +1690,75 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         def unary_add_fn_mod(v):
             s = v.s
             return (op_recip | op_rsqrt) | (op_exp2 & (s == 0)) \
-                | (op_silu & step_in((2, 40, 46), s)) \
+                | ((op_silu | op_silu_glu) & step_in((2, 40, 46), s)) \
                 | (op_smexp & step_in(sm_sub, s))
 
         def unary_mul_in1(v):
             s = v.s
+            # VEC_SILU_GLU steps 0..50 decode exactly as VEC_SILU's;
+            # step 52 multiplies the parked silu product by b[i].
+            silu_glu_in1 = Mux((s == 0) | (s == 50), v.x,
+                               Mux(
+                                   s == 52, v.f,
+                                   Mux(
+                                       step_in((38, 44), s),
+                                       v.acc & 0x7fffffff,
+                                       Mux(step_in((42, 48), s), v.f,
+                                           Mux(s == 4, EXP2_C[7], v.acc)))))
             return Mux(
-                op_silu,
-                Mux((s == 0) | (s == 50), v.x,
-                    Mux(
-                        step_in((38, 44), s), v.acc & 0x7fffffff,
-                        Mux(step_in((42, 48), s), v.f,
-                            Mux(s == 4, EXP2_C[7], v.acc)))),
+                op_silu_glu, silu_glu_in1,
                 Mux(
-                    op_smexp, Mux(s == sm_mul[0], EXP2_C[7], v.acc),
-                    Mux(
-                        op_exp2, Mux(s == exp_mul[0], EXP2_C[7], v.acc),
+                    op_silu,
+                    Mux((s == 0) | (s == 50), v.x,
                         Mux(
-                            op_recip & step_in(rec_xy, s), v.x & 0x7fffffff,
+                            step_in((38, 44), s), v.acc & 0x7fffffff,
+                            Mux(step_in((42, 48), s), v.f,
+                                Mux(s == 4, EXP2_C[7], v.acc)))),
+                    Mux(
+                        op_smexp, Mux(s == sm_mul[0], EXP2_C[7], v.acc),
+                        Mux(
+                            op_exp2, Mux(s == exp_mul[0], EXP2_C[7], v.acc),
                             Mux(
-                                op_rsqrt & (s == rs_half[0]),
-                                Const(0x3f000000, 32),
+                                op_recip & step_in(rec_xy, s),
+                                v.x & 0x7fffffff,
                                 Mux(
-                                    op_rsqrt & step_in(rs_ty, s), v.tmp,
-                                    Mux(op_rsqrt & step_in(rs_hy, s), v.f,
-                                        v.acc)))))))
+                                    op_rsqrt & (s == rs_half[0]),
+                                    Const(0x3f000000, 32),
+                                    Mux(
+                                        op_rsqrt & step_in(rs_ty, s), v.tmp,
+                                        Mux(op_rsqrt & step_in(rs_hy, s), v.f,
+                                            v.acc))))))))
 
         def unary_mul_in2(v):
             s = v.s
-            return Mux(
-                op_silu,
+            silu_glu_in2 = Mux(
+                s == 0, Const(SILU_NLOG2E_BITS, 32),
                 Mux(
-                    s == 0, Const(SILU_NLOG2E_BITS, 32),
+                    s == 52, v.b,
                     Mux(
                         s == 50, v.f ^ (v.acc & 0x80000000),
                         Mux(step_in((38, 44), s), v.f,
-                            Mux(step_in((42, 48), s), v.tmp, v.f)))),
+                            Mux(step_in((42, 48), s), v.tmp, v.f)))))
+            return Mux(
+                op_silu_glu, silu_glu_in2,
                 Mux(
-                    op_smexp, v.f,
+                    op_silu,
                     Mux(
-                        op_exp2, v.f,
+                        s == 0, Const(SILU_NLOG2E_BITS, 32),
                         Mux(
-                            op_recip & step_in(rec_xy, s), v.acc,
+                            s == 50, v.f ^ (v.acc & 0x80000000),
+                            Mux(step_in((38, 44), s), v.f,
+                                Mux(step_in((42, 48), s), v.tmp, v.f)))),
+                    Mux(
+                        op_smexp, v.f,
+                        Mux(
+                            op_exp2, v.f,
                             Mux(
-                                op_rsqrt & (s == rs_half[0]), v.x,
-                                Mux(op_rsqrt & step_in(rs_hy + rs_ty, s),
-                                    v.acc, v.tmp))))))
+                                op_recip & step_in(rec_xy, s), v.acc,
+                                Mux(
+                                    op_rsqrt & (s == rs_half[0]), v.x,
+                                    Mux(op_rsqrt & step_in(rs_hy + rs_ty, s),
+                                        v.acc, v.tmp)))))))
 
         def silu_w3_operand(v):
             # The +1 add's operand: the Horner result scaled by 2^i
@@ -1652,45 +1775,60 @@ class VectorUnit(HasTRoomParams, Elaboratable):
 
         def unary_add_in1(v):
             s = v.s
+            silu_glu_in1 = Mux(
+                s == 2, v.tmp,
+                Mux(s == 32, silu_w3_operand(v),
+                    Mux(step_in((40, 46), s), Const(0x40000000, 32), v.tmp)))
             return Mux(
-                op_silu,
+                op_silu_glu,
+                silu_glu_in1,
                 Mux(
-                    s == 2, v.tmp,
+                    op_silu,
                     Mux(
-                        s == 32, silu_w3_operand(v),
-                        Mux(step_in((40, 46), s), Const(0x40000000, 32),
-                            v.tmp))),
-                Mux(
-                    op_smexp,
-                    # step 0 subtracts the folded maximum from the
-                    # element; steps 2..30 are exp2's range subtract
-                    # and Horner adds, all reading un_tmp.
-                    Mux(s == 0, v.x, v.tmp),
-                    Mux(
-                        op_exp2 & (s == 0), v.x,
+                        s == 2, v.tmp,
                         Mux(
-                            op_exp2, v.tmp,
-                            Mux(op_recip, Const(0x40000000, 32),
-                                Const(0x3fc00000, 32))))))
+                            s == 32, silu_w3_operand(v),
+                            Mux(step_in((40, 46), s), Const(0x40000000, 32),
+                                v.tmp))),
+                    Mux(
+                        op_smexp,
+                        # step 0 subtracts the folded maximum from the
+                        # element; steps 2..30 are exp2's range subtract
+                        # and Horner adds, all reading un_tmp.
+                        Mux(s == 0, v.x, v.tmp),
+                        Mux(
+                            op_exp2 & (s == 0), v.x,
+                            Mux(
+                                op_exp2, v.tmp,
+                                Mux(op_recip, Const(0x40000000, 32),
+                                    Const(0x3fc00000, 32)))))))
 
         def unary_add_in3(v):
             s = v.s
+            silu_glu_in3 = Mux(
+                s == 2, v.i2f,
+                Mux(
+                    s == 32, Const(SILU_ONE_BITS, 32),
+                    Mux(step_in((40, 46), s), v.tmp,
+                        EXP2_C[((30 - s) >> 2)[:3]])))
             return Mux(
-                op_silu,
+                op_silu_glu, silu_glu_in3,
                 Mux(
-                    s == 2, v.i2f,
+                    op_silu,
                     Mux(
-                        s == 32, Const(SILU_ONE_BITS, 32),
-                        Mux(step_in((40, 46), s), v.tmp,
-                            EXP2_C[((30 - s) >> 2)[:3]]))),
-                Mux(
-                    op_smexp,
-                    Mux(s == 0, sm_m,
-                        Mux(s == 2, v.i2f, EXP2_C[((30 - s) >> 2)[:3]])),
+                        s == 2, v.i2f,
+                        Mux(
+                            s == 32, Const(SILU_ONE_BITS, 32),
+                            Mux(step_in((40, 46), s), v.tmp,
+                                EXP2_C[((30 - s) >> 2)[:3]]))),
                     Mux(
-                        op_exp2 & (s == 0), v.i2f,
-                        Mux(op_exp2, EXP2_C[((exp_add[-1] - s) >> 2)[:3]],
-                            v.tmp))))
+                        op_smexp,
+                        Mux(s == 0, sm_m,
+                            Mux(s == 2, v.i2f, EXP2_C[((30 - s) >> 2)[:3]])),
+                        Mux(
+                            op_exp2 & (s == 0), v.i2f,
+                            Mux(op_exp2, EXP2_C[((exp_add[-1] - s) >> 2)[:3]],
+                                v.tmp)))))
 
         for kind, g, unit, sel, go in extra_issues:
             view = unary_view(sel)
@@ -1780,8 +1918,32 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         q_st_meta = Signal()
         q_st_drain = Signal()
 
-        q_max_go = in_elem & q_any & ~op_q_mul & q_st_amax & elem_a_ok \
-            & (q_idx < q_valid) & (Const(1) if q_pipeline else ~q_maxbusy)
+        # Experimental lookahead for full-block direct GEMV only.
+        # AMAX of the following segment uses TMEM and an integer compare
+        # while the current segment uses the FP pipelines.
+        q_next_buf = Array(Signal(32, name=f'q_next_{i}') for i in range(32))
+        q_next_count = Signal(range(33))
+        q_next_amax = Signal(31)
+        q_st_next = Signal()
+        q_lookahead = (Const(q_pipeline) & op_q_act & ~op_q_mul
+                       & (n_l >= 128) & (n_l[:5] == 0))
+        q_more = ((q_seg + 1) << 5) < n_l
+        q_next_go = (in_elem & q_lookahead & ~op_q_norm & q_more & elem_a_ok
+                     & (q_next_count < 32)
+                     & (q_st_scale | q_st_quant | q_st_next))
+        next_abs = a_word[:31]
+        next_nan = (a_word[23:31] == 255) & a_word[:23].any()
+        with m.If(q_next_go):
+            m.d.sync += [
+                q_next_buf[q_next_count[:5]].eq(a_word),
+                q_next_count.eq(q_next_count + 1),
+            ]
+            with m.If(~next_nan & (next_abs > q_next_amax)):
+                m.d.sync += q_next_amax.eq(next_abs)
+
+        q_max_go = in_elem & q_any & ~op_q_mul & ~op_q_norm & q_st_amax \
+            & elem_a_ok & (q_idx < q_valid) \
+            & (Const(1) if q_pipeline else ~q_maxbusy)
         # G4 folds the *rounded* final MUL result while filling qbuf. The
         # segment does not enter SCALE until all products have retired, so
         # the shared multiplier never mixes producer and quantizer results.
@@ -1795,12 +1957,145 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # Scale classification of q_amax: zero or subnormal (every
         # |x| < 2^-126, or an all-NaN fold) zeroes the segment;
         # >= 2^126 keeps sc but forces inv = +0.
-        qae = q_amax[23:31]
+        q_pre_active = Signal()
+        q_pre_done = Signal()
+        q_act_inv = Signal(32)
+        q_act_scale = Signal(32)
+        q_scan_buf = Array(Signal(32, name=f'q_scan_{i}') for i in range(32))
+        q_scan_count = Signal(range(33))
+        q_scan_amax = Signal(31)
+        q_scan_go = (Const(bool(extra_mul)) & in_elem & q_pre_active
+                     & ~op_q_norm
+                     & (((q_seg + 2) << 5) < n_l) & elem_a_ok
+                     & (q_scan_count < 32))
+        with m.If(q_scan_go):
+            m.d.sync += [
+                q_scan_buf[q_scan_count[:5]].eq(a_word),
+                q_scan_count.eq(q_scan_count + 1),
+            ]
+            with m.If(~next_nan & (next_abs > q_scan_amax)):
+                m.d.sync += q_scan_amax.eq(next_abs)
+        q_scale_amax = Mux(q_pre_active, q_next_amax, q_amax)
+        q_scale_running = q_st_scale | q_pre_active
+        q_scale_valid = fmul.out.valid
+        q_scale_data = fmul.out.bits.data
+        if extra_mul:
+            q_scale_valid = Mux(q_pre_active, extra_mul[0].out.valid,
+                                q_scale_valid)
+            q_scale_data = Mux(q_pre_active, extra_mul[0].out.bits.data,
+                               q_scale_data)
+            with m.If(q_lookahead & q_more & (q_next_count == 32)
+                      & (q_st_quant | q_st_next) & ~q_pre_active
+                      & ~q_pre_done):
+                m.d.sync += [q_pre_active.eq(1), q_step.eq(0), q_wait.eq(0)]
+
+        # RMS-fold producer chain (VEC_NORM_QUANT_ACT): the normed
+        # products y_i = R(R(x_i*s)*w_i) -- the exact words the
+        # quantizer consumes -- stream through two otherwise-idle FMA
+        # groups as a two-stage dependency: t = R(x*s) issues on the
+        # SMEXP sum adder as A-window words arrive, y = R(t*w) on the
+        # last extra multiplier as the t results surface (one word per
+        # cycle after the three-cycle fill; both units share the FMA
+        # latency, and a small t FIFO absorbs it), so every scan stage
+        # of the three-segment lookahead folds the *rounded products'*
+        # magnitudes while the current segment's scale (group 2) and
+        # quantize (groups 0/1) run undisturbed. Unit identity routes
+        # the captures -- no phase bookkeeping. The chain fills qbuf
+        # in AMAX, q_next during the first segment's scale/quantize,
+        # and q_scan once the pre-scale is active; targets switch only
+        # at fully retired boundaries, so the t FIFO starts each
+        # target empty.
+        emu = extra_mul[1] if len(extra_mul) >= 2 else None
+        q_norm_chain = q_pipeline and emu is not None
+        if q_norm_chain:
+            q_ntf = Array(Signal(32, name=f'q_ntf{i}') for i in range(8))
+            q_nt_head = Signal(3)
+            q_nt_tail = Signal(3)
+            q_nt_cnt = Signal(4)
+            q_niss = Signal(6)
+            # the chain's target: 0 qbuf (AMAX), 1 the next-segment
+            # scan, 2 the pre-active scan. A register, not a decode of
+            # q_pre_active: the pre-scale completes before the scan's
+            # last words land, and the scan target must persist
+            # through q_pre_done until the LOOKAHEAD promotion.
+            q_ntgt = Signal(2)
+            q_n_amax = in_elem & op_q_norm & q_st_amax
+            q_n_scan = in_elem & op_q_norm & (q_ntgt == 2)
+            q_n_next = in_elem & op_q_norm & (q_ntgt == 1)
+            q_n_more = Mux(q_ntgt == 0, Const(1),
+                           Mux(q_ntgt == 2, ((q_seg + 2) << 5) < n_l, q_more))
+            q_nlim = Mux(q_ntgt == 0, q_valid, Const(32, 6))
+            q_ny_go = Signal(name='q_ny_go')
+            q_nt_go = Signal(name='q_nt_go')
+            m.d.comb += q_ny_go.eq(in_elem & op_q_norm
+                                   & (q_n_amax | q_n_scan | q_n_next)
+                                   & q_n_more & oscal_ok & (q_nt_cnt != 0)
+                                   & elem_b_ok)
+            m.d.comb += q_nt_go.eq(in_elem & op_q_norm
+                                   & (q_n_amax | q_n_scan | q_n_next)
+                                   & q_n_more & oscal_ok & elem_a_ok
+                                   & (q_niss < q_nlim) & (q_nt_cnt < 5))
+            q_ntcap = Signal(name='q_ntcap')
+            q_nycap = Signal(name='q_nycap')
+            m.d.comb += q_ntcap.eq(in_elem & op_q_norm & fsum.out.valid)
+            m.d.comb += q_nycap.eq(in_elem & op_q_norm & emu.out.valid)
+            ny_word = emu.out.bits.data
+            ny_abs = ny_word[:31]
+            ny_nan = (ny_word[23:31] == 255) & ny_word[:23].any()
+            with m.If(q_ntcap):
+                m.d.sync += q_ntf[q_nt_tail].eq(fsum.out.bits.data)
+            m.d.sync += q_nt_tail.eq(q_nt_tail + Mux(q_ntcap, 1, 0))
+            # one statement per counter: a push and a pop (or an issue
+            # and a boundary reset) in the same cycle must not override
+            # each other (the consume-counter rule)
+            m.d.sync += q_nt_cnt.eq(q_nt_cnt + Mux(q_ntcap, 1, 0) -
+                                    Mux(q_ny_go, 1, 0))
+            m.d.sync += q_nt_head.eq(q_nt_head + Mux(q_ny_go, 1, 0))
+            with m.If(q_nycap):
+                with m.If(q_n_amax):
+                    pass  # through the q_fill extension below
+                with m.Elif(q_n_scan):
+                    m.d.sync += [
+                        q_scan_buf[q_scan_count[:5]].eq(ny_word),
+                        q_scan_count.eq(q_scan_count + 1),
+                    ]
+                    with m.If(~ny_nan & (ny_abs > q_scan_amax)):
+                        m.d.sync += q_scan_amax.eq(ny_abs)
+                with m.Else():
+                    m.d.sync += [
+                        q_next_buf[q_next_count[:5]].eq(ny_word),
+                        q_next_count.eq(q_next_count + 1),
+                    ]
+                    with m.If(~ny_nan & (ny_abs > q_next_amax)):
+                        m.d.sync += q_next_amax.eq(ny_abs)
+            # target advances only at fully retired boundaries: the
+            # AMAX exit (lookahead commands) and the pre-scale arm.
+            # The arm -- not a LOOKAHEAD-state decode -- also re-arms
+            # the scan budget: it fires only after the promotion has
+            # consumed the completed scan, so no capture can wrap
+            # into an un-promoted buffer.
+            q_n_adv0 = in_elem & op_q_norm & q_st_amax \
+                & (q_idx == q_valid) & ~q_maxbusy & q_lookahead \
+                & (q_ntgt == 0)
+            q_n_arm = in_elem & op_q_norm & q_lookahead & q_more \
+                & (q_next_count == 32) & (q_st_quant | q_st_next) \
+                & ~q_pre_active & ~q_pre_done
+            q_n_rst = q_n_adv0 | q_n_arm
+            m.d.sync += q_ntgt.eq(
+                Mux(q_n_adv0, 1, Mux(q_n_arm & (q_ntgt == 1), 2, q_ntgt)))
+            m.d.sync += q_niss.eq(Mux(q_n_rst, 0, q_niss + Mux(q_nt_go, 1, 0)))
+            # the AMAX target retires through the shared segment fill
+            # (qbuf + the magnitude fold), like the G4 producer
+            q_fill = q_fill | (q_nycap & q_n_amax)
+            q_fill_word = Mux(q_nycap & q_n_amax, emu.out.bits.data,
+                              q_fill_word)
+
+        qae = q_scale_amax[23:31]
         q_zero = qae == 0
         q_big = qae >= 253
-        q_cls = q_st_scale & ~q_wait & (q_step == 0)
+        q_cls = q_scale_running & ~q_wait & (q_step == 0)
         q_seed_go = q_cls & ~q_zero & ~q_big
-        q_issue = q_st_scale & ~q_wait & (q_step != 0)
+        q_issue = q_scale_running & ~q_wait & (q_step != 0)
         q_it_go = q_issue & ((q_step == 2) | (q_step == 8))
         q_sub_go = q_issue & ((q_step == 4) | (q_step == 10))
         q_upd_go = q_issue & ((q_step == 6) | (q_step == 12))
@@ -1894,6 +2189,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 q_maxbusy.eq(0),
                 q_actbuf.eq(0),
             ]
+            if q_norm_chain:
+                m.d.sync += [q_ntgt.eq(0), q_niss.eq(0)]
 
         with m.If(q_pgo):
             m.d.sync += q_pissued.eq(q_pissued + 1)
@@ -1934,21 +2231,24 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 m.d.sync += [q_step.eq(1), q_wait.eq(1)]
         with m.Elif(q_issue):
             m.d.sync += [q_step.eq(q_step + 1), q_wait.eq(1)]
-        with m.If(q_st_scale & q_wait):
+        with m.If(q_scale_running & q_wait):
             with m.If(frec.out.valid & (q_step == 1)):
                 m.d.sync += q_y.eq(frec.out.bits.data)
-            with m.If(fmul.out.valid & q_it_cap):
-                m.d.sync += q_t.eq(fmul.out.bits.data)
-            with m.If(fmul.out.valid & q_upd_cap):
-                m.d.sync += q_y.eq(fmul.out.bits.data)
-            with m.If(fmul.out.valid & q_sc_cap):
-                m.d.sync += q_sc.eq(fmul.out.bits.data)
+            with m.If(q_scale_valid & q_it_cap):
+                m.d.sync += q_t.eq(q_scale_data)
+            with m.If(q_scale_valid & q_upd_cap):
+                m.d.sync += q_y.eq(q_scale_data)
+            with m.If(q_scale_valid & q_sc_cap):
+                m.d.sync += q_sc.eq(q_scale_data)
             with m.If(fadd.out.valid & q_sub_cap):
                 m.d.sync += q_t.eq(fadd.out.bits.data)
             with m.If((frec.out.valid & (q_step == 1))
-                      | (fmul.out.valid & (q_it_cap | q_upd_cap))
+                      | (q_scale_valid & (q_it_cap | q_upd_cap))
                       | (fadd.out.valid & q_sub_cap)):
                 m.d.sync += [q_step.eq(q_step + 1), q_wait.eq(0)]
+        q_scale_done = (q_cls & q_zero) | (q_scale_valid & q_sc_cap)
+        with m.If(q_pre_active & q_scale_done):
+            m.d.sync += [q_pre_active.eq(0), q_pre_done.eq(1)]
         if q_pipeline:
             with m.If(q_m1_go):
                 m.d.sync += q_idx.eq(q_idx + 1)
@@ -1991,6 +2291,14 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             with m.State('QIDLE'):
                 with m.If(in_elem & q_any & q_arm):
                     q_start_segment()
+                    m.d.sync += [
+                        q_next_count.eq(0),
+                        q_next_amax.eq(0),
+                        q_pre_active.eq(0),
+                        q_pre_done.eq(0),
+                        q_scan_count.eq(0),
+                        q_scan_amax.eq(0)
+                    ]
                     m.d.sync += [q_arm.eq(0), q_seg.eq(0), q_didx.eq(0)]
                     m.next = 'AMAX'
             with m.State('AMAX'):
@@ -2000,22 +2308,15 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     m.next = 'SCALE'
             with m.State('SCALE'):
                 m.d.comb += q_st_scale.eq(1)
-                with m.If(q_cls & q_zero):
+                with m.If(q_scale_done):
                     m.d.sync += [
                         q_idx.eq(0),
                         q_ccnt.eq(0),
                         q_bcnt.eq(0),
                         q_pe.eq(0),
-                        q_pewait.eq(0)
-                    ]
-                    m.next = 'QUANT'
-                with m.If(fmul.out.valid & q_sc_cap):
-                    m.d.sync += [
-                        q_idx.eq(0),
-                        q_ccnt.eq(0),
-                        q_bcnt.eq(0),
-                        q_pe.eq(0),
-                        q_pewait.eq(0)
+                        q_pewait.eq(0),
+                        q_act_inv.eq(Mux(q_zero, 0, q_y)),
+                        q_act_scale.eq(Mux(q_zero, 0, q_scale_data)),
                     ]
                     m.next = 'QUANT'
             with m.State('QUANT'):
@@ -2051,17 +2352,63 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     self.act_wr.valid.eq(1),
                     self.act_wr.bits.seg.eq(q_seg[:self.lg_act_segs]),
                     self.act_wr.bits.quants.eq(q_actbuf),
-                    self.act_wr.bits.s_act.eq(q_sc),
+                    self.act_wr.bits.s_act.eq(q_act_scale),
                     self.act_wr.bits.sum_a.eq(q_sum),
                 ]
                 with m.If(self.act_wr.fire):
-                    with m.If(consumed == n_l):
+                    with m.If(~q_more):
                         m.d.sync += q_act_done.eq(1)
                         m.next = 'QIDLE'
+                    with m.Elif(q_lookahead):
+                        m.next = 'LOOKAHEAD'
                     with m.Else():
                         m.d.sync += q_seg.eq(q_seg + 1)
                         q_start_segment()
                         m.next = 'AMAX'
+            with m.State('LOOKAHEAD'):
+                m.d.comb += q_st_next.eq(1)
+                # the fused op's producer scan runs three cycles longer
+                # than the raw scan; wait for its full retirement too
+                if q_norm_chain:
+                    q_lh_enter = Mux(
+                        op_q_norm,
+                        q_pre_done & ((q_scan_count == 32)
+                                      | ~(((q_seg + 2) << 5) < n_l)),
+                        q_pre_done)
+                else:
+                    q_lh_enter = q_pre_done
+                with m.If(q_lh_enter if extra_mul else q_next_count == 32):
+                    for i in range(32):
+                        m.d.sync += qbuf[i].eq(q_next_buf[i])
+                    m.d.sync += [
+                        q_seg.eq(q_seg + 1),
+                        q_valid.eq(32),
+                        q_amax.eq(q_next_amax),
+                        q_next_count.eq(0),
+                        q_next_amax.eq(0),
+                        q_sum.eq(0),
+                        q_actbuf.eq(0),
+                        q_step.eq(0),
+                        q_wait.eq(0),
+                    ]
+                    if extra_mul:
+                        for i in range(32):
+                            m.d.sync += q_next_buf[i].eq(q_scan_buf[i])
+                        m.d.sync += [
+                            q_next_count.eq(q_scan_count),
+                            q_next_amax.eq(q_scan_amax),
+                            q_scan_count.eq(0),
+                            q_scan_amax.eq(0),
+                            q_pre_done.eq(0),
+                            q_act_inv.eq(q_y),
+                            q_act_scale.eq(q_sc),
+                            q_idx.eq(0),
+                            q_ccnt.eq(0),
+                            q_bcnt.eq(0),
+                        ]
+                        m.next = 'QUANT'
+                    else:
+                        m.next = 'SCALE'
             with m.State('DRAIN'):
                 m.d.comb += q_st_drain.eq(1)
                 # Leave only on the last word's accepted enqueue: the
@@ -2229,7 +2576,8 @@ class VectorUnit(HasTRoomParams, Elaboratable):
 
         m.d.comb += fmul.inp.valid.eq(elem_mul_go | sq_mul_go | un_mul_go0
                                       | q_pgo
-                                      | q_it_go | q_upd_go | q_sc_go | q_m1_go
+                                      | ((q_it_go | q_upd_go | q_sc_go)
+                                         & ~q_pre_active) | q_m1_go
                                       | (Const(0) if q_pipeline else q_m2_go))
         if fmul1 is not None:
             m.d.comb += fmul1.inp.valid.eq(un_mul_go1 | (
@@ -2261,7 +2609,7 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 if q_pipeline:
                     m.d.comb += [
                         fmul.inp.bits.in1.eq(qbuf[q_idx]),
-                        fmul.inp.bits.in2.eq(q_y),
+                        fmul.inp.bits.in2.eq(q_act_inv),
                         fmul1.inp.bits.in1.eq(q_pipe_data),
                         fmul1.inp.bits.in2.eq(Const(F127_BITS, 32)),
                     ]
@@ -2308,9 +2656,9 @@ class VectorUnit(HasTRoomParams, Elaboratable):
             frec.inp.bits.rm.eq(RoundingMode.RNE),
             frec.inp.bits.in1.eq(
                 Mux(
-                    q_any, q_amax,
+                    q_any, q_scale_amax,
                     Mux(
-                        op_silu, un_acc[sel_rec] & 0x7fffffff,
+                        op_silu | op_silu_glu, un_acc[sel_rec] & 0x7fffffff,
                         Mux(op_rsqrt, un_x[sel_rec],
                             un_x[sel_rec] & 0x7fffffff)))),
             frec.inp.bits.in2.eq(0),
@@ -2320,6 +2668,47 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         #
         # FPU unit outputs, captured by the owning context.
         #
+        if extra_mul:
+            scale_mul = extra_mul[0]
+            with m.If(q_pre_active):
+                m.d.comb += [
+                    scale_mul.inp.valid.eq(q_it_go | q_upd_go | q_sc_go),
+                    scale_mul.inp.bits.fn.eq(FPUOperator.MUL),
+                    scale_mul.inp.bits.rm.eq(RoundingMode.RNE),
+                    scale_mul.inp.bits.in1.eq(Mux(q_upd_go, q_y,
+                                                  q_scale_amax)),
+                    scale_mul.inp.bits.in2.eq(
+                        Mux(q_it_go, q_y, Mux(q_sc_go, INV127_BITS, q_t))),
+                    scale_mul.inp.bits.in3.eq(0),
+                ]
+
+        # The producer chain's drives, placed after the unary context
+        # and SMEXP drives so the later assignments take priority: the
+        # contexts are idle during VEC_NORM_QUANT_ACT (their tag FIFOs
+        # pop only on nonzero counts), and the SMEXP sum adder serves
+        # the chain's first multiply stage instead.
+        if q_norm_chain:
+            with m.If(op_q_norm):
+                m.d.comb += [
+                    fsum.inp.valid.eq(q_nt_go),
+                    fsum.inp.bits.fn.eq(FPUOperator.MUL),
+                    fsum.inp.bits.fn_mod.eq(0),
+                    fsum.inp.bits.rm.eq(RoundingMode.RNE),
+                    fsum.inp.bits.in1.eq(a_word),
+                    fsum.inp.bits.in2.eq(oscalar),
+                    fsum.inp.bits.in3.eq(0),
+                ]
+            with m.If(op_q_norm & q_ny_go):
+                m.d.comb += [
+                    emu.inp.valid.eq(q_ny_go),
+                    emu.inp.bits.fn.eq(FPUOperator.MUL),
+                    emu.inp.bits.fn_mod.eq(0),
+                    emu.inp.bits.rm.eq(RoundingMode.RNE),
+                    emu.inp.bits.in1.eq(q_ntf[q_nt_head]),
+                    emu.inp.bits.in2.eq(b_word),
+                    emu.inp.bits.in3.eq(0),
+                ]
+
         m.d.comb += [
             sq_q.enq.valid.eq(op_sumsq & fmul.out.valid),
             sq_q.enq.bits.val.eq(fmul.out.bits.data),
@@ -2357,7 +2746,10 @@ class VectorUnit(HasTRoomParams, Elaboratable):
         # other.
         #
         consume_a = elem_add_go | elem_mul_go | sum_add_go | sq_mul_go \
-            | max_go | un_go | q_max_go | q_pgo | f16_go | pswap_go | sm_max_go
+            | max_go | un_go | q_max_go | q_pgo | f16_go | pswap_go | sm_max_go \
+            | q_next_go | q_scan_go
+        if q_norm_chain:
+            consume_a = consume_a | q_nt_go
         with m.If(consume_a):
             m.d.sync += [
                 awin.eq(awin >> 32),
@@ -2365,7 +2757,12 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                 consumed.eq(consumed + 1),
                 self.elements.eq(self.elements + 1),
             ]
-        with m.If(binary_b & (elem_add_go | elem_mul_go | q_pgo)):
+        q_nb_go = elem_add_go | elem_mul_go | q_pgo
+        if q_norm_chain:
+            q_nb_go = q_nb_go | q_ny_go
+        # The unary accept is a B consumer only for VEC_SILU_GLU (one
+        # word per accept, in lockstep with the A window's shift).
+        with m.If((binary_b & q_nb_go) | (un_go & op_silu_glu)):
             m.d.sync += [bwin.eq(bwin >> 32), bhave.eq(bhave - 4)]
 
         m.d.sync += issued.eq(
@@ -2470,11 +2867,13 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                         op_rsqrt.eq(offer.op == VecOp.VEC_RSQRT),
                         op_quant.eq(offer.op == VecOp.VEC_QUANT),
                         op_q_act.eq((offer.op == VecOp.VEC_QUANT_ACT)
-                                    | o_q_mul),
+                                    | o_q_mul | o_q_norm),
                         op_q_mul.eq(o_q_mul),
+                        op_q_norm.eq(o_q_norm),
                         op_f16.eq(offer.op == VecOp.VEC_F16),
                         op_pswap.eq(offer.op == VecOp.VEC_PSWAP),
                         op_silu.eq(offer.op == VecOp.VEC_SILU),
+                        op_silu_glu.eq(offer.op == VecOp.VEC_SILU_GLU),
                         op_smexp.eq(offer.op == VecOp.VEC_SMEXP),
                         n_l.eq(offer.n),
                         a_base.eq(offer.a_base),
@@ -2501,7 +2900,10 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                         bbeat.eq(0),
                         bscalar.eq(0),
                         bscal_ok.eq(0),
+                        oscalar.eq(0),
+                        oscal_ok.eq(0),
                         rd_pend.eq(0),
+                        rd_o.eq(0),
                         ord_cnt.eq(0),
                         ord_head.eq(0),
                         ord_tail.eq(0),
@@ -2549,6 +2951,14 @@ class VectorUnit(HasTRoomParams, Elaboratable):
                     for i in range(4):
                         m.d.sync += part[i].eq(0)
                         m.d.sync += sm_p[i].eq(0)
+                    if q_norm_chain:
+                        m.d.sync += [
+                            q_nt_head.eq(0),
+                            q_nt_tail.eq(0),
+                            q_nt_cnt.eq(0),
+                            q_ntgt.eq(0),
+                            q_niss.eq(0),
+                        ]
                     m.d.sync += cls_valid.eq(0)
                     # Unary contexts: control state resets; the data
                     # registers are dead state, re-latched at accept

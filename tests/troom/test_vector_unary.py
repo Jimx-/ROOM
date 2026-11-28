@@ -378,7 +378,12 @@ def test_unit_unary_interleave_equivalence(op, ctx):
     assert writes == [(O_BASE + 8 * i, d) for i, d in enumerate(exp)]
 
 
-def test_unit_silu_equals_chain():
+@pytest.mark.parametrize('geometry', [
+    dict(tmem_clusters=1),
+    dict(data_width=512, n_tmem_banks=8, tmem_clusters=2),
+],
+                         ids=['single-cluster', 'split-tmem'])
+def test_unit_silu_equals_chain(geometry):
     """The fused VEC_SILU op is bit-identical to the standalone
     five-command sigmoid chain it replaces (the S1 identity gate):
     same operands, the backend's own ``-log2(e)`` scalar beat and
@@ -400,7 +405,7 @@ def test_unit_silu_equals_chain():
     ]
     words += [f32_bits(rng.uniform(-70.0, 70.0)) for _ in range(32)]
     n = len(words)
-    params = dict(PARAMS)
+    params = dict(PARAMS, **geometry)
     bb = params['data_width'] // 8
 
     # The fused op.
@@ -417,8 +422,11 @@ def test_unit_silu_equals_chain():
     # B_BASE, the ones vector above it, four scratch regions spaced
     # clear of the inputs.
     npad = ((n * 4 + bb - 1) // bb) * bb
-    r0, r1, r2, r3 = (O_BASE + 0x400, O_BASE + 0x600, O_BASE + 0x800,
-                      O_BASE + 0xa00)
+    scratch = O_BASE + 0x400
+    if params['tmem_clusters'] == 2:
+        # Same local offset as B, but in the other cluster.
+        scratch = params['tmem_bytes'] // 2 + B_BASE
+    r0, r1, r2, r3 = (scratch + i * 0x200 for i in range(4))
     assert B_BASE + bb + npad <= r0
     b_bytes = words_to_bytes([SILU_NLOG2E_BITS]) + bytes(bb - 4)
     b_bytes += words_to_bytes([SILU_ONE_BITS] * n)
