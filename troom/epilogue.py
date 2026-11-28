@@ -4,7 +4,8 @@ Each lane owns conversion, scaling, accumulation and fold pipelines. There is
 no shared arithmetic scheduler; independent lanes accept one record per cycle
 when their row snapshots and result drain have capacity.
 
-Per lane (all ``FPUFMA`` MUL/ADD semantics, rounding points and the
+Per lane (``FPUFMA`` MUL/ADD semantics, which the dedicated units of
+``troom.fpu`` reproduce bit for bit; rounding points and the
 ``isum_4`` fold order match the frozen ``mm_row_results`` contract):
 
     S,d (,mi*sum_a,dmin for Q4_K) -> i2f/f16w (2 cycles)
@@ -59,9 +60,10 @@ from amaranth.hdl.rec import Direction, Record
 from amaranth.utils import log2_int
 
 from room.consts import RoundingMode
-from room.fpu import FPUFMA, FPFormat, FPUOperator
+from room.fpu import FPUOperator
 
 from troom.consts import Format, Status
+from troom.fpu import FPAdd32, FPMul32
 from troom.convert import Fp16Widen, IntToFP32
 from troom.matrix import MmSegment
 from troom.types import HasTRoomParams
@@ -70,7 +72,7 @@ from roomsoc.interconnect.stream import Decoupled, Queue
 
 # Context taps (offsets from the cast-issue cycle).  The push is
 # registered, so ``sh[k]`` is visible one cycle after the cast: with
-# the converters answering in 2 cycles and every ``FPUFMA`` in 3, the
+# the converters answering in 2 cycles and every FP unit in 3, the
 # record's events land at cast+5/+8/+11/+14 and the taps sit one
 # earlier.
 _TAP_SCALE = 4  # u/v multiply issue reads s_act (event at +5)
@@ -145,12 +147,12 @@ class Epilogue(HasTRoomParams, Elaboratable):
         m = Module()
 
         n = self.n_outputs
-        lane_bits = max(log2_int(n), 1)
+        lane_bits = max((n - 1).bit_length(), 1)
         bw = self.beat_bytes // 4
         lg_bw = log2_int(bw)
 
-        def fpu(name):
-            u = FPUFMA(32, FPFormat.S, latency=3)
+        def fpu(name, unit):
+            u = unit()
             m.submodules[name] = u
             return u
 
@@ -178,13 +180,13 @@ class Epilogue(HasTRoomParams, Elaboratable):
             i2f_b.append(i2fb)
             f16w_a.append(f16a)
             f16w_b.append(f16b)
-            mul_a0.append(fpu(f'l{l}_ma0'))
-            mul_a1.append(fpu(f'l{l}_ma1'))
-            mul_b0.append(fpu(f'l{l}_mb0'))
-            mul_b1.append(fpu(f'l{l}_mb1'))
-            add_sub.append(fpu(f'l{l}_asub'))
-            add_acc.append(fpu(f'l{l}_aacc'))
-            add_fold.append(fpu(f'l{l}_afold'))
+            mul_a0.append(fpu(f'l{l}_ma0', FPMul32))
+            mul_a1.append(fpu(f'l{l}_ma1', FPMul32))
+            mul_b0.append(fpu(f'l{l}_mb0', FPMul32))
+            mul_b1.append(fpu(f'l{l}_mb1', FPMul32))
+            add_sub.append(fpu(f'l{l}_asub', FPAdd32))
+            add_acc.append(fpu(f'l{l}_aacc', FPAdd32))
+            add_fold.append(fpu(f'l{l}_afold', FPAdd32))
 
         res_q = []
         for l in range(n):
@@ -211,11 +213,20 @@ class Epilogue(HasTRoomParams, Elaboratable):
         # (3 issue slots per row, results in row order).
         E = self.epi_snap_bufs
         lg_e = log2_int(E)
-        snap = [[[Signal(32, name=f'snap{b}{l}{i}') for i in range(4)]
-                 for l in range(n)] for b in range(E)]
-        snap_row = [[
-            Signal(self.rows_bits, name=f'snap_row{b}{l}') for l in range(n)
-        ] for b in range(E)]
+        # Snapshots have one writer and one asynchronous head reader per
+        # lane. Distributed RAM avoids a register file and wide read mux.
+        snap_reads = []
+        snap_writes = []
+        for lane in range(n):
+            memory = Memory(width=128 + self.rows_bits,
+                            depth=E,
+                            attrs={'ram_style': 'distributed'})
+            read = memory.read_port(domain='comb')
+            write = memory.write_port()
+            m.submodules[f'snap_read{lane}'] = read
+            m.submodules[f'snap_write{lane}'] = write
+            snap_reads.append(read)
+            snap_writes.append(write)
         snap_hd = [Signal(lg_e, name=f'snap_hd{l}') for l in range(n)]
         snap_cnt = [
             Signal(range(E + 1), name=f'snap_cnt{l}') for l in range(n)
@@ -237,12 +248,26 @@ class Epilogue(HasTRoomParams, Elaboratable):
                   for l in range(n)]
         fh1v = [[Signal(name=f'fh1v{k}{l}') for k in range(E)]
                 for l in range(n)]
-        fh1val = [[Signal(32, name=f'fh1val{k}{l}') for k in range(E)]
-                  for l in range(n)]
         fh2v = [[Signal(name=f'fh2v{k}{l}') for k in range(E)]
                 for l in range(n)]
-        fh2val = [[Signal(32, name=f'fh2val{k}{l}') for k in range(E)]
-                  for l in range(n)]
+        fold_reads = []
+        fold_writes = []
+        for lane in range(n):
+            # The halves land independently. Each has a single writer
+            # addressed by the landing tag and one context-head reader.
+            reads, writes = [], []
+            for half in range(2):
+                memory = Memory(width=32,
+                                depth=E,
+                                attrs={'ram_style': 'distributed'})
+                read = memory.read_port(domain='comb')
+                write = memory.write_port()
+                m.submodules[f'fold_read{lane}_{half}'] = read
+                m.submodules[f'fold_write{lane}_{half}'] = write
+                reads.append(read)
+                writes.append(write)
+            fold_reads.append(reads)
+            fold_writes.append(writes)
         frow = [[Signal(self.rows_bits, name=f'frow{k}{l}') for k in range(E)]
                 for l in range(n)]
         # Result-queue reservations: the final fold checks room at
@@ -467,14 +492,14 @@ class Epilogue(HasTRoomParams, Elaboratable):
         rd_snap = [[Signal(32, name=f'snap_rds{i}l{l}') for i in range(4)]
                    for l in range(n)]
         for l in range(n):
+            read = snap_reads[l]
             m.d.comb += [
+                read.addr.eq(snap_hd[l]),
                 rd_avail[l].eq(snap_cnt[l] != 0),
-                rd_row[l].eq(
-                    Array(snap_row[b][l] for b in range(E))[snap_hd[l]]),
+                rd_row[l].eq(read.data[128:]),
             ]
             for i in range(4):
-                m.d.comb += rd_snap[l][i].eq(
-                    Array(snap[b][l][i] for b in range(E))[snap_hd[l]])
+                m.d.comb += rd_snap[l][i].eq(read.data.word_select(i, 32))
 
         # Fold launches per lane (used by the add_cnt accounting).
         # One adder, three issue kinds, strictly row-ordered effects:
@@ -517,8 +542,16 @@ class Epilogue(HasTRoomParams, Elaboratable):
                 ff_land[l].eq(add_fold[l].out.valid
                               & (ftag[l][2][:2] == FC_FF)),
             ]
-            ff_h1 = Array(fh1val[l][k] for k in range(E))[ctx_hd[l]]
-            ff_h2 = Array(fh2val[l][k] for k in range(E))[ctx_hd[l]]
+            first, second = fold_reads[l]
+            landing = ftag[l][2]
+            for half, kind in enumerate((FC_F1, FC_F2)):
+                write = fold_writes[l][half]
+                m.d.comb += [
+                    fold_reads[l][half].addr.eq(ctx_hd[l]),
+                    write.addr.eq(landing[2:]),
+                    write.data.eq(add_fold[l].out.bits.data),
+                    write.en.eq(add_fold[l].out.valid & (landing[:2] == kind)),
+                ]
             m.d.comb += [
                 add_fold[l].inp.valid.eq(fold_f1[l] | fold_f2[l]
                                          | fold_ff[l]),
@@ -528,10 +561,10 @@ class Epilogue(HasTRoomParams, Elaboratable):
                 add_fold[l].inp.bits.in2.eq(0),
                 add_fold[l].inp.bits.in1.eq(
                     Mux(fold_f1[l], rd_snap[l][0],
-                        Mux(fold_f2[l], rd_snap[l][1], ff_h1))),
+                        Mux(fold_f2[l], rd_snap[l][1], first.data))),
                 add_fold[l].inp.bits.in3.eq(
                     Mux(fold_f1[l], rd_snap[l][2],
-                        Mux(fold_f2[l], rd_snap[l][3], ff_h2))),
+                        Mux(fold_f2[l], rd_snap[l][3], second.data))),
             ]
             add_terms.append(fold_f1[l] + fold_f2[l] + fold_ff[l])
             # Fold adder tag advance: which landing is F1/F2/FF, and
@@ -582,20 +615,21 @@ class Epilogue(HasTRoomParams, Elaboratable):
                 for i in range(4):
                     with m.If(idx == i):
                         m.d.sync += bank[l][i].eq(add_acc[l].out.bits.data)
-                with m.If(lrow_last):
-                    for i in range(4):
-                        word = Mux(idx == i, add_acc[l].out.bits.data,
-                                   Mux(i > lseg_k, 0, bank[l][i]))
-                        for b in range(E):
-                            with m.If(cap_buf[l] == b):
-                                m.d.sync += snap[b][l][i].eq(word)
-                    for b in range(E):
-                        with m.If(cap_buf[l] == b):
-                            m.d.sync += snap_row[b][l].eq(lrow)
-                    # Occupancy moves from ``pend`` to the snapshot
-                    # queue; the single combined update below also
-                    # folds the F2 release, so capture and release in
-                    # one cycle cannot drop either term.
+            words = [
+                Mux(idx == i, add_acc[l].out.bits.data,
+                    Mux(i > lseg_k, 0, bank[l][i])) for i in range(4)
+            ]
+            write = snap_writes[l]
+            m.d.comb += [
+                write.addr.eq(cap_buf[l]),
+                write.data.eq(Cat(*words, lrow)),
+                write.en.eq(cap_now[l]),
+            ]
+
+            # Occupancy moves from ``pend`` to the snapshot
+            # queue; the single combined update below also
+            # folds the F2 release, so capture and release in
+            # one cycle cannot drop either term.
 
         # Pending-capture accounting: the fire-side increment and the
         # capture-side decrement MUST combine in one assignment -- two
@@ -679,12 +713,10 @@ class Epilogue(HasTRoomParams, Elaboratable):
                         with m.If(kind == FC_F1):
                             m.d.sync += [
                                 fh1v[l][k].eq(1),
-                                fh1val[l][k].eq(add_fold[l].out.bits.data),
                             ]
                         with m.If(kind == FC_F2):
                             m.d.sync += [
                                 fh2v[l][k].eq(1),
-                                fh2val[l][k].eq(add_fold[l].out.bits.data),
                             ]
                             # F1 always lands first (one in-order
                             # adder), so both halves are live now.
@@ -717,7 +749,12 @@ class Epilogue(HasTRoomParams, Elaboratable):
         beat_buf = Signal(self.data_width)
         total = (rows_l + (bw - 1)) >> lg_bw
 
-        lane = prow[:lane_bits] if n > 1 else Const(0)
+        if n == 5:
+            lane = Signal(range(n))
+            with m.If(self.start & self.ready):
+                m.d.sync += lane.eq(0)
+        else:
+            lane = prow[:lane_bits] if n > 1 else Const(0)
         take = Array(q.deq.valid for q in res_q)[lane]
         take &= Array(q.deq.bits.row for q in res_q)[lane] == prow
         take_val = Array(q.deq.bits.val for q in res_q)[lane]
@@ -729,7 +766,8 @@ class Epilogue(HasTRoomParams, Elaboratable):
         m.d.comb += [
             self.tmem_w.valid.eq(flushing | final_partial),
             self.tmem_w.bits.addr.eq(r_base_l + (bidx << self.lg_beat)),
-            self.tmem_w.bits.data.eq(beat_next),
+            # A valid write flushes the buffer while take is false.
+            self.tmem_w.bits.data.eq(beat_buf),
         ]
         for l, q in enumerate(res_q):
             m.d.comb += q.deq.ready.eq(take & (lane == l))
@@ -744,6 +782,8 @@ class Epilogue(HasTRoomParams, Elaboratable):
                 beat_buf.eq(0),
             ]
         with m.If(take):
+            if n == 5:
+                m.d.sync += lane.eq(Mux(lane == n - 1, 0, lane + 1))
             m.d.sync += [
                 prow.eq(prow + 1),
                 beat_buf.eq(beat_next),
