@@ -13,7 +13,19 @@ from amaranth import *
 from amaranth.hdl.rec import Direction, Record
 from amaranth.utils import log2_int
 
+from troom.abi import VBUILD_KOFF_LANE_MASK, VBUILD_KOFF_LANE_SHIFT
 from troom.consts import Format
+
+
+def rtl_div_const(value, divisor):
+    """Divide an unsigned RTL value by a positive constant exactly."""
+    if (divisor & (divisor - 1)) == 0:
+        return value >> log2_int(divisor)
+    # The rounded-up reciprocal's error is less than 1/divisor
+    # across the input domain, so it cannot change the floor.
+    shift = len(value) + (divisor - 1).bit_length()
+    reciprocal = ((1 << shift) + divisor - 1) // divisor
+    return (value * reciprocal) >> shift
 
 
 class HasTRoomParams:
@@ -47,19 +59,19 @@ class HasTRoomParams:
         #
         # Systolic array geometry
         #
+        self.mm_starvation_counters = params.get('mm_starvation_counters',
+                                                 False)
         self.seg_len = params.get('seg_len', 32)
         self.n_outputs = params.get('n_outputs', 2)
         self.n_tokens = params.get('n_tokens', 1)
 
         log2_int(self.seg_len, need_pow2=True)
 
-        if self.n_outputs < 1:
-            raise ValueError('n_outputs must be at least 1')
-
-        # The matrix unit maps output rows to pipelines by dividing by
-        # n_outputs; a power of two keeps that mapping shifts only.
-        log2_int(self.n_outputs, need_pow2=True)
-
+        max_lanes = (VBUILD_KOFF_LANE_MASK >> VBUILD_KOFF_LANE_SHIFT) + 1
+        if not 1 <= self.n_outputs <= max_lanes:
+            raise ValueError(
+                f'n_outputs must be between 1 and {max_lanes} (VBUILD lane field)'
+            )
         if self.n_tokens < 1:
             raise ValueError('n_tokens must be at least 1')
 
@@ -125,6 +137,8 @@ class HasTRoomParams:
                        (Format.Q5_0, Format.Q8_0, Format.Q4_K, Format.Q6_K)))
         self.mm_seg_fifo = params.get('mm_seg_fifo', 8)
         self.mm_act_fifo = params.get('mm_act_fifo', 4)
+        self.sg_act_wrap = params.get('sg_act_wrap', False)
+        self.sg_lane_bypass = params.get('sg_lane_bypass', False)
         self.mm_out_depth = params.get('mm_out_depth', 16)
         self.mm_result_q = params.get('mm_result_q', 4)
         # S4 short-row slice (2026-11-02): epilogue row-context depth.

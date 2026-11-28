@@ -44,6 +44,7 @@ import struct
 
 from room.fpu import FPURec
 
+from troom.abi import SG1_BEAT_BYTES, SG1_DEFAULT_PL_BEATS, SG1_STRIPE_BEATS
 from troom.consts import (
     Format,
     Opcode,
@@ -401,6 +402,27 @@ def _unpack_k4_scales(q):
             sc.append((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4))
             mi.append((q[j + 4] >> 4) | ((q[j] >> 6) << 4))
     return sc, mi
+
+
+def split_sg1_payload(payload, pl_beats=SG1_DEFAULT_PL_BEATS):
+    """Return packed (PL bytes, PS bytes) for a striped SG1 descriptor.
+
+    Upload the returned byte strings to dram_addr and w_base. Upload the
+    original scale stream separately at dram_stride in PL DDR.
+    """
+    if not 0 <= pl_beats < SG1_STRIPE_BEATS:
+        raise ValueError('PL beats must be between 0 and 31')
+    if pl_beats == 0:
+        pl_beats = SG1_DEFAULT_PL_BEATS
+    if len(payload) % SG1_BEAT_BYTES:
+        raise ValueError('SG1 payload must contain whole 64-byte beats')
+    pl, ps = bytearray(), bytearray()
+    chunk_bytes = SG1_STRIPE_BEATS * SG1_BEAT_BYTES
+    pl_bytes = pl_beats * SG1_BEAT_BYTES
+    for offset in range(0, len(payload), chunk_bytes):
+        pl.extend(payload[offset:offset + pl_bytes])
+        ps.extend(payload[offset + pl_bytes:offset + chunk_bytes])
+    return bytes(pl), bytes(ps)
 
 
 def pack_row(fmt, segs):
@@ -1287,17 +1309,21 @@ def vbuild_tile(window, beat_bytes):
     return b''.join(vbuild_quant_row(col(d)) + bytes(pad) for d in range(64))
 
 
-def vbuild_sg1(window):
+def vbuild_sg1(window, lanes=4):
     """The SG1 payload and meta staging images of one 64-slot window.
 
     Byte-for-byte what the engine's SG1 drain (nonzero ``m_base``,
     64-byte beat) stages: quant bytes and FP16 d patterns identical to
     :func:`vbuild_tile`'s rows, placed in the stream consumption order
-    (group-major, block within group, lane within block; four lanes) --
-    payload 4096 bytes, chunk (row, block) at ``((row >> 2) * 8 +
-    block * 4 + (row & 3)) * 32``; meta 256 bytes, d16 (row, block) at
-    ``(row >> 2) * 16 + block * 8 + (row & 3) * 2``. Mirrors the host
-    builder's ``troom_sg1_pack`` at four lanes.
+    (group-major, block within group, lane within block) over
+    ``lanes``-row interleave groups -- the consuming stream engine's
+    ``n_outputs``, the frozen quad at the default -- with a short
+    final group dropping its missing lanes exactly like the on-wire
+    pack. Payload 4096 bytes, chunk (row, block) at
+    ``((row // lanes) * 2 * lanes + block * gl + (row % lanes)) * 32``
+    (``gl`` the row's group's live lane count); meta 256 bytes, d16
+    (row, block) at the same cell index times two. Mirrors the host
+    builder's ``troom_sg1_pack`` at the matching lane count.
     """
     assert len(window) == 64 * 64
 
@@ -1308,10 +1334,37 @@ def vbuild_sg1(window):
     payload = bytearray(64 * 64)
     meta = bytearray(64 * 4)
     for r in range(64):
+        g, l = divmod(r, lanes)
+        gl = lanes if (g + 1) * lanes <= 64 else 64 - g * lanes
         for j in range(2):
-            off = ((r >> 2) * 8 + j * 4 + (r & 3)) * 32
+            off = (g * 2 * lanes + j * gl + l) * 32
             payload[off:off + 32] = rows[r][34 * j + 2:34 * j + 34]
-            moff = (r >> 2) * 16 + j * 8 + (r & 3) * 2
+            moff = (g * 2 * lanes + j * gl + l) * 2
+            meta[moff:moff + 2] = rows[r][34 * j:34 * j + 2]
+    return bytes(payload), bytes(meta)
+
+
+def vbuild_sg1_wide(window, lanes=4):
+    """The wide (128-dim) V tile's SG1 images -- the temporal
+    full-rebuild reference. ``window`` is the 64-slot slot-major image
+    (slots at or above the live count already zero). The interleave
+    group is ``lanes`` rows (the consuming engine's ``n_outputs``,
+    the frozen quad at the default); a short final group drops its
+    missing lanes."""
+    assert len(window) == 64 * 128
+    rows = [
+        vbuild_quant_row([window[j * 128 + d] for j in range(64)])
+        for d in range(128)
+    ]
+    payload = bytearray(128 * 64)
+    meta = bytearray(128 * 4)
+    for r in range(128):
+        g, l = divmod(r, lanes)
+        gl = lanes if (g + 1) * lanes <= 128 else 128 - g * lanes
+        for j in range(2):
+            off = (g * 2 * lanes + j * gl + l) * 32
+            payload[off:off + 32] = rows[r][34 * j + 2:34 * j + 34]
+            moff = (g * 2 * lanes + j * gl + l) * 2
             meta[moff:moff + 2] = rows[r][34 * j:34 * j + 2]
     return bytes(payload), bytes(meta)
 
@@ -1342,22 +1395,115 @@ def vbuild_sg1_k(group):
     return bytes(payload), bytes(meta)
 
 
-def vbuild_sg1_block_mask(blk):
+def vbuild_sg1_k_stream(rows, lanes=4):
+    """The whole-stream K images of ``rows`` canonical Q8_0 slot rows.
+
+    Every slot of one per-head stream packs into ``lanes``-row
+    interleave groups -- group-major, block within group, lane within
+    block -- so 16-row maintenance blocks concatenate cleanly only
+    where ``lanes`` divides 16 (the quad). ``rows`` is a whole number
+    of groups (pad the tail with zero rows); each row is
+    ``blocks * 34`` bytes.
+    """
+    blocks = len(rows[0]) // 34
+    assert len(rows) % lanes == 0
+    payload = bytearray()
+    meta = bytearray()
+    for group in range(len(rows) // lanes):
+        for j in range(blocks):
+            for lane in range(lanes):
+                blk = rows[group * lanes + lane]
+                payload += blk[34 * j + 2:34 * j + 34]
+                meta += blk[34 * j:34 * j + 2]
+    return bytes(payload), bytes(meta)
+
+
+def _k_window_geo(blocks, nq, p0, lanes):
+    """(first group, groups, cells, meta first beat, meta beats)."""
+    g0 = p0 // lanes
+    ng = (p0 % lanes + nq - 1) // lanes + 1
+    cells = ng * blocks * lanes
+    first = (g0 * blocks * lanes * 2) // 64
+    mb = ((g0 * blocks * lanes * 2 - first * 64) + cells * 2 + 63) // 64
+    return g0, ng, cells, first, mb
+
+
+def vbuild_sg1_k_window_slice(pay0, met0, blocks, nq, p0, lanes=4):
+    """The staging slices a K window run pre-reads: the window's
+    payload beats and beat-aligned meta beats of the prior stream
+    images (``blocks`` Q8_0 blocks per slot row). The host LOADs
+    exactly these before the descriptor."""
+    g0, ng, cells, first, mb = _k_window_geo(blocks, nq, p0, lanes)
+    pay = pay0[g0 * blocks * lanes * 32:(g0 + ng) * blocks * lanes * 32]
+    met = met0[first * 64:first * 64 + mb * 64]
+    return pay, met
+
+
+def vbuild_sg1_k_window(pay0, met0, rows, p0, lanes=4):
+    """One K window run's staging images and rewrite masks (non-quad).
+
+    A K mode of a non-quad build (``rows`` 16/17/20) stages the whole
+    interleave window its rebuilt rows touch: every ``lanes``-row
+    group containing one of them. ``pay0``/``met0`` are the per-head
+    stream images before the run (whole groups); ``rows`` the run's
+    rebuilt canonical slot rows in stream order (dead rows are zero
+    rows); ``p0`` the stream slot of the first. Returns ``(pay, met,
+    mpay, mmet)``: the staging payload beats (``r_base``) and meta
+    beats (``m_base``) the run leaves -- the window's slice of the
+    stream with the rebuilt cells replaced, every other byte the
+    pre-read prior image -- and the byte masks of the cells it
+    rewrote. The meta window is the beat-aligned slice of the stream
+    meta holding the window's 2-B cells, so its first cell can sit
+    anywhere inside its beat (the hardware takes that offset from the
+    first group's index mod 16).
+    """
+    blocks = len(rows[0]) // 34
+    nq = len(rows)
+    assert nq in (16, 2, 1) and blocks in (2, 4)
+    assert len(pay0) % (blocks * lanes * 32) == 0
+    assert (p0 + nq - 1) // lanes < len(pay0) // (blocks * lanes * 32)
+    g0, ng, cells, first, mb = _k_window_geo(blocks, nq, p0, lanes)
+    pay = bytearray(pay0[g0 * blocks * lanes * 32:(g0 + ng) * blocks * lanes *
+                         32])
+    met = bytearray(met0[first * 64:first * 64 + mb * 64])
+    assert len(met) == mb * 64
+    mpay = bytearray(len(pay))
+    mmet = bytearray(len(met))
+    for i, blk in enumerate(rows):
+        for j in range(blocks):
+            g, l = divmod(p0 + i, lanes)
+            c = g * blocks * lanes + j * lanes + l
+            po = (c - g0 * blocks * lanes) * 32
+            pay[po:po + 32] = blk[34 * j + 2:34 * j + 34]
+            mpay[po:po + 32] = b'\x01' * 32
+            mo = c * 2 - first * 64
+            met[mo:mo + 2] = blk[34 * j:34 * j + 2]
+            mmet[mo:mo + 2] = b'\x01\x01'
+    return bytes(pay), bytes(met), bytes(mpay), bytes(mmet)
+
+
+def vbuild_sg1_block_mask(blk, lanes=4):
     """Byte masks of one V block's SG1 staging extents (P2d-a).
 
     Marks, over the 4096-B payload and 256-B meta images, exactly the
-    bytes a partial run (descriptor ``rows`` 1/2) writes: block
-    ``blk``'s 32 quant bytes per row at the natural chunk offsets and
-    its per-row d16 halfword cells. The unmarked extents are the
-    host-loaded previous build's bytes and are never written."""
+    cells a partial run (descriptor ``rows`` 1/2) rebuilds: block
+    ``blk``'s chunk and d16 cell per row, at their interleave offsets
+    over ``lanes``-row groups (the consuming engine's ``n_outputs``).
+    At an odd group width the boundary beat straddles the blocks: the
+    run writes that whole beat, but its retained half carries the
+    pre-read previous build's bytes, so the mask marks only the
+    rebuilt cells -- exactly the extents that take the reference's
+    values. The unmarked extents are the host-loaded previous build's
+    bytes and are never rebuilt."""
     assert blk in (0, 1)
     pay = bytearray(64 * 64)
     met = bytearray(64 * 4)
     for r in range(64):
-        off = ((r >> 2) * 8 + blk * 4 + (r & 3)) * 32
-        pay[off:off + 32] = b'\x01' * 32
-        moff = (r >> 2) * 16 + blk * 8 + (r & 3) * 2
-        met[moff:moff + 2] = b'\x01\x01'
+        g, l = divmod(r, lanes)
+        gl = lanes if (g + 1) * lanes <= 64 else 64 - g * lanes
+        c = g * 2 * lanes + blk * gl + l
+        pay[32 * c:32 * c + 32] = b'\x01' * 32
+        met[2 * c:2 * c + 2] = b'\x01\x01'
     return bytes(pay), bytes(met)
 
 
@@ -1457,7 +1603,7 @@ def vbuild_pfold_bits(p_bits, d16):
     return fp32_mul_bits(p_bits, f32_bits(fp16_to_f32(d16)))
 
 
-def vbuild_sg1_append(slot, blk, p, pay0, srow0):
+def vbuild_sg1_append(slot, blk, p, pay0, srow0, lanes=4):
     """The composed staging images of one append run (rows 18/19).
 
     ``pay0``/``srow0`` are the host-loaded prior images (the dims*64-B
@@ -1475,7 +1621,9 @@ def vbuild_sg1_append(slot, blk, p, pay0, srow0):
     for the window's whole lifetime (A-keep reader).
 
     The slot is 64 or 128 patterns (the appended token's dims); the
-    payload image is dims*64 bytes either way.
+    payload image is dims*64 bytes either way. ``lanes`` is the
+    consuming engine's n_outputs (the frozen quad at the default):
+    each dim row's chunk sits at its ``lanes``-row interleave cell.
     """
     dims = len(slot)
     assert dims in (64, 128)
@@ -1485,7 +1633,7 @@ def vbuild_sg1_append(slot, blk, p, pay0, srow0):
     pay = bytearray(pay0)
     srow = bytearray(srow0)
     for d in range(dims):
-        off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32 + p
+        off = vbuild_sg1_cell(d, blk, lanes, dims) * 32 + p
         pay[off] = row[34 * (d >> 5) + 2 + (d & 31)]
     d16 = int.from_bytes(row[0:2], 'little')
     wo = 4 * (blk * 32 + p)
@@ -1493,7 +1641,7 @@ def vbuild_sg1_append(slot, blk, p, pay0, srow0):
     return bytes(pay), bytes(srow)
 
 
-def vbuild_sg1_append_mask(blk, p, dims=64):
+def vbuild_sg1_append_mask(blk, p, dims=64, lanes=4):
     """Byte masks of one append run's staging writes: block ``blk``'s
     chunk byte ``p`` per dim row (payload) and the scale row's word
     ``blk*32 + p``. The unmarked extents are the host-loaded previous
@@ -1502,7 +1650,7 @@ def vbuild_sg1_append_mask(blk, p, dims=64):
     pay = bytearray(dims * 64)
     srow = bytearray(64 * 4)
     for d in range(dims):
-        off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32 + p
+        off = vbuild_sg1_cell(d, blk, lanes, dims) * 32 + p
         pay[off] = 1
     wo = 4 * (blk * 32 + p)
     srow[wo] = 1
@@ -1510,6 +1658,14 @@ def vbuild_sg1_append_mask(blk, p, dims=64):
     srow[wo + 2] = 1
     srow[wo + 3] = 1
     return bytes(pay), bytes(srow)
+
+
+def vbuild_sg1_append_beats(blk, dims=64, lanes=4):
+    """The payload beats a V append composes on a non-quad build: the
+    distinct beats holding the block's cells, in image order."""
+    return sorted(
+        {vbuild_sg1_cell(d, blk, lanes, dims) >> 1
+         for d in range(dims)})
 
 
 def vbuild_sg1_k_append(slot, k, pay0, met0):
@@ -1644,26 +1800,6 @@ def _vbuild_block_state(seg):
     return best, d16, r, qs
 
 
-def vbuild_sg1_wide(window):
-    """The wide (128-dim) V tile's SG1 images -- the temporal
-    full-rebuild reference. ``window`` is the 64-slot slot-major image
-    (slots at or above the live count already zero)."""
-    assert len(window) == 64 * 128
-    rows = [
-        vbuild_quant_row([window[j * 128 + d] for j in range(64)])
-        for d in range(128)
-    ]
-    payload = bytearray(128 * 64)
-    meta = bytearray(128 * 4)
-    for r in range(128):
-        for j in range(2):
-            off = ((r >> 2) * 8 + j * 4 + (r & 3)) * 32
-            payload[off:off + 32] = rows[r][34 * j + 2:34 * j + 34]
-            moff = (r >> 4) * 64 + ((r >> 2) & 3) * 16 + j * 8 + (r & 3) * 2
-            meta[moff:moff + 2] = rows[r][34 * j:34 * j + 2]
-    return bytes(payload), bytes(meta)
-
-
 def vbuild_sg1_k4_state(window, k):
     """The open block's state image (128 x 8 B) after the temporal
     rebuild at live prefix ``k`` -- pattern | reserved | r per row."""
@@ -1678,7 +1814,17 @@ def vbuild_sg1_k4_state(window, k):
     return bytes(st)
 
 
-def vbuild_sg1_k4_append(window, k, pay0, met0, st0, heal=False):
+def vbuild_sg1_cell(row, blk, lanes=4, rows=128):
+    """The staging cell index of tile row ``row``'s block ``blk`` in a
+    row-interleaved SG1 image of ``lanes``-row groups over ``rows``
+    rows (group-major, block within group, lane within block; the
+    final group drops its missing lanes)."""
+    group, lane = divmod(row, lanes)
+    gl = lanes if (group + 1) * lanes <= rows else rows - group * lanes
+    return group * 2 * lanes + blk * gl + lane
+
+
+def vbuild_sg1_k4_append(window, k, pay0, met0, st0, heal=False, lanes=4):
     """One K4 selective append's composed staging images (rows 3|WIDE).
 
     ``window`` is the full 64-slot pool image (the open block's live
@@ -1688,7 +1834,10 @@ def vbuild_sg1_k4_append(window, k, pay0, met0, st0, heal=False):
     retained exact pattern strictly rises (or every row under heal)
     re-quantize through the frozen per-block sequence -- chunk, d16
     cell and state row all rewritten; every other row writes only its
-    new column byte quantized under the state's stored r bits."""
+    new column byte quantized under the state's stored r bits.
+    ``lanes`` is the consuming engine's n_outputs (the frozen quad at
+    the default): the cells sit at the five-lane interleave on a
+    non-quad build, the state image being row-indexed either way."""
     assert len(window) == 64 * 128
     assert len(pay0) == 128 * 64 and len(met0) == 128 * 4
     assert len(st0) == 128 * 8
@@ -1701,12 +1850,13 @@ def vbuild_sg1_k4_append(window, k, pay0, met0, st0, heal=False):
         mag = xh & 0x7FFF
         pat = int.from_bytes(st0[d * 8:d * 8 + 2], 'little')
         r = int.from_bytes(st0[d * 8 + 4:d * 8 + 8], 'little')
+        cell = vbuild_sg1_cell(d, blk, lanes)
         if heal or (mag < 0x7C01 and mag > pat):
             seg = [window[(32 * blk + j) * 128 + d] for j in range(e)]
             npat, d16, nr, qs = _vbuild_block_state(seg)
-            off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32
+            off = cell * 32
             pay[off:off + 32] = bytes(qs) + bytes(32 - e)
-            moff = ((d >> 4) * 32 + ((d >> 2) & 3) * 8 + blk * 4 + (d & 3)) * 2
+            moff = cell * 2
             met[moff:moff + 2] = d16.to_bytes(2, 'little')
             st[d * 8:d * 8 + 2] = npat.to_bytes(2, 'little')
             st[d * 8 + 4:d * 8 + 8] = nr.to_bytes(4, 'little')
@@ -1714,6 +1864,6 @@ def vbuild_sg1_k4_append(window, k, pay0, met0, st0, heal=False):
             q = q8_rne_bits(
                 fp32_mul_bits(fp32_mul_bits(f32_bits(fp16_to_f32(xh)), r),
                               F127_BITS))
-            off = ((d >> 2) * 8 + blk * 4 + (d & 3)) * 32 + pos
+            off = cell * 32 + pos
             pay[off] = q
     return bytes(pay), bytes(met), bytes(st)

@@ -69,13 +69,18 @@ from troom.abi import (
     CAPS_VBUILD_VAPP,
     CAPS_VBUILD_K4,
     CAPS_VB_COUNTERS,
+    CAPS_MM_STARVATION,
+    CAPS_SG1_STRIPED,
+    CAPS_VEC_NORM_QUANT_ACT,
+    MM_STARVATION_COUNTERS,
+    REG_MM_STARVATION,
+    REG_MM_STARVATION_END,
     CAPS_VEC_QUANT_ACT,
     CAPS_VEC_MUL_QUANT_ACT,
-    CAPS_VEC_NORM_QUANT_ACT,
-    CAPS_VEC_SILU_GLU,
     CAPS_VEC_F16,
     CAPS_VEC_PSWAP,
     CAPS_VEC_SILU,
+    CAPS_VEC_SILU_GLU,
     CAPS_VEC_SMEXP,
     CAPS_WATCHDOG,
     CMD_DESC_BYTES,
@@ -172,7 +177,13 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
         fall inside. Defaults admit the whole 32-bit space.
     """
 
-    def __init__(self, params, *, mem_base=0, mem_size=None, name=None):
+    def __init__(self,
+                 params,
+                 *,
+                 mem_base=0,
+                 mem_size=None,
+                 sg1_striped=False,
+                 name=None):
         HasTRoomParams.__init__(self, params)
         Peripheral.__init__(self, name=name)
 
@@ -184,6 +195,7 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
             raise ValueError(
                 f'memory window [{mem_base:#x}, {mem_base + mem_size:#x}) '
                 f'exceeds the {self.addr_width}-bit address space')
+        self.sg1_striped = sg1_striped
         self.mem_base = mem_base
         self.mem_size = mem_size
 
@@ -261,7 +273,21 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
             ('vb_zero_blocks', 48, Direction.FANOUT),
         ])
 
+        if self.mm_starvation_counters:
+            self.mm_diag_i = {
+                name: Signal(48, name=f'mm_diag_{name}')
+                for name in MM_STARVATION_COUNTERS
+            }
         bank = self.csr_bank()
+        if self.mm_starvation_counters:
+            self._snap_mm_diag = {
+                name:
+                bank.csr(64,
+                         'r',
+                         addr=REG_MM_STARVATION + 8 * index,
+                         name=f'mm_diag_{name}')
+                for index, name in enumerate(MM_STARVATION_COUNTERS)
+            }
         self._id = bank.csr(32, 'r', addr=REG_ID, name='id')
         self._abi_version = bank.csr(32,
                                      'r',
@@ -465,34 +491,41 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
         m.d.comb += [
             self._id.r_data.eq(TROOM_ID),
             self._abi_version.r_data.eq(TROOM_ABI_VERSION),
-            self._caps.r_data.eq(
-                (1 << CAPS_FMT0) | (1 << CAPS_WATCHDOG)
-                | (1 << CAPS_ENGINE_COUNTERS)
-                | (1 << CAPS_MM_EPI_COUNTERS)
-                | (1 << CAPS_SGEMV)
-                | (1 << CAPS_VBUILD)
-                | (1 << CAPS_VBUILD_SG1)
-                | (1 << CAPS_VBUILD_K)
-                | (1 << CAPS_VEC_F16)
-                | (1 << CAPS_VEC_PSWAP)
-                | (1 << CAPS_PARAM_PAGE)
-                | (1 << CAPS_VEC_SILU)
-                | (1 << CAPS_VEC_SMEXP)
-                | (1 << CAPS_VBUILD_PART)
-                | Mux(self.vbuild_native_append, 1 << CAPS_VBUILD_VAPP, 0)
-                | Mux(self.vbuild_native_append, 1 << CAPS_VBUILD_DAPP, 0)
-                | Mux(self.vbuild_k4_selective, 1 << CAPS_VBUILD_K4, 0)
-                | Mux(self.act_max_k >= 4096, 1 << CAPS_ACT_K4096, 0)
-                | Mux(self.vbuild_max_head_dim == 128, 1 << CAPS_VBUILD_HD128,
-                      0)
-                | Mux(self.act_banks == 2, 1 << CAPS_ACT_BANK, 0)
-                | Mux(self.tmem_clusters == 2, 1 << CAPS_TMEM_SPLIT, 0)
-                | (1 << CAPS_VB_COUNTERS)
-                | (1 << CAPS_VEC_QUANT_ACT)
-                | (1 << CAPS_VEC_MUL_QUANT_ACT)
-                | Mux(self.vec_quant_pipe and self.vec_mul_units >= 4,
-                      1 << CAPS_VEC_NORM_QUANT_ACT, 0)
-                | (1 << CAPS_VEC_SILU_GLU)),
+            self._caps.r_data.
+            eq((1 << CAPS_FMT0) | (1 << CAPS_WATCHDOG)
+               | (1 << CAPS_ENGINE_COUNTERS)
+               | (1 << CAPS_MM_EPI_COUNTERS)
+               | (1 << CAPS_SGEMV)
+               | (1 << CAPS_VBUILD)
+               | (1 << CAPS_VBUILD_SG1)
+               # Every VBUILD mode stages at the consuming engine's
+               # n_outputs-row interleave on any build (the K modes
+               # through the rows-bit lane-offset field), so the K
+               # orientation is advertised at every lane count.
+               | (1 << CAPS_VBUILD_K)
+               | (1 << CAPS_VEC_F16)
+               | (1 << CAPS_VEC_PSWAP)
+               | (1 << CAPS_PARAM_PAGE)
+               | (1 << CAPS_VEC_SILU)
+               | (1 << CAPS_VEC_SMEXP)
+               | (1 << CAPS_VBUILD_PART)
+               | Mux(self.vbuild_native_append, 1 << CAPS_VBUILD_VAPP, 0)
+               | Mux(self.vbuild_native_append, 1 << CAPS_VBUILD_DAPP, 0)
+               | Mux(self.vbuild_k4_selective, 1 << CAPS_VBUILD_K4, 0)
+               | Mux(self.act_max_k >= 4096, 1 << CAPS_ACT_K4096, 0)
+               | Mux(self.vbuild_max_head_dim == 128, 1 << CAPS_VBUILD_HD128,
+                     0)
+               | Mux(self.act_banks == 2, 1 << CAPS_ACT_BANK, 0)
+               | Mux(self.tmem_clusters == 2, 1 << CAPS_TMEM_SPLIT, 0)
+               | (1 << CAPS_VB_COUNTERS)
+               | (int(self.mm_starvation_counters) << CAPS_MM_STARVATION)
+               | (int(self.sg1_striped) << CAPS_SG1_STRIPED)
+               # Bit 27 is reserved for the experimental PV prefetch image.
+               | (1 << CAPS_VEC_QUANT_ACT)
+               | (1 << CAPS_VEC_MUL_QUANT_ACT)
+               | Mux(self.vec_quant_pipe and self.vec_mul_units >= 4,
+                     1 << CAPS_VEC_NORM_QUANT_ACT, 0)
+               | (1 << CAPS_VEC_SILU_GLU)),
             self._mem_base.r_data.eq(self.mem_base),
             self._mem_size.r_data.eq(self.mem_size),
             self._beat_bytes.r_data.eq(self.beat_bytes),
@@ -769,6 +802,9 @@ class TroomController(HasTRoomParams, Peripheral, Elaboratable):
                  'vb_dispatch_cycles', 'vb_dead_blocks', 'vb_zero_blocks')):
                 m.d.sync += csr.r_data.eq(self.counters_i[field])
 
+            if self.mm_starvation_counters:
+                for name, csr in self._snap_mm_diag.items():
+                    m.d.sync += csr.r_data.eq(self.mm_diag_i[name])
         m.d.comb += self.abort.eq(run_active & fatal_sticky)
 
         return m
@@ -783,8 +819,9 @@ class TroomAXILiteBridge(Elaboratable):
     """
 
     def __init__(self, axil, ctrl, *, base_addr=0):
-        if (base_addr < 0 or base_addr % 4
-                or base_addr + REG_PARAM_BASE + 4 > 2**32):
+        if (base_addr < 0 or base_addr % 4 or base_addr +
+            (REG_MM_STARVATION_END if ctrl.mm_starvation_counters else
+             REG_VB_ZERO_BLOCKS + 8) > 2**32):
             raise ValueError('MMIO window must be aligned and fit in 32 bits')
         self.axil = axil
         self.ctrl = ctrl
@@ -860,6 +897,10 @@ class TroomAXILiteBridge(Elaboratable):
 
         write_ok = mapped(aw_addr, writable)
         read_ok = mapped(ar_addr, readable)
+        if self.ctrl.mm_starvation_counters:
+            read_ok |= ((ar_addr >= self.base_addr + REG_MM_STARVATION)
+                        & (ar_addr < self.base_addr + REG_MM_STARVATION_END)
+                        & (ar_addr[:2] == 0))
         with m.FSM():
             with m.State('IDLE'):
                 with m.If(aw_pending & w_pending):

@@ -227,15 +227,111 @@ prefix given the state contract; the host maintains that state
 beside the payload/meta shadows and re-derives it via heal after any
 fallback rebuild (rewind/overwrite/grow), which themselves stay the
 installed chains.
+
+Non-quad staging (2026-11-25/26,
+plans/2026-11-23-troom-qwen3-breakthrough.md): a build whose
+``n_outputs`` is not 4 interleaves the SG1 staging in
+``n_outputs``-row groups -- the consuming stream engine's lane
+count -- instead of the frozen quad layout. The cell order itself is
+unchanged (group-major, block within group, lane within block; a
+short final group drops its missing lanes exactly like the on-wire
+pack), so the V images keep their sizes; only the group width moves.
+
+* V full and partial extents (rows 0, 1/2): payload beats pair
+  staging-consecutive chunks of the wider group. At an odd group
+  width the boundary beat between the row's two blocks straddles them
+  (block 0's last lane with block 1's lane 0), so the drain holds
+  block 1's lane-0 chunk for the group's span and composes that beat
+  at the group's last row; the meta beats (sixteen rows each) can
+  straddle group boundaries, so the d16 scatter alternates between two
+  beat accumulators. A partial run pre-reads its straddle beats and
+  composes the retained neighbor half from two parity-banked
+  registers.
+* The V append (rows 18/19) patches block ``blk``'s chunk byte p in
+  every dim row's cell: the drain walks the distinct beats holding
+  those cells (at five lanes 38 at 64 dims, 77 at 128), pre-reads each
+  and patches
+  the one or two of its rows in it -- a group's last even cell lands
+  alone in a straddle beat's low half and block 1's lane 0 in its
+  high half, each over the retained neighbor. The scale row stays
+  the four-beat F32 row.
+* K4 (rows 3|WIDE) composes the open block's beats from the same
+  cell positions: the block's payload slice is its beats in image
+  order (77 at five lanes: three per full group, two in the
+  three-lane tail), a row composes when its cell is a beat's high
+  half or sits alone in a straddle beat's low half, the pre-read banks
+  cycle by beat rank, and the meta cells follow the cell index. The
+  row-indexed state image is unchanged.
+* The K orientation (rows 16/17/20) differs in kind: the K image is
+  ONE per-head stream of slot rows, and at five lanes a maintenance
+  block's cells straddle the five-row groups (16 is not a multiple of
+  five), so a block cannot be staged on its own.
+  The descriptor's rows bits 5..11 therefore carry the lane offset of
+  the first rebuilt slot -- bits 5..7 its lane, bits 8..11 its group
+  index mod 16, which fixes the meta slice's beat alignment -- and
+  the run stages the whole interleave window its rows touch (four
+  groups for a block at five lanes, one or two for a pair or a token):
+  ``r_base``
+  and ``m_base`` name the window's payload beats and its beat-aligned
+  meta slice of the PRIOR stream image, which the host LOADs first.
+  The unit pre-reads them, lands its rows' cells (dead rows as zero
+  rows) and writes every beat back, the neighboring blocks' cells
+  riding the pre-read; the host STOREs the window to the image at
+  the same offsets. The stream is consumed in whole groups (its row
+  count a multiple of ``n_outputs``), so the layout is static. The
+  field must be zero on every other mode and on every quad build.
+
+The lane count enters as ``n_outputs`` throughout these drains. A build
+supports one through eight lanes (the K modes use a three-bit lane offset).
+
+What a build cannot reach it does not build (2026-11-27,
+plans/2026-11-23-troom-qwen3-breakthrough.md,
+results/troom-vbuild-congestion-20261127). The production image packed
+this unit into islands at 96-99% LUT density whose worst paths were
+control cones in front of wide register banks. Five rewrites, each an
+identity on every reachable state:
+
+* The append modes (rows 18/19 and the K append, row 20) are elaborated
+  only on a build that enables them (``vbuild_native_append``). A build
+  without native append rejects those descriptors at accept exactly as
+  before; its image has no APPW state, no append register and none of
+  the disabled drain's terms in the cones of the TMEM write port and the
+  meta accumulator. Synthesis cannot find this on its own -- the
+  parameter gates the accept, not the state machine -- so the image
+  carried the whole append datapath (about 3,900 LUTs out of context,
+  six of the accumulator's nine write sources) behind a state it never
+  entered.
+* The legacy drain's shift register ends with the row instead of the
+  padded row: above the first beat only the row's own bytes are ever
+  non-zero, because the padding loads zero and every shift moves zero
+  into the bits it vacates.
+* The gather and quant bank selectors do not carry the K4 walk's block.
+  A K4 run leaves FILL for K4ROW and visits neither GATHER, SCALE nor
+  QUANT; with the block in the selector, banks 2 and 3 (the heal and
+  wide-append banks) carried a gather decode they could never pass.
+* The K4 staging position -- group, lane, cell, compose role, beat rank
+  and meta beat of a tile row -- is a constant table over the open
+  block and the row. The arithmetic it replaces, a constant division,
+  two products and a subtraction in carry chains, was the head of the
+  unit's worst path, twenty logic levels from ``k4_land_row`` to the
+  meta accumulator.
+* The row pass's advance condition is what the general step rule reduces
+  to at the last slot -- the armed meta write, if any, fired -- instead
+  of the geometry that ``entry_v`` and ``entry_stall`` derive from the
+  lane position, and the row assembly clears one cycle after the row
+  pass (``rowclr``) rather than in its last cycle. Nothing writes the
+  assembly in the first cycle of GATHER, SCALE, KDRAIN or DONE, and no
+  path reads it there.
 """
 
 from amaranth import *
 from amaranth.hdl.rec import Direction, Record
 
 from room.consts import RoundingMode
-from room.fpu import FPFormat, FPUFMA, FPUOperator, FPURec
+from room.fpu import FPFormat, FPUOperator, FPURec
 
 from troom.consts import Status
+from troom.fpu import FPAdd32, FPMul32
 from troom.convert import Fp16Widen, Fp32To16
 from troom.types import HasTRoomParams
 from troom.vector import F127_BITS, INV127_BITS
@@ -316,6 +412,13 @@ class VBuildDesc(HasTRoomParams, Record):
     image (payload lanes and meta cells, pre-read composed, ``m_base``
     the K meta staging); every other nonzero ``rows`` is rejected at
     accept.
+
+    On a build whose ``n_outputs`` is not 4, the K modes (16/17/20)
+    read ``rows`` bits 5..11 as the lane offset of the first rebuilt
+    slot (bits 5..7 its lane, 8..11 its group index mod 16) and stage
+    the whole interleave window of that run (see the module
+    docstring); bits 12..14 stay reserved, and bits 5..14 must be
+    zero on every other mode and on every quad build.
     """
 
     def __init__(self, params, name=None, src_loc_at=0):
@@ -420,19 +523,27 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         slot_words = Signal.like(slot_words_value)
         m.d.comb += slot_words.eq(slot_words_value)
 
-        fmul_s = m.submodules.fmul_s = FPUFMA(32, FPFormat.S, latency=3)
-        fmul_q1 = m.submodules.fmul_q1 = FPUFMA(32, FPFormat.S, latency=3)
-        fmul_q2 = m.submodules.fmul_q2 = FPUFMA(32, FPFormat.S, latency=3)
-        fadd_s = m.submodules.fadd_s = FPUFMA(32, FPFormat.S, latency=3)
+        fmul_s = m.submodules.fmul_s = FPMul32()
+        fmul_q1 = m.submodules.fmul_q1 = FPMul32()
+        fmul_q2 = m.submodules.fmul_q2 = FPMul32()
+        fadd_s = m.submodules.fadd_s = FPAdd32()
         frec = m.submodules.frec = FPURec(32, FPFormat.S, latency=3)
         f16w = m.submodules.f16w = Fp16Widen()
         f16n = m.submodules.f16n = Fp32To16()
+        # The append modes (rows 18/19 and the K append, row 20) exist
+        # only on a build that enables them. A build without native
+        # append rejects those descriptors at accept (BAD_SHAPE, in the
+        # validation below), so none of their state, datapath or drain
+        # is elaborated there: the signals fold to constants and the
+        # FSM has no APPW state.
+        app_on = self.vbuild_native_append
         # P2d-b: the append's dedicated d16 widen (the token scale's
         # F32 row word). Not shared with f16w: the scale completion
         # issues it right where the quant stream's element widens are
         # about to start, and the shared unit's two-cycle pipeline
         # would collide at the QUANT entry.
-        f16wa = m.submodules.f16wa = Fp16Widen()
+        if app_on:
+            f16wa = m.submodules.f16wa = Fp16Widen()
         # D3b: the chain engine's dedicated widen. Not shared with
         # f16w (the element stream's unit): a chain's step-0 widen
         # issues the same cycle a cursor element may widen.
@@ -467,7 +578,19 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         offer_wide = (offer.rows[15] if len(offer.rows) > 15 else Const(0))
         offer_reserved = (offer.rows[16:].any()
                           if len(offer.rows) > 16 else Const(0))
-        offer_mode = offer.rows[:15]
+        # The mode code is rows bits 0..4. Bits 5..11 are the K
+        # staging lane offset (non-quad K modes only: the first rebuilt
+        # slot's lane and its group index mod 16) and bits 12..14 stay
+        # reserved; both must be zero everywhere else, exactly as the
+        # 15-bit code compare required before the field existed.
+        offer_code = offer.rows[:5]
+        offer_koff = (offer.rows[5:12] if len(offer.rows) > 5 else Const(0, 0))
+        offer_loff = (offer.rows[5:8] if len(offer.rows) >= 8 else Const(0, 3))
+        offer_g16 = (offer.rows[8:12] if len(offer.rows) >= 12 else Const(
+            0, 4))
+        offer_rsv = (offer.rows[12:15].any()
+                     if len(offer.rows) > 12 else Const(0))
+        nonquad = self.n_outputs != 4
         offer_dims_value = Mux(offer_wide, 128, 64)
         offer_dims = Signal.like(offer_dims_value)
         m.d.comb += offer_dims.eq(offer_dims_value)
@@ -478,27 +601,27 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # row-extent code (17) and the Q3c append code (20) share the
         # 16-row group geometry.
         offer_krow = Signal()
-        m.d.comb += offer_krow.eq((offer_mode == VB_K_ROWS) \
-            | (offer_mode == VB_ROWS_K_PART) \
-            | (offer_mode == VB_ROWS_K_APP))
+        m.d.comb += offer_krow.eq((offer_code == VB_K_ROWS) \
+            | (offer_code == VB_ROWS_K_PART) \
+            | (offer_code == VB_ROWS_K_APP))
         offer_vb0 = Signal()
-        m.d.comb += offer_vb0.eq(offer_mode == VB_ROWS_V_B0)
+        m.d.comb += offer_vb0.eq(offer_code == VB_ROWS_V_B0)
         offer_vb1 = Signal()
-        m.d.comb += offer_vb1.eq(offer_mode == VB_ROWS_V_B1)
+        m.d.comb += offer_vb1.eq(offer_code == VB_ROWS_V_B1)
         offer_kp = Signal()
-        m.d.comb += offer_kp.eq(offer_mode == VB_ROWS_K_PART)
+        m.d.comb += offer_kp.eq(offer_code == VB_ROWS_K_PART)
         offer_va0 = Signal()
-        m.d.comb += offer_va0.eq(offer_mode == VB_ROWS_V_APP0)
+        m.d.comb += offer_va0.eq(offer_code == VB_ROWS_V_APP0)
         offer_va1 = Signal()
-        m.d.comb += offer_va1.eq(offer_mode == VB_ROWS_V_APP1)
+        m.d.comb += offer_va1.eq(offer_code == VB_ROWS_V_APP1)
         offer_va = Signal()
         m.d.comb += offer_va.eq(offer_va0 | offer_va1)
         offer_ka = Signal()
-        m.d.comb += offer_ka.eq(offer_mode == VB_ROWS_K_APP)
+        m.d.comb += offer_ka.eq(offer_code == VB_ROWS_K_APP)
         offer_app = Signal()
         m.d.comb += offer_app.eq(offer_va | offer_ka)
         offer_k4 = Signal()
-        m.d.comb += offer_k4.eq(offer_mode == VB_ROWS_V_K4)
+        m.d.comb += offer_k4.eq(offer_code == VB_ROWS_V_K4)
         # K4's k field strips the heal bit for every live-count use;
         # the open block is the window's upper half past live 32.
         offer_k4_live = offer.k[:7]
@@ -516,13 +639,79 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                                Mux(offer_vb1, 2, Mux(offer_kp, 3, 0)))
         offer_part = Signal.like(offer_part_value)
         m.d.comb += offer_part.eq(offer_part_value)
-        # An append (either family) reads exactly one slot row.
-        a_end_o_value = Mux(offer_app, offer.a_base + offer_slot_bytes,
-                            offer.a_base + offer_live * offer_slot_bytes)
+        # An append (either family) reads exactly one slot row. Its
+        # extent is validated on a build that can accept one; elsewhere
+        # an append descriptor is rejected by shape_bad whatever this
+        # bound says.
+        a_end_o_value = offer.a_base + offer_live * offer_slot_bytes
+        if app_on:
+            a_end_o_value = Mux(offer_app, offer.a_base + offer_slot_bytes,
+                                a_end_o_value)
         a_end_o = Signal.like(a_end_o_value)
         m.d.comb += a_end_o.eq(a_end_o_value)
+        # ---- non-quad K staging window (offer-time geometry) ----
+        # A K run on a non-quad build stages the WHOLE interleave
+        # window its rebuilt rows touch -- every n_outputs-row group
+        # containing one of them -- at r_base (payload, whole 64-B
+        # beats) and m_base (meta, the window's beat-aligned slice of
+        # the stream meta). The window is `cells` cells wide, a cell
+        # being one slot's 32-B chunk (or 2-B d16) of one block; the
+        # meta cell index is the payload cell index. `mhwoff` is the
+        # first cell's halfword offset inside its beat, fixed by the
+        # first group's index mod 16 because a period of 16 groups
+        # spans a whole number of beats (16 * blocks * lanes * 2 B is
+        # a multiple of 64: blocks * lanes is even).
+        _kwin_max_cells = 0
+        _kwin_mb_max = 1
+        if nonquad:
+            _L = self.n_outputs
+            _knb = (2, max_blocks)
+
+            def _kwin_cells(nq, wide, loff):
+                ng = (loff + nq - 1) // _L + 1
+                return ng * _knb[wide] * _L
+
+            _kwin_max_cells = max(
+                _kwin_cells(16, _w, lo) for _w in (0, 1) for lo in range(_L))
+            for _w in (0, 1):
+                for loff in range(_L):
+                    for nq in (16, 2, 1):
+                        cells = _kwin_cells(nq, _w, loff)
+                        for g in range(16):
+                            mhwoff = ((g * _knb[_w] * _L * 2) % 64) // 2
+                            _kwin_mb_max = max(_kwin_mb_max,
+                                               (mhwoff + cells + 31) // 32)
+        kcells_o = Const(0, 8)
+        kmhw_o = Const(0, 6)
+        if nonquad:
+            kcells_o = Signal(range(_kwin_max_cells + 1))
+            with m.Switch(Cat(offer_loff, offer_wide, offer_kp, offer_ka)):
+                for loff in range(_L):
+                    for _wide in (0, 1):
+                        for kp, ka in ((0, 0), (1, 0), (0, 1)):
+                            nq = 2 if kp else (1 if ka else 16)
+                            with m.Case(loff | (_wide << 3) | (kp << 4)
+                                        | (ka << 5)):
+                                m.d.comb += kcells_o.eq(
+                                    _kwin_cells(nq, _wide, loff))
+                with m.Default():
+                    m.d.comb += kcells_o.eq(0)
+            kmhw_o = Signal(6)
+            with m.Switch(Cat(offer_g16, offer_wide)):
+                for _wide in (0, 1):
+                    for g in range(16):
+                        with m.Case(g | (_wide << 4)):
+                            m.d.comb += kmhw_o.eq(
+                                ((g * _knb[_wide] * _L * 2) % 64) // 2)
+                with m.Default():
+                    m.d.comb += kmhw_o.eq(0)
+        # The window's payload and meta beat counts.
+        kpb_o = (kcells_o >> 1)
+        kmb_o = ((kmhw_o + kcells_o + 31) >> 5)[:5]
         r_end_o_value = Mux(
-            offer_krow, offer.r_base + VB_K_ROWS * offer_dims,
+            offer_krow,
+            Mux(Const(nonquad), offer.r_base + (kpb_o << 6),
+                offer.r_base + VB_K_ROWS * offer_dims),
             Mux(offer_sg1, offer.r_base + offer_dims * 64,
                 offer.r_base + offer_dims * self.row_pad))
         r_end_o = Signal.like(r_end_o_value)
@@ -533,17 +722,35 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # K4 append's names the meta staging with the open block's
         # state image at m_base + dims*4 (the range grows by dims*8).
         m_end_o_value = Mux(
-            offer_va, offer.m_base + VB_SG1_SROW,
+            offer_k4, offer.m_base + offer_dims * 4 + offer_dims * 8,
             Mux(
-                offer_k4, offer.m_base + offer_dims * 4 + offer_dims * 8,
-                Mux(offer_krow, offer.m_base + VB_K_ROWS * (offer_dims >> 4),
-                    offer.m_base + offer_dims * 4)))
+                offer_krow,
+                Mux(Const(nonquad), offer.m_base + (kmb_o << 6),
+                    offer.m_base + VB_K_ROWS * (offer_dims >> 4)),
+                offer.m_base + offer_dims * 4))
+        if app_on:
+            m_end_o_value = Mux(offer_va, offer.m_base + VB_SG1_SROW,
+                                m_end_o_value)
         m_end_o = Signal.like(m_end_o_value)
         m.d.comb += m_end_o.eq(m_end_o_value)
+        # The lane-offset field is only meaningful on a K mode of a
+        # non-quad build: anywhere else, and the reserved bits
+        # everywhere, must read zero.
+        koff_bad = Signal()
+        m.d.comb += koff_bad.eq((((offer_koff != 0) | offer_rsv)
+                                 & Mux(offer_krow, Const(not nonquad), 1))
+                                | (offer_krow & Const(nonquad)
+                                   & (offer_rsv |
+                                      (offer_loff >= self.n_outputs)
+                                      | Const(len(offer.rows) < 12))))
         shape_bad = Signal()
-        m.d.comb += shape_bad.eq(offer_reserved | ((offer_mode != 0) & ~offer_krow & ~offer_vb0
+        # Every mode is accepted at every lane count (the non-quad builds
+        # carry their own drains); on a non-quad build the K modes'
+        # lane-offset field is checked by koff_bad above.
+        m.d.comb += shape_bad.eq(offer_reserved | ((offer_code != 0) & ~offer_krow & ~offer_vb0
                      & ~offer_vb1 & ~offer_kp & ~offer_va & ~offer_ka
                      & ~offer_k4) \
+            | koff_bad \
             | Mux(offer_krow,
                   ~offer_sg1 | (offer.k > VB_K_ROWS),
                   (offer_live == 0) | (offer_live > VB_SLOTS)) \
@@ -595,15 +802,66 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         m.d.comb += part_blk.eq(part == 2)
         part_k = Signal()
         m.d.comb += part_k.eq(part == 3)
-        vapp = Signal()  # append mode: one slot under the token scale
-        kapp = Signal()  # Q3c K append: one token into its group image
-        app_blk = Signal()  # the appended-to open block
+        # Generalized staging position (n_outputs != 4 builds only): the
+        # row's interleave group and lane within it, latched beside
+        # `row` and advanced with it so the staging index formulas read
+        # registers instead of dividing by the group width. The meta
+        # beat walks and the armed write live here too (not inside the
+        # 64-byte-beat block) so the IDLE reset can reach them at any
+        # beat width; below the deployed beat they are dead state.
+        if self.n_outputs != 4:
+            _lanes = self.n_outputs
+            sgrp = Signal(range(max_dims // _lanes + 1))
+            slane = Signal(range(_lanes))
+            _mb = max_dims * 2 // 32  # meta beats of the widest tile
+            mbeat0 = Signal(range(_mb + 1))
+            mbeat1 = Signal(range(_mb + 1))
+            mwr_v = Signal()
+            mwr_beat = Signal(range(_mb))
+            strret_v = Signal(2)
+            # The K staging window (non-quad K modes): the payload
+            # store holds the window's whole 64-B beats -- one 32-B
+            # cell per half, written by the 256-bit enable lane -- so
+            # a rebuilt row's chunk is a whole-half store write and
+            # the retained neighbours ride the pre-read. The meta
+            # window is small enough for register banks (one per
+            # beat, halfword cells). kloff/kpb/kmb/kmhw are the
+            # run-constant geometry latched at accept; kpp/kpm walk
+            # the pre-read, kpj a row's block patches, kdb the drain.
+            _kwin_depth = _kwin_max_cells // 2
+            kwin = Memory(width=self.data_width,
+                          depth=_kwin_depth,
+                          name='kwin')
+            m.submodules.kwin_w = kwin_w = kwin.write_port(
+                granularity=max(1, self.data_width // 2))
+            m.submodules.kwin_r = kwin_r = kwin.read_port(transparent=False)
+            kloff = Signal(3)
+            kpb = Signal(range(_kwin_depth + 1))
+            kmb = Signal(range(_kwin_mb_max + 1))
+            kmhw = Signal(6)
+            kpp = Signal.like(kpb)
+            kpm = Signal.like(kmb)
+            kpre_idx = Signal(range(_kwin_depth))
+            kpj = Signal(2)
+            kdb = Signal(range(_kwin_depth + _kwin_mb_max + 1))
+            kdb_d = Signal.like(kdb)
+            metab = Array(
+                Array(Signal(16, name=f'mkb{b}_{i}') for i in range(32))
+                for b in range(_kwin_mb_max))
+        # Append-mode state is build-conditional (see app_on): constants
+        # on a build without native append.
+        vapp = Signal() if app_on else Const(
+            0)  # append: one slot, token scale
+        kapp = Signal() if app_on else Const(0)  # Q3c K append: one token
+        app_blk = Signal()  # the appended-to open block (K4 shares it)
         app_pos = Signal(5)  # the slot's position inside that block
-        app_w = Signal(7)  # append drain beat: V payload/srow or K/meta
-        app_ph = Signal()  # beat latched, write pending
-        app_rd = Signal()  # a beat pre-read is outstanding
-        app_d32 = Signal(32)  # the widened token d16 (the row's patch word)
-        kr = Signal(4)  # a K append's token index k-1 inside the group
+        app_w = Signal(7) if app_on else Const(0, 7)  # append drain beat
+        app_ph = Signal() if app_on else Const(
+            0)  # beat latched, write pending
+        app_rd = Signal() if app_on else Const(
+            0)  # a beat pre-read outstanding
+        app_d32 = Signal(32) if app_on else Const(0, 32)  # widened token d16
+        kr = Signal(4) if app_on else Const(0, 4)  # K append's token index k-1
         # K4 selective requant (rows 3): latched mode state.
         k4 = Signal()  # this run is a K4 selective append
         k4_heal = Signal()  # requantize every row, rewrite the state
@@ -728,7 +986,16 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # meta beat g+1 likewise).
         k4st_next = Signal(5)  # 0..16 (16 = every state beat requested)
         k4met_next = Signal(4)  # 0..8 (8 = every meta beat requested)
-        k4pay_next = Signal(7)  # 0..64
+        # The open block's payload slice holds `_k4pos`'s beats in image
+        # order: 64 on the quad, 77 at five lanes, 128 at one lane, so the
+        # payload cursor is sized by the slice (see _k4pos for the layout)
+        # and never narrower than the quad's.
+        _k4groups = max_dims // self.n_outputs
+        _k4tail = max_dims - _k4groups * self.n_outputs
+        _k4bpg = (self.n_outputs + 1) // 2
+        _k4tbg = (_k4tail + 1) // 2
+        K4_PAY_BEATS = _k4groups * _k4bpg + _k4tbg
+        k4pay_next = Signal(range(max(65, K4_PAY_BEATS + 1)))
         k4st_rq = Signal()
         k4met_rq = Signal()
         k4met_v = Signal()  # a meta beat is latched in meta_hw
@@ -737,8 +1004,12 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # pairs in flight, so a bank's previous occupant has always
         # composed before its next response lands.
         k4pay_v = Signal(4)
-        k4pay_beat = Array(
-            Signal(self.data_width, name=f'k4pay{i}') for i in range(4))
+        k4pay_store = Memory(width=self.data_width,
+                             depth=4,
+                             attrs={'ram_style': 'distributed'})
+        m.submodules.k4pay_read = k4pay_read = k4pay_store.read_port(
+            domain='comb')
+        m.submodules.k4pay_write = k4pay_write = k4pay_store.write_port()
         # Pair-beat compose results (assigned inside the SG1 staging
         # block where the row assembly is visible).
         k4_even_res = Signal(8 * 32)
@@ -776,12 +1047,23 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         in_quant = Signal()
         in_drain = Signal()
         in_sg1w = Signal()  # SG1 staging beat writes
-        in_appw = Signal()  # append-mode patch drain
+        in_appw = (Signal() if app_on else Const(0))  # append patch drain
         in_drainload = Signal()  # row dispatch / pre-read hold
         in_k4row = Signal()  # K4 walk: dispatch / compare / quick issue
+        # The non-quad K staging window: pre-read of the window's
+        # payload and meta beats, a rebuilt row's block patches into
+        # the store, and the store's write-back. A quad build has no
+        # window, so its indicators never leave zero.
+        in_kpre = Const(0)
+        in_kpatch = Const(0)
+        in_kdrain = Const(0)
+        if nonquad:
+            in_kpre = Signal()
+            in_kpatch = Signal()
+            in_kdrain = Signal()
         running = Signal()
         m.d.comb += running.eq(in_fill | in_gather | in_scale | in_quant | in_drain \
-            | in_sg1w | in_appw | in_k4row)
+            | in_sg1w | in_appw | in_k4row | in_kpre | in_kpatch | in_kdrain)
 
         # ------------------------------------------------------------------
         # Fill: one outstanding TMEM read at a time; each returned
@@ -924,12 +1206,15 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         hh_mag = Signal(16)
         cur_bank = Signal()
         # A V append banks its gather segments by block index; every
-        # other mode alternates the two banks per block/row. A K4
-        # risen row gathers the open block like a partial row.
-        gbank_value = Mux(vapp | k4, blk, cur_bank)
+        # other mode alternates the two banks per block/row. A K4 run
+        # never gets here: it leaves FILL for K4ROW and visits neither
+        # GATHER, SCALE nor QUANT, so the walk's block is not a selector.
+        # (With it, banks 2 and 3 -- the heal and wide-append banks --
+        # carried a gather decode they could never pass.)
+        gbank_value = Mux(vapp, blk, cur_bank)
         gbank = Signal.like(gbank_value)
         m.d.comb += gbank.eq(gbank_value)
-        qbank_value = Mux(vapp | k4, blk, cur_bank)
+        qbank_value = Mux(vapp, blk, cur_bank)
         qbank = Signal.like(qbank_value)
         m.d.comb += qbank.eq(qbank_value)
 
@@ -945,7 +1230,12 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
 
         # The last output row: dim 63 (V) or slot 15 (K); a K append
         # builds exactly one row.
-        last_row_value = Mux(kapp, 0, Mux(krow, VB_K_ROWS - 1, dims - 1))
+        # A non-quad K window run rebuilds 16 rows (the full
+        # orientation), the two rows of the dirty pair (the partial) or
+        # the appended token's row (the K append).
+        _k_last = Mux(part_k, 1, VB_K_ROWS - 1) if self.n_outputs != 4 \
+            else VB_K_ROWS - 1
+        last_row_value = Mux(kapp, 0, Mux(krow, _k_last, dims - 1))
         last_row = Signal.like(last_row_value)
         m.d.comb += last_row.eq(last_row_value)
         last_blk_value = Mux(krow & wide, 3, 1)
@@ -998,7 +1288,7 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # consumes pxmax16), with liveness whole-row as always. A K4
         # walk never prefetches either.
         nxt_live_value = Mux(
-            vapp | k4, 0,
+            vapp, 0,
             Mux(krow, Mux(next_row < live, 32, 0), Mux(blk == 0, hi_eff,
                                                        lo_eff)))
         nxt_live = Signal.like(nxt_live_value)
@@ -1023,14 +1313,177 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         pre_limit = Signal.like(pre_limit_value)
         m.d.comb += pre_limit.eq(pre_limit_value)
         pre_go = Signal()
-        m.d.comb += pre_go.eq((part != 0) & ~pre_rd & (pre_cnt < pre_limit) \
-            & meta_boundary & (meta_group == pre_cnt) & in_gather)
-        pre_index_value = Mux(part_k & wide_k, pair_base >> 3, pre_cnt)
-        pre_index = Signal.like(pre_index_value)
-        m.d.comb += pre_index.eq(pre_index_value)
-        pre_addr_value = m_base + (pre_index << 6)
-        pre_addr = Signal.like(pre_addr_value)
-        m.d.comb += pre_addr.eq(pre_addr_value)
+        pre_addr = Signal(aw)
+        if self.n_outputs == 4:
+            m.d.comb += pre_go.eq((part != 0) & ~pre_rd & (pre_cnt < pre_limit) \
+                & meta_boundary & (meta_group == pre_cnt) & in_gather)
+            pre_index_value = Mux(part_k & wide_k, pair_base >> 3, pre_cnt)
+            pre_index = Signal.like(pre_index_value)
+            m.d.comb += pre_index.eq(pre_index_value)
+            m.d.comb += pre_addr.eq(m_base + (pre_index << 6))
+        else:
+            # Generalized interleave: two due-driven pre-read walks
+            # sharing the single outstanding beat -- the partial's
+            # meta beats (into the alternating accumulators) and its
+            # straddle-boundary payload beats (the retained neighbor
+            # half). A walk fires once the row cursor is within two
+            # rows of its op's first consumer: a row's
+            # gather/scale/quant is tens of cycles, so the response
+            # lands long before the scatter or compose that consumes
+            # it (the DRAINLOAD pre-read hold below is the backstop).
+            lanes = self.n_outputs
+            _vrows_set = (64, max_dims) if max_dims != 64 else (64, )
+
+            def _gl(g, vr):
+                return lanes if (g + 1) * lanes <= vr else vr - g * lanes
+
+            def _cell(r, j, vr):
+                g, l = divmod(r, lanes)
+                return g * 2 * lanes + j * _gl(g, vr) + l
+
+            # (vr, beat, block) -> the first/last row scattering that
+            # block's cell into that meta beat; block None is the full
+            # run's last row over either block.
+            _first = {}
+            _lastrow = {}
+            for _vr in _vrows_set:
+                for _bm in range(_vr * 2 // 32):
+                    for _b in (0, 1):
+                        _rs = [
+                            r for r in range(_vr)
+                            if _cell(r, _b, _vr) >> 5 == _bm
+                        ]
+                        _first[(_vr, _bm, _b)] = min(_rs)
+                        _lastrow[(_vr, _bm, _b)] = max(_rs)
+                    _lastrow[(_vr, _bm, None)] = max(_lastrow[(_vr, _bm, 0)],
+                                                     _lastrow[(_vr, _bm, 1)])
+            _maxmb = max(_vr * 2 // 32 for _vr in _vrows_set)
+            _groups_n = (64 + lanes - 1) // lanes
+            _groups_w = ((max_dims + lanes - 1) //
+                         lanes if max_dims != 64 else _groups_n)
+            _tail_n = 64 - (_groups_n - 1) * lanes
+            _tail_w = (max_dims -
+                       (_groups_w - 1) * lanes if max_dims != 64 else _tail_n)
+
+            def _fw(m, b):
+                """The partial's first scatter row for meta beat ``m``
+                (its block cells), muxed by the tile width."""
+                if (64, m, b) in _first:
+                    if max_dims != 64:
+                        return Mux(wide, _first[(max_dims, m, b)],
+                                   _first[(64, m, b)])
+                    return _first[(64, m, b)]
+                return _first[(max_dims, m, b)]
+
+            gmet_cnt = Signal(range(_maxmb + 1))
+            gbdy_cnt = Signal(range(max_dims // lanes + 1))
+            pre_kind = Signal(2)  # latched at issue: 0 V meta beat, 1 V
+            pre_acc = Signal()  # boundary beat, 2 K payload, 3 K meta
+            pre_bpar = Signal()  # a boundary op's group parity
+            mbeats_cur = (Mux(wide, _maxmb, 64 * 2 //
+                              32) if max_dims != 64 else 64 * 2 // 32)
+
+            def _bdy_lim(vr):
+                """Groups whose lane count is odd -- the ones whose
+                block boundary straddles a payload beat."""
+                return sum(1 for g in range((vr + lanes - 1) // lanes)
+                           if _gl(g, vr) % 2)
+
+            bdy_lim = (Mux(wide, _bdy_lim(max_dims), _bdy_lim(64))
+                       if max_dims != 64 else _bdy_lim(64))
+            _fdue = [
+                Mux(part_blk, _fw(m, 1), _fw(m, 0)) for m in range(_maxmb)
+            ]
+            gmet_due = part_vb & (gmet_cnt < mbeats_cur) \
+                & (row + 2 >= Array(_fdue)[gmet_cnt])
+            # The boundary beat's fire row follows the partial's
+            # compose side: block 0 composes the straddle at the
+            # group's LAST row (pre-read at the group's first row --
+            # any earlier and the NEXT group's boundary would land
+            # before this group's compose consumed the register),
+            # block 1 composes it at the group's FIRST row (pre-read
+            # two rows ahead).
+            # Limit lookahead to a group so a pre-read cannot overwrite
+            # the parity bank still needed by the current row.
+            lookahead = min(2, lanes)
+            block0_delay = min(2, lanes - 1)
+            gbdy_due = (part_vb & (gbdy_cnt < bdy_lim)
+                        & (row + lookahead >= gbdy_cnt * lanes +
+                           Mux(part_blk, 0, block0_delay)))
+            m.d.comb += pre_go.eq(part_vb & ~pre_rd & ~in_fill
+                                  & (gmet_due | gbdy_due)
+                                  & (in_gather | in_scale | in_quant
+                                     | in_drainload | in_sg1w))
+            # The boundary beat of group g (of lane count gl, odd) pairs
+            # block 0's lane gl-1 with block 1's lane 0: chunk
+            # g*2*lanes + gl - 1, an even staging index, so the beat's
+            # byte offset is that chunk times 32.
+            _gl_t = Mux(gbdy_cnt == Mux(wide, _groups_w, _groups_n) - 1,
+                        Mux(wide, _tail_w, _tail_n), lanes)
+            m.d.comb += pre_addr.eq(
+                Mux(gmet_due, m_base + (gmet_cnt << 6),
+                    r_base + ((gbdy_cnt * (2 * lanes) + _gl_t - 1) << 5)))
+
+        # ---- non-quad K staging window: the pre-read walk ----
+        # One outstanding beat at a time through the shared pre-read
+        # flag: the window's payload beats 0..kpb-1 from r_base into
+        # the store, then its meta beats 0..kmb-1 from m_base into the
+        # register banks. The response routes by pre_kind (2 payload,
+        # 3 meta) and the in-flight beat index latched at issue. Every
+        # K mode of a non-quad build is a window run (kwin_mode): the
+        # full 16-row orientation, the two-row partial and the K
+        # append differ only in which rows it rebuilds.
+        kwin_mode = Const(0)
+        kpre_go = Const(0)
+        kpre_addr = Const(0, aw)
+        kd_pay = Const(0)
+        kd_v = Const(0)
+        kd_last = Const(0)
+        if nonquad:
+            kwin_mode = Signal()
+            # krow is also set for a V append (its token row gathers in
+            # the K direction); the window is the K modes' alone.
+            m.d.comb += kwin_mode.eq(krow & ~vapp)
+            kpre_pay = Signal()
+            m.d.comb += kpre_pay.eq(kpp < kpb)
+            kpre_go = Signal()
+            m.d.comb += kpre_go.eq(in_kpre & ~pre_rd
+                                   & (kpre_pay | (kpm < kmb)))
+            kpre_addr = Signal(aw)
+            m.d.comb += kpre_addr.eq(
+                Mux(kpre_pay, r_base + (kpp << 6), m_base + (kpm << 6)))
+            # The cursor names the next beat to stage. A one-entry output
+            # register isolates the BRAM/meta mux from the shared TMEM port.
+            kd_pending = Signal()
+            kd_v = Signal()
+            kd_last = Signal()
+            kd_addr = Signal(aw)
+            kd_data = Signal(self.data_width)
+            kd_stage = Signal()
+            kd_pop = Signal()
+            kd_pay = Signal()
+            m.d.comb += [
+                kd_pay.eq(kdb < kpb),
+                kd_pop.eq(in_kdrain & self.tmem_w.fire),
+                kd_stage.eq(in_kdrain & (kdb < kpb + kmb)
+                            & Mux(kd_pay, kdb_d == kdb, 1)
+                            & (~kd_pending | kd_pop)),
+                kd_v.eq(in_kdrain & kd_pending),
+                kwin_r.addr.eq(kdb),
+                kwin_r.en.eq(in_kdrain & kd_pay),
+            ]
+            with m.If(kwin_r.en):
+                m.d.sync += kdb_d.eq(kdb)
+            with m.Else():
+                m.d.sync += kdb_d.eq(_kwin_depth + _kwin_mb_max)
+            with m.If(kd_stage):
+                m.d.sync += [
+                    kd_pending.eq(1),
+                    kd_last.eq(kdb == kpb + kmb - 1),
+                    kdb.eq(kdb + 1),
+                ]
+            with m.Elif(kd_pop):
+                m.d.sync += kd_pending.eq(0)
 
         # Append-mode pre-read: one outstanding beat at a time, the
         # patch drain's compose source. A V append's beat w < 32 (64)
@@ -1038,28 +1491,64 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # remaining four beats are the F32 scale row at m_base. A K
         # append's beats 0..blocks-1 are the token's per-block payload
         # beats (lane pair kr>>1 & 1) and the last beat its meta beat.
-        app_req = Signal()
-        m.d.comb += app_req.eq(in_appw & ~app_rd & ~app_ph)
-        app_srow = Signal()
-        m.d.comb += app_srow.eq(Mux(wide, app_w[6], app_w[5]))
         # K: the meta beat is beat index `blocks` (2 narrow, 4 wide).
-        app_kmeta = Signal()
-        m.d.comb += app_kmeta.eq(
-            kapp & (app_w == Mux(wide, Const(4, 7), Const(2, 7))))
-        app_kmetabeat = Signal()
-        m.d.comb += app_kmetabeat.eq(Mux(wide, kr[3], 0))
-        # A K payload beat b sits at the token's own row-pair group and
-        # lane: ((r>>2)*4*blocks + b*4 + (r&3)&~1) beats from r_base.
-        app_kpay_value = r_base + Mux(wide, kr[2:4] << 9, kr[2:4] << 8) \
-            + (app_w << 7) + (kr[1] << 6)
-        app_kpay = Signal.like(app_kpay_value)
-        m.d.comb += app_kpay.eq(app_kpay_value)
-        app_raddr_value = Mux(
-            kapp, Mux(app_kmeta, m_base + (app_kmetabeat << 6), app_kpay),
-            Mux(app_srow, m_base + (Mux(wide, app_w[:6], app_w[:5]) << 6),
-                r_base + (app_w[1:7] << 8) + (app_w[0] << 6) + (app_blk << 7)))
-        app_raddr = Signal.like(app_raddr_value)
-        m.d.comb += app_raddr.eq(app_raddr_value)
+        if app_on:
+            app_kmeta = Signal()
+            m.d.comb += app_kmeta.eq(
+                kapp & (app_w == Mux(wide, Const(4, 7), Const(2, 7))))
+            app_kmetabeat = Signal()
+            m.d.comb += app_kmetabeat.eq(Mux(wide, kr[3], 0))
+            # A K payload beat b sits at the token's own row-pair group and
+            # lane: ((r>>2)*4*blocks + b*4 + (r&3)&~1) beats from r_base.
+            app_kpay_value = r_base + Mux(wide, kr[2:4] << 9, kr[2:4] << 8) \
+                + (app_w << 7) + (kr[1] << 6)
+            app_kpay = Signal.like(app_kpay_value)
+            m.d.comb += app_kpay.eq(app_kpay_value)
+            # ---- non-quad V append walk (the generalized patch drain) ----
+            # Block app_blk's cells sit at c(d) = g*2*lanes + app_blk*lanes
+            # + l, so its payload is no longer a run of self-contained
+            # beats: the drain visits the distinct beats holding those
+            # cells in order, pre-reads each and patches the one or two of
+            # its rows in it (an even cell is a beat's low half, the next
+            # row's odd cell that beat's high half; a group's last even
+            # cell lands alone under the other block's retained half).
+            # ``arow``/``acell``/``alane`` walk row, cell and lane together
+            # (+1 within a group, lanes+1 across one); ``abeat`` is the beat
+            # being composed, ``asec``/``aph2`` the second row's delayed
+            # patch, ``asrow`` the four-beat scale-row phase.
+            app_srow_q = Mux(wide, app_w[6], app_w[5])
+            app_raddr_value = Mux(
+                kapp, Mux(app_kmeta, m_base + (app_kmetabeat << 6), app_kpay),
+                Mux(
+                    app_srow_q,
+                    m_base + (Mux(wide, app_w[:6], app_w[:5]) << 6), r_base +
+                    (app_w[1:7] << 8) + (app_w[0] << 6) + (app_blk << 7)))
+            app_req_value = in_appw & ~app_rd & ~app_ph
+            app_srow_value = app_srow_q
+            if nonquad:
+                _L = self.n_outputs
+                arow = Signal(range(max_dims + 1))
+                acell = Signal(range(max_dims * 2 + 1))
+                alane = Signal(range(_L))
+                abeat = Signal(7)
+                asec = Signal()
+                aph2 = Signal()
+                asrow = Signal()
+                # The scale-row phase keeps the quad's four app_w beats.
+                app_req_value = in_appw & ~app_rd & ~app_ph & ~aph2
+                app_srow_value = asrow
+                app_raddr_value = Mux(asrow, m_base + (app_w[:2] << 6),
+                                      r_base + ((acell >> 1) << 6))
+            app_req = Signal()
+            m.d.comb += app_req.eq(app_req_value)
+            app_srow = Signal()
+            m.d.comb += app_srow.eq(app_srow_value)
+            app_raddr = Signal.like(app_raddr_value)
+            m.d.comb += app_raddr.eq(app_raddr_value)
+        else:
+            app_req = Const(0)
+            app_srow = Const(0)
+            app_raddr = Const(0, aw)
 
         # The unit's single TMEM read port: the fill while filling,
         # then the meta pre-reads of a partial run, the append drain's
@@ -1067,6 +1556,7 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # pre-reads (one outstanding K4 read at a time; TMEM itself
         # accepts one -- the class register routes the response).
         in_k4w = in_k4row
+
         # Every K4 request and completion stays in K4ROW. The state
         # request additionally waits for the bank's previous beat
         # write to retire, and the payload request stays within the
@@ -1077,7 +1567,92 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # pair (k4_land_row[1:] is the last completed row's pair), four
         # banks cycling, so a bank's previous occupant has always
         # composed first.
+        # ---- non-quad K4 positions ----
+        # A wide tile row r sits at staging cell c(r) = g*2*lanes +
+        # blk*gl + l ((g, l) = divmod(r, lanes), gl the group's lane
+        # count), so the open block's payload slice is its beats in
+        # image order, ranked: a full group gives each block
+        # (lanes + 1) // 2 beats -- at an odd lane count one of them,
+        # the straddle beat, is shared (five lanes: lanes 0-1, lanes
+        # 2-3, then block 0's lane 4 over block 1's lane 0) -- and a
+        # short tail group fewer. A row COMPOSES when its cell is a
+        # beat's high half (the low half is the previous row's, held)
+        # or when the cell above it is not this block's (an even cell:
+        # it lands alone in the low half over the retained neighbour).
+        # `_k4pos` derives a tile row's group, lane, beat rank, compose
+        # role and meta beat.
+
+        def _k4pos(r, tag):
+            # Every field is a constant function of (app_blk, r), read
+            # from a table. The arithmetic this replaces -- a constant
+            # division, two products and a subtraction, in carry chains --
+            # was the head of the unit's worst path: from k4_land_row
+            # through the compose role and the beat bank to the meta
+            # accumulator's write decode.
+            lanes = self.n_outputs
+
+            def _pos(blk, rr):
+                g_, l_ = divmod(rr, lanes)
+                tail_ = g_ == _k4groups
+                gl_ = _k4tail if tail_ else lanes
+                return (g_, l_, tail_, gl_, g_ * 2 * lanes + gl_ * blk + l_,
+                        (_k4groups * _k4bpg if tail_ else g_ * _k4bpg) +
+                        (((gl_ * blk + l_) >> 1) - ((gl_ * blk) >> 1)),
+                        (l_ + 1) < gl_)
+
+            entries = [
+                _pos(blk, rr) for blk in (0, 1) for rr in range(1 << len(r))
+            ]
+            index = Cat(r, app_blk)
+
+            def _table(width, field, name):
+                sig = Signal(width, name=name)
+                m.d.comb += sig.eq(
+                    Array([Const(e[field], width) for e in entries])[index])
+                return sig
+
+            pos = {}
+            pos['cell'] = cell = _table(
+                len(Signal(range(max_dims * 2 * lanes))), 4, f'k4{tag}_cell')
+            pos['l'] = l = _table(len(Signal(range(lanes))), 1, f'k4{tag}_l')
+            pos['nxt'] = nxt = _table(1, 6, f'k4{tag}_nxt')
+            pos['odd'] = odd = Signal(name=f'k4{tag}_odd')
+            pos['comp'] = comp = Signal(name=f'k4{tag}_comp')
+            m.d.comb += [odd.eq(cell[0]), comp.eq(cell[0] | ~nxt)]
+            pos['rank'] = _table(len(Signal(range(K4_PAY_BEATS + 2))), 5,
+                                 f'k4{tag}_rank')
+            pos['mbeat'] = mbeat = Signal(3, name=f'k4{tag}_mbeat')
+            m.d.comb += mbeat.eq(cell[5:8])
+            return pos
+
+        # The last tile row whose block cell falls in each meta beat
+        # (32 cells): a beat's write arms at that row's completion,
+        # whatever the block (the quad's 16-row multiple).
+        _k4met_last = {}
+        for _blk in (0, 1):
+            for _m in range(max_dims * 2 // 32):
+                _rows = [
+                    r for r in range(max_dims)
+                    if ((((r // self.n_outputs) * 2 * self.n_outputs) + _blk *
+                         (self.n_outputs if
+                          (r // self.n_outputs) < _k4groups else _k4tail) +
+                         (r % self.n_outputs)) >> 5) == _m
+                ]
+                _k4met_last[(_blk, _m)] = max(_rows)
+
+        # Composed beats since accept: the non-quad pre-read gate rides
+        # this count instead of the landing row's pair index (a quad
+        # build keeps the pair gate and never counts).
+        k4_ncomp = Const(0)
+        if nonquad:
+            k4_ncomp = Signal(range(K4_PAY_BEATS + 1))
+        k4pl = _k4pos(k4_land_row, 'l') if nonquad else None
+        k4pd = _k4pos(row, 'd') if nonquad else None
         k4pay_gate_value = k4_land_row[1:] + 3
+        if nonquad:
+            # Three un-composed beats at most: the count rides the
+            # completions instead of the landing row's pair index.
+            k4pay_gate_value = k4_ncomp + 3
         k4pay_gate = Signal.like(k4pay_gate_value)
         m.d.comb += k4pay_gate.eq(k4pay_gate_value)
         k4st_rq_go = Signal()
@@ -1089,37 +1664,75 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # is pending. Track demand by the cursor, rather than collapsing
         # those events into a single request bit.
         k4pay_demand = Signal()
-        m.d.comb += k4pay_demand.eq((k4pay_next < 64)
-                                    & (k4pay_next <= (row >> 1)))
+        k4pay_demand_value = ((k4pay_next < 64) & (k4pay_next <= (row >> 1)))
+        if nonquad:
+            # The dispatch row's own beat: every beat through it.
+            k4pay_demand_value = ((k4pay_next < K4_PAY_BEATS)
+                                  & (k4pay_next <= k4pd['rank']))
+        m.d.comb += k4pay_demand.eq(k4pay_demand_value)
         k4pay_rq_go = Signal()
         m.d.comb += k4pay_rq_go.eq(in_k4w & k4pay_demand & ~k4_rd_busy \
             & (k4pay_next <= k4pay_gate))
-        m.d.comb += [
-            self.tmem_rreq.valid.eq((in_fill & more_fill) | pre_go
-                                    | app_req | k4st_rq_go | k4met_rq_go
-                                    | k4pay_rq_go),
-            self.tmem_rreq.bits.addr.eq(
+        k4pay_addr_value = (r_base + (k4pay_next[1:7] << 8) +
+                            (k4pay_next[0] << 6) + (app_blk << 7))
+        if nonquad:
+            # The block's slice: beat ``rank`` at r_base + rank beats.
+            k4pay_addr_value = r_base + (k4pay_next << 6)
+        rreq_go = ((in_fill & more_fill) | pre_go | app_req | k4st_rq_go
+                   | k4met_rq_go | k4pay_rq_go)
+        rreq_addr = Mux(
+            k4pay_rq_go, k4pay_addr_value,
+            Mux(
+                k4met_rq_go, m_base + (k4met_next << 6),
                 Mux(
-                    k4pay_rq_go, r_base + (k4pay_next[1:7] << 8) +
-                    (k4pay_next[0] << 6) + (app_blk << 7),
+                    k4st_rq_go,
+                    m_base + (dims << 2) + (app_blk << 10) + (k4st_next << 6),
                     Mux(
-                        k4met_rq_go, m_base + (k4met_next << 6),
-                        Mux(
-                            k4st_rq_go, m_base + (dims << 2) +
-                            (app_blk << 10) + (k4st_next << 6),
-                            Mux(
-                                app_req, app_raddr,
-                                Mux(
-                                    pre_go, pre_addr, a_base +
-                                    (fill_wlo << 2) + (fill_beat << lg))))))),
-            self.tmem_rresp.ready.eq(running),
+                        app_req, app_raddr,
+                        Mux(pre_go, pre_addr,
+                            a_base + (fill_wlo << 2) + (fill_beat << lg))))))
+        if nonquad:
+            # The K window's pre-read owns the port outside the other
+            # engines' phases; it still sits first in the address mux.
+            rreq_go = rreq_go | kpre_go
+            rreq_addr = Mux(kpre_go, kpre_addr, rreq_addr)
+        m.d.comb += [
+            self.tmem_rreq.valid.eq(rreq_go),
+            self.tmem_rreq.bits.addr.eq(rreq_addr),
+            self.tmem_rresp.ready.eq(running | (
+                in_drainload if self.n_outputs != 4 else 0)),
         ]
+        if nonquad:
+            with m.If(kpre_go & self.tmem_rreq.fire):
+                m.d.sync += [
+                    pre_rd.eq(1),
+                    pre_kind.eq(Mux(kpre_pay, 2, 3)),
+                    kpre_idx.eq(Mux(kpre_pay, kpp, kpm)),
+                ]
+                with m.If(kpre_pay):
+                    m.d.sync += kpp.eq(kpp + 1)
+                with m.Else():
+                    m.d.sync += kpm.eq(kpm + 1)
         with m.If(in_fill & more_fill & self.tmem_rreq.fire):
             m.d.sync += [rd_pend.eq(1), fill_beat.eq(fill_beat + 1)]
         with m.If(pre_go & self.tmem_rreq.fire):
             m.d.sync += pre_rd.eq(1)
-        with m.If(app_req & self.tmem_rreq.fire):
-            m.d.sync += app_rd.eq(1)
+            if self.n_outputs != 4:
+                # Latch the winning walk's kind (the address mux's
+                # priority: meta over boundary) and advance it; the
+                # accumulator parity rides with a meta op.
+                m.d.sync += [
+                    pre_kind.eq(Mux(gmet_due, 0, 1)),
+                    pre_acc.eq(gmet_cnt[0]),
+                    pre_bpar.eq(gbdy_cnt[0]),
+                ]
+                with m.If(gmet_due):
+                    m.d.sync += gmet_cnt.eq(gmet_cnt + 1)
+                with m.Else():
+                    m.d.sync += gbdy_cnt.eq(gbdy_cnt + 1)
+        if app_on:
+            with m.If(app_req & self.tmem_rreq.fire):
+                m.d.sync += app_rd.eq(1)
         # The port's winner under the address mux's priority.
         win_met = Signal()
         m.d.comb += win_met.eq(~k4pay_rq_go & k4met_rq_go)
@@ -1237,11 +1850,18 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         m.d.comb += k4_st_ok.eq(Mux(row[3], k4st_v[1], k4st_v[0]))
         ec_free_any = Cat(*[~a for a in ec_alloc]).any()
         k4_walk_go = Signal()
+        # A composing row's dispatch waits for its beat's pre-read and
+        # the free write latch (quad: every odd row composes its pair).
+        _k4w_bank_ok = (~row[0] | (~k4w_pay_v
+                                   & k4pay_v.bit_select(row[1:3], 1)))
+        if nonquad:
+            _k4w_bank_ok = (~k4pd['comp']
+                            | (~k4w_pay_v
+                               & k4pay_v.bit_select(k4pd['rank'][:2], 1)))
         m.d.comb += k4_walk_go.eq(k4 & in_k4row & k4_bufd \
             & ~k4_done_wait & ~ec_dispatch_done & k4_st_ok & ~ec_steal_d1 \
             & (~k4_heal | hh_ready.bit_select(row[0], 1)) \
-            & (~row[0] | (~k4w_pay_v
-                          & k4pay_v.bit_select(row[1:3], 1))) \
+            & _k4w_bank_ok \
             & (ec_fcnt != EC_FIFO) & (~k4_rise | ec_free_any))
         k4q_stream = Signal()
         m.d.comb += k4q_stream.eq(k4 & in_k4row)
@@ -1920,8 +2540,9 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         # The append's dedicated d16 widen: issued once at the scale
         # completion, latched two cycles later; the drain reads the
         # word long after (the whole quant walk runs between).
-        with m.If(f16wa.out_valid):
-            m.d.sync += app_d32.eq(f16wa.out)
+        if app_on:
+            with m.If(f16wa.out_valid):
+                m.d.sync += app_d32.eq(f16wa.out)
 
         # Bounded RNE int8 helper of the second product (the frozen
         # bit helper of troom.vector / q8_rne_bits in the model).
@@ -2025,11 +2646,14 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             m.d.sync += k4q_pend.eq(k4q_pend - 1)
 
         # ------------------------------------------------------------------
-        # Tile drain: the padded row shifts out as whole beats.
+        # Tile drain: the padded row shifts out as whole beats. The
+        # register ends with the row: above the first beat only the row's
+        # own bytes are ever non-zero, because the padding loads zero and
+        # every shift moves zero into the bits it vacates.
         # ------------------------------------------------------------------
         beats_per_row = self.row_pad // bb
         dbeat = Signal(range(beats_per_row + 1))
-        drain_sr = Signal(8 * self.row_pad)
+        drain_sr = Signal(max(self.data_width, 8 * VB_ROW_RAW))
         drain_prefetched = Signal()
 
         # ------------------------------------------------------------------
@@ -2073,26 +2697,242 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             # scatter below in elaboration order, so a same-cycle
             # scatter (a freshly quantized d16 of this very row) wins
             # the cell, exactly the compose a partial run needs.
-            with m.If(pre_rd & self.tmem_rresp.fire):
-                m.d.sync += [
-                    pre_rd.eq(0),
-                    pre_cnt.eq(pre_cnt + 1),
-                ]
-                for i in range(32):
-                    m.d.sync += meta_hw[i].eq(
-                        self.tmem_rresp.bits.data[16 * i:16 * i + 16])
-            # Append-mode compose (P2d-b): latch the pre-read beat the
-            # same way, then scatter this run's two patch bytes (a
-            # payload beat: the appended position of both lanes'
-            # chunks) or the token d16 (the scale-row beat) into the
-            # LATCHED response -- the compose must not race the
-            # accumulator's old content, so the patched halfwords are
-            # rebuilt from the response directly.
-            with m.If(app_rd & self.tmem_rresp.fire):
-                m.d.sync += [app_rd.eq(0), app_ph.eq(1)]
-                for i in range(32):
-                    m.d.sync += meta_hw[i].eq(
-                        self.tmem_rresp.bits.data[16 * i:16 * i + 16])
+            if self.n_outputs == 4:
+                with m.If(pre_rd & self.tmem_rresp.fire):
+                    m.d.sync += [
+                        pre_rd.eq(0),
+                        pre_cnt.eq(pre_cnt + 1),
+                    ]
+                    for i in range(32):
+                        m.d.sync += meta_hw[i].eq(
+                            self.tmem_rresp.bits.data[16 * i:16 * i + 16])
+            else:
+                # The generalized walks' response: a meta beat fills
+                # its alternating accumulator wholesale; a boundary
+                # beat contributes the retained half (the half the
+                # partial's block does not rebuild -- block 0 owns the
+                # beat's low chunk, block 1 the high one). The retained
+                # halves live two banks deep by group parity: block 1's
+                # compose for group g sits one row after group g-1's,
+                # so a single register would be consumed between its
+                # landing and its use.
+                meta_hw2 = Array(
+                    Signal(16, name=f'mhw2_{i}') for i in range(32))
+                strret0 = Signal(256, name='strret0')
+                strret1 = Signal(256, name='strret1')
+                with m.If(pre_rd & self.tmem_rresp.fire):
+                    m.d.sync += pre_rd.eq(0)
+                    with m.If(pre_kind == 1):
+                        with m.If(pre_bpar):
+                            m.d.sync += [
+                                strret1.eq(
+                                    Mux(part_blk,
+                                        self.tmem_rresp.bits.data[:256],
+                                        self.tmem_rresp.bits.data[256:])),
+                                strret_v[1].eq(1),
+                            ]
+                        with m.Else():
+                            m.d.sync += [
+                                strret0.eq(
+                                    Mux(part_blk,
+                                        self.tmem_rresp.bits.data[:256],
+                                        self.tmem_rresp.bits.data[256:])),
+                                strret_v[0].eq(1),
+                            ]
+                    # K window responses use the staging pipeline below.
+                    with m.Elif(~pre_kind[1]):
+                        with m.If(pre_acc):
+                            for i in range(32):
+                                m.d.sync += meta_hw2[i].eq(
+                                    self.tmem_rresp.bits.data[16 * i:16 * i +
+                                                              16])
+                        with m.Else():
+                            for i in range(32):
+                                m.d.sync += meta_hw[i].eq(
+                                    self.tmem_rresp.bits.data[16 * i:16 * i +
+                                                              16])
+                # ---- the K window store and its patches ----
+                # A rebuilt row's cell for block j is staging cell
+                # kbase + j*lanes, where kbase is the row's
+                # (group, lane) position derived from the latched lane
+                # offset: group (loff + row) // lanes, lane
+                # (loff + row) % lanes. The payload cell is the store
+                # half kcs (a whole 256-bit enable lane), the meta
+                # cell the halfword kmhw + kcs of the window's banks.
+                # The store's write port serves the pre-read response
+                # (a whole beat) and the KPATCH state (one cell).
+                kbase_n = Signal(range(_kwin_max_cells))
+                kbase_w = Signal.like(kbase_n)
+                with m.Switch(kloff):
+                    for loff in range(_L):
+                        with m.Case(loff):
+                            with m.Switch(row[:4]):
+                                for i in range(16):
+                                    with m.Case(i):
+                                        _g, _l = divmod(loff + i, _L)
+                                        m.d.comb += [
+                                            kbase_n.eq(_g * 2 * _L + _l),
+                                            kbase_w.eq(_g * max_blocks * _L +
+                                                       _l),
+                                        ]
+                                with m.Default():
+                                    m.d.comb += [kbase_n.eq(0), kbase_w.eq(0)]
+                    with m.Default():
+                        m.d.comb += [kbase_n.eq(0), kbase_w.eq(0)]
+                kcs_value = Mux(wide, kbase_w, kbase_n) + (kpj * _L)
+                kcs = Signal.like(kcs_value)
+                m.d.comb += kcs.eq(kcs_value)
+                kp_chunk = Signal(8 * 32)
+                kp_d16 = Signal(16)
+                with m.Switch(kpj):
+                    for j in range(max_blocks):
+                        with m.Case(j):
+                            _wi, _half = divmod(j * 34, 4)
+                            m.d.comb += [
+                                kp_chunk.eq(chunks[j]),
+                                kp_d16.eq(rowwords[_wi][_half * 8:_half * 8 +
+                                                        16]),
+                            ]
+                    with m.Default():
+                        m.d.comb += [kp_chunk.eq(0), kp_d16.eq(0)]
+                with m.If(pre_rd & self.tmem_rresp.fire & (pre_kind == 2)):
+                    m.d.comb += [
+                        kwin_w.addr.eq(kpre_idx),
+                        kwin_w.data.eq(self.tmem_rresp.bits.data),
+                        kwin_w.en.eq(3),
+                    ]
+                with m.Elif(in_kpatch):
+                    m.d.comb += [
+                        kwin_w.addr.eq(kcs[1:]),
+                        kwin_w.data.eq(
+                            Mux(kcs[0], kp_chunk << (self.data_width // 2),
+                                kp_chunk)),
+                        kwin_w.en.eq(1 << kcs[0]),
+                    ]
+                with m.Else():
+                    m.d.comb += kwin_w.en.eq(0)
+                kmi = Signal(7)
+                m.d.comb += kmi.eq(kmhw + kcs)
+                # Decode to per-bank write controls before the register
+                # boundary. Full-beat preloads and halfword patches share
+                # the registered data but use separate local strobes.
+                meta_pre = pre_rd & self.tmem_rresp.fire & (pre_kind == 3)
+                meta_beat_d = Signal(self.data_width)
+                meta_patch_d = Signal(16)
+                meta_word_d = Signal(5)
+                with m.If(meta_pre):
+                    m.d.sync += meta_beat_d.eq(self.tmem_rresp.bits.data)
+                with m.If(in_kpatch):
+                    m.d.sync += [
+                        meta_patch_d.eq(kp_d16),
+                        meta_word_d.eq(kmi[:5])
+                    ]
+                for b in range(_kwin_mb_max):
+                    full_we = Signal(name=f'kwin_meta_full_we{b}',
+                                     attrs={'keep': 'true'})
+                    patch_we = Signal(name=f'kwin_meta_patch_we{b}',
+                                      attrs={'keep': 'true'})
+                    m.d.sync += [
+                        full_we.eq(meta_pre & (kpre_idx == b)),
+                        patch_we.eq(in_kpatch & (kmi[5:] == b)),
+                    ]
+                    with m.If(full_we):
+                        for i in range(32):
+                            m.d.sync += metab[b][i].eq(
+                                meta_beat_d.word_select(i, 16))
+                    with m.Elif(patch_we):
+                        m.d.sync += metab[b][meta_word_d].eq(meta_patch_d)
+
+            # Append-mode compose exists on a build that accepts appends
+            # only (app_on).
+            if app_on:
+                # Append-mode compose (P2d-b): latch the pre-read beat the
+                # same way, then scatter this run's two patch bytes (a
+                # payload beat: the appended position of both lanes'
+                # chunks) or the token d16 (the scale-row beat) into the
+                # LATCHED response -- the compose must not race the
+                # accumulator's old content, so the patched halfwords are
+                # rebuilt from the response directly.
+                if nonquad:
+                    # The non-quad V append walk: the response cycle
+                    # patches the beat's first row straight from the
+                    # response; a second row of the same beat patches from
+                    # the latched accumulator the cycle after (aph2), and
+                    # only then does the beat's write arm (app_ph). The
+                    # scale-row phase answers exactly like the quad.
+                    _L = self.n_outputs
+                    _agroups = max_dims // _L
+                    _atail = max_dims - _agroups * _L
+
+                    def _a_step():
+                        """Advance the walk past one patched row: a cell
+                        within the group, and across a group boundary
+                        lanes + 1 cells -- less the tail group's missing
+                        lanes when the walk is block 1's."""
+                        m.d.sync += arow.eq(arow + 1)
+                        with m.If(alane == _L - 1):
+                            m.d.sync += alane.eq(0)
+                            m.d.sync += acell.eq(
+                                acell + _L + 1 -
+                                Mux(arow + 1 == _agroups * _L, app_blk, 0) *
+                                (_L - _atail))
+                        with m.Else():
+                            m.d.sync += [
+                                alane.eq(alane + 1),
+                                acell.eq(acell + 1)
+                            ]
+
+                    m.d.comb += asec.eq(~acell[0] & (alane + 1 < _L)
+                                        & (arow + 1 < dims))
+                    # The patch byte of tile row ``arow``: its dim's byte
+                    # of the token row's chunk for that 32-dim block.
+                    ap_ch = Signal(8 * 32)
+                    with m.Switch(arow[5:7]):
+                        for j in range(max_blocks):
+                            with m.Case(j):
+                                m.d.comb += ap_ch.eq(chunks[j])
+                        with m.Default():
+                            m.d.comb += ap_ch.eq(0)
+                    ap_val = ap_ch.word_select(arow[:5], 8)
+                    ap_hw = Cat(app_pos[1:5], acell[0])
+                    ap_rh = self.tmem_rresp.bits.data.word_select(ap_hw, 16)
+                    ap_lh = Signal(16)
+                    m.d.comb += ap_lh.eq(meta_hw[ap_hw])
+                    with m.If(app_rd & self.tmem_rresp.fire):
+                        m.d.sync += [
+                            app_rd.eq(0),
+                            app_ph.eq(Mux(asrow, 1, ~asec)),
+                            aph2.eq(~asrow & asec),
+                            abeat.eq(acell >> 1),
+                        ]
+                        for i in range(32):
+                            m.d.sync += meta_hw[i].eq(
+                                self.tmem_rresp.bits.data[16 * i:16 * i + 16])
+                        # The walk steps past the beat's first row.
+                        with m.If(~asrow):
+                            _a_step()
+                    with m.If(app_rd & self.tmem_rresp.fire & ~asrow):
+                        with m.If(app_pos[0]):
+                            m.d.sync += meta_hw[ap_hw].eq(
+                                Cat(ap_rh[:8], ap_val))
+                        with m.Else():
+                            m.d.sync += meta_hw[ap_hw].eq(
+                                Cat(ap_val, ap_rh[8:]))
+                    with m.If(aph2):
+                        with m.If(app_pos[0]):
+                            m.d.sync += meta_hw[ap_hw].eq(
+                                Cat(ap_lh[:8], ap_val))
+                        with m.Else():
+                            m.d.sync += meta_hw[ap_hw].eq(
+                                Cat(ap_val, ap_lh[8:]))
+                        m.d.sync += [aph2.eq(0), app_ph.eq(1)]
+                        _a_step()
+                else:
+                    with m.If(app_rd & self.tmem_rresp.fire):
+                        m.d.sync += [app_rd.eq(0), app_ph.eq(1)]
+                        for i in range(32):
+                            m.d.sync += meta_hw[i].eq(
+                                self.tmem_rresp.bits.data[16 * i:16 * i + 16])
             # K4 staging-read responses (single outstanding, routed by
             # the class register): a state beat latches into its
             # parity bank, a meta beat into meta_hw, a payload beat
@@ -2100,9 +2940,13 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             with m.If(k4_rd_busy & self.tmem_rresp.fire):
                 m.d.sync += k4_rd_busy.eq(0)
                 with m.If(k4_rd_cls == 0):
-                    for i in range(32):
-                        m.d.sync += k4st[Cat(Const(i, 5), k4_rd_beat[0])].eq(
-                            self.tmem_rresp.bits.data[16 * i:16 * i + 16])
+                    # Decode parity once and write the selected full beat.
+                    # Constant halfword destinations avoid 32 indexed writes.
+                    for parity in range(2):
+                        with m.If(k4_rd_beat[0] == parity):
+                            m.d.sync += Cat(
+                                *k4st[32 * parity:32 * (parity + 1)]).eq(
+                                    self.tmem_rresp.bits.data)
                     with m.If(k4_rd_beat[0]):
                         m.d.sync += k4st_v[1].eq(1)
                     with m.Else():
@@ -2119,119 +2963,285 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                             self.tmem_rresp.bits.data[16 * i:16 * i + 16])
                     m.d.sync += [k4met_v.eq(1), k4met_next.eq(k4met_next + 1)]
                 with m.Else():
+                    m.d.comb += [
+                        k4pay_write.addr.eq(k4_rd_beat[:2]),
+                        k4pay_write.data.eq(self.tmem_rresp.bits.data),
+                        k4pay_write.en.eq(1),
+                    ]
                     m.d.sync += [
-                        k4pay_beat[k4_rd_beat[:2]].eq(
-                            self.tmem_rresp.bits.data),
                         k4pay_v.bit_select(k4_rd_beat[:2], 1).eq(1),
                         k4pay_next.eq(k4pay_next + 1)
                     ]
-            app_hw0 = app_pos[1:5]
-            app_hw1 = Cat(app_pos[1:5], 1)  # (p >> 1) + 16
-            app_rh0 = self.tmem_rresp.bits.data.word_select(app_hw0, 16)
-            app_rh1 = self.tmem_rresp.bits.data.word_select(app_hw1, 16)
-            # Beat w's lanes are dims 2w and 2w+1: chunk (dim >> 5),
-            # byte 2*(w mod 16) (+1 for the odd lane). A K append's
-            # beat w is block w's chunk outright.
-            app_we = Cat(0, app_w[0:4])
-            app_wo = Cat(1, app_w[0:4])
-            app_ci = Mux(kapp, app_w[:2], app_w[4:6])
-            app_ch = Signal(8 * 32)
-            with m.Switch(app_ci):
-                for j in range(max_blocks):
-                    with m.Case(j):
-                        m.d.comb += app_ch.eq(chunks[j])
-            app_be = app_ch.word_select(app_we, 8)
-            app_bo = app_ch.word_select(app_wo, 8)
-            with m.If(app_rd & self.tmem_rresp.fire & ~kapp & ~app_srow):
-                # Byte p of the beat is the even lane's chunk, 32+p the
-                # odd lane's; the lane within the halfword is p & 1.
-                with m.If(app_pos[0]):
-                    m.d.sync += meta_hw[app_hw0].eq(Cat(app_rh0[:8], app_be))
-                    m.d.sync += meta_hw[app_hw1].eq(Cat(app_rh1[:8], app_bo))
-                with m.Else():
-                    m.d.sync += meta_hw[app_hw0].eq(Cat(app_be, app_rh0[8:]))
-                    m.d.sync += meta_hw[app_hw1].eq(Cat(app_bo, app_rh1[8:]))
-            # Scale-row beats: patch WORD k-1 of the 256-B F32 row with
-            # the widened token d16. The word spans halfword cells
-            # 2*((k-1)&15) and +1 of beat pay_beats + ((k-1) >> 4);
-            # every other cell keeps the latched response (the 1.0s the
-            # host seeded and the previous appends' words). Cat is
-            # LSB-first in this tree: the beat index is (blk << 1) |
-            # p[4] and the cell base is (p & 15) << 1.
-            app_pay_beats = Mux(wide, Const(VB_APP_WIDE_PAY_BEATS, 7),
-                                Const(32, 7))
-            app_sw0 = Cat(0, app_pos[0:4])  # 2 * ((k-1) & 15)
-            with m.If(app_rd & self.tmem_rresp.fire & ~kapp & app_srow
-                      & (app_w == (app_pay_beats + Cat(app_pos[4], app_blk)))):
-                m.d.sync += meta_hw[app_sw0].eq(app_d32[:16])
-                m.d.sync += meta_hw[app_sw0 + 1].eq(app_d32[16:])
-            # K append payload beats: the token's whole 32-B chunk of
-            # block w lands in its lane's sixteen halfword cells (a
-            # chunk is half a beat); the neighbor lane's cells keep
-            # the latched response.
-            app_kc = Cat(Const(0, 4), kr[0])  # 16 * (token lane)
-            with m.If(app_rd & self.tmem_rresp.fire & kapp & ~app_kmeta):
-                for j in range(16):
-                    m.d.sync += meta_hw[app_kc + j].eq(
-                        app_ch.word_select(j, 16))
-            # K append meta beat: the four per-block d16 cells at
-            # (r>>2)*8*blocks + 4*b + (r&3) within the group image's
-            # meta halfwords (narrow: one beat; wide: beat r>>3).
-            app_kcell = Mux(wide, kr[2] << 4, kr[2:4] << 3)
-            with m.If(app_rd & self.tmem_rresp.fire & kapp & app_kmeta):
-                for j in range(max_blocks):
-                    wi, half = divmod(j * 34, 4)
-                    m.d.sync += meta_hw[app_kcell + 4 * j + kr[:2]].eq(
-                        rowwords[wi][half * 8:half * 8 + 16])
+            if app_on:
+                app_hw0 = app_pos[1:5]
+                app_hw1 = Cat(app_pos[1:5], 1)  # (p >> 1) + 16
+                app_rh0 = self.tmem_rresp.bits.data.word_select(app_hw0, 16)
+                app_rh1 = self.tmem_rresp.bits.data.word_select(app_hw1, 16)
+                # Beat w's lanes are dims 2w and 2w+1: chunk (dim >> 5),
+                # byte 2*(w mod 16) (+1 for the odd lane). A K append's
+                # beat w is block w's chunk outright.
+                app_we = Cat(0, app_w[0:4])
+                app_wo = Cat(1, app_w[0:4])
+                app_ci = Mux(kapp, app_w[:2], app_w[4:6])
+                app_ch = Signal(8 * 32)
+                with m.Switch(app_ci):
+                    for j in range(max_blocks):
+                        with m.Case(j):
+                            m.d.comb += app_ch.eq(chunks[j])
+                app_be = app_ch.word_select(app_we, 8)
+                app_bo = app_ch.word_select(app_wo, 8)
+                if not nonquad:
+                    with m.If(app_rd & self.tmem_rresp.fire & ~kapp
+                              & ~app_srow):
+                        # Byte p of the beat is the even lane's chunk, 32+p the
+                        # odd lane's; the lane within the halfword is p & 1.
+                        with m.If(app_pos[0]):
+                            m.d.sync += meta_hw[app_hw0].eq(
+                                Cat(app_rh0[:8], app_be))
+                            m.d.sync += meta_hw[app_hw1].eq(
+                                Cat(app_rh1[:8], app_bo))
+                        with m.Else():
+                            m.d.sync += meta_hw[app_hw0].eq(
+                                Cat(app_be, app_rh0[8:]))
+                            m.d.sync += meta_hw[app_hw1].eq(
+                                Cat(app_bo, app_rh1[8:]))
+                # Scale-row beats: patch WORD k-1 of the 256-B F32 row with
+                # the widened token d16. The word spans halfword cells
+                # 2*((k-1)&15) and +1 of beat pay_beats + ((k-1) >> 4);
+                # every other cell keeps the latched response (the 1.0s the
+                # host seeded and the previous appends' words). Cat is
+                # LSB-first in this tree: the beat index is (blk << 1) |
+                # p[4] and the cell base is (p & 15) << 1. A non-quad walk
+                # numbers the scale-row beats 0..3 in their own phase.
+                app_pay_beats = Mux(wide, Const(VB_APP_WIDE_PAY_BEATS, 7),
+                                    Const(32, 7))
+                app_sw0 = Cat(0, app_pos[0:4])  # 2 * ((k-1) & 15)
+                app_sw_beat = Mux(Const(nonquad), Cat(app_pos[4], app_blk),
+                                  app_pay_beats + Cat(app_pos[4], app_blk))
+                with m.If(app_rd & self.tmem_rresp.fire & ~kapp & app_srow
+                          & (app_w == app_sw_beat)):
+                    m.d.sync += meta_hw[app_sw0].eq(app_d32[:16])
+                    m.d.sync += meta_hw[app_sw0 + 1].eq(app_d32[16:])
+                # K append payload beats: the token's whole 32-B chunk of
+                # block w lands in its lane's sixteen halfword cells (a
+                # chunk is half a beat); the neighbor lane's cells keep
+                # the latched response.
+                app_kc = Cat(Const(0, 4), kr[0])  # 16 * (token lane)
+                with m.If(app_rd & self.tmem_rresp.fire & kapp & ~app_kmeta):
+                    for j in range(16):
+                        m.d.sync += meta_hw[app_kc + j].eq(
+                            app_ch.word_select(j, 16))
+                # K append meta beat: the four per-block d16 cells at
+                # (r>>2)*8*blocks + 4*b + (r&3) within the group image's
+                # meta halfwords (narrow: one beat; wide: beat r>>3).
+                app_kcell = Mux(wide, kr[2] << 4, kr[2:4] << 3)
+                with m.If(app_rd & self.tmem_rresp.fire & kapp & app_kmeta):
+                    for j in range(max_blocks):
+                        wi, half = divmod(j * 34, 4)
+                        m.d.sync += meta_hw[app_kcell + 4 * j + kr[:2]].eq(
+                            rowwords[wi][half * 8:half * 8 + 16])
             # This row's two halfword cells inside its 64-byte meta
             # beat: group g' = (row >> 2) & 3 contributes j0 at
             # 8*g' + lane and j1 at 8*g' + 4 + lane.
-            meta_row = Signal(4)
-            m.d.comb += meta_row.eq((row + Mux(part_k, pair_base, 0))
-                                    & Mux(wide_k, 7, 15))
-            meta_indices = [
-                (meta_row >> 2) * Mux(wide_k, 16, 8) + j * 4 + meta_row[:2]
-                for j in range(max_blocks)
-            ]
-            sg_blocks = Mux(wide_k, 4, 2)
-            sg1_meta_now = Mux(part_k, row[:4].all(),
-                               Mux(wide_k, row[:3].all(), row[:4].all()))
-            pay_ok = Mux(part_vb, sg1_widx == part_blk,
-                         Mux(part_k, row <= live, 1))
-            sg1_wr = in_sg1w & (((sg1_widx != sg_blocks) & pay_ok)
-                                | ((sg1_widx == sg_blocks) & sg1_meta_now))
-            meta_out_index = Mux(part_k & wide_k, pair_base >> 3, meta_group)
-            sg1_waddr = Mux(
-                sg1_widx == sg_blocks, m_base + (meta_out_index << 6),
-                r_base + (row >> 2) * Mux(wide_k, 512, 256) + (row[1] << 6) +
-                (sg1_widx << 7))
-            # Keep ArrayProxy lowering outside the metadata selector: its
-            # out-of-range default must not substitute index 3 for beat 4.
-            sg1_payload = Signal(self.data_width)
-            m.d.comb += sg1_payload.eq(
-                Cat(Array(holds)[sg1_widx],
-                    Array(chunks)[sg1_widx]))
-            sg1_wdata = Mux(sg1_widx == sg_blocks, Cat(*meta_hw), sg1_payload)
-            # A gated beat advances the walk in the cycle it would have
-            # written, so a partially-gated sequence (V block extent,
-            # K dead pairs) still reaches the meta beat and completes.
-            sg1_adv = (sg1_wr & self.tmem_w.fire) | (~sg1_wr & in_sg1w)
-            with m.If(sg1_wr & self.tmem_w.fire):
-                m.d.sync += [
-                    sg1_widx.eq(sg1_widx + 1),
-                    self.beats.eq(self.beats + 1),
+            if self.n_outputs == 4:
+                meta_row = Signal(4)
+                m.d.comb += meta_row.eq((row + Mux(part_k, pair_base, 0))
+                                        & Mux(wide_k, 7, 15))
+                meta_indices = [
+                    (meta_row >> 2) * Mux(wide_k, 16, 8) + j * 4 + meta_row[:2]
+                    for j in range(max_blocks)
                 ]
-            with m.If(~sg1_wr & in_sg1w):
-                m.d.sync += sg1_widx.eq(sg1_widx + 1)
-            sg1_last = in_sg1w & (((sg1_widx == sg_blocks - 1) & ~sg1_meta_now
-                                   | (sg1_widx == sg_blocks)) & sg1_adv)
-            app_waddr = Mux(
-                kapp, Mux(app_kmeta, m_base + (app_kmetabeat << 6), app_kpay),
-                Mux(
-                    app_srow, m_base + (Mux(wide, app_w[:6], app_w[:5]) << 6),
-                    r_base + (app_w[1:7] << 8) + (app_w[0] << 6) +
-                    (app_blk << 7)))
-            app_wdata = Cat(*meta_hw)[:self.data_width]
+                sg_blocks = Mux(wide_k, 4, 2)
+                sg1_meta_now = Mux(part_k, row[:4].all(),
+                                   Mux(wide_k, row[:3].all(), row[:4].all()))
+                pay_ok = Mux(part_vb, sg1_widx == part_blk,
+                             Mux(part_k, row <= live, 1))
+                sg1_wr = in_sg1w & (((sg1_widx != sg_blocks) & pay_ok)
+                                    | ((sg1_widx == sg_blocks) & sg1_meta_now))
+                meta_out_index = Mux(part_k & wide_k, pair_base >> 3,
+                                     meta_group)
+                sg1_waddr = Mux(
+                    sg1_widx == sg_blocks, m_base + (meta_out_index << 6),
+                    r_base + (row >> 2) * Mux(wide_k, 512, 256) +
+                    (row[1] << 6) + (sg1_widx << 7))
+                # Keep ArrayProxy lowering outside the metadata selector: its
+                # out-of-range default must not substitute index 3 for beat 4.
+                sg1_payload = Signal(self.data_width)
+                m.d.comb += sg1_payload.eq(
+                    Cat(Array(holds)[sg1_widx],
+                        Array(chunks)[sg1_widx]))
+                sg1_wdata = Mux(sg1_widx == sg_blocks, Cat(*meta_hw),
+                                sg1_payload)
+                # A gated beat advances the walk in the cycle it would have
+                # written, so a partially-gated sequence (V block extent,
+                # K dead pairs) still reaches the meta beat and completes.
+                sg1_adv = (sg1_wr & self.tmem_w.fire) | (~sg1_wr & in_sg1w)
+                with m.If(sg1_wr & self.tmem_w.fire):
+                    m.d.sync += [
+                        sg1_widx.eq(sg1_widx + 1),
+                        self.beats.eq(self.beats + 1),
+                    ]
+                with m.If(~sg1_wr & in_sg1w):
+                    m.d.sync += sg1_widx.eq(sg1_widx + 1)
+                sg1_last = in_sg1w & ((
+                    (sg1_widx == sg_blocks - 1) & ~sg1_meta_now
+                    | (sg1_widx == sg_blocks)) & sg1_adv)
+            else:
+                # ---- the generalized interleave drain (V modes) ----
+                # A row's staging roles follow from the parity of its
+                # chunk indices c(j) = g*2*lanes + j*gl + l: an even c
+                # is a beat's low half (held unless it is the group's
+                # straddle tail), an odd c its high half (composed with
+                # the held partner, or -- at lane 0 of block 1 -- held
+                # across the whole group as that straddle's high half).
+                # Every term below is an explicit combinational signal
+                # (the file's rule for reused expressions): the role
+                # tests feed the FSM's DRAINLOAD state, and a Python
+                # Value alias would be re-expanded into each of the
+                # ~1,500 per-signal processes that carry the state
+                # switch -- the first five-lane elaboration measured
+                # 68 MB of RTLIL against 6.8 MB for the quad unit.
+                groups_rt = Signal(range(max_dims // lanes + 1))
+                m.d.comb += groups_rt.eq(Mux(wide, _groups_w, _groups_n))
+                in_tail = Signal()
+                m.d.comb += in_tail.eq(sgrp == groups_rt - 1)
+                gl = Signal(range(lanes + 1))
+                m.d.comb += gl.eq(
+                    Mux(in_tail, Mux(wide, _tail_w, _tail_n), lanes))
+                hold0 = Signal()
+                m.d.comb += hold0.eq(~slane[0] & (slane != gl - 1))
+                hold1 = Signal()
+                m.d.comb += hold1.eq(~(gl[0] ^ slane[0]) & (slane != gl - 1))
+                strh1 = Signal()
+                m.d.comb += strh1.eq((slane == 0) & gl[0])
+                comp0 = Signal()
+                m.d.comb += comp0.eq(slane[0])
+                strc0 = Signal()
+                m.d.comb += strc0.eq((slane == gl - 1) & gl[0])
+                comp1 = Signal()
+                m.d.comb += comp1.eq((gl[0] ^ slane[0]) & (slane != 0))
+                cbase = Signal(range(max_dims // lanes * 2 * lanes + 1))
+                m.d.comb += cbase.eq(sgrp * (2 * lanes))
+                cell0 = Signal.like(cbase)
+                m.d.comb += cell0.eq(cbase + slane)
+                cell1 = Signal.like(cbase)
+                m.d.comb += cell1.eq(cbase + gl + slane)
+                strhead_c1 = Signal(256)
+                mwr_sel = Signal()
+
+                def _lf(m, mode):
+                    """The last row scattering into meta beat ``m``;
+                    ``mode`` None is either block (a full run), 0/1 the
+                    partial's rebuilt block."""
+                    if (64, m, mode) in _lastrow:
+                        if max_dims != 64:
+                            return Mux(wide, _lastrow[(max_dims, m, mode)],
+                                       _lastrow[(64, m, mode)])
+                        return _lastrow[(64, m, mode)]
+                    return _lastrow[(max_dims, m, mode)]
+
+                _lr = [
+                    Mux(part_vb, Mux(part_blk, _lf(m, 1), _lf(m, 0)),
+                        _lf(m, None)) for m in range(_maxmb)
+                ]
+                # The arm rows of the two beat walks, selected once.
+                lrow0 = Signal(range(max_dims))
+                lrow1 = Signal.like(lrow0)
+                with m.Switch(mbeat0):
+                    for _mbi in range(_maxmb):
+                        with m.Case(_mbi):
+                            m.d.comb += lrow0.eq(_lr[_mbi])
+                    with m.Default():
+                        m.d.comb += lrow0.eq(0)
+                with m.Switch(mbeat1):
+                    for _mbi in range(_maxmb):
+                        with m.Case(_mbi):
+                            m.d.comb += lrow1.eq(_lr[_mbi])
+                    with m.Default():
+                        m.d.comb += lrow1.eq(0)
+                arm0 = Signal()
+                m.d.comb += arm0.eq((mbeat0 < mbeats_cur) & (row == lrow0))
+                arm1 = Signal()
+                m.d.comb += arm1.eq((mbeat1 < mbeats_cur) & (row == lrow1))
+                # The slot decode: slot 0 is block 0's entry (a pair
+                # compose or the group's straddle beat), slot 1 block
+                # 1's pair, and the first empty slot carries the armed
+                # meta write.
+                slot = sg1_widx
+                entry_v = Mux(slot == 0, comp0 | strc0,
+                              Mux(slot == 1, comp1, 0))
+                entry_str = Mux(slot == 0, strc0, 0)
+                gate_ok = Mux(
+                    entry_str, 1,
+                    Mux(slot == 0, ~part_vb | ~part_blk, ~part_vb | part_blk))
+                # A partial's straddle compose waits for its retained
+                # half's pre-read (fail-loud rather than corrupt).
+                entry_stall = part_vb & entry_str \
+                    & ~strret_v.bit_select(sgrp[0], 1)
+                meta_slot = ~entry_v & mwr_v
+                sg1_wr = in_sg1w & ((entry_v & gate_ok) | meta_slot) \
+                    & ~entry_stall
+                beat_idx = Mux(
+                    entry_str, (cbase + gl - 1) >> 1,
+                    Mux(slot == 0, (cbase + slane) >> 1,
+                        (cbase + gl + slane) >> 1))
+                sg1_waddr = Mux(meta_slot, m_base + (mwr_beat << 6),
+                                r_base + (beat_idx << 6))
+                pairdata = Mux(slot == 0, Cat(holds[0], chunks[0]),
+                               Cat(holds[1], chunks[1]))
+                strsel = Array([strret0, strret1])[sgrp[0]]
+                strdata = Mux(
+                    part_vb,
+                    Mux(part_blk, Cat(strsel, strhead_c1),
+                        Cat(chunks[0], strsel)), Cat(chunks[0], strhead_c1))
+                sg1_wdata = Mux(meta_slot,
+                                Mux(mwr_sel, Cat(*meta_hw2), Cat(*meta_hw)),
+                                Mux(entry_str, strdata, pairdata))
+                # The walk visits all three slots (block 0's entry at
+                # 0, block 1's at 1, the armed meta at the first empty
+                # slot): an entry slot steps on its write or its block
+                # gate (a partial's other block skips), an empty slot
+                # steps immediately, and the walk ends after slot 2.
+                step = in_sg1w & ~entry_stall \
+                    & (~sg1_wr | self.tmem_w.fire)
+                with m.If(step):
+                    m.d.sync += sg1_widx.eq(sg1_widx + 1)
+                with m.If(sg1_wr & self.tmem_w.fire):
+                    m.d.sync += self.beats.eq(self.beats + 1)
+                    with m.If(meta_slot):
+                        m.d.sync += mwr_v.eq(0)
+                    with m.Elif(entry_str):
+                        # The straddle compose consumed the retained
+                        # half; the next boundary pre-read re-arms it.
+                        m.d.sync += strret_v.bit_select(sgrp[0], 1).eq(0)
+                # The last slot carries no entry (entry_v is 0 there),
+                # so the general step rule evaluated there reduces to
+                # this: the row ends once the armed meta write, if any,
+                # fires. It is written out because it is the row pass's
+                # advance condition -- it fans out to every row register
+                # -- and must not carry the staging geometry that entry_v
+                # and entry_stall derive from the lane position.
+                sg1_last = in_sg1w & (sg1_widx == 2) \
+                    & (~mwr_v | self.tmem_w.fire)
+            if app_on:
+                app_waddr = Mux(
+                    kapp,
+                    Mux(app_kmeta, m_base + (app_kmetabeat << 6), app_kpay),
+                    Mux(
+                        app_srow,
+                        m_base + (Mux(wide, app_w[:6], app_w[:5]) << 6),
+                        r_base + (app_w[1:7] << 8) + (app_w[0] << 6) +
+                        (app_blk << 7)))
+                if nonquad:
+                    # The V append walk writes the composed payload beat
+                    # (``abeat``, latched at its response) or a scale-row
+                    # beat; the K append never reaches APPW here.
+                    app_waddr = Mux(asrow, m_base + (app_w[:2] << 6),
+                                    r_base + (abeat << 6))
+                app_wdata = Cat(*meta_hw)[:self.data_width]
+            else:
+                app_waddr = Const(0, aw)
+                app_wdata = Const(0, self.data_width)
 
             # ----------------------------------------------------------
             # K4 beat compose (rows 3): the pair beat's two 32-B chunk
@@ -2270,8 +3280,17 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             ec_land_last = ec_tag_last[EC_TAGS - 1]
             ec_land_ctx = ec_tag_ctx[EC_TAGS - 1]
             ec_rlast_land = k4q_land & ec_land_risen & ec_land_last
-            ec_pay_ok = ~k4_land_row[0] \
+            ec_pay_ok_value = ~k4_land_row[0] \
                 | (~k4w_pay_v & k4pay_v.bit_select(k4_land_row[1:3], 1))
+            if nonquad:
+                # The landing row composes on its role, not its parity,
+                # and its beat's bank is the rank's low bits.
+                ec_pay_ok_value = ~k4pl['comp'] \
+                    | (~k4w_pay_v & k4pay_v.bit_select(k4pl['rank'][:2], 1))
+                ec_pay_ok = Signal()
+                m.d.comb += ec_pay_ok.eq(ec_pay_ok_value)
+            else:
+                ec_pay_ok = ec_pay_ok_value
             ec_park = ec_rlast_land & (~k4met_v | ~ec_pay_ok)
             ec_exit = ec_pend & k4met_v & ec_pay_ok
             ec_rcomp = (ec_rlast_land & ~ec_park) | ec_exit
@@ -2302,16 +3321,51 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             # cycling by pair index, selected by the landing cursor.
             k4_comp_bank = Signal(2)
             k4_paysel = Signal(self.data_width)
+            k4_comp_bank_value = k4_land_row[1:3]
+            if nonquad:
+                k4_comp_bank_value = k4pl['rank'][:2]
             m.d.comb += [
-                k4_comp_bank.eq(k4_land_row[1:3]),
-                k4_paysel.eq(k4pay_beat[k4_comp_bank])
+                k4_comp_bank.eq(k4_comp_bank_value),
+                k4pay_read.addr.eq(k4_comp_bank),
+                k4_paysel.eq(k4pay_read.data)
             ]
-            m.d.comb += k4_even_res.eq(
-                Mux(k4_hold_risen, k4_hold_chunk,
-                    k4_patch32(k4_paysel[:8 * 32], app_pos, k4_hold_byte)))
-            m.d.comb += k4_odd_res.eq(
-                Mux(ec_rcomp & k4_land_row[0], ec_chunk_now,
-                    k4_patch32(k4_paysel[8 * 32:], app_pos, ec_quick_byte)))
+            if nonquad:
+                # The composing row's beat: its own cell goes to the
+                # half its cell index names (fresh chunk when risen,
+                # else the pre-read half with its column byte patched);
+                # the other half is the previous row's held cell (a
+                # high cell with a run partner below) or the pre-read
+                # neighbour's retained half (a straddle beat).
+                k4_held = Signal(256)
+                k4_own_src = Signal(256)
+                k4_own = Signal(256)
+                m.d.comb += [
+                    k4_held.eq(
+                        Mux(
+                            k4_hold_risen, k4_hold_chunk,
+                            k4_patch32(k4_paysel[:8 * 32], app_pos,
+                                       k4_hold_byte))),
+                    k4_own_src.eq(
+                        Mux(k4pl['odd'], k4_paysel[8 * 32:],
+                            k4_paysel[:8 * 32])),
+                    k4_own.eq(
+                        Mux(ec_rcomp, ec_chunk_now,
+                            k4_patch32(k4_own_src, app_pos, ec_quick_byte))),
+                    k4_even_res.eq(
+                        Mux(k4pl['odd'],
+                            Mux(k4pl['l'] != 0, k4_held, k4_paysel[:8 * 32]),
+                            k4_own)),
+                    k4_odd_res.eq(Mux(k4pl['odd'], k4_own,
+                                      k4_paysel[8 * 32:])),
+                ]
+            else:
+                m.d.comb += k4_even_res.eq(
+                    Mux(k4_hold_risen, k4_hold_chunk,
+                        k4_patch32(k4_paysel[:8 * 32], app_pos, k4_hold_byte)))
+                m.d.comb += k4_odd_res.eq(
+                    Mux(ec_rcomp & k4_land_row[0], ec_chunk_now,
+                        k4_patch32(k4_paysel[8 * 32:], app_pos,
+                                   ec_quick_byte)))
             # The K4 beat write arbiter: one write per cycle, payload
             # over state over meta, one-deep latches.
             k4w_any = k4w_pay_v | k4w_st_v | k4w_met_v
@@ -2367,8 +3421,14 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                                              q_byte_r)),
                     ec_land_cnt.eq(ec_land_cnt + 1)
                 ]
+            # A non-composing row parks its data in the hold registers
+            # (quad: the even row of a pair); a composing one loads the
+            # payload write latch from its beat.
+            _k4_hold_cond = ~k4_land_row[0]
+            if nonquad:
+                _k4_hold_cond = ~k4pl['comp']
             with m.If(ec_complete):
-                with m.If(~k4_land_row[0]):
+                with m.If(_k4_hold_cond):
                     with m.If(ec_rcomp):
                         m.d.sync += [
                             k4_hold_risen.eq(1),
@@ -2380,14 +3440,21 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                             k4_hold_byte.eq(ec_quick_byte)
                         ]
                 with m.Else():
+                    _k4w_pay_addr_value = (r_base + ((k4_land_row >> 2) << 8) +
+                                           (k4_land_row[1] << 6) +
+                                           (app_blk << 7))
+                    _k4w_bank = k4_land_row[1:3]
+                    if nonquad:
+                        _k4w_pay_addr_value = r_base + (k4pl['rank'] << 6)
+                        _k4w_bank = k4pl['rank'][:2]
                     m.d.sync += [
                         k4w_pay_v.eq(1),
-                        k4w_pay_addr.eq(r_base + ((k4_land_row >> 2) << 8) +
-                                        (k4_land_row[1] << 6) +
-                                        (app_blk << 7)),
+                        k4w_pay_addr.eq(_k4w_pay_addr_value),
                         k4w_pay_data.eq(Cat(k4_even_res, k4_odd_res)),
-                        k4pay_v.bit_select(k4_land_row[1:3], 1).eq(0),
+                        k4pay_v.bit_select(_k4w_bank, 1).eq(0),
                     ]
+                    if nonquad:
+                        m.d.sync += k4_ncomp.eq(k4_ncomp + 1)
             # The risen completion scatters using the landing cursor's
             # indices and the completing context's values, then frees
             # the context and re-opens the cursor.
@@ -2408,17 +3475,27 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                 with m.Switch(k4_land_row[:4]):
                     for i in range(16):
                         base = 32 * (i >> 3) + 4 * (i & 7)
-                        meta = ((i >> 2) << 3) | (i & 3)
                         with m.Case(i):
                             m.d.sync += [
                                 k4st[base].eq(ec_cmag),
                                 k4st[base + 2].eq(ec_cr[:16]),
                                 k4st[base + 3].eq(ec_cr[16:])
                             ]
-                            with m.If(app_blk):
-                                m.d.sync += meta_hw[meta + 4].eq(ec_cd16)
-                            with m.Else():
-                                m.d.sync += meta_hw[meta].eq(ec_cd16)
+                # The d16 lands in the meta beat accumulator at the
+                # row's staging cell: (row>>2)*8 + blk*4 + (row&3) on
+                # the quad, the five-lane cell index's low bits on a
+                # non-quad build.
+                if nonquad:
+                    m.d.sync += meta_hw[k4pl['cell'][:5]].eq(ec_cd16)
+                else:
+                    with m.Switch(k4_land_row[:4]):
+                        for i in range(16):
+                            meta = ((i >> 2) << 3) | (i & 3)
+                            with m.Case(i):
+                                with m.If(app_blk):
+                                    m.d.sync += meta_hw[meta + 4].eq(ec_cd16)
+                                with m.Else():
+                                    m.d.sync += meta_hw[meta].eq(ec_cd16)
                 for c in range(EC_CTXS):
                     with m.If(ec_cctx == c):
                         m.d.sync += ec_alloc[c].eq(0)
@@ -2451,11 +3528,24 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                     # exactly the serialized order the bank needs.
                     with m.If(k4st_next != 16):
                         m.d.sync += k4st_rq.eq(1)
-                with m.If(k4_land_row[:4].all()):
-                    m.d.sync += [
-                        k4w_met_due.eq(1),
-                        k4w_met_idx.eq(k4_land_row[4:7])
-                    ]
+                _k4met_arm = k4_land_row[:4].all()
+                _k4met_idx = k4_land_row[4:7]
+                if nonquad:
+                    # The beat's last row by table (the landing row's
+                    # own meta beat names the entry).
+                    k4met_last = Signal(range(max_dims + 1))
+                    with m.Switch(Cat(k4pl['mbeat'], app_blk)):
+                        for _blk in (0, 1):
+                            for _m in range(max_dims * 2 // 32):
+                                with m.Case(_m | (_blk << 3)):
+                                    m.d.comb += k4met_last.eq(
+                                        _k4met_last[(_blk, _m)])
+                        with m.Default():
+                            m.d.comb += k4met_last.eq(max_dims)
+                    _k4met_arm = k4_land_row == k4met_last
+                    _k4met_idx = k4pl['mbeat']
+                with m.If(_k4met_arm):
+                    m.d.sync += [k4w_met_due.eq(1), k4w_met_idx.eq(_k4met_idx)]
                 with m.If(k4_land_row == last_row):
                     m.d.sync += k4_done_wait.eq(1)
             # Deferred state/meta beat writes: each latch loads as
@@ -2493,23 +3583,44 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             k4w_data = Const(0, self.data_width)
             k4_comp = Const(0)
 
+        tw_valid = in_drain | (in_sg1w & sg1_wr) | (in_appw & app_ph) | k4w_go
+        tw_addr = Mux(
+            k4w_go, k4w_addr,
+            Mux(
+                in_appw, app_waddr,
+                Mux(in_sg1w, sg1_waddr,
+                    r_base + (row * self.row_pad) + (dbeat << lg))))
+        tw_data = Mux(
+            k4w_go, k4w_data,
+            Mux(
+                in_appw, app_wdata,
+                Mux(in_sg1w, sg1_wdata[:self.data_width],
+                    drain_sr[:self.data_width])))
+        if nonquad:
+            # The K window's write-back has the port to itself: the
+            # store's payload beats at r_base, then the meta banks at
+            # m_base.
+            kd_mdata = Signal(self.data_width)
+            with m.Switch(kdb - kpb):
+                for b in range(_kwin_mb_max):
+                    with m.Case(b):
+                        m.d.comb += kd_mdata.eq(Cat(*metab[b]))
+                with m.Default():
+                    m.d.comb += kd_mdata.eq(0)
+            with m.If(kd_stage):
+                m.d.sync += [
+                    kd_addr.eq(
+                        Mux(kd_pay, r_base + (kdb << 6),
+                            m_base + ((kdb - kpb) << 6))),
+                    kd_data.eq(Mux(kd_pay, kwin_r.data, kd_mdata)),
+                ]
+            tw_valid = tw_valid | kd_v
+            tw_addr = Mux(kd_v, kd_addr, tw_addr)
+            tw_data = Mux(kd_v, kd_data, tw_data)
         m.d.comb += [
-            self.tmem_w.valid.eq(in_drain | (in_sg1w & sg1_wr)
-                                 | (in_appw & app_ph) | k4w_go),
-            self.tmem_w.bits.addr.eq(
-                Mux(
-                    k4w_go, k4w_addr,
-                    Mux(
-                        in_appw, app_waddr,
-                        Mux(in_sg1w, sg1_waddr,
-                            r_base + (row * self.row_pad) + (dbeat << lg))))),
-            self.tmem_w.bits.data.eq(
-                Mux(
-                    k4w_go, k4w_data,
-                    Mux(
-                        in_appw, app_wdata,
-                        Mux(in_sg1w, sg1_wdata[:self.data_width],
-                            drain_sr[:self.data_width])))),
+            self.tmem_w.valid.eq(tw_valid),
+            self.tmem_w.bits.addr.eq(tw_addr),
+            self.tmem_w.bits.data.eq(tw_data),
         ]
 
         # ------------------------------------------------------------------
@@ -2521,16 +3632,27 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
         def start_scale():
             m.d.sync += [s_step.eq(0), s_wait.eq(0), zero_blk.eq(0)]
 
+        rowclr = Signal()  # the finished row's assembly clears next cycle
+
         def clear_row():
             for k in range(row_words):
                 m.d.sync += rowwords[k].eq(0)
 
-        def advance_row():
+        def advance_row(last='DONE'):
             """Next-row transition shared by the drain paths: bump the
-            row cursor, clear the row assembly, and enter the next
-            row's scale (prefetched) or gather."""
+            row cursor, arm the row assembly's clear, and enter the next
+            row's scale (prefetched) or gather. ``last`` is the state
+            entered after the final row (a K window run still has its
+            store to write back).
+
+            The clear lands one cycle after this transition, from the
+            ``rowclr`` register below: nothing writes the assembly in the
+            first cycle of GATHER, SCALE, KDRAIN or DONE, and every drain
+            path decides this transition in its last cycle from the
+            staging geometry, so a clear issued here would put that
+            geometry in front of all 17 words' enables."""
             with m.If(row == last_row):
-                m.next = 'DONE'
+                m.next = last
             with m.Else():
                 m.d.sync += [
                     row.eq(row + 1),
@@ -2538,7 +3660,15 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                     wbyte.eq(0),
                     cur_bank.eq(~cur_bank),
                 ]
-                clear_row()
+                if self.n_outputs != 4:
+                    # The staging position rides the row cursor: the
+                    # lane wraps at the group width, and the group ends
+                    # with it.
+                    with m.If(slane == self.n_outputs - 1):
+                        m.d.sync += [slane.eq(0), sgrp.eq(sgrp + 1)]
+                    with m.Else():
+                        m.d.sync += slane.eq(slane + 1)
+                m.d.sync += rowclr.eq(1)
                 with m.If(drain_prefetched):
                     m.d.sync += [
                         xmax16.eq(pxmax16),
@@ -2549,6 +3679,11 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                 with m.Else():
                     start_block()
                     m.next = 'GATHER'
+
+        with m.If(rowclr):
+            m.d.sync += [
+                rowclr.eq(0), *[rowwords[k].eq(0) for k in range(row_words)]
+            ]
 
         with m.FSM(name='vbuild') as fsm:
             with m.State('IDLE'):
@@ -2571,14 +3706,16 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                         part.eq(offer_part),
                         live.eq(offer_live[:7]),
                         pair_base.eq((offer.k - 1) & 14),
-                        vapp.eq(offer_va),
-                        kapp.eq(offer_ka),
-                        kr.eq((offer.k - 1)[:4]),
+                        *([
+                            vapp.eq(offer_va),
+                            kapp.eq(offer_ka),
+                            kr.eq((offer.k - 1)[:4])
+                        ] if app_on else []),
                         app_blk.eq(Mux(offer_k4, offer_k4_blk, offer_va1)),
                         app_pos.eq((offer.k - 1)[:5]),
-                        app_w.eq(0),
-                        app_ph.eq(0),
-                        app_rd.eq(0),
+                        *([app_w.eq(0),
+                           app_ph.eq(0),
+                           app_rd.eq(0)] if app_on else []),
                         fill_wlo.eq(
                             Mux(offer_vb1 | (offer_k4 & offer_k4_blk),
                                 32 * (offer_slot_bytes >> 2), 0)),
@@ -2587,7 +3724,9 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                                 32 * (offer_slot_bytes >> 2), 0)),
                         fill_total.eq(
                             Mux(offer_app, offer_slot_bytes >> 2,
-                                offer_live * (offer_slot_bytes >> 2))),
+                                offer_live * (offer_slot_bytes >> 2)
+                                ) if app_on else offer_live *
+                            (offer_slot_bytes >> 2)),
                         fill_beat.eq(0),
                         fill_have.eq(0),
                         fill_next_v.eq(0),
@@ -2616,6 +3755,36 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                         nrm_pend.eq(0),
                         nrm_iss.eq(0),
                         sg1_widx.eq(0),
+                        # Generalized-interleave run state: the staging
+                        # position, both accumulators' beat walks, the
+                        # armed meta write, the pre-read walks and the
+                        # retained straddle half all start empty.
+                        *([
+                            sgrp.eq(0),
+                            slane.eq(0),
+                            mbeat0.eq(0),
+                            mbeat1.eq(1),
+                            mwr_v.eq(0),
+                            mwr_beat.eq(0),
+                            strret_v.eq(0),
+                            gmet_cnt.eq(0),
+                            gbdy_cnt.eq(0),
+                            pre_kind.eq(0),
+                            pre_acc.eq(0),
+                            pre_bpar.eq(0),
+                            # The K window's run geometry and walks.
+                            kloff.eq(offer_loff),
+                            kpb.eq(kpb_o),
+                            kmb.eq(kmb_o),
+                            kmhw.eq(kmhw_o),
+                            kpp.eq(0),
+                            kpm.eq(0),
+                            kpj.eq(0),
+                            k4_ncomp.eq(0),
+                            kdb.eq(0),
+                            kd_pending.eq(0),
+                            kdb_d.eq(_kwin_depth + _kwin_mb_max)
+                        ] if self.n_outputs != 4 else []),
                         # K4 selective-append state. The walk STARTS in
                         # quick mode: the first rows may all be quick
                         # (a real prior state beats the new column),
@@ -2704,9 +3873,46 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                         # state/meta beat-0 pre-requests armed.
                         m.d.sync += blk.eq(app_blk)
                         m.next = 'K4ROW'
+                    if self.n_outputs != 4:
+                        # A K window run first pre-reads its staging
+                        # window: the retained neighbours' cells the
+                        # drain composes around its own rows.
+                        with m.Elif(kwin_mode):
+                            m.next = 'KPRE'
                     with m.Else():
                         start_block()
                         m.next = 'GATHER'
+
+            if self.n_outputs != 4:
+                with m.State('KPRE'):
+                    # The K window pre-read: payload beats into the
+                    # store, then meta beats into the banks (one
+                    # outstanding at a time through the pre-read flag).
+                    m.d.comb += in_kpre.eq(1)
+                    with m.If((kpp == kpb) & (kpm == kmb) & ~pre_rd):
+                        start_block()
+                        m.next = 'GATHER'
+
+                with m.State('KPATCH'):
+                    # A rebuilt row lands its cells: one block per
+                    # cycle, the chunk into the store half and the d16
+                    # into the meta bank; then the next row (or, after
+                    # the last, the write-back).
+                    m.d.comb += in_kpatch.eq(1)
+                    m.d.sync += kpj.eq(kpj + 1)
+                    with m.If(kpj == Mux(wide, max_blocks - 1, 1)):
+                        m.d.sync += [self.rows.eq(self.rows + 1), kpj.eq(0)]
+                        advance_row('KDRAIN')
+
+                with m.State('KDRAIN'):
+                    # The store's payload beats, then the meta banks,
+                    # back to the staging the host stores from. The
+                    # last beat's write completes the run.
+                    m.d.comb += in_kdrain.eq(1)
+                    with m.If(kd_v & self.tmem_w.fire):
+                        m.d.sync += self.beats.eq(self.beats + 1)
+                        with m.If(kd_last):
+                            m.next = 'DONE'
 
             with m.State('GATHER'):
                 m.d.comb += in_gather.eq(1)
@@ -2732,18 +3938,24 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                         start_scale()
                         m.next = 'SCALE'
                 with m.Elif(gather_valid & (gather_index == cur_live - 1)):
-                    with m.If(vapp & (blk != last_blk)):
-                        # The append's next gather segment: dims
-                        # 32*(blk+1).. of the same slot continue the
-                        # SAME amax fold (no xmax16/xnan reset, no
-                        # scale yet) into the next bank.
-                        m.d.sync += [
-                            blk.eq(blk + 1),
-                            gi.eq(0),
-                            cur_bank.eq(~cur_bank),
-                        ]
-                        m.next = 'GATHER'
-                    with m.Else():
+                    if app_on:
+                        with m.If(vapp & (blk != last_blk)):
+                            # The append's next gather segment: dims
+                            # 32*(blk+1).. of the same slot continue the
+                            # SAME amax fold (no xmax16/xnan reset, no
+                            # scale yet) into the next bank.
+                            m.d.sync += [
+                                blk.eq(blk + 1),
+                                gi.eq(0),
+                                cur_bank.eq(~cur_bank),
+                            ]
+                            m.next = 'GATHER'
+                        with m.Else():
+                            # The last live slot folds this cycle; the
+                            # scale sequencer arms on the next.
+                            start_scale()
+                            m.next = 'SCALE'
+                    else:
                         # The last live slot folds this cycle; the scale
                         # sequencer arms on the next.
                         start_scale()
@@ -2763,22 +3975,26 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                             wi, half = divmod(j * 34, 4)
                             m.d.sync += rowwords[wi][half * 8:half * 8 +
                                                      16].eq(d16)
-                    with m.If(vapp):
-                        for j in range(max_blocks):
-                            wi, half = divmod(j * 34, 4)
-                            m.d.sync += rowwords[wi][half * 8:half * 8 +
-                                                     16].eq(d16)
-                        # Widen the token d16 into its F32 row word
-                        # now (the dedicated unit is idle in SCALE);
-                        # the drain patches it beats later.
-                        m.d.comb += [f16wa.inp_valid.eq(1), f16wa.inp.eq(d16)]
-                        # The single scale ran at the last segment
-                        # (the gather's final block); re-arm the quant
-                        # walk as the block-0 pass so chunk 0
-                        # quantizes dims 0..31 from bank 0 first, then
-                        # the QUANT transition above walks the later
-                        # banks' segments.
-                        m.d.sync += [blk.eq(0), cur_bank.eq(0)]
+                    if app_on:
+                        with m.If(vapp):
+                            for j in range(max_blocks):
+                                wi, half = divmod(j * 34, 4)
+                                m.d.sync += rowwords[wi][half * 8:half * 8 +
+                                                         16].eq(d16)
+                            # Widen the token d16 into its F32 row word
+                            # now (the dedicated unit is idle in SCALE);
+                            # the drain patches it beats later.
+                            m.d.comb += [
+                                f16wa.inp_valid.eq(1),
+                                f16wa.inp.eq(d16)
+                            ]
+                            # The single scale ran at the last segment
+                            # (the gather's final block); re-arm the quant
+                            # walk as the block-0 pass so chunk 0
+                            # quantizes dims 0..31 from bank 0 first, then
+                            # the QUANT transition above walks the later
+                            # banks' segments.
+                            m.d.sync += [blk.eq(0), cur_bank.eq(0)]
                     m.d.sync += [
                         wbyte.eq(wbyte + 2),
                         q_iss.eq(0),
@@ -2824,42 +4040,55 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                 with m.If((q_iss == cur_live) & (q_land == cur_live)
                           & prefetch_done):
                     m.d.sync += [q_iss.eq(0), q_land.eq(0)]
+
+                    def quant_block0_done():
+                        # A block-0 partial is done with this row
+                        # once block 0 lands: block 1's extents
+                        # stay loaded, so skip its zero-amax round
+                        # entirely (and re-enter GATHER -- no
+                        # prefetch is outstanding).
+                        m.d.sync += drain_prefetched.eq(0)
+                        m.next = 'DRAINLOAD'
+
+                    def quant_next_block():
+                        m.d.sync += [
+                            blk.eq(blk + 1),
+                            cur_bank.eq(~cur_bank),
+                            xmax16.eq(pxmax16),
+                            xnan.eq(pxnan),
+                            # Realign the byte cursor: a capped
+                            # quant stream stopped at 2 + cur_live,
+                            # but the next block's bytes start at
+                            # its fixed 34-byte slot boundary.
+                            wbyte.eq((blk + 1) * 34),
+                        ]
+                        start_scale()
+                        m.next = 'SCALE'
+
                     with m.If(blk != last_blk):
-                        with m.If(vapp):
-                            # The append's next quant segment: dims
-                            # 32*(blk+1).. from the matching bank under
-                            # the SAME scale (no second scale pass),
-                            # their bytes at the fixed 34-byte chunk
-                            # boundaries.
-                            m.d.sync += [
-                                blk.eq(blk + 1),
-                                cur_bank.eq(~cur_bank),
-                                wbyte.eq((blk + 1) * 34 + 2),
-                                drain_prefetched.eq(0),
-                            ]
-                            m.next = 'QUANT'
-                        with m.Elif(part_vb0):
-                            # A block-0 partial is done with this row
-                            # once block 0 lands: block 1's extents
-                            # stay loaded, so skip its zero-amax round
-                            # entirely (and re-enter GATHER -- no
-                            # prefetch is outstanding).
-                            m.d.sync += drain_prefetched.eq(0)
-                            m.next = 'DRAINLOAD'
-                        with m.Else():
-                            m.d.sync += [
-                                blk.eq(blk + 1),
-                                cur_bank.eq(~cur_bank),
-                                xmax16.eq(pxmax16),
-                                xnan.eq(pxnan),
-                                # Realign the byte cursor: a capped
-                                # quant stream stopped at 2 + cur_live,
-                                # but the next block's bytes start at
-                                # its fixed 34-byte slot boundary.
-                                wbyte.eq((blk + 1) * 34),
-                            ]
-                            start_scale()
-                            m.next = 'SCALE'
+                        if app_on:
+                            with m.If(vapp):
+                                # The append's next quant segment: dims
+                                # 32*(blk+1).. from the matching bank under
+                                # the SAME scale (no second scale pass),
+                                # their bytes at the fixed 34-byte chunk
+                                # boundaries.
+                                m.d.sync += [
+                                    blk.eq(blk + 1),
+                                    cur_bank.eq(~cur_bank),
+                                    wbyte.eq((blk + 1) * 34 + 2),
+                                    drain_prefetched.eq(0),
+                                ]
+                                m.next = 'QUANT'
+                            with m.Elif(part_vb0):
+                                quant_block0_done()
+                            with m.Else():
+                                quant_next_block()
+                        else:
+                            with m.If(part_vb0):
+                                quant_block0_done()
+                            with m.Else():
+                                quant_next_block()
                     with m.Else():
                         # A partial run never prefetches the next row's
                         # selected block (nxt_live is 0 on the exit
@@ -2869,28 +4098,50 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                                                         & (part == 0) & ~vapp)
                         m.next = 'DRAINLOAD'
 
-            with m.State('DRAINLOAD'):
-                m.d.comb += in_drainload.eq(1)
-                with m.If(vapp | kapp):
-                    # Append-mode drain: the row assembly is the token
-                    # row; APPW pre-reads, patches and writes back the
-                    # V payload/scale-row beats or the K payload/meta
-                    # beats, all composed from the pre-read image.
+            def drainload_append():
+                # Append-mode drain: the row assembly is the token
+                # row; APPW pre-reads, patches and writes back the
+                # V payload/scale-row beats or the K payload/meta
+                # beats, all composed from the pre-read image.
+                m.d.sync += [
+                    self.rows.eq(self.rows + 1),
+                    app_w.eq(0),
+                    app_ph.eq(0),
+                    app_rd.eq(0),
+                ]
+                if self.n_outputs != 4:
+                    # The walk starts at the block's first cell
+                    # (lane 0 of group 0).
                     m.d.sync += [
-                        self.rows.eq(self.rows + 1),
-                        app_w.eq(0),
-                        app_ph.eq(0),
-                        app_rd.eq(0),
+                        arow.eq(0),
+                        alane.eq(0),
+                        acell.eq(app_blk * self.n_outputs),
+                        abeat.eq(0),
+                        aph2.eq(0),
+                        asrow.eq(0),
                     ]
-                    m.next = 'APPW'
-                with m.Elif(~sg1):
-                    m.d.sync += [
-                        drain_sr.eq(
-                            Cat(rowbuf,
-                                Const(0, 8 * self.row_pad - 8 * VB_ROW_RAW))),
-                        dbeat.eq(0),
-                    ]
-                    m.next = 'DRAIN'
+                m.next = 'APPW'
+
+            def drainload_legacy():
+                m.d.sync += [
+                    drain_sr.eq(rowbuf[:8 * VB_ROW_RAW]),
+                    dbeat.eq(0),
+                ]
+                m.next = 'DRAIN'
+
+            def drainload_v_row():
+                """The row pass's exits, in their standing priority:
+                the append drain (a build that accepts appends only),
+                the legacy tile shift-out, the pre-read hold and the
+                SG1 scatter."""
+                if app_on:
+                    with m.If(vapp | kapp):
+                        drainload_append()
+                    with m.Elif(~sg1):
+                        drainload_legacy()
+                else:
+                    with m.If(~sg1):
+                        drainload_legacy()
                 with m.Elif(pre_rd):
                     # A partial run's meta pre-read still outstanding:
                     # hold the scatter one cycle so the loaded beat
@@ -2904,26 +4155,88 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                     # above is unused in this mode.
                     m.d.sync += self.rows.eq(self.rows + 1)
                     if self.beat_bytes == VB_SG1_BEAT:
-                        # Partial gating: a V block-extent run writes
-                        # only its block's cells; a K row-extent run
-                        # writes only rows < live (dead rows keep the
-                        # pre-read cells instead of today's zeros).
-                        for j in range(max_blocks):
-                            meta_go = (j < sg_blocks) & ~part_k_row_dead \
-                                & Mux(part_vb, part_blk == j, 1)
-                            wi, half = divmod(j * 34, 4)
-                            with m.If(meta_go):
-                                m.d.sync += meta_hw[meta_indices[j]].eq(
-                                    rowwords[wi][half * 8:half * 8 + 16])
-                        with m.If(~row[0]):
-                            m.d.sync += [
-                                hold.eq(chunk)
-                                for hold, chunk in zip(holds, chunks)
-                            ]
-                            advance_row()
-                        with m.Else():
+                        if self.n_outputs == 4:
+                            # Partial gating: a V block-extent run writes
+                            # only its block's cells; a K row-extent run
+                            # writes only rows < live (dead rows keep the
+                            # pre-read cells instead of today's zeros).
+                            for j in range(max_blocks):
+                                meta_go = (j < sg_blocks) & ~part_k_row_dead \
+                                    & Mux(part_vb, part_blk == j, 1)
+                                wi, half = divmod(j * 34, 4)
+                                with m.If(meta_go):
+                                    m.d.sync += meta_hw[meta_indices[j]].eq(
+                                        rowwords[wi][half * 8:half * 8 + 16])
+                            with m.If(~row[0]):
+                                m.d.sync += [
+                                    hold.eq(chunk)
+                                    for hold, chunk in zip(holds, chunks)
+                                ]
+                                advance_row()
+                            with m.Else():
+                                m.d.sync += sg1_widx.eq(0)
+                                m.next = 'SG1W'
+                        else:
+                            # The generalized interleave: scatter the
+                            # row's d16 cells into the beat accumulator
+                            # their staging index names (a row's cells
+                            # can straddle a meta beat boundary -- the
+                            # two accumulators alternate), load this
+                            # row's held chunks, arm any completing
+                            # meta beat, and enter SG1W when the row
+                            # has entries or an armed write.
+                            for j, cell in ((0, cell0), (1, cell1)):
+                                meta_go = ~part_k_row_dead \
+                                    & Mux(part_vb, part_blk == j, 1)
+                                wi, half = divmod(j * 34, 4)
+                                with m.If(meta_go):
+                                    with m.If(cell[5]):
+                                        m.d.sync += meta_hw2[cell[:5]].eq(
+                                            rowwords[wi][half * 8:half * 8 +
+                                                         16])
+                                    with m.Else():
+                                        m.d.sync += meta_hw[cell[:5]].eq(
+                                            rowwords[wi][half * 8:half * 8 +
+                                                         16])
+                            with m.If(hold0):
+                                m.d.sync += holds[0].eq(chunks[0])
+                            with m.If(hold1):
+                                m.d.sync += holds[1].eq(chunks[1])
+                            with m.If(strh1):
+                                m.d.sync += strhead_c1.eq(chunks[1])
+                            with m.If(arm0):
+                                m.d.sync += [
+                                    mwr_v.eq(1),
+                                    mwr_sel.eq(0),
+                                    mwr_beat.eq(mbeat0),
+                                    mbeat0.eq(mbeat0 + 2),
+                                ]
+                            with m.If(arm1):
+                                m.d.sync += [
+                                    mwr_v.eq(1),
+                                    mwr_sel.eq(1),
+                                    mwr_beat.eq(mbeat1),
+                                    mbeat1.eq(mbeat1 + 2),
+                                ]
                             m.d.sync += sg1_widx.eq(0)
-                            m.next = 'SG1W'
+                            with m.If(comp0 | strc0 | comp1 | arm0 | arm1):
+                                m.next = 'SG1W'
+                            with m.Else():
+                                advance_row()
+
+            with m.State('DRAINLOAD'):
+                m.d.comb += in_drainload.eq(1)
+                if self.n_outputs != 4:
+                    # A K window row lands its cells in KPATCH (every K
+                    # mode of a non-quad build is a window run, so the
+                    # append is the only branch it displaces).
+                    with m.If(kwin_mode):
+                        m.d.sync += kpj.eq(0)
+                        m.next = 'KPATCH'
+                    with m.Else():
+                        drainload_v_row()
+                else:
+                    drainload_v_row()
 
             with m.State('K4ROW'):
                 # Both K4 prongs dispatch into the shared chain/element
@@ -2962,25 +4275,49 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
                 with m.If(sg1_last):
                     advance_row()
 
-            with m.State('APPW'):
-                # Append-mode patch drain: each beat was pre-read into
-                # the accumulator with its patch bytes (the widened d16
-                # word, a whole K chunk, or the K meta cells) scattered
-                # on the response; write the composed beat back, then
-                # advance to the next. A V append walks 36 beats at 64
-                # dims / 68 at 128 (payload then scale row); a K append
-                # walks one beat per block plus the meta beat.
-                m.d.comb += in_appw.eq(1)
-                app_last = Mux(
-                    kapp, Mux(wide, Const(max_blocks, 7), Const(2, 7)),
-                    Mux(wide, Const(VB_APP_WIDE_TOTAL_BEATS - 1, 7),
-                        Const(35, 7)))
-                with m.If(app_ph & self.tmem_w.fire):
-                    m.d.sync += self.beats.eq(self.beats + 1)
-                    with m.If(app_w == app_last):
-                        m.next = 'DONE'
-                    with m.Else():
-                        m.d.sync += [app_w.eq(app_w + 1), app_ph.eq(0)]
+            if app_on:
+                with m.State('APPW'):
+                    # Append-mode patch drain: each beat was pre-read into
+                    # the accumulator with its patch bytes (the widened d16
+                    # word, a whole K chunk, or the K meta cells) scattered
+                    # on the response; write the composed beat back, then
+                    # advance to the next. A V append walks 36 beats at 64
+                    # dims / 68 at 128 (payload then scale row); a K append
+                    # walks one beat per block plus the meta beat.
+                    m.d.comb += in_appw.eq(1)
+                    app_last = Mux(
+                        kapp, Mux(wide, Const(max_blocks, 7), Const(2, 7)),
+                        Mux(wide, Const(VB_APP_WIDE_TOTAL_BEATS - 1, 7),
+                            Const(35, 7)))
+                    if nonquad:
+                        # The V append walk: a payload beat's write either
+                        # fetches the next beat of the block's cells or, once
+                        # the last row landed, opens the four-beat scale-row
+                        # phase (app_w 0..3); a second row of the same beat
+                        # patches from the accumulator one cycle after the
+                        # response, and arms the write after it (that walk
+                        # lives beside the compose logic above).
+                        with m.If(app_ph & self.tmem_w.fire):
+                            m.d.sync += self.beats.eq(self.beats + 1)
+                            with m.If(~asrow):
+                                m.d.sync += app_ph.eq(0)
+                                with m.If(arow == dims):
+                                    m.d.sync += [asrow.eq(1), app_w.eq(0)]
+                            with m.Else():
+                                with m.If(app_w == 3):
+                                    m.next = 'DONE'
+                                with m.Else():
+                                    m.d.sync += [
+                                        app_w.eq(app_w + 1),
+                                        app_ph.eq(0)
+                                    ]
+                    else:
+                        with m.If(app_ph & self.tmem_w.fire):
+                            m.d.sync += self.beats.eq(self.beats + 1)
+                            with m.If(app_w == app_last):
+                                m.next = 'DONE'
+                            with m.Else():
+                                m.d.sync += [app_w.eq(app_w + 1), app_ph.eq(0)]
 
             with m.State('DRAIN'):
                 m.d.comb += in_drain.eq(1)
@@ -3024,15 +4361,16 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             m.d.sync += self.scale_cycles.eq(self.scale_cycles + 1)
         with m.If(in_quant | (in_k4row & ~ec_chain_busy & ~ec_heal_gather)):
             m.d.sync += self.quant_cycles.eq(self.quant_cycles + 1)
-        with m.If(in_drain | in_sg1w | in_appw):
+        with m.If(in_drain | in_sg1w | in_appw | in_kpatch | in_kdrain):
             m.d.sync += self.drain_cycles.eq(self.drain_cycles + 1)
         with m.If(running):
             m.d.sync += self.run_cycles.eq(self.run_cycles + 1)
         # D1 riders (see the declaration block for the partition
         # identity). The wait subsets must stay subsets: fill waits
-        # only in FILL, drain-side waits only across the three drain
-        # states, prefetch only inside QUANT.
-        with m.If(in_drainload):
+        # only in FILL, drain-side waits only across the drain states,
+        # prefetch only inside QUANT. A K window run's staging pre-read
+        # is dispatch-side (it holds the row pass like DRAINLOAD does).
+        with m.If(in_drainload | in_kpre):
             m.d.sync += self.dispatch_cycles.eq(self.dispatch_cycles + 1)
         with m.If(in_fill & ~fill_have):
             m.d.sync += self.fill_wait_cycles.eq(self.fill_wait_cycles + 1)
@@ -3041,7 +4379,8 @@ class VBuildUnit(HasTRoomParams, Elaboratable):
             | (in_drain & ~self.tmem_w.fire) \
             | (in_appw & app_ph & ~self.tmem_w.fire) \
             | (in_appw & app_rd & ~self.tmem_rresp.fire) \
-            | (in_appw & app_req & ~self.tmem_rreq.fire))
+            | (in_appw & app_req & ~self.tmem_rreq.fire) \
+            | (in_kdrain & kd_v & ~self.tmem_w.fire))
         with m.If(drain_wait):
             m.d.sync += self.drain_wait_cycles.eq(self.drain_wait_cycles + 1)
         with m.If(prefetch_go):

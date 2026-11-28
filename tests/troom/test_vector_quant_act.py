@@ -34,6 +34,7 @@ import pytest
 from amaranth import Elaboratable, Module
 from amaranth.sim import Passive, Simulator
 
+from troom.abi import PV_EARLY_WEIGHTS_FLAG
 from troom.consts import Format, Opcode, Status, VecOp
 from troom.stream import pack_stream_q8_0
 from troom.tmem import TMEM
@@ -886,3 +887,59 @@ def test_core_q_act_mixed_fill_priority():
     assert all(s is Status.OK for s in results.values()), results
     check_chain_results(image, chain_reference(fmt, k, rows, wsegs, words), k,
                         rows)
+
+
+@pytest.mark.parametrize('width,lanes,banks', [(64, 2, 2), (512, 4, 2),
+                                               (64, 2, 1)])
+def test_pv_early_weights_keeps_activation_commit_order(width, lanes, banks):
+    """Fetch PV weights while direct P quantization fills the next ACT bank."""
+    rng = random.Random(822)
+    k, rows = 64, 128
+    fmt = Format.Q8_0
+    words = [f32_bits(f32(rng.uniform(-1, 1))) for _ in range(k)]
+    wsegs = gen_wsegs(rng, fmt, rows * (k // 32))
+    params = dict(PARAMS,
+                  data_width=width,
+                  n_outputs=lanes,
+                  act_banks=banks,
+                  n_tmem_banks=8 if width == 512 else 4,
+                  act_max_k=4096,
+                  tmem_bytes=64 * 1024)
+    timing = []
+    for early in (False, True):
+        program, image, _, _ = q_act_chain(params, words, wsegs, fmt, k, rows)
+        if early:
+            program[3], program[4] = program[4], program[3]
+            program[3].update(seq=5, w_stride=PV_EARLY_WEIGHTS_FLAG)
+            program[4]['seq'] = 6
+        overlap = []
+
+        def watch(dut):
+
+            def proc():
+                yield Passive()
+                stream = dut.core.stream
+                while True:
+                    assert not (yield dut.core.act_wr_conflict)
+                    if (yield stream.act_fill_busy):
+                        assert not (yield stream.actram.commit)
+                        if (yield stream.mem_rreq.fire):
+                            overlap.append(1)
+                    yield
+
+            return proc
+
+        results, image, counters = run_program(params,
+                                               program,
+                                               image,
+                                               deadline=40000,
+                                               watch=watch)
+        assert bool(overlap) == (early and banks == 2)
+        assert all(s is Status.OK for s in results.values()), results
+        check_chain_results(image, chain_reference(fmt, k, rows, wsegs, words),
+                            k, rows)
+        timing.append(counters['cycles'])
+    print(
+        f'PV early weights cycles ({width}-bit, {banks} ACT banks): {timing}')
+    if banks == 2:
+        assert timing[1] < timing[0], timing

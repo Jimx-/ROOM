@@ -38,7 +38,8 @@ import pytest
 import random
 import struct
 
-from troom.abi import VBUILD_ROWS_HD128
+from troom.abi import (VBUILD_KOFF_GROUP_SHIFT, VBUILD_KOFF_LANE_SHIFT,
+                       VBUILD_ROWS_HD128, vbuild_koff)
 from troom.consts import Status
 from troom.tmem import TMEM
 from troom.types import HasTRoomParams
@@ -50,20 +51,28 @@ from tests.troom.model import (
     VB_OPEN_META_BITS, f32_bits, fp16_to_f32, vbuild_pfold_bits, vbuild_sg1,
     vbuild_sg1_append, vbuild_sg1_append_mask, vbuild_sg1_block_mask,
     vbuild_sg1_k, vbuild_sg1_k_append, vbuild_sg1_k_append_mask,
-    vbuild_sg1_k_mask, vbuild_quant_row, vbuild_quant_row_token, vbuild_tile,
-    vbuild_sg1_wide, vbuild_sg1_k4_append, vbuild_sg1_k4_state)
+    vbuild_sg1_k_mask, vbuild_sg1_k_stream, vbuild_sg1_k_window,
+    vbuild_sg1_cell, vbuild_sg1_append_beats, vbuild_sg1_k_window_slice,
+    vbuild_quant_row, vbuild_quant_row_token, vbuild_tile, vbuild_sg1_wide,
+    vbuild_sg1_k4_append, vbuild_sg1_k4_state)
 
 PARAMS = dict(
     addr_width=32,
     data_width=64,
     id_width=4,
     seg_len=32,
-    n_outputs=2,
+    # The consuming stream engine's lane count: the SG1 staging
+    # interleave follows it (the deployed quad images), and the
+    # five-lane tests below override it to 5.
+    n_outputs=4,
     n_tokens=1,
     tmem_bytes=64 * 1024,
     n_tmem_banks=4,
     act_max_k=1024,
 )
+
+# The five-lane staging geometry: n_outputs=5 with the 64-B SG1 beat.
+FIVE = dict(PARAMS, data_width=512, n_outputs=5)
 
 A_BASE = 0x100
 R_BASE = 0x2000
@@ -902,6 +911,634 @@ def test_vbuild_sg1_partial_nan_block1():
     mpay, mmet = vbuild_sg1_block_mask(1)
     assert pay == compose_retained(retain_pattern(64 * 64), mpay, ref_pay)
     assert met == compose_retained(retain_pattern(64 * 4), mmet, ref_met)
+
+
+# ---------------------------------------------------------------------
+# Five-lane staging (n_outputs=5, plans/2026-11-23-troom-qwen3-breakthrough):
+# the SG1 interleave group widens to the consuming stream engine's
+# five output rows. The payload beats then pair staging-consecutive
+# chunks -- the boundary beat of each group straddles the row's two
+# blocks (block 0's lane 4 with block 1's lane 0), the drain holding
+# block 1's lane-0 chunk across the group -- the 16-row meta beats
+# straddle group boundaries across two alternating accumulators, the
+# final group is short (four lanes, dropped lane), and a partial
+# extent pre-reads its straddle beats and composes the retained
+# neighbor half.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('live', [64, 33, 20, 1])
+def test_vbuild_sg1_five_lane_matches_model(live):
+    """The five-lane drain stages the frozen model's five-row
+    interleave byte for byte, at every live count: same totals (128
+    payload beats + 4 meta beats), group width 5, short final group."""
+    rng = random.Random(5300 + live)
+    window = gen_window(rng, live)
+    params = dict(FIVE)
+    beats, res = run_build(params, window, live, m_base=M_BASE)
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, meta = sg1_images(beats, hp)
+    ref_pay, ref_meta = vbuild_sg1(window, lanes=5)
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert meta == ref_meta, first_diff(meta, ref_meta)
+    assert len(beats) == (64 * 64 + 64 * 4) // hp.beat_bytes
+    edead, ezero = expected_skips(window, live)
+    assert res['counters']['dead_blocks'] == edead
+    assert res['counters']['zero_blocks'] == ezero
+
+
+def test_vbuild_sg1_five_lane_special_heavy_window():
+    rng = random.Random(53)
+    window = [rng.choice(SPECIAL_16) for _ in range(64 * 64)]
+    params = dict(FIVE)
+    beats, res = run_build(params, window, 64, m_base=M_BASE)
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, meta = sg1_images(beats, hp)
+    ref_pay, ref_meta = vbuild_sg1(window, lanes=5)
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert meta == ref_meta, first_diff(meta, ref_meta)
+
+
+def test_vbuild_sg1_five_lane_all_zero_window():
+    """A fully-dead tile still stages every byte at five lanes: the
+    zero-amax skips ride the same drain schedule, so every straddle
+    and meta boundary still writes."""
+    window = [0x0000] * 64 * 64
+    params = dict(FIVE)
+    beats, res = run_build(params, window, 64, m_base=M_BASE)
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, meta = sg1_images(beats, hp)
+    ref_pay, ref_meta = vbuild_sg1(window, lanes=5)
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert meta == ref_meta, first_diff(meta, ref_meta)
+    assert not any(pay) and not any(meta)
+
+
+@pytest.mark.parametrize('live', [64, 48, 33])
+def test_vbuild_sg1_five_lane_partial_block1_matches_model(live):
+    """rows == 2 at five lanes: block 1's extents take the reference's
+    bytes; the straddle beats' retained halves (and every other
+    unrebuilt cell) keep the loaded previous build's bytes."""
+    rng = random.Random(5400 + live)
+    window = gen_window(rng, live)
+    params = dict(FIVE)
+    beats, res = run_build(params,
+                           window,
+                           live,
+                           a_base=P_BASE,
+                           m_base=M_BASE,
+                           rows=2,
+                           retain=True)
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, met = images_over(beats, hp, retain_pattern(64 * 64),
+                           retain_pattern(64 * 4))
+    ref_pay, ref_met = vbuild_sg1(window, lanes=5)
+    mpay, mmet = vbuild_sg1_block_mask(1, lanes=5)
+    assert pay == compose_retained(retain_pattern(64 * 64), mpay, ref_pay), \
+        first_diff(pay, compose_retained(retain_pattern(64 * 64), mpay, ref_pay))
+    assert met == compose_retained(retain_pattern(64 * 4), mmet, ref_met), \
+        first_diff(met, compose_retained(retain_pattern(64 * 4), mmet, ref_met))
+    # 12 full groups' 3 payload beats (two intra-block pairs plus the
+    # composed straddle) + the short final group's 2 + 4 meta beats.
+    assert len(beats) == (38 * 64 + 64 * 4) // hp.beat_bytes
+
+
+@pytest.mark.parametrize('live', [32, 20, 1])
+def test_vbuild_sg1_five_lane_partial_block0_matches_model(live):
+    """rows == 1 at five lanes: the same contract on block 0's
+    extents, whose straddle beat composes the fresh low half with the
+    pre-read retained high half."""
+    rng = random.Random(5500 + live)
+    window = gen_window(rng, live)
+    params = dict(FIVE)
+    beats, res = run_build(params,
+                           window,
+                           live,
+                           a_base=P_BASE,
+                           m_base=M_BASE,
+                           rows=1,
+                           retain=True)
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, met = images_over(beats, hp, retain_pattern(64 * 64),
+                           retain_pattern(64 * 4))
+    ref_pay, ref_met = vbuild_sg1(window, lanes=5)
+    mpay, mmet = vbuild_sg1_block_mask(0, lanes=5)
+    assert pay == compose_retained(retain_pattern(64 * 64), mpay, ref_pay)
+    assert met == compose_retained(retain_pattern(64 * 4), mmet, ref_met)
+    assert len(beats) == (38 * 64 + 64 * 4) // hp.beat_bytes
+
+
+def test_vbuild_sg1_five_lane_partial_zero_amax_block1():
+    """A block-1 extent whose live data is all zero at five lanes: the
+    zero-amax rows ride the same compose schedule, the straddle beats
+    write composed zeros, and the retained cells stay loaded."""
+    rng = random.Random(56)
+    window = gen_window(rng, 48)
+    for j in range(32, 48):
+        for d in range(64):
+            window[j * 64 + d] = 0x0000
+    params = dict(FIVE)
+    beats, res = run_build(params,
+                           window,
+                           48,
+                           a_base=P_BASE,
+                           m_base=M_BASE,
+                           rows=2,
+                           retain=True)
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, met = images_over(beats, hp, retain_pattern(64 * 64),
+                           retain_pattern(64 * 4))
+    ref_pay, ref_met = vbuild_sg1(window, lanes=5)
+    mpay, mmet = vbuild_sg1_block_mask(1, lanes=5)
+    assert pay == compose_retained(retain_pattern(64 * 64), mpay, ref_pay)
+    assert met == compose_retained(retain_pattern(64 * 4), mmet, ref_met)
+
+
+@pytest.mark.parametrize('live', [64, 40, 1])
+def test_vbuild_wide_sg1_five_lane_matches_model(live):
+    """The wide (128-dim) V tile at five lanes: 25 full groups plus a
+    short 3-lane final group whose own straddle lands block 0's lane 2
+    with block 1's lane 0; 256 payload beats + 8 meta beats."""
+    rng = random.Random(5600 + live)
+    window = []
+    for j in range(64):
+        window.extend(gen_slot128(rng) if j < live else [0] * 128)
+    params = dict(FIVE, act_max_k=4096, vbuild_max_head_dim=128)
+    beats, res = run_build(params,
+                           window,
+                           live,
+                           m_base=M_BASE,
+                           rows=VBUILD_ROWS_HD128)
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, meta = images_over(beats, hp, bytes(128 * 64), bytes(128 * 4))
+    ref_pay, ref_meta = vbuild_sg1_wide(window, lanes=5)
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert meta == ref_meta, first_diff(meta, ref_meta)
+    assert len(beats) == (128 * 64 + 128 * 4) // hp.beat_bytes
+
+
+@pytest.mark.parametrize('live', [64, 45])
+def test_vbuild_wide_sg1_five_lane_partial_matches_model(live):
+    """The wide partial extent at five lanes: block 1's cells at the
+    160-B group stride, the straddle beats composed from the pre-read
+    retained halves (the wide staging is 8192 B of payload, so the
+    prior images are explicit)."""
+    rng = random.Random(5700 + live)
+    window = []
+    for j in range(64):
+        window.extend(gen_slot128(rng) if j < live else [0] * 128)
+    params = dict(FIVE, act_max_k=4096, vbuild_max_head_dim=128)
+    beats, res = run_build(params,
+                           window,
+                           live,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=2 | VBUILD_ROWS_HD128,
+                           retain_images=((R_BASE, retain_pattern(128 * 64)),
+                                          (M_BASE, retain_pattern(128 * 4))))
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(params)
+    pay, met = images_over(beats, hp, retain_pattern(128 * 64),
+                           retain_pattern(128 * 4))
+    ref_pay, ref_met = vbuild_sg1_wide(window, lanes=5)
+    # The five-lane block mask over the wide tile: block 1's cells at
+    # the 10-cell group stride (the tail group's 6).
+    mpay = bytearray(128 * 64)
+    mmet = bytearray(128 * 4)
+    for r in range(128):
+        g, l = divmod(r, 5)
+        gl = 5 if (g + 1) * 5 <= 128 else 128 - g * 5
+        c = g * 10 + gl + l
+        mpay[32 * c:32 * c + 32] = b'\x01' * 32
+        mmet[2 * c:2 * c + 2] = b'\x01\x01'
+    assert pay == compose_retained(retain_pattern(128 * 64),
+                                    bytes(mpay), ref_pay), \
+        first_diff(pay, compose_retained(retain_pattern(128 * 64),
+                                         bytes(mpay), ref_pay))
+    assert met == compose_retained(retain_pattern(128 * 4), bytes(mmet),
+                                   ref_met)
+
+
+# ---------------------------------------------------------------------
+# Five-lane K staging window (rows 16/17/20 on a non-quad build,
+# plans/2026-11-23-troom-qwen3-breakthrough.md): the K image is one
+# per-head stream, so a 16-row maintenance block cannot interleave in
+# five-row groups by itself. A K run stages the whole interleave
+# window its rebuilt rows touch -- every five-row group containing one
+# of them -- pre-read from the host-loaded prior image: the rebuilt
+# cells replace theirs, every other byte rides the pre-read. The
+# descriptor's rows bits 5..11 carry the first rebuilt slot's lane and
+# its group index mod 16 (the meta slice's beat alignment).
+# ---------------------------------------------------------------------
+
+FIVE_WIDE = dict(FIVE, act_max_k=4096, vbuild_max_head_dim=128)
+
+
+def c_partition(c):
+    """The D1 active-cycle identity over a run's counters."""
+    return c['active'] == c['fill'] + (c['gather'] - c['prefetch']) \
+        + c['scale'] + c['quant'] + c['drain'] + c['dispatch'] + c['tiles']
+
+
+def k_win_params(wide, **over):
+    return dict(FIVE_WIDE if wide else FIVE, **over)
+
+
+def k_win_run(params, wide, img, live, code, p0, pay0, met0, nq, **kw):
+    """One non-quad K window run over explicit prior stream images.
+
+    The staging is preloaded with the model's window slices; returns
+    (beats, result, payload, meta) with the images the run leaves.
+    """
+    blocks = 4 if wide else 2
+    pay_s, met_s = vbuild_sg1_k_window_slice(pay0, met0, blocks, nq, p0, 5)
+    beats, res = run_build(params,
+                           img,
+                           live,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=code | (VBUILD_ROWS_HD128 if wide else 0)
+                           | vbuild_koff(p0, 5),
+                           retain_images=((R_BASE, pay_s), (M_BASE, met_s)),
+                           **kw)
+    hp = HasTRoomParams(params)
+    pay, met = images_over(beats, hp, pay_s, met_s)
+    return beats, res, pay, met
+
+
+def k_win_stream(rng, wide, nslots, specials=False):
+    """A per-head K stream: ``nslots`` slot patterns, their canonical
+    Q8_0 rows and the dead-row zero row."""
+    gen = gen_slot128 if wide else gen_slot
+    slots = [gen(rng, specials) for _ in range(nslots)]
+    return slots, [vbuild_quant_row(s)
+                   for s in slots], bytes(34 * (4 if wide else 2))
+
+
+def k_win_images(prior, wide):
+    """The whole-stream images of ``prior`` rows over full five-row
+    groups (zero rows pad the tail up to a whole 80-row layout period,
+    so the image carries the complete window -- meta beats included --
+    of every block named in it)."""
+    prior = list(prior)
+    while len(prior) % 80:
+        prior.append(bytes(34 * (4 if wide else 2)))
+    return vbuild_sg1_k_stream(prior, lanes=5)
+
+
+@pytest.mark.parametrize('wide', [False, True])
+@pytest.mark.parametrize('b', range(6))
+@pytest.mark.parametrize('live', [16, 11, 1, 0])
+def test_vbuild_k_window_full_matches_model(wide, b, live):
+    """rows == 16 at five lanes: the block's 16 rows replace their
+    cells in the touched four-group window at every lane offset
+    (blocks 0..4 cycle loff 0..4), dead tail rows landing as the zero
+    rows of a full rebuild; every other byte is the pre-read image."""
+    rng = random.Random(6100 + b * 10 + live + 100 * wide)
+    nslots = 16 * (b + 2) + 5
+    slots, canon, zero = k_win_stream(rng, wide, nslots)
+    # A stale prior image -- other data everywhere -- so a retained
+    # byte that should have been rebuilt shows, and vice versa.
+    _, stale, _ = k_win_stream(random.Random(99 + b + 100 * wide), wide,
+                               nslots)
+    pay0, met0 = k_win_images(stale, wide)
+    rows = [canon[16 * b + i] if i < live else zero for i in range(16)]
+    exp_pay, exp_met, mpay, mmet = vbuild_sg1_k_window(pay0,
+                                                       met0,
+                                                       rows,
+                                                       16 * b,
+                                                       lanes=5)
+    img = [p for i in range(16) for p in slots[16 * b + i]]
+    beats, res, pay, met = k_win_run(k_win_params(wide), wide, img, live, 16,
+                                     16 * b, pay0, met0, 16)
+    assert res['status'] is Status.OK
+    assert pay == exp_pay, first_diff(pay, exp_pay)
+    assert met == exp_met, first_diff(met, exp_met)
+    # 20 (40) payload beats and two to four whole meta beats.
+    assert len(exp_pay) == 64 * (40 if wide else 20)
+    assert 128 <= len(exp_met) <= 256 and len(exp_met) % 64 == 0
+    assert len(beats) == (len(exp_pay) + len(exp_met)) // 64
+    # Every one of the block's 16 rows lands (the dead tail as zero
+    # cells): the mask covers the whole block, not only its live rows.
+    blocks = 4 if wide else 2
+    assert sum(mpay) == 32 * blocks * 16
+    assert sum(mmet) == 2 * blocks * 16
+    c = res['counters']
+    assert c_partition(c), c
+    assert c['rows'] == 16 and c['tiles'] == 1
+    assert c['beats'] == len(beats)
+
+
+@pytest.mark.parametrize('wide', [False, True])
+@pytest.mark.parametrize('b', range(5))
+@pytest.mark.parametrize('r', [0, 1, 3, 4, 5, 8, 9, 12, 14, 15])
+def test_vbuild_k_window_partial_matches_model(wide, b, r):
+    """rows == 17 at five lanes: the dirty pair re-based at buffer rows
+    0/1 (k keeps the group's live prefix) lands in the one- or
+    two-group window around its real stream slots -- every lane offset
+    and every meta beat alignment (the first group's index mod 16
+    covers all residues across blocks and pairs)."""
+    rng = random.Random(6300 + b * 16 + r + 100 * wide)
+    blocks = 4 if wide else 2
+    nslots = 16 * (b + 2) + 5
+    slots, canon, zero = k_win_stream(rng, wide, nslots)
+    k = r + 1
+    p0 = 16 * b + (r & ~1)
+    # The honest prior: block b built at prefix r, the appended row
+    # still a zero row; everything else current.
+    prior = list(canon)
+    for i in range(r, 16):
+        prior[16 * b + i] = zero
+    pay0, met0 = k_win_images(prior, wide)
+    live = 1 if k % 2 else 2
+    rows = [canon[p0]] + ([canon[p0 + 1]] if live == 2 else [zero])
+    exp_pay, exp_met, mpay, mmet = vbuild_sg1_k_window(pay0,
+                                                       met0,
+                                                       rows,
+                                                       p0,
+                                                       lanes=5)
+    img = [p for s in range(p0, p0 + 2) for p in slots[s]]
+    beats, res, pay, met = k_win_run(k_win_params(wide), wide, img, k, 17, p0,
+                                     pay0, met0, 2)
+    assert res['status'] is Status.OK
+    assert pay == exp_pay, first_diff(pay, exp_pay)
+    assert met == exp_met, first_diff(met, exp_met)
+    assert len(beats) == (len(exp_pay) + len(exp_met)) // 64
+    assert c_partition(res['counters']), res['counters']
+    # Exactly the pair's two cells-per-block changed: at even r the
+    # dead odd lane lands as the dead-tail zeros, so the mask is the
+    # whole pair either way.
+    assert sum(mpay) == 32 * blocks * 2
+    assert sum(mmet) == 2 * blocks * 2
+    assert live == (1 if k % 2 else 2)
+    # The run is materially cheaper than the block's full rebuild.
+    img_full = [p for s in range(16 * b, 16 * b + 16) for p in slots[s]]
+    _, full, _, _ = k_win_run(k_win_params(wide), wide, img_full, k, 16,
+                              16 * b, pay0, met0, 16)
+    assert res['counters']['run'] < full['counters']['run'] * 3 // 4
+
+
+@pytest.mark.parametrize('wide', [False, True])
+@pytest.mark.parametrize('b,r', [(0, 0), (2, 7), (1, 15), (3, 10), (4, 4)])
+def test_vbuild_k_window_append_matches_model(wide, b, r):
+    """rows == 20 at five lanes (native-append builds only): the token's
+    row patches its cells into the one-group window holding its slot."""
+    rng = random.Random(6500 + b * 16 + r + 100 * wide)
+    blocks = 4 if wide else 2
+    nslots = 16 * (b + 2) + 5
+    slots, canon, zero = k_win_stream(rng, wide, nslots)
+    p0 = 16 * b + r
+    prior = list(canon)
+    prior[p0] = zero
+    pay0, met0 = k_win_images(prior, wide)
+    exp_pay, exp_met, mpay, mmet = vbuild_sg1_k_window(pay0,
+                                                       met0, [canon[p0]],
+                                                       p0,
+                                                       lanes=5)
+    beats, res, pay, met = k_win_run(
+        k_win_params(wide, vbuild_native_append=True), wide, list(slots[p0]),
+        r + 1, 20, p0, pay0, met0, 1)
+    assert res['status'] is Status.OK
+    assert pay == exp_pay, first_diff(pay, exp_pay)
+    assert met == exp_met, first_diff(met, exp_met)
+    assert len(beats) == (len(exp_pay) + len(exp_met)) // 64
+    assert sum(mpay) == 32 * blocks and sum(mmet) == 2 * blocks
+    assert c_partition(res['counters']), res['counters']
+
+
+@pytest.mark.parametrize('wide', [False, True])
+def test_vbuild_k_window_stream_chain(wide):
+    """The host flow end to end over one 80-row layout period: a
+    device image maintained in Python takes each run's staging back at
+    the window's offsets. Three full blocks, a block grown through six
+    pair patches (rows 17) and a block filled by sixteen token appends
+    (rows 20) assemble exactly the whole-stream pack of the same rows
+    -- the lane-offset math holds across every block boundary, and
+    the three modes agree byte for byte with one full rebuild."""
+    rng = random.Random(6700 + wide)
+    blocks = 4 if wide else 2
+    slots, canon, zero = k_win_stream(rng, wide, 85)
+    # The never-built image: 100 named zero rows, which k_win_images pads
+    # to a whole 80-row layout period (160 rows), all zero.
+    pay = bytearray(k_win_images([zero] * 100, wide)[0])
+    met = bytearray(k_win_images([zero] * 100, wide)[1])
+    params = k_win_params(wide, vbuild_native_append=True)
+
+    def store(wpay, wmet, p0):
+        g0 = p0 // 5
+        off = g0 * blocks * 5 * 32
+        pay[off:off + len(wpay)] = wpay
+        mfirst = (g0 * blocks * 5 * 2) // 64
+        met[mfirst * 64:mfirst * 64 + len(wmet)] = wmet
+
+    def build(img, live, code, p0, nq):
+        prior_pay, prior_met = bytes(pay), bytes(met)
+        beats, res, wpay, wmet = k_win_run(params, wide, img, live, code, p0,
+                                           prior_pay, prior_met, nq)
+        assert res['status'] is Status.OK, (code, p0, res['status'])
+        # Every step is exactly the model's window over the image as it
+        # stood: the rebuilt rows' cells replaced (a full run's dead tail,
+        # and a pair's dead odd lane, as zero rows), every other byte the
+        # prior image. ``live`` is a full run's live-row count and a
+        # pair's live prefix k (its odd lane is live exactly at even k).
+        if code == 16:
+            rows = [canon[p0 + i] if i < live else zero for i in range(16)]
+        elif code == 17:
+            rows = [canon[p0]] + ([canon[p0 + 1]] if live % 2 == 0 else [zero])
+        else:
+            rows = [canon[p0]]
+        exp_pay, exp_met, _, _ = vbuild_sg1_k_window(prior_pay,
+                                                     prior_met,
+                                                     rows,
+                                                     p0,
+                                                     lanes=5)
+        assert wpay == exp_pay, (code, p0, first_diff(wpay, exp_pay))
+        assert wmet == exp_met, (code, p0, first_diff(wmet, exp_met))
+        store(wpay, wmet, p0)
+
+    for b in range(3):
+        img = [p for i in range(16) for p in slots[16 * b + i]]
+        build(img, 16, 16, 16 * b, 16)
+    # Block 3: prefix 4, then pairs 4..9 (each even r rebuilds one
+    # live row and lands the dead odd lane's zeros).
+    img = [p for i in range(48, 52) for p in slots[i]]
+    build(img, 4, 16, 48, 16)
+    for r in range(4, 10):
+        p0 = 48 + (r & ~1)
+        img = [p for s in range(p0, p0 + 2) for p in slots[s]]
+        build(img, r + 1, 17, p0, 2)
+    # Block 4: one token per append.
+    for r in range(16):
+        build(list(slots[64 + r]), r + 1, 20, 64 + r, 1)
+    # Blocks 0..2 full; block 3 grown to prefix 10 (its rows 58..63 were
+    # never built and stay the all-zero image's zero rows); block 4 filled
+    # by the appends; every row past it stays zero. The reference spans the
+    # whole image (k_win_images pads to a whole 80-row layout period).
+    ref_rows = canon[:58] + [zero] * (len(pay) // (32 * blocks) - 58)
+    ref_rows[64:80] = canon[64:80]
+    ref_pay, ref_met = vbuild_sg1_k_stream(ref_rows, lanes=5)
+    assert bytes(pay) == ref_pay, first_diff(bytes(pay), ref_pay)
+    assert bytes(met) == ref_met, first_diff(bytes(met), ref_met)
+
+
+def test_vbuild_k_window_write_stalls():
+    """Backpressure on the window's write-back holds each beat (the
+    harness asserts valid stays high with stable data) and changes no
+    byte; the write-back waits show in the drain-wait counter."""
+    rng = random.Random(6800)
+    # 85 slots: 17 whole groups, so the image carries the full window
+    # of every block (and its meta beats) the cases below touch.
+    slots, canon, _ = k_win_stream(rng, False, 85)
+    pay0, met0 = k_win_images(canon, False)
+    # (code, k, first slot, rows of the window image): a full block,
+    # a two-live-row pair (even k) and a one-live-row pair (odd k,
+    # the dead odd lane landing as zeros).
+    for code, k, p0, nq in ((16, 16, 48, 16), (17, 6, 52, 2), (17, 5, 52, 2)):
+        rows = ([canon[48 + i]
+                 for i in range(16)] if code == 16 else [canon[p0]] +
+                ([canon[p0 + 1]] if k % 2 == 0 else [bytes(68)]))
+        img = [p for s in range(p0, p0 + nq) for p in slots[s]]
+        exp = vbuild_sg1_k_window(pay0, met0, rows, p0, lanes=5)
+        beats, res, pay, met = k_win_run(dict(FIVE),
+                                         False,
+                                         img,
+                                         k,
+                                         code,
+                                         p0,
+                                         pay0,
+                                         met0,
+                                         nq,
+                                         write_stalls=True)
+        assert res['status'] is Status.OK
+        assert pay == exp[0] and met == exp[1], (code, p0)
+        assert c_partition(res['counters']), res['counters']
+        assert res['counters']['drain_wait'] > 0
+
+
+@pytest.mark.parametrize('wide', [False, True])
+def test_vbuild_k_window_special_rows(wide):
+    """Special-heavy slots with NaN and infinity dims quantize to the
+    model's bytes inside the window (the quantizer is untouched), and
+    an all-zero block lands zero chunks and zero d16 cells over the
+    retained neighbours."""
+    rng = random.Random(6900 + wide)
+    zero = bytes(34 * (4 if wide else 2))
+    slots, canon, _ = k_win_stream(rng, wide, 53, specials=True)
+    for i, row in enumerate(slots):
+        if i % 3 == 0:
+            row[5] = 0x7e00
+            row[20] = 0x7c00
+    canon = [vbuild_quant_row(s) for s in slots]
+    pay0, met0 = k_win_images(canon, wide)
+    img = [p for i in range(16, 32) for p in slots[i]]
+    beats, res, pay, met = k_win_run(k_win_params(wide), wide, img, 16, 16, 16,
+                                     pay0, met0, 16)
+    assert res['status'] is Status.OK
+    exp = vbuild_sg1_k_window(pay0, met0, canon[16:32], 16, lanes=5)
+    assert pay == exp[0] and met == exp[1]
+    zimg = [0] * (16 * (128 if wide else 64))
+    beats, res, pay, met = k_win_run(k_win_params(wide), wide, zimg, 16, 16,
+                                     32, pay0, met0, 16)
+    assert res['status'] is Status.OK
+    exp = vbuild_sg1_k_window(pay0, met0, [zero] * 16, 32, lanes=5)
+    assert pay == exp[0] and met == exp[1]
+
+
+@pytest.mark.parametrize('rows,k,params_over,want', [
+    (18, 5, dict(vbuild_native_append=False), Status.BAD_SHAPE),
+    (19, 33, dict(vbuild_native_append=False), Status.BAD_SHAPE),
+    (VBUILD_ROWS_HD128 | 18, 5, dict(vbuild_native_append=False),
+     Status.BAD_SHAPE),
+    (20, 5, dict(vbuild_native_append=False), Status.BAD_SHAPE),
+])
+def test_vbuild_five_lane_production_rejects_appends(rows, k, params_over,
+                                                     want):
+    """The production five-lane build has no native append, so every
+    append mode rejects at accept exactly as the quad production
+    build does (the drains themselves are exercised on native-append
+    builds above)."""
+    params = dict(FIVE, **params_over)
+    if params.get('vbuild_max_head_dim', 64) == 128:
+        params.setdefault('act_max_k', 4096)
+    beats, res = run_build(params,
+                           gen_window(random.Random(7), 64),
+                           k,
+                           m_base=M_BASE,
+                           rows=rows)
+    assert res['status'] is want
+    assert not beats
+
+
+@pytest.mark.parametrize(
+    'rows,k,params_over,want',
+    [
+        # A lane at or beyond the group width.
+        (16 | (5 << VBUILD_KOFF_LANE_SHIFT), 5, {}, Status.BAD_SHAPE),
+        (17 | (7 << VBUILD_KOFF_LANE_SHIFT), 5, {}, Status.BAD_SHAPE),
+        # The reserved bits above the field.
+        (16 | (1 << 12), 5, {}, Status.BAD_SHAPE),
+        (16 | (1 << 14), 5, {}, Status.BAD_SHAPE),
+        # The field on a non-K mode of the same build.
+        (0 | vbuild_koff(3, 5), 64, {}, Status.BAD_SHAPE),
+        (2 | vbuild_koff(3, 5), 40, {}, Status.BAD_SHAPE),
+        # The field on a four-lane build (the 15-bit code compare used
+        # to reject these; the explicit rule must too).
+        (16 | vbuild_koff(3, 5), 5, dict(n_outputs=4), Status.BAD_SHAPE),
+        (17 | vbuild_koff(3, 5), 5, dict(n_outputs=4), Status.BAD_SHAPE),
+        # A descriptor too narrow to carry the field.
+        (16, 5, dict(rows_bits=8), Status.BAD_SHAPE),
+    ])
+def test_vbuild_k_window_rejects_bad_lane_offset(rows, k, params_over, want):
+    params = dict(FIVE, **params_over)
+    beats, res = run_build(params,
+                           gen_window(random.Random(8), 16),
+                           k,
+                           m_base=M_BASE,
+                           rows=rows)
+    assert res['status'] is want, (hex(rows), res['status'])
+    assert not beats
+
+
+@pytest.mark.parametrize('rows,k,m_base,want', [
+    (16, 17, M_BASE, Status.BAD_SHAPE),
+    (16, 5, 0, Status.BAD_SHAPE),
+    (17, 0, M_BASE, Status.BAD_SHAPE),
+])
+def test_vbuild_k_window_keeps_standing_shape_checks(rows, k, m_base, want):
+    """The K modes' standing range checks (k, the SG1 requirement) are
+    unchanged on a non-quad build."""
+    beats, res = run_build(dict(FIVE),
+                           gen_window(random.Random(9), 16),
+                           k,
+                           m_base=m_base,
+                           rows=rows)
+    assert res['status'] is want
+    assert not beats
+
+
+def test_vbuild_k_window_offset_field_abi():
+    """The helper packs the slot's lane and group mod 16 into rows bits
+    5..11 and nothing else."""
+    assert vbuild_koff(0, 5) == 0
+    assert vbuild_koff(16, 5) == (1 << VBUILD_KOFF_LANE_SHIFT) \
+        | (3 << VBUILD_KOFF_GROUP_SHIFT)
+    assert vbuild_koff(79, 5) == (4 << VBUILD_KOFF_LANE_SHIFT) \
+        | (15 << VBUILD_KOFF_GROUP_SHIFT)
+    assert vbuild_koff(80, 5) == 0
+    for slot in range(160):
+        f = vbuild_koff(slot, 5)
+        assert f >> 12 == 0 and (f & 31) == 0
+        assert (f >> 5) & 7 == slot % 5
+        assert (f >> 8) & 15 == (slot // 5) % 16
 
 
 @pytest.mark.parametrize('r', range(16))
@@ -2501,6 +3138,708 @@ def test_vbuild_k4_both_tmem_placements(placement):
         assert bytes(met_got) == exp_met, step
         assert bytes(st_got) == exp_st, step
         pay, met, st = exp_pay, exp_met, exp_st
+
+
+# ---------------------------------------------------------------------
+# Five-lane V append (rows 18/19 on a non-quad build, native-append
+# builds only): the open block's chunks sit at the n_outputs-row cell
+# positions, so the patch drain visits the distinct beats holding them
+# -- 38 at 64 dims and 77 at 128 (against the quad's 32 and 64) --
+# pre-reading each and patching the one or two of its rows in it; a
+# group's last even cell lands alone in the straddle beat's low half
+# and block 1's lane 0 in its high half, each over the retained
+# neighbour. The four-beat scale row is unchanged.
+# ---------------------------------------------------------------------
+
+
+def vapp_run5(wide, slot, rows, p, pay0, srow0, **kw):
+    blk = rows - 18
+    dims = 128 if wide else 64
+    params = k_win_params(wide, vbuild_native_append=True)
+    return run_build(params,
+                     slot,
+                     p + 1 + 32 * blk,
+                     a_base=P_BASE,
+                     r_base=R_BASE,
+                     m_base=M_BASE,
+                     rows=rows | (VBUILD_ROWS_HD128 if wide else 0),
+                     retain_images=((R_BASE, pay0), (M_BASE, srow0)),
+                     **kw)
+
+
+@pytest.mark.parametrize('wide', [False, True])
+@pytest.mark.parametrize('rows,blk', [(18, 0), (19, 1)])
+@pytest.mark.parametrize('p', [0, 1, 15, 16, 31])
+def test_vbuild_vappend_five_lane_matches_model(wide, rows, blk, p):
+    """One appended slot under the per-token scale: block blk's chunk
+    byte p lands in every dim row's cell at its five-lane position and
+    the widened d16 in the scale row's word; every other byte keeps
+    the loaded previous appends' bytes."""
+    rng = random.Random(9100 + 100 * wide + rows * 40 + p)
+    slot = gen_slot128(rng) if wide else gen_slot(rng)
+    dims = 128 if wide else 64
+    pay0, srow0 = retain_pattern(dims * 64), retain_pattern(256)
+    beats, res = vapp_run5(wide, slot, rows, p, pay0, srow0)
+    assert res['status'] is Status.OK
+    hp = HasTRoomParams(k_win_params(wide))
+    pay, srow = images_over(beats, hp, pay0, srow0)
+    ref_pay, ref_srow = vbuild_sg1_append(slot, blk, p, pay0, srow0, lanes=5)
+    assert pay == ref_pay, first_diff(pay, ref_pay)
+    assert srow == ref_srow, first_diff(srow, ref_srow)
+    # The block's distinct beats plus the four scale-row beats.
+    nbeats = len(vbuild_sg1_append_beats(blk, dims, 5))
+    assert nbeats == (77 if wide else 38)
+    assert len(beats) == nbeats + 4
+    # No meta staging write anywhere: the payload image then the row.
+    ranks = sorted({addr for addr, _ in beats if addr < M_BASE})
+    assert all(R_BASE <= a < R_BASE + dims * 64 for a in ranks)
+    assert {a
+            for a, _ in beats
+            if a >= M_BASE} == {M_BASE + 64 * i
+                                for i in range(4)}
+    c = res['counters']
+    assert c_partition(c), c
+    # Rate guard: the append stays the patch class, not a rebuild.
+    assert c['run'] < (5000 if wide else 2500), c
+    assert c['quant'] <= (200 if wide else 96)
+
+
+@pytest.mark.parametrize('wide', [False, True])
+def test_vbuild_vappend_five_lane_zero_nan_and_stalls(wide):
+    """A fully zero slot (d16 0 in the scale word), a NaN slot (never
+    wins the fold, saturates its own bytes), and the same walk under
+    write backpressure."""
+    rng = random.Random(9200 + wide)
+    dims = 128 if wide else 64
+    pay0, srow0 = retain_pattern(dims * 64), retain_pattern(256)
+    zero = [0] * dims
+    nan = gen_slot128(rng, False) if wide else gen_slot(rng, False)
+    nan[7] = 0x7e00
+    nan[40 % dims] = 0xfd00
+    for slot, rows, p in ((zero, 18, 3), (nan, 19, 20)):
+        blk = rows - 18
+        for stalls in (False, True):
+            beats, res = vapp_run5(wide,
+                                   slot,
+                                   rows,
+                                   p,
+                                   pay0,
+                                   srow0,
+                                   write_stalls=stalls)
+            assert res['status'] is Status.OK
+            hp = HasTRoomParams(k_win_params(wide))
+            pay, srow = images_over(beats, hp, pay0, srow0)
+            ref = vbuild_sg1_append(slot, blk, p, pay0, srow0, lanes=5)
+            assert pay == ref[0] and srow == ref[1], (rows, stalls)
+            assert c_partition(res['counters']), res['counters']
+
+
+@pytest.mark.parametrize('wide', [False, True])
+def test_vbuild_vappend_five_lane_then_append(wide):
+    """The deployment shape: a second append composes over the first's
+    output images (loaded back into staging), the incremental open
+    tail the emission slice drives."""
+    rng = random.Random(9300 + wide)
+    dims = 128 if wide else 64
+    hp = HasTRoomParams(k_win_params(wide))
+    for rows, ps in ((18, (5, 6, 7)), (19, (30, 31))):
+        pay0, srow0 = retain_pattern(dims * 64), retain_pattern(256)
+        for p in ps:
+            slot = gen_slot128(rng) if wide else gen_slot(rng)
+            beats, res = vapp_run5(wide, slot, rows, p, pay0, srow0)
+            assert res['status'] is Status.OK
+            pay, srow = images_over(beats, hp, pay0, srow0)
+            ref = vbuild_sg1_append(slot, rows - 18, p, pay0, srow0, lanes=5)
+            assert pay == ref[0], (rows, p, first_diff(pay, ref[0]))
+            assert srow == ref[1], (rows, p)
+            pay0, srow0 = ref
+
+
+def test_vbuild_vappend_five_lane_beat_abi():
+    """The block's beats: three per full five-row group for either
+    block (the straddle beat shared), two in the short tail group."""
+    for dims, n in ((64, 38), (128, 77)):
+        b0 = vbuild_sg1_append_beats(0, dims, 5)
+        b1 = vbuild_sg1_append_beats(1, dims, 5)
+        assert len(b0) == len(b1) == n
+        assert b0[:5] == [0, 1, 2, 5, 6] and b1[:5] == [2, 3, 4, 7, 8]
+        # Together the two blocks cover the tile's beats; they share
+        # each straddle beat (one per full group, plus the tail's when
+        # the tail group is odd-width).
+        assert sorted(set(b0) | set(b1)) == list(range(dims))
+        assert len(set(b0) & set(b1)) == (26 if dims == 128 else 12)
+    assert vbuild_sg1_append_beats(0, 64, 5)[-2:] == [60, 61]
+    assert vbuild_sg1_append_beats(1, 64, 5)[-2:] == [62, 63]
+    assert vbuild_sg1_append_beats(0, 128, 5)[-2:] == [125, 126]
+    assert vbuild_sg1_append_beats(1, 128, 5)[-2:] == [126, 127]
+
+
+# ---------------------------------------------------------------------
+# Five-lane K4 (rows 3|WIDE on a non-quad build): the selective
+# append's cells sit at the five-lane interleave, so the open block's
+# payload slice is 77 beats -- three per full five-row group (the
+# third the straddle beat shared with the other block) and two in the
+# three-lane tail group -- and a row composes on its cell's position,
+# not its parity: the high half of a beat composes over the previous
+# row's held cell, a block's last even cell lands alone over the
+# retained neighbour. The meta cells follow the same cell index; the
+# row-indexed state image is unchanged.
+# ---------------------------------------------------------------------
+
+K4_FIVE = dict(FIVE_WIDE, vbuild_k4_selective=True)
+
+
+def k4_block_beats(blk, lanes=5):
+    """The open block's payload beats in image order."""
+    return sorted({vbuild_sg1_cell(d, blk, lanes) >> 1 for d in range(128)})
+
+
+def k4_to_slice(pay, blk, lanes=5):
+    return b''.join(pay[b * 64:(b + 1) * 64]
+                    for b in k4_block_beats(blk, lanes))
+
+
+def k4_from_slice(pay, slice_, blk, lanes=5):
+    pay = bytearray(pay)
+    for rank, b in enumerate(k4_block_beats(blk, lanes)):
+        pay[b * 64:(b + 1) * 64] = slice_[rank * 64:(rank + 1) * 64]
+    return bytes(pay)
+
+
+def k4_run5(win, k, pay, met, st, heal=False, **kw):
+    """One five-lane K4 run over prior full images; the payload staging
+    carries the open block's 77-beat slice. Returns (beats, result)."""
+    blk = 1 if k > 32 else 0
+    return run_build(dict(K4_FIVE),
+                     win[:k * 128],
+                     k | (K4_HEAL_BIT if heal else 0),
+                     a_base=P_BASE,
+                     r_base=R_BASE,
+                     m_base=M_BASE,
+                     rows=K4_ROWS,
+                     retain_images=((R_BASE, k4_to_slice(pay, blk)),
+                                    (M_BASE, met), (ST_BASE + blk * 1024, st)),
+                     deadline=16000,
+                     **kw)
+
+
+def k4_images5(beats, pay0, met0, st0, blk):
+    """The three composed images of a five-lane K4 run, the payload
+    writes mapped from the block slice back into the tile image."""
+    pay, met, st = bytearray(pay0), bytearray(met0), bytearray(st0)
+    st_base = ST_BASE + blk * 1024
+    slice_ = bytearray(k4_to_slice(pay0, blk))
+    for addr, data in beats:
+        for i in range(64):
+            if R_BASE <= addr < R_BASE + len(slice_):
+                slice_[addr - R_BASE + i] = (data >> (8 * i)) & 0xff
+            elif M_BASE <= addr < M_BASE + len(met):
+                met[addr - M_BASE + i] = (data >> (8 * i)) & 0xff
+            elif st_base <= addr < st_base + len(st):
+                st[addr - st_base + i] = (data >> (8 * i)) & 0xff
+            else:
+                raise AssertionError(hex(addr))
+    return k4_from_slice(pay, bytes(slice_), blk), bytes(met), bytes(st)
+
+
+def k4_window(rng, k, specials=True):
+    win = []
+    for j in range(64):
+        win.extend(gen_slot128(rng, specials) if j < k else [0] * 128)
+    return win
+
+
+def k4_temporal5(win, k):
+    w = list(win[:k * 128]) + [0] * ((64 - k) * 128)
+    return vbuild_sg1_wide(w, lanes=5)
+
+
+@pytest.mark.parametrize('k', [1, 2, 5, 17, 32, 33, 40, 64])
+def test_vbuild_k4_five_lane_append_matches_model(k):
+    """One five-lane K4 append over random prior images equals the
+    model's composed images, writes exactly 77+8+16 beats, and the
+    counters hold the D1 partition identity."""
+    rng = random.Random(8100 + k)
+    win = k4_window(rng, k)
+    blk = 1 if k > 32 else 0
+    pay0 = retain_pattern(128 * 64)
+    met0 = retain_pattern(128 * 4)
+    st0 = vbuild_sg1_k4_state(win, k - 1) \
+        if k > 1 and k != 33 else bytes(128 * 8)
+    beats, res = k4_run5(win, k, pay0, met0, st0)
+    assert res['status'] is Status.OK
+    got = k4_images5(beats, pay0, met0, st0, blk)
+    exp = vbuild_sg1_k4_append(win, k, pay0, met0, st0, lanes=5)
+    for actual, reference in zip(got, exp):
+        assert actual == reference, first_diff(actual, reference)
+    assert len(beats) == 77 + 8 + 16
+    c = res['counters']
+    assert c['active'] == c['fill'] + (c['gather'] - c['prefetch']) \
+        + c['scale'] + c['quant'] + c['drain'] + c['dispatch'] \
+        + c['tiles'], c
+    assert c['rows'] == 128 and c['tiles'] == 1
+    # Every payload write names a beat of the block's slice, in order.
+    ranks = [
+        addr - R_BASE for addr, _ in beats if R_BASE <= addr < R_BASE + 77 * 64
+    ]
+    assert len(ranks) == 77 and ranks == sorted(set(ranks))
+
+
+@pytest.mark.parametrize('k,pattern', [
+    (2, 'all'),
+    (2, 'quick'),
+    (2, 'alternating'),
+    (17, 'boundaries'),
+    (33, 'all'),
+    (34, 'alternating'),
+])
+def test_vbuild_k4_five_lane_interleaved_chains_progress(k, pattern):
+    """Deterministic quick/risen mixes at five lanes -- every row
+    rising (the straddle rows land alone or over a held chunk), none,
+    alternating, and the meta-bank boundary rows -- exhaust and reuse
+    chain contexts under write backpressure."""
+    win = [0x3800 + d * 8 for _ in range(64) for d in range(128)]
+    for d in range(128):
+        risen = (pattern == 'all' or (pattern == 'alternating' and d % 2 == 0)
+                 or (pattern == 'boundaries' and d % 16 in (0, 7, 8, 15)))
+        win[(k - 1) * 128 + d] = (0x4000 + d * 8 if risen else 0x3400 + d * 4)
+    if pattern != 'quick':
+        win[(k - 1) * 128 + 3] = 0x7c00
+        win[(k - 1) * 128 + 9] = 0x7e00
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    states = [bytes(128 * 8), bytes(128 * 8)]
+    for step in range(1, k):
+        blk = int(step > 32)
+        pay, met, states[blk] = vbuild_sg1_k4_append(win,
+                                                     step,
+                                                     pay,
+                                                     met,
+                                                     states[blk],
+                                                     lanes=5)
+    blk = int(k > 32)
+    st = states[blk]
+    beats, res = k4_run5(win, k, pay, met, st, write_stalls=pattern != 'all')
+    assert res['status'] is Status.OK
+    expected = vbuild_sg1_k4_append(win, k, pay, met, st, lanes=5)
+    got = k4_images5(beats, pay, met, st, blk)
+    for actual, reference in zip(got, expected):
+        assert actual == reference, first_diff(actual, reference)
+    assert len(beats) == 77 + 8 + 16
+    c = res['counters']
+    assert c['active'] == (c['fill'] + c['gather'] - c['prefetch'] +
+                           c['scale'] + c['quant'] + c['drain'] +
+                           c['dispatch'] + c['tiles']), c
+
+
+@pytest.mark.parametrize('k', [1, 5, 33, 64])
+def test_vbuild_k4_five_lane_temporal_identity_at_k(k):
+    """A five-lane K4-maintained window equals the five-lane temporal
+    full rebuild at live prefix k (the chain from zero images across
+    the block-1 boundary), and the state equals the temporal
+    extraction."""
+    rng = random.Random(8200 + k)
+    win = k4_window(rng, k)
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    sts = [bytes(128 * 8), bytes(128 * 8)]
+    for step in range(1, k + 1):
+        blk = 1 if step > 32 else 0
+        beats, res = k4_run5(win, step, pay, met, sts[blk])
+        assert res['status'] is Status.OK, step
+        pay, met, st_new = vbuild_sg1_k4_append(win,
+                                                step,
+                                                pay,
+                                                met,
+                                                sts[blk],
+                                                lanes=5)
+        got = k4_images5(beats, pay, met, st_new, blk)
+        assert got == (pay, met, st_new), step
+        sts[blk] = st_new
+    ref_pay, ref_met = k4_temporal5(win, k)
+    assert pay == ref_pay, (k, first_diff(pay, ref_pay))
+    assert met == ref_met, (k, first_diff(met, ref_met))
+    blk = 1 if k > 32 else 0
+    assert sts[blk] == vbuild_sg1_k4_state(win, k)
+
+
+@pytest.mark.parametrize('heal_k', [8, 40])
+def test_vbuild_k4_five_lane_heal_after_corrupt_state(heal_k):
+    """A stale state is re-derived by the heal flag at five lanes: the
+    images equal the temporal rebuild whatever the prior state, with
+    the special-value pool and write backpressure of the quad gate."""
+    rng = random.Random(8300 + heal_k)
+    win = [0] * (64 * 128)
+    blk = int(heal_k > 32)
+    first = blk * 32
+    for j in range(first, heal_k):
+        for d in range(128):
+            bits = 0x3400 + d * 8 + (j - first) * 4
+            kind = d % 8
+            if kind == 0:
+                bits = 0x8000 if j % 2 else 0
+            elif kind == 1:
+                bits = 0x7e00
+            elif kind == 2:
+                bits = 0x7c00 if j == first else 0x3c00
+            elif kind == 3:
+                bits = 1 + (j - first)
+            elif kind == 4:
+                bits = 0x4000 + d * 8 if j == heal_k - 1 else 0x3000
+            elif kind == 5:
+                bits |= 0x8000
+            elif kind == 6:
+                bits = 0x7e00 if j == first else bits
+            win[j * 128 + d] = bits
+    pay = bytes(rng.randrange(256) for _ in range(128 * 64))
+    met = bytes(rng.randrange(256) for _ in range(128 * 4))
+    st = bytes(rng.randrange(256) for _ in range(128 * 8))
+    beats, res = k4_run5(win,
+                         heal_k,
+                         pay,
+                         met,
+                         st,
+                         heal=True,
+                         write_stalls=True)
+    assert res['status'] is Status.OK
+    got = k4_images5(beats, pay, met, st, blk)
+    expected = vbuild_sg1_k4_append(win,
+                                    heal_k,
+                                    pay,
+                                    met,
+                                    st,
+                                    heal=True,
+                                    lanes=5)
+    for actual, reference in zip(got, expected):
+        assert actual == reference, first_diff(actual, reference)
+    assert len(beats) == 77 + 8 + 16
+    c = res['counters']
+    assert c['active'] == (c['fill'] + c['gather'] - c['prefetch'] +
+                           c['scale'] + c['quant'] + c['drain'] +
+                           c['dispatch'] + c['tiles']), c
+    assert c['rows'] == 128 and c['tiles'] == 1
+    # The temporal identity holds on the open block's own cells. It is a
+    # cell comparison, not a beat one: every straddle beat holds one cell
+    # of each block, and the untouched block's half keeps the random
+    # prior image (it was never rebuilt).
+    ref_pay, ref_met = k4_temporal5(win, heal_k)
+    for d in range(128):
+        c = vbuild_sg1_cell(d, blk, 5)
+        assert got[0][32 * c:32 * c + 32] == ref_pay[32 * c:32 * c + 32], d
+        assert got[1][2 * c:2 * c + 2] == ref_met[2 * c:2 * c + 2], d
+
+
+def test_vbuild_k4_five_lane_rate_beats_partial():
+    """At the same live count a five-lane K4 append runs materially
+    fewer cycles than the block-1 partial rebuild of the same block
+    on the same build."""
+    rng = random.Random(8400)
+    k = 45
+    win = k4_window(rng, k)
+    pay, met = bytes(128 * 64), bytes(128 * 4)
+    st = vbuild_sg1_k4_state(win, k - 1)
+    beats, res = k4_run5(win, k, pay, met, st)
+    assert res['status'] is Status.OK
+    c_k4 = res['counters']
+    beats, res = run_build(dict(FIVE_WIDE),
+                           win[:k * 128],
+                           k,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=2 | VBUILD_ROWS_HD128,
+                           retain_images=((R_BASE, retain_pattern(128 * 64)),
+                                          (M_BASE, retain_pattern(128 * 4))))
+    assert res['status'] is Status.OK
+    c_part = res['counters']
+    assert c_k4['run'] < 0.6 * c_part['run'], (c_k4, c_part)
+    assert c_k4['scale'] < 0.2 * c_part['scale'], (c_k4, c_part)
+
+
+def test_vbuild_k4_five_lane_relaunch():
+    """Heal and append prongs, both blocks and a live-count shrink on
+    one DUT: the beat ranks, the composed-bank count and the payloads
+    banks reset per run."""
+    params = dict(K4_FIVE)
+    hp = HasTRoomParams(params)
+    dut = Harness(params)
+    beats = []
+    rng = random.Random(8500)
+    win = [p for _ in range(64) for p in gen_slot128(rng)]
+
+    def tx():
+        pay, met = bytes(128 * 64), bytes(128 * 4)
+        states = [bytes(128 * 8), bytes(128 * 8)]
+        for launch, (k, heal) in enumerate(
+            ((2, True), (3, False), (33, True), (34, False), (1, True),
+             (2, False)),
+                start=1):
+            blk = int(k > 32)
+            st = states[blk]
+            image = b''.join(p.to_bytes(2, 'little') for p in win[:k * 128])
+            for base, blob in ((P_BASE, image), (R_BASE, k4_to_slice(pay,
+                                                                     blk)),
+                               (M_BASE, met), (ST_BASE + blk * 1024, st)):
+                for off in range(0, len(blob), hp.beat_bytes):
+                    word = int.from_bytes(blob[off:off + hp.beat_bytes],
+                                          'little')
+                    yield from tmem_write_routed(dut.tmem, base + off, word)
+            begin = len(beats)
+            sink = dut.dut.sink
+            yield sink.bits.a_base.eq(P_BASE)
+            yield sink.bits.r_base.eq(R_BASE)
+            yield sink.bits.m_base.eq(M_BASE)
+            yield sink.bits.k.eq(k | (K4_HEAL_BIT if heal else 0))
+            yield sink.bits.rows.eq(K4_ROWS)
+            yield sink.valid.eq(1)
+            yield
+            for _ in range(100):
+                if (yield sink.fire):
+                    break
+                yield
+            else:
+                raise TimeoutError('K4 relaunch was not accepted')
+            yield sink.valid.eq(0)
+            yield
+            for _ in range(16000):
+                if (yield dut.dut.done):
+                    assert Status((yield dut.dut.status)) is Status.OK
+                    yield
+                    break
+                yield
+            else:
+                raise TimeoutError(f'K4 relaunch did not finish: {k}, {heal}')
+            emitted = beats[begin:]
+            assert len(emitted) == 101, (k, heal, len(emitted))
+            expected = vbuild_sg1_k4_append(win,
+                                            k,
+                                            pay,
+                                            met,
+                                            st,
+                                            heal=heal,
+                                            lanes=5)
+            got = k4_images5(emitted, pay, met, st, blk)
+            for actual, reference in zip(got, expected):
+                assert actual == reference, (k, heal,
+                                             first_diff(actual, reference))
+            assert (yield dut.dut.rows) == 128 * launch
+            assert (yield dut.dut.tiles) == launch
+            pay, met, states[blk] = expected
+            yield
+
+    def watch():
+        yield Passive()
+        while True:
+            if (yield dut.dut.tmem_w.fire):
+                beats.append(
+                    ((yield
+                      dut.dut.tmem_w.bits.addr), (yield
+                                                  dut.dut.tmem_w.bits.data)))
+            yield
+
+    sim = Simulator(dut)
+    sim.add_clock(1e-6)
+    sim.add_sync_process(tx)
+    sim.add_sync_process(watch)
+    sim.run()
+
+
+def test_vbuild_k4_slice_abi():
+    """The open block's slice is 77 beats: three per full group and
+    two in the tail, the two blocks sharing each straddle beat."""
+    b0, b1 = k4_block_beats(0), k4_block_beats(1)
+    assert len(b0) == len(b1) == 77
+    assert b0[:5] == [0, 1, 2, 5, 6] and b1[:5] == [2, 3, 4, 7, 8]
+    assert b0[-2:] == [125, 126] and b1[-2:] == [126, 127]
+    assert sorted(set(b0) | set(b1)) == list(range(128))
+    assert len(set(b0) & set(b1)) == 26
+
+
+# ---------------------------------------------------------------------
+# Other non-quad lane counts: a build allows any power of two and five
+# (types.py), and the non-quad drains are written in terms of
+# n_outputs, not of five. One run of every mode at one, two and eight
+# lanes holds them to the lane-parameterized models. The K modes, K4
+# and the appends were rejected at accept on a non-quad build until
+# 2026-11-26; lifting the rejection without generalizing K4's
+# row-to-group step left it hanging at every count but two and five,
+# which the first test here catches. The one known exception is pinned
+# at the end: the 11-25 V partial drain of block 1 at one lane.
+# ---------------------------------------------------------------------
+
+
+def nonquad_params(lanes):
+    return dict(FIVE_WIDE,
+                n_outputs=lanes,
+                vbuild_native_append=True,
+                vbuild_k4_selective=True)
+
+
+def images_at(beats, base, prior):
+    """``prior`` with every beat the run wrote inside it applied."""
+    img = bytearray(prior)
+    for addr, data in beats:
+        if base <= addr < base + len(prior):
+            off = addr - base
+            img[off:off + 64] = data.to_bytes(64, 'little')[:len(prior) - off]
+    return bytes(img)
+
+
+def nonquad_k_window(lanes, code, k, p0, nq):
+    """One K window run at ``lanes``: (beats, result, payload, meta,
+    the model's payload and meta)."""
+    rng = random.Random(7300 + lanes * 10 + code + k)
+    slots = [gen_slot128(rng, False) for _ in range(80)]
+    canon = [vbuild_quant_row(s) for s in slots]
+    zero = bytes(136)
+    if code == 16:
+        rows = [canon[p0 + i] for i in range(16)]
+    elif code == 17 and k % 2 == 0:
+        rows = [canon[p0], canon[p0 + 1]]
+    else:
+        rows = [canon[p0]] + ([zero] if code == 17 else [])
+    img = [p for s in range(p0, p0 + nq) for p in slots[s]]
+    prior = list(canon)
+    for i in range(nq):
+        prior[p0 + i] = zero
+    while len(prior) % lanes:
+        prior.append(zero)
+    pay0, met0 = vbuild_sg1_k_stream(prior, lanes=lanes)
+    pay_s, met_s = vbuild_sg1_k_window_slice(pay0, met0, 4, nq, p0, lanes)
+    params = nonquad_params(lanes)
+    beats, res = run_build(params,
+                           img,
+                           k,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=code | VBUILD_ROWS_HD128
+                           | vbuild_koff(p0, lanes),
+                           retain_images=((R_BASE, pay_s), (M_BASE, met_s)))
+    hp = HasTRoomParams(params)
+    pay, met = images_over(beats, hp, pay_s, met_s)
+    exp = vbuild_sg1_k_window(pay0, met0, rows, p0, lanes=lanes)
+    return beats, res, pay, met, exp
+
+
+def nonquad_k4(lanes, k):
+    """One K4 append at ``lanes`` equals its model on all three images
+    and writes exactly the block's slice, the meta and the state."""
+    rng = random.Random(7400 + lanes * 10 + k)
+    win = k4_window(rng, k)
+    blk = 1 if k > 32 else 0
+    pay0, met0 = retain_pattern(128 * 64), retain_pattern(128 * 4)
+    st0 = vbuild_sg1_k4_state(win, k - 1) if k > 1 else bytes(128 * 8)
+    st_base = ST_BASE + blk * 1024
+    slice0 = k4_to_slice(pay0, blk, lanes)
+    beats, res = run_build(nonquad_params(lanes),
+                           win[:k * 128],
+                           k,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=K4_ROWS,
+                           deadline=16000,
+                           retain_images=((R_BASE, slice0), (M_BASE, met0),
+                                          (st_base, st0)))
+    assert res['status'] is Status.OK, (lanes, k)
+    written = bytearray(slice0)
+    n_pay = 0
+    for addr, data in beats:
+        if R_BASE <= addr < R_BASE + len(slice0):
+            off = addr - R_BASE
+            written[off:off + 64] = data.to_bytes(64, 'little')
+            n_pay += 1
+        else:
+            assert (M_BASE <= addr < M_BASE + 512
+                    or st_base <= addr < st_base + 1024), hex(addr)
+    got = (k4_from_slice(pay0, bytes(written), blk, lanes),
+           images_at(beats, M_BASE, met0), images_at(beats, st_base, st0))
+    exp = vbuild_sg1_k4_append(win, k, pay0, met0, st0, lanes=lanes)
+    for actual, reference in zip(got, exp):
+        assert actual == reference, (lanes, k, first_diff(actual, reference))
+    assert n_pay == len(slice0) // 64
+    assert len(beats) == n_pay + 8 + 16
+
+
+def nonquad_vappend(lanes, rows, p):
+    """One V append at ``lanes`` equals its model."""
+    blk = rows - 18
+    rng = random.Random(7500 + lanes * 10 + rows * 40 + p)
+    slot = gen_slot128(rng)
+    params = nonquad_params(lanes)
+    pay0, srow0 = retain_pattern(128 * 64), retain_pattern(256)
+    beats, res = run_build(params,
+                           slot,
+                           p + 1 + 32 * blk,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=rows | VBUILD_ROWS_HD128,
+                           retain_images=((R_BASE, pay0), (M_BASE, srow0)))
+    assert res['status'] is Status.OK, (lanes, rows)
+    hp = HasTRoomParams(params)
+    pay, srow = images_over(beats, hp, pay0, srow0)
+    exp = vbuild_sg1_append(slot, blk, p, pay0, srow0, lanes=lanes)
+    assert pay == exp[0], (lanes, rows, first_diff(pay, exp[0]))
+    assert srow == exp[1], (lanes, rows)
+    assert len(beats) == len(vbuild_sg1_append_beats(blk, 128, lanes)) + 4
+
+
+@pytest.mark.parametrize('lanes', [1, 2, 3, 6, 7, 8])
+def test_vbuild_nonquad_other_lane_counts(lanes):
+    """Check K block, pair, and token builds plus K4 and V append."""
+    for code, k, p0, nq in ((16, 16, 16, 16), (17, 6, 50, 2), (17, 5, 50, 2),
+                            (20, 8, 23, 1)):
+        beats, res, pay, met, exp = nonquad_k_window(lanes, code, k, p0, nq)
+        assert res['status'] is Status.OK, (code, p0)
+        assert pay == exp[0], (code, p0, first_diff(pay, exp[0]))
+        assert met == exp[1], (code, p0, first_diff(met, exp[1]))
+        assert len(beats) == (len(exp[0]) + len(exp[1])) // 64
+    for k in (17, 40):
+        nonquad_k4(lanes, k)
+    for rows in (18, 19):
+        nonquad_vappend(lanes, rows, 5)
+
+
+def nonquad_v_drain(lanes, code, live):
+    """The V full (code 0) or partial (code 1, block 0; code 2, block 1)
+    extent at ``lanes`` equals its model over the retained staging: the
+    whole tile for a full run, the block's cells for a partial one."""
+    params = dict(FIVE_WIDE, n_outputs=lanes)
+    rng = random.Random(5700 + live)
+    window = []
+    for j in range(64):
+        window.extend(gen_slot128(rng) if j < live else [0] * 128)
+    beats, res = run_build(params,
+                           window,
+                           live,
+                           a_base=P_BASE,
+                           r_base=R_BASE,
+                           m_base=M_BASE,
+                           rows=code | VBUILD_ROWS_HD128,
+                           retain_images=((R_BASE, retain_pattern(128 * 64)),
+                                          (M_BASE, retain_pattern(128 * 4))))
+    assert res['status'] is Status.OK, (lanes, code, live)
+    hp = HasTRoomParams(params)
+    pay, met = images_over(beats, hp, retain_pattern(128 * 64),
+                           retain_pattern(128 * 4))
+    ref_pay, ref_met = vbuild_sg1_wide(window, lanes=lanes)
+    if code:
+        blk = code - 1
+        epay = bytearray(retain_pattern(128 * 64))
+        emet = bytearray(retain_pattern(128 * 4))
+        for r in range(128):
+            c = vbuild_sg1_cell(r, blk, lanes, 128)
+            epay[32 * c:32 * c + 32] = ref_pay[32 * c:32 * c + 32]
+            emet[2 * c:2 * c + 2] = ref_met[2 * c:2 * c + 2]
+        ref_pay, ref_met = bytes(epay), bytes(emet)
+    assert pay == ref_pay, (lanes, code, live, first_diff(pay, ref_pay))
+    assert met == ref_met, (lanes, code, live, first_diff(met, ref_met))
+
+
+@pytest.mark.parametrize('lanes', [1, 2, 3, 6, 7, 8])
+@pytest.mark.parametrize('code,live', [(0, 64), (1, 20), (2, 45), (2, 64)])
+def test_vbuild_nonquad_v_drain_lane_counts(lanes, code, live):
+    nonquad_v_drain(lanes, code, live)
 
 
 @pytest.mark.parametrize('overrides', [dict(rows_bits=8), dict(act_max_k=64)])

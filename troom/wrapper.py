@@ -71,6 +71,7 @@ class TroomWrapper(HasTRoomParams, Elaboratable):
                  mem_base=0,
                  mem_size=None,
                  mmio_base=0,
+                 read_topology=None,
                  reset_cycles=8,
                  name=None):
         HasTRoomParams.__init__(self, params)
@@ -90,11 +91,17 @@ class TroomWrapper(HasTRoomParams, Elaboratable):
 
         # Command interface components. The memory window bounds both
         # the controller's buffer checks and every tensor DMA issue.
+        sg1_striped = read_topology is not None and read_topology.striped
         self.ctrl = TroomController(params,
                                     mem_base=mem_base,
-                                    mem_size=mem_size)
+                                    mem_size=mem_size,
+                                    sg1_striped=sg1_striped)
         self.fetcher = CommandFetcher(params)
-        self.core = Core(params, mem_base=mem_base, mem_size=mem_size)
+        self.core = Core(params,
+                         mem_base=mem_base,
+                         mem_size=mem_size,
+                         read_topology=read_topology)
+        self.aux_buses = self.core.aux_buses
         self.writer = CompletionWriter(params)
 
         # Observation: the compute-core re-arm reset.
@@ -104,6 +111,9 @@ class TroomWrapper(HasTRoomParams, Elaboratable):
         m = Module()
 
         ctrl = m.submodules.ctrl = self.ctrl
+        if self.mm_starvation_counters:
+            for name, counter in self.core.stream.diag.items():
+                m.d.comb += ctrl.mm_diag_i[name].eq(counter)
         fetcher = m.submodules.fetcher = self.fetcher
         core_rst = Signal()
         m.submodules.core = ResetInserter(core_rst)(self.core)

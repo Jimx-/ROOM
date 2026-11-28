@@ -26,10 +26,11 @@ from troom.types import (
     dma_desc_layout,
 )
 
+from troom.abi import PV_EARLY_WEIGHTS_FLAG, SG1_STRIPE_FLAG
 from troom.dma import DMA
 from troom.epilogue import Epilogue
 from troom.quantize import ActLoader
-from troom.stream import StreamAxiReader, StreamGemv
+from troom.stream import StreamAxiReader, StreamGemv, StreamMultiPortReader
 from troom.tmem import TMEM
 from troom.vector import VectorUnit
 from troom.vbuild import VBuildUnit
@@ -57,24 +58,23 @@ class Command(HasTRoomParams, Record):
 
     def __init__(self, params, name=None, src_loc_at=0):
         HasTRoomParams.__init__(self, params)
-        Record.__init__(
-            self,
-            [
-                ('opcode', Opcode, Direction.FANOUT),
-                ('evt', self.evt_bits, Direction.FANOUT),
-                ('seq', self.seq_bits, Direction.FANOUT),
-                ('fmt', Format, Direction.FANOUT),
-                ('vec_op', VecOp, Direction.FANOUT),
-                ('k', self.lg_act_k + 1, Direction.FANOUT),
-                ('w_base', self.tmem_addr_width, Direction.FANOUT),
-                ('w_stride', self.tmem_addr_width, Direction.FANOUT),
-                ('r_base', self.tmem_addr_width, Direction.FANOUT),
-                ('a_base', self.tmem_addr_width, Direction.FANOUT),
-                ('m_base', self.tmem_addr_width, Direction.FANOUT),
-            ] + [(name, width, Direction.FANOUT)
-                 for name, width in dma_desc_layout(self)],
-            name=name,
-            src_loc_at=src_loc_at + 1)
+        Record.__init__(self,
+                        [
+                            ('opcode', Opcode, Direction.FANOUT),
+                            ('evt', self.evt_bits, Direction.FANOUT),
+                            ('seq', self.seq_bits, Direction.FANOUT),
+                            ('fmt', Format, Direction.FANOUT),
+                            ('vec_op', VecOp, Direction.FANOUT),
+                            ('k', self.lg_act_k + 1, Direction.FANOUT),
+                            ('w_base', self.addr_width, Direction.FANOUT),
+                            ('w_stride', 32, Direction.FANOUT),
+                            ('r_base', self.tmem_addr_width, Direction.FANOUT),
+                            ('a_base', self.tmem_addr_width, Direction.FANOUT),
+                            ('m_base', self.tmem_addr_width, Direction.FANOUT),
+                        ] + [(name, width, Direction.FANOUT)
+                             for name, width in dma_desc_layout(self)],
+                        name=name,
+                        src_loc_at=src_loc_at + 1)
 
 
 class Completion(HasTRoomParams, Record):
@@ -112,8 +112,14 @@ class Core(HasTRoomParams, Elaboratable):
     complete with ``BAD_RANGE`` without bus traffic.
     """
 
-    def __init__(self, params, *, mem_base=0, mem_size=None):
+    def __init__(self,
+                 params,
+                 *,
+                 mem_base=0,
+                 mem_size=None,
+                 read_topology=None):
         super().__init__(params)
+        self.split_responses = read_topology is not None
 
         self.mem_base = mem_base
         self.mem_size = mem_size
@@ -127,8 +133,14 @@ class Core(HasTRoomParams, Elaboratable):
 
         self.stream = StreamGemv(self.params,
                                  mem_base=mem_base,
-                                 mem_size=mem_size)
-        self.sreader = StreamAxiReader(self.params)
+                                 mem_size=mem_size,
+                                 read_topology=read_topology)
+        if self.split_responses:
+            self.sreader = StreamMultiPortReader(self.params, read_topology)
+            self.aux_buses = self.sreader.aux_buses
+        else:
+            self.sreader = StreamAxiReader(self.params)
+            self.aux_buses = {}
 
         # Recovery stops new engine issue while already-issued DMA drains.
         self.halt = Signal()
@@ -210,8 +222,16 @@ class Core(HasTRoomParams, Elaboratable):
         m.d.comb += [
             core_arb.bus.connect(self.bus),
             self.stream.mem_rreq.connect(self.sreader.rreq),
-            self.sreader.rresp.connect(self.stream.mem_rresp),
         ]
+        if self.split_responses:
+            m.d.comb += [
+                self.sreader.presp.connect(self.stream.mem_rresp),
+                self.sreader.mresp.connect(self.stream.mem_sresp),
+                self.sreader.pair_en.eq(self.stream.pair_ok),
+                self.sreader.triple_en.eq(self.stream.triple_ok),
+            ]
+        else:
+            m.d.comb += self.sreader.rresp.connect(self.stream.mem_rresp)
         epi = m.submodules.epi = Epilogue(self.params)
         actload = m.submodules.actload = ActLoader(self.params)
         vector = m.submodules.vector = VectorUnit(self.params)
@@ -476,6 +496,9 @@ class Core(HasTRoomParams, Elaboratable):
         cur_fmt = Signal(Format)
         cur_vec_op = Signal(VecOp)
         cur_k = Signal(self.lg_act_k + 1)
+        cur_ps_base = Signal(self.addr_width)
+        cur_pl_beats = Signal(5)
+        cur_early_weights = Signal()
         cur_a_base = Signal(self.tmem_addr_width)
         cur_m_base = Signal(self.tmem_addr_width)
 
@@ -723,6 +746,17 @@ class Core(HasTRoomParams, Elaboratable):
                             cur_k.eq(deq.k),
                             cur_rows.eq(deq.rows),
                             cur_r_base.eq(deq.r_base),
+                            cur_ps_base.eq(
+                                Mux(
+                                    deq.w_stride[5:] == (SG1_STRIPE_FLAG >> 5),
+                                    Mux(deq.w_base == 0, 0x80000000,
+                                        deq.w_base), 0)),
+                            cur_pl_beats.eq(deq.w_stride),
+                            cur_early_weights.eq(
+                                Const(self.act_banks == 2)
+                                & (deq.w_stride == PV_EARLY_WEIGHTS_FLAG)
+                                & (deq.fmt == Format.Q8_0) & (deq.k == 64)
+                                & (deq.rows == 128)),
                             cur_a_base.eq(deq.a_base),
                             cur_m_base.eq(deq.m_base),
                         ]
@@ -878,6 +912,8 @@ class Core(HasTRoomParams, Elaboratable):
                 | (cur_vec_op == VecOp.VEC_MUL_QUANT_ACT)
                 | (cur_vec_op == VecOp.VEC_NORM_QUANT_ACT))
         act_fill_busy = actload.active | (vector.active & vec_act_direct)
+        m.d.comb += self.stream.act_fill_busy.eq(act_fill_busy)
+
         m.d.comb += self.act_wr_conflict.eq(actload.act_wr.valid
                                             & vector.act_wr.valid)
         m.d.comb += [
@@ -885,13 +921,17 @@ class Core(HasTRoomParams, Elaboratable):
             dma.sink.bits.store.eq(is_store),
             actload.sink.valid.eq(
                 fsm.ongoing('EXEC') & ~self.halt & is_actload
-                & act_offer_ok & act_epi_ok),
+                & act_offer_ok & act_epi_ok & ~self.stream.act_commit_pending),
             actload.sink.bits.a_base.eq(cur_a_base),
             actload.sink.bits.m_base.eq(cur_m_base),
             actload.sink.bits.k.eq(cur_k),
             vector.sink.valid.eq(
                 fsm.ongoing('EXEC') & ~self.halt & is_vector
-                & vec_cls_ok),
+                & vec_cls_ok
+                & (~self.stream.act_commit_pending
+                   | ((cur_vec_op != VecOp.VEC_QUANT_ACT)
+                      & (cur_vec_op != VecOp.VEC_MUL_QUANT_ACT)
+                      & (cur_vec_op != VecOp.VEC_NORM_QUANT_ACT)))),
             vector.sink.bits.op.eq(cur_vec_op),
             vector.sink.bits.n.eq(cur_k),
             vector.sink.bits.a_base.eq(cur_a_base),
@@ -907,10 +947,13 @@ class Core(HasTRoomParams, Elaboratable):
         m.d.comb += [
             self.stream.sink.valid.eq(
                 fsm.ongoing('EXEC') & ~self.halt & is_smatmul
-                & r_ok & epi.ready & ~act_fill_busy),
+                & r_ok & epi.ready & (~act_fill_busy | cur_early_weights)),
+            self.stream.sink.bits.early_weights.eq(cur_early_weights),
             self.stream.sink.bits.fmt.eq(cur_fmt),
             self.stream.sink.bits.k.eq(cur_k),
             self.stream.sink.bits.rows.eq(cur_rows),
+            self.stream.sink.bits.ps_base.eq(cur_ps_base),
+            self.stream.sink.bits.pl_beats.eq(cur_pl_beats),
             self.stream.sink.bits.p_base.eq(cur_dma.dram_addr),
             self.stream.sink.bits.m_base.eq(cur_dma.dram_stride),
         ]
@@ -929,6 +972,13 @@ class Core(HasTRoomParams, Elaboratable):
             | actload.active | vector.active | vbuild.active
             | self.stream.active)
 
+        if self.mm_starvation_counters:
+            m.d.comb += [
+                self.stream.dma_beat.eq((dma_bus.r.valid & dma_bus.r.ready)
+                                        | (dma_bus.w.valid & dma_bus.w.ready)),
+                self.stream.payload_request.eq(self.sreader.payload_request),
+                self.stream.scale_request.eq(self.sreader.scale_request),
+            ]
         m.d.sync += self.cycle_count.eq(self.cycle_count + 1)
 
         m.d.comb += [

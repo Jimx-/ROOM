@@ -80,7 +80,7 @@ from troom.abi import (
     pack_indirect,
     pack_completion,
 )
-from troom.consts import Opcode, Status, VecOp
+from troom.consts import Format, Opcode, Status, VecOp
 from troom.types import HasTRoomParams
 from troom.wrapper import TroomWrapper
 
@@ -1127,5 +1127,89 @@ def test_param_page_launch_resolves_markers_e2e():
                                      for i in range(len(prog))]
         check_tensor_outputs(image, vec_n)
         assert not (yield top.ram.protocol_error)
+
+    run_wrap(top, main, collect_writes(top, image))
+
+
+def test_mm_starvation_snapshot():
+    from troom.abi import (CAPS_MM_STARVATION, MM_STARVATION_CLASSES,
+                           MM_STARVATION_FIELDS, MM_STARVATION_MASKS,
+                           REG_MM_STARVATION)
+
+    # Three Q8_0 descriptors exercise the projection, QK and PV banks.
+    # Reset-zero activation and payload images are sufficient to check
+    # the exact work and traffic counts through the public launch path.
+    shapes = ((256, 4), (128, 256), (64, 128))
+    cmds = []
+    for k, rows in shapes:
+        cmds += [
+            dict(opcode=Opcode.SQUANTIZE, evt=1, k=k, a_base=0, m_base=0x400),
+            dict(opcode=Opcode.WAIT, evt=1),
+            dict(opcode=Opcode.SMATMUL,
+                 evt=2,
+                 k=k,
+                 rows=rows,
+                 fmt=int(Format.Q8_0),
+                 r_base=0x800,
+                 dram_addr=0x4000,
+                 dram_stride=0xc000),
+            dict(opcode=Opcode.WAIT, evt=2),
+        ]
+    cmds.append(dict(opcode=Opcode.END))
+    cmds = [wrap_cmd(seq=seq, **cmd) for seq, cmd in enumerate(cmds, start=1)]
+    end_base = 0x3000
+    image = make_image([(CMD_BASE, cmds), (end_base, [cmds[-1]])])
+    image.extend(bytes(0xd000 - len(image)))
+    top = WrapperTop(dict(WRAP_PARAMS, mm_starvation_counters=True),
+                     bytes(image),
+                     read_latency=6)
+
+    def main():
+        caps = yield from mmio_read(top, REG_CAPS)
+        assert caps & (1 << CAPS_MM_STARVATION)
+        for submit_id, count in ((1, len(cmds)), (2, 1)):
+            # The second launch points directly at END and should clear
+            # every diagnostic bank while publishing a new snapshot.
+            base = CMD_BASE if submit_id == 1 else end_base
+            result = yield from launch(top,
+                                       image,
+                                       submit_id=submit_id,
+                                       cmd_base=base,
+                                       count=count,
+                                       comp_base=COMP_BASE,
+                                       capacity=16)
+            assert result['status'] & (1 << STATUS_DONE), result
+            assert all(status == Status.OK for _, status in result['records'])
+            standard = yield from read_counters(top)
+            diag = {}
+            off = REG_MM_STARVATION
+            for bank in MM_STARVATION_CLASSES:
+                fields = diag[bank] = {}
+                for field in MM_STARVATION_FIELDS:
+                    lo = yield from mmio_read(top, off)
+                    hi = yield from mmio_read(top, off + 4)
+                    fields[field] = lo | (hi << 32)
+                    off += 8
+            if submit_id == 2:
+                assert all(not any(bank.values()) for bank in diag.values())
+                continue
+            total_starve = 0
+            for (k, rows), fields in zip(shapes, diag.values()):
+                starve = sum(fields[f'mask_{mask:02x}']
+                             for mask in MM_STARVATION_MASKS)
+                assert fields['commands'] == 1
+                assert fields['macs'] == k * rows
+                assert fields['payload_beats'] == k * rows // BEAT
+                assert fields['scale_beats'] == (k * rows // 16 + BEAT -
+                                                 1) // BEAT
+                assert fields['first_issue_wait'] > 0
+                assert fields['mask_03'] + fields['mask_07'] + fields[
+                    'mask_0b'] + fields['mask_0f'] > 0
+                assert fields[
+                    'run'] == fields['issue'] + fields['credit'] + starve
+                total_starve += starve
+            assert total_starve == standard['array_starve']
+            assert sum(bank['run']
+                       for bank in diag.values()) == standard['mm_run_cycles']
 
     run_wrap(top, main, collect_writes(top, image))

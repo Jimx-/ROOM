@@ -218,7 +218,9 @@ CAPS_ENGINE_COUNTERS = 2  # observation-counter window implemented
 CAPS_MM_EPI_COUNTERS = 3  # matrix/epilogue cycle-breakdown window
 CAPS_VBUILD = 4  # device-side V-window tile builder (VBUILD opcode)
 CAPS_VBUILD_SG1 = 5  # VBUILD SG1 drain (payload+meta staging via m_base)
-CAPS_VBUILD_K = 6  # VBUILD K orientation (16 slot rows via rows == 16)
+CAPS_VBUILD_K = 6  # VBUILD K orientation (rows == 16/17/20; on a build
+# whose n_outputs is not 4 the descriptor's rows bits 5..11 carry the
+# first rebuilt slot's lane offset -- VBUILD_KOFF_*, below)
 # E2 ABI rider (decided 2026-10-28, resident-decode follow-up): GEMV
 # engine presence is discovered from this word instead of the
 # reject-only probe launch. This source generation always carries the
@@ -305,6 +307,35 @@ CAPS_VBUILD_VAPP = 17
 CAPS_ACT_K4096 = 18
 CAPS_VBUILD_HD128 = 19
 VBUILD_ROWS_HD128 = 1 << 15
+# Five-lane K staging (2026-11-26,
+# plans/2026-11-23-troom-qwen3-breakthrough.md): the K orientation's
+# lane-offset field. On a build whose n_outputs is not 4, the K modes
+# (rows 16/17/20) read rows bits 5..11 as the first rebuilt slot's
+# position inside its per-head stream: bits 5..7 hold the slot's lane
+# index within its n_outputs-row interleave group (slot mod n_outputs)
+# and bits 8..11 its group index mod 16, which fixes the meta image's
+# beat alignment. Bits 12..14 stay reserved (zero), and the field must
+# be zero on every other mode and on every four-lane build, whose
+# staging needs no offset.
+VBUILD_MODE_MASK = 0x1f
+VBUILD_KOFF_LANE_SHIFT = 5
+VBUILD_KOFF_GROUP_SHIFT = 8
+VBUILD_KOFF_LANE_MASK = 0x7 << VBUILD_KOFF_LANE_SHIFT
+VBUILD_KOFF_GROUP_MASK = 0xf << VBUILD_KOFF_GROUP_SHIFT
+
+
+def vbuild_koff(slot, lanes):
+    """The K lane-offset field for a run whose first slot is ``slot``.
+
+    ``lanes`` is the consuming stream engine's n_outputs on a non-quad
+    build. The host mirrors this to fill rows bits 5..11 of a K-mode
+    VBUILD descriptor.
+    """
+    group, lane = divmod(slot, lanes)
+    return (lane << VBUILD_KOFF_LANE_SHIFT) | (
+        (group & 0xf) << VBUILD_KOFF_GROUP_SHIFT)
+
+
 # Q3c direct-append slice (2026-11-10,
 # plans/2026-11-09-troom-qwen3-hill-climb.md): the final-format append
 # writer family of the frozen candidate-A contract
@@ -390,6 +421,12 @@ ERROR_INDEX_NONE = 0xffffffff
 
 CMD_FORMAT_0 = 0
 
+# Striped SG1 weight placement uses w_stride bit 31 and a 32-beat period.
+SG1_STRIPE_FLAG = 0x80000000
+SG1_STRIPE_BEATS = 32
+SG1_DEFAULT_PL_BEATS = 16
+SG1_BEAT_BYTES = 64
+
 # Public command field order; word ``i`` of a descriptor carries
 # ``CMD_FIELDS[i]`` serialized as a little-endian 32-bit integer.
 CMD_FIELDS = (
@@ -457,8 +494,8 @@ def command_field_shapes(hp):
         ('fmt', _enum_width(Format)),
         ('vec_op', _enum_width(VecOp)),
         ('k', hp.lg_act_k + 1),
-        ('w_base', hp.tmem_addr_width),
-        ('w_stride', hp.tmem_addr_width),
+        ('w_base', hp.addr_width),
+        ('w_stride', 32),
         ('r_base', hp.tmem_addr_width),
         ('a_base', hp.tmem_addr_width),
         ('m_base', hp.tmem_addr_width),
@@ -525,6 +562,14 @@ def pack_completion(seq, status):
     return int(seq).to_bytes(4, 'little') + int(status).to_bytes(4, 'little')
 
 
+# Optional Qwen3 G4 diagnostic window. Each field is a 48-bit launch
+# counter in a 64-bit read-only snapshot, using the existing launch reset.
+CAPS_MM_STARVATION = 25
+CAPS_SG1_STRIPED = 26
+CAPS_PV_EARLY_WEIGHTS = 27
+# Exact w_stride marker for unstriped Q8_0 k=64, rows=128 SMATMUL.
+PV_EARLY_WEIGHTS_FLAG = 1 << 30
+
 # Fused RMS quantization requires the pipelined quantizer and four
 # vector multiplier groups. The scalar is read from the r_base beat.
 CAPS_VEC_NORM_QUANT_ACT = 28
@@ -538,3 +583,30 @@ CAPS_VEC_NORM_QUANT_ACT = 28
 # image family from images whose vector unit rejects the opcode at
 # accept.
 CAPS_VEC_SILU_GLU = 29
+
+REG_MM_STARVATION = 0x200
+MM_STARVATION_CLASSES = ('other', 'qk', 'pv')
+# Mask bits: activation empty, required lane empty, payload short, scale
+# short. The last two bits describe the decoder head when a lane is empty.
+MM_STARVATION_MASKS = (1, 2, 3, 6, 7, 10, 11, 14, 15)
+MM_STARVATION_FIELDS = (
+    'commands',
+    'run',
+    'issue',
+    'credit',
+    'macs',
+    'first_issue_wait',
+    'payload_beats',
+    'scale_beats',
+    'payload_requests',
+    'scale_requests',
+    'payload_eligible_short',
+    'scale_eligible_short',
+    'payload_outstanding_gap',
+    'scale_outstanding_gap',
+    'dma_overlap',
+) + tuple(f'mask_{mask:02x}' for mask in MM_STARVATION_MASKS)
+MM_STARVATION_COUNTERS = tuple(f'{kind}_{field}'
+                               for kind in MM_STARVATION_CLASSES
+                               for field in MM_STARVATION_FIELDS)
+REG_MM_STARVATION_END = REG_MM_STARVATION + 8 * len(MM_STARVATION_COUNTERS)

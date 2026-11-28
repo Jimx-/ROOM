@@ -217,7 +217,9 @@ def test_fetches_and_decodes_format0_descriptors():
     cmds = [
         rich_cmd(1),
         signal_cmd(2, evt=1),
-        rich_cmd(3),
+        dict(rich_cmd(3, Opcode.SMATMUL),
+             w_base=0x31000000,
+             w_stride=0x8000000d),
         signal_cmd(4, evt=2),
         end_cmd(5)
     ]

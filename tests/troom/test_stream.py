@@ -537,6 +537,15 @@ def test_stream_q8_0_records(k, rows):
     assert res['bubbles'] == res['starve'] + res['credit']
 
 
+@pytest.mark.parametrize('lanes', range(1, 9))
+def test_stream_q8_0_lane_counts(lanes):
+    params = dict(PARAMS, data_width=512, n_outputs=lanes)
+    rows = 3 * lanes - 1
+    out = run_stream(128, rows, params=params, stall_sink=True, seed=13)
+    assert out['results'][-1]['status'] == Status.OK
+    check_records(out['records'], out['expected'], n_outputs=lanes)
+
+
 def test_stream_q8_0_odd_rows_backpressure():
     out = run_stream(128, 5, stall_sink=True, seed=13)
     assert out['results'][-1]['status'] is Status.OK
@@ -1085,7 +1094,7 @@ def asm_golden_step(st, beat, beat_in, pitch, consume, bb, ub, depth, slots=2):
     return (avail, can_take, slots_out, (uf2, ucnt2, part_next, ph2))
 
 
-def asm_bench(dw, pitch, seed, cycles=400, banked=False):
+def asm_bench(dw, pitch, seed, cycles=400, banked=False, five=False):
     """Drive one UnitAssembler against its golden model.
 
     pysim clock discipline: drive inputs, naked-yield (they become this
@@ -1099,15 +1108,19 @@ def asm_bench(dw, pitch, seed, cycles=400, banked=False):
 
     bb = dw // 8
     ub, depth, slots = ASM_UB, ASM_DEPTH, ASM_SLOTS
+    if five:
+        ub, depth, slots = 192, 10, 5
     dut = UnitAssembler(beat_bytes=bb,
                         unit_bytes=ub,
                         depth=depth,
                         pitches=ASM_PITCHES,
                         slots=slots,
-                        banked_slots=banked)
+                        banked_slots=banked,
+                        dual=five,
+                        triple=five)
     rng = random.Random(seed)
     init = ([0] * depth, 0, 0, 0)
-    state = {'st': init, 'ph_seen': set()}
+    state = {'st': init, 'ph_seen': set(), 'heads': set(), 'widths': set()}
 
     def run():
         yield dut.pitch.eq(pitch)
@@ -1120,17 +1133,30 @@ def asm_bench(dw, pitch, seed, cycles=400, banked=False):
         yield
         st = init
         for _ in range(cycles):
-            offer = rng.getrandbits(dw)
-            probe = asm_golden_step(st, offer, True, pitch, 0, bb, ub, depth)
+            max_beats = 3 if pitch == 32 else 2 if pitch >= 128 else 1
+            lanes = rng.randint(1, max_beats) if five else 1
+            offer = rng.getrandbits(dw * lanes)
+            incoming = bb * lanes
+            probe = asm_golden_step(st, offer, True, pitch, 0, incoming, ub,
+                                    depth)
             take = probe[1] if rng.random() < 0.9 else False
-            base = asm_golden_step(st, offer, take, pitch, 0, bb, ub, depth)
+            base = asm_golden_step(st, offer, take, pitch, 0, incoming, ub,
+                                   depth)
             consume = rng.randint(0, min(base[0], slots))
-            e = asm_golden_step(st, offer, take, pitch, consume, bb, ub, depth,
-                                slots)
+            e = asm_golden_step(st, offer, take, pitch, consume, incoming, ub,
+                                depth, slots)
             yield dut.beat.eq(offer)
+            if five:
+                yield dut.beat1.eq(offer >> dw)
+                yield dut.beat2.eq(offer >> (2 * dw))
+                yield dut.beat1_in.eq(lanes >= 2)
+                yield dut.beat2_in.eq(lanes == 3)
             yield dut.beat_in.eq(1 if take else 0)
             yield dut.consume.eq(consume)
             yield  # inputs now active for this cycle; state == st
+            state['heads'].add((yield dut.head))
+            if take:
+                state['widths'].add(lanes)
             slots_got = []
             for v in range(slots):
                 slots_got.append((yield dut.slot[v]))
@@ -1160,6 +1186,14 @@ def asm_bench(dw, pitch, seed, cycles=400, banked=False):
     sim.add_sync_process(run)
     sim.run()
     return state
+
+
+@pytest.mark.parametrize('pitch,max_beats', [(20, 1), (32, 3), (128, 2),
+                                             (192, 2)])
+def test_unit_assembler_five_columns(pitch, max_beats):
+    state = asm_bench(512, pitch, seed=91 + pitch, banked=True, five=True)
+    assert state['heads'] == set(range(10))
+    assert state['widths'] == set(range(1, max_beats + 1))
 
 
 @pytest.mark.parametrize('pitch', ASM_PITCHES)
@@ -1297,3 +1331,15 @@ def test_stream_registered_reservations(pay_depth, meta_depth, credits, burst):
                     seed=72)
     assert all(r['status'] is Status.OK for r in out['results'])
     check_records(out['records'], out['expected'])
+
+
+def test_sg_act_wrap_preserves_row_group_boundaries():
+    """Read the next ACT group early, including a partially masked final group."""
+    params = dict(params_for(), data_width=512, n_outputs=4, act_max_k=4096)
+    runs = []
+    for wrap in (False, True):
+        result = run_stream(1024, 9, params=dict(params, sg_act_wrap=wrap))
+        check_records(result['records'], result['expected'], n_outputs=4)
+        runs.append(result['results'][0])
+    assert runs[1]['slots'] == runs[0]['slots']
+    assert runs[1]['run_cycles'] <= runs[0]['run_cycles']

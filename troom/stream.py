@@ -93,13 +93,20 @@ padding bytes, bursts issued, port idle under work) are exposed for
 the phase B rate accounting.
 """
 
+from math import gcd
+
+from dataclasses import dataclass
+
 from amaranth import *
 from amaranth.hdl.rec import Direction, Record
 from amaranth.utils import log2_int
 
+from troom.abi import SG1_DEFAULT_PL_BEATS as SG1_DEFAULT_PRIMARY_BEATS
+from troom.abi import (MM_STARVATION_CLASSES, MM_STARVATION_COUNTERS,
+                       MM_STARVATION_MASKS, SG1_STRIPE_BEATS)
 from troom.consts import Format, Status
 from troom.matrix import ActRAM, ActWord, MacArray, MmSegment, WSegWord
-from troom.types import HasTRoomParams
+from troom.types import rtl_div_const, HasTRoomParams
 
 from roomsoc.interconnect.axi import AXIInterface
 from roomsoc.interconnect.axi.common import AXIBurst
@@ -142,6 +149,10 @@ def stream_groups(rows, n_outputs):
     n_outputs or the decode reads the wrong lanes.
     """
     return (rows + n_outputs - 1) // n_outputs
+
+
+def rtl_stream_groups(rows, lanes):
+    return rtl_div_const(rows + (lanes - 1), lanes)[:len(rows)]
 
 
 def pack_stream_q8_0(wsegs, k, rows, n_outputs=2):
@@ -345,6 +356,9 @@ class StreamMatmulDesc(HasTRoomParams, Record):
             ('fmt', Format, Direction.FANOUT),
             ('k', self.lg_act_k + 1, Direction.FANOUT),
             ('rows', self.rows_bits, Direction.FANOUT),
+            ('ps_base', self.addr_width, Direction.FANOUT),
+            ('pl_beats', 5, Direction.FANOUT),
+            ('early_weights', 1, Direction.FANOUT),
             ('p_base', self.addr_width, Direction.FANOUT),
             ('m_base', self.addr_width, Direction.FANOUT),
         ],
@@ -375,6 +389,40 @@ class StreamReadResp(HasTRoomParams, Record):
         Record.__init__(self, [
             ('data', self.data_width, Direction.FANOUT),
             ('meta', 1, Direction.FANOUT),
+        ],
+                        name=name,
+                        src_loc_at=src_loc_at + 1)
+
+
+class StreamPayPair(HasTRoomParams, Record):
+    """Ordered payload beats, with a third lane on widened readers."""
+
+    def __init__(self, params, name=None, src_loc_at=0, *, triple=False):
+        HasTRoomParams.__init__(self, params)
+        layout = [
+            ('data0', self.data_width, Direction.FANOUT),
+            ('data1', self.data_width, Direction.FANOUT),
+            ('dual', 1, Direction.FANOUT),
+        ]
+        if triple:
+            layout += [
+                ('data2', self.data_width, Direction.FANOUT),
+                ('triple', 1, Direction.FANOUT),
+            ]
+        Record.__init__(self, layout, name=name, src_loc_at=src_loc_at + 1)
+
+    @property
+    def beat_count(self):
+        return 1 + self.dual + getattr(self, 'triple', 0)
+
+
+class StreamScaleBeat(HasTRoomParams, Record):
+    """One returned scale beat on the striped path's separate port."""
+
+    def __init__(self, params, name=None, src_loc_at=0):
+        HasTRoomParams.__init__(self, params)
+        Record.__init__(self, [
+            ('data', self.data_width, Direction.FANOUT),
         ],
                         name=name,
                         src_loc_at=src_loc_at + 1)
@@ -421,6 +469,21 @@ class UnitAssembler(Elaboratable):
     of one super-block group), so depth must cover the bonded group
     plus the streaming margin (the phase-B b3 lesson: the file held
     one streaming chunk too few and starved the bonded pair).
+
+    Three structural rules keep the mux fabric small, and each is an
+    identity on every reachable state:
+
+    * Only the phase bits some pitch can reach get a shift stage, and
+      the sub-beat stages span one lane. A pitch with a sub-beat phase
+      completes at most four units per intake, so its delivery must
+      already be single-lane (``beat1_in``/``beat2_in`` low) for the
+      completion count to be exact.
+    * A completion index past the pitch's bound (four, or MAX_COMP for
+      the 32-byte pitch) is never built; the golden model reads zero
+      there, because the view is zero above the arrived bytes and
+      ``part`` is zero above ``ph``.
+    * The slot bypass is the bank write steering: the completion that
+      becomes visible unit v is written to the bank column v reads.
     """
 
     MAX_COMP = 4  # completions per beat across the payload pitches
@@ -432,11 +495,19 @@ class UnitAssembler(Elaboratable):
                  depth,
                  pitches,
                  slots=2,
-                 banked_slots=False):
+                 banked_slots=False,
+                 dual=False,
+                 triple=False):
         assert beat_bytes <= unit_bytes
         assert all(p <= unit_bytes for p in pitches)
-        assert depth & (depth - 1) == 0
-        assert 1 <= slots <= self.MAX_COMP
+        self.non_power_of_two_banks = banked_slots and (slots &
+                                                        (slots - 1)) != 0
+        if self.non_power_of_two_banks:
+            assert depth == 2 * slots
+        else:
+            assert depth & (depth - 1) == 0
+        assert 1 <= slots <= depth
+        assert banked_slots or slots <= (6 if triple else self.MAX_COMP)
         self.bb = beat_bytes
         self.unit_bytes = unit_bytes
         self.depth = depth
@@ -447,14 +518,30 @@ class UnitAssembler(Elaboratable):
         # Wide units complete once per beat; flat units fit in 32 bytes.
         self.banked_slots = banked_slots
         if banked_slots:
-            assert slots & (slots - 1) == 0
-            assert depth >= slots
             assert all(p <= WIN_BYTES or p > beat_bytes for p in pitches)
+        # dual: a second beat lane may land in the same cycle, so the
+        # intake accepts up to 2*beat_bytes bytes per cycle. The
+        # caller must hold beat1_in low whenever the runtime pitch can
+        # complete more than MAX_COMP units across two beats (pitch 20
+        # with 64-byte beats); pitches of 32 and above stay within
+        # MAX_COMP at both widths.
+        self.dual = dual
+        self.triple = triple
+        if triple:
+            assert dual and beat_bytes == 64 and depth >= 6
+            self.MAX_COMP = 6
+            self.beat2 = Signal(beat_bytes * 8)
+            self.beat2_in = Signal()
+        if dual:
+            assert beat_bytes * 2 <= unit_bytes or min(pitches) > beat_bytes
 
         self.beat = Signal(beat_bytes * 8)
         self.beat_in = Signal()
+        if dual:
+            self.beat1 = Signal(beat_bytes * 8)
+            self.beat1_in = Signal()
         self.pitch = Signal(8)
-        self.consume = Signal(3)
+        self.consume = Signal(range(slots + 1))
         self.clr = Signal()
 
         self.avail = Signal(range(depth + 1))
@@ -462,37 +549,78 @@ class UnitAssembler(Elaboratable):
         self.slot = [
             Signal(unit_bytes * 8, name=f'slot{i}') for i in range(slots)
         ]
-        self.rotation = Signal(max(log2_int(slots), 1))
+        self.rotation = Signal(max((slots - 1).bit_length(), 1))
 
         # State (attributes for waveform observation). ``uf[i]`` is
         # bank i of the stationary circular file; ``head`` names the
         # bank holding visible unit 0.
         self.uf = [Signal(unit_bytes * 8, name=f'uf{i}') for i in range(depth)]
-        self.head = Signal(log2_int(depth))
+        self.head = Signal(range(depth))
         self.ucnt = Signal(range(depth + 1))
         self.part = Signal(unit_bytes * 8)
         self.ph = Signal(8)
 
+    def completion_bound(self, pitch):
+        """Most units one intake can complete at ``pitch``.
+
+        ``cu_full`` is a compare sum over exactly this many terms, so no
+        completion at or past the bound is ever counted or enabled.
+        """
+        return self.MAX_COMP if pitch == WIN_BYTES else 4
+
     def elaborate(self, platform):
         m = Module()
         ub, depth, bb = self.unit_bytes, self.depth, self.bb
+        lg_bb = log2_int(bb)
 
         # The logical assembly view: the partial unit's ``ph`` bytes
-        # followed by the beat's ``bb`` -- the part register is kept
+        # followed by the intake's lanes -- the part register is kept
         # zero above ``ph`` (enforced by construction below), so the
-        # view is the part OR the beat shifted up by ``ph``. The only
-        # variable movement is one beat-width shifter; every unit
-        # slice below is a constant-offset selection.
-        bs = (Cat(self.beat, Const(0, ub * 8)) <<
-              (self.ph * 8))[:(ub + bb) * 8]
-        stream = Cat(self.part, Const(0, bb * 8)) | bs
+        # view is the part OR the lanes shifted up by ``ph``. Pitch is
+        # fixed until clr. Since transfers append whole beats, a phase
+        # is a multiple of gcd(beat_bytes, pitch): one shift stage per
+        # bit every reachable phase can set, no others.
+        phase_mask = 0
+        fine_max = 0
+        for pitch in self.pitches:
+            for phase in range(0, pitch, gcd(bb, pitch)):
+                phase_mask |= phase
+                fine_max = max(fine_max, phase & (bb - 1))
+        lanes = [self.beat]
+        tot = self.ph + bb
+        if self.dual:
+            lanes.append(Mux(self.beat1_in, self.beat1, 0))
+            tot = tot + Mux(self.beat1_in, bb, 0)
+        if self.triple:
+            lanes.append(Mux(self.beat2_in, self.beat2, 0))
+            tot = tot + Mux(self.beat2_in, bb, 0)
+
+        view_bits = (ub + bb * len(lanes)) * 8
+        shift = Signal(8)
+        m.d.comb += shift.eq(self.ph & phase_mask)
+        aligned = Cat(*lanes)[:view_bits]
+        if fine_max:
+            # Sub-beat stages run first, over one lane plus the largest
+            # fine phase: a pitch with a sub-beat phase completes at
+            # most four units per intake, which already requires its
+            # delivery on one lane, so nothing above that span can move.
+            # Shifts add, so the stage order is free.
+            fine_span = 8 * (bb + fine_max)
+            low = aligned[:fine_span]
+            for bit in range(lg_bb):
+                if phase_mask & (1 << bit):
+                    low = Mux(shift[bit], (low << (8 << bit))[:fine_span], low)
+            aligned = Cat(low, aligned[fine_span:])
+        for bit in range(lg_bb, phase_mask.bit_length()):
+            aligned = Mux(shift[bit], (aligned << (8 << bit))[:view_bits],
+                          aligned)
+        stream = Cat(self.part, Const(0, bb * len(lanes) * 8)) | aligned
         stream_bits = len(stream)
-        tot = self.ph + bb  # valid bytes once this cycle's beat lands
 
         # Completion count without a runtime divider (the step-4
         # review's $div hazard): ``pitch`` is constrained to
         # ``pitches`` and the phase invariant ``ph < pitch`` bounds
-        # tot = ph + beat_bytes, so for each supported pitch the
+        # ``tot = ph + beat_bytes``, so for each supported pitch the
         # quotient equals a bounded compare sum (cu <= 4; the extreme
         # is pitch 20 with 64-byte beats: tot <= 83 < 5*20). The
         # residual phase is a per-pitch constant-multiply subtraction
@@ -504,8 +632,9 @@ class UnitAssembler(Elaboratable):
         cu_full = Const(0, 3)
         rem = tot
         for p in self.pitches:
-            c = ((tot >= 4 * p).as_unsigned() + (tot >= 3 * p).as_unsigned() +
-                 (tot >= 2 * p).as_unsigned() + (tot >= p).as_unsigned())[:3]
+            c = sum((tot >= i * p)
+                    for i in range(1,
+                                   self.completion_bound(p) + 1))[:3]
             cu_full = Mux(self.pitch == p, c, cu_full)
             rem = Mux(self.pitch == p, tot - c * p, rem)
         cu = Mux(self.beat_in, cu_full, 0)
@@ -515,13 +644,21 @@ class UnitAssembler(Elaboratable):
 
         # This cycle's completions: units [k*pitch, (k+1)*pitch) of
         # the view, a constant slice per candidate pitch (cases past
-        # the stream are dead states and read as zero).
+        # the stream are dead states and read as zero). A completion
+        # index the pitch cannot reach stays zero.
         comp = []
         for k in range(self.MAX_COMP):
             per_p = []
             for p in self.pitches:
                 lo, hi = 8 * p * k, 8 * p * (k + 1)
-                if hi <= stream_bits:
+                # The third lane is enabled only for the 32-byte pitch.
+                # A wide unit can complete only once on the two-beat path.
+                intake_bytes = bb * (1 + self.dual +
+                                     (self.triple and p == WIN_BYTES))
+                reachable = k < self.completion_bound(p)
+                if self.banked_slots:
+                    reachable = reachable and k * p < intake_bytes
+                if reachable and hi <= stream_bits:
                     per_p.append(
                         Cat(stream[lo:hi], Const(0, ub * 8 - (hi - lo))))
                 else:
@@ -533,21 +670,64 @@ class UnitAssembler(Elaboratable):
             m.d.comb += completed.eq(expr)
             comp.append(completed)
 
-        # Stationary bank file: visible unit v reads bank
-        # (head + v) % depth -- a depth-way select per bit -- when the
-        # file holds it (ucnt > v); otherwise this cycle's completion
-        # v - ucnt bypasses to the slot the same cycle. Slots past the
-        # file and the completions are dead states (can_take bounds
-        # the sequence) and read as zero.
+        lgh = len(self.head)
+        lg_slots = (self.slots - 1).bit_length()
+
+        def wrap(index):
+            if self.non_power_of_two_banks:
+                return Mux(index >= depth, index - depth, index)
+            return index[:lgh]
+
         def bank_at(sel):
             expr = self.uf[0]
             for i in range(1, self.depth):
                 expr = Mux(sel == i, self.uf[i], expr)
             return expr
 
-        lgh = log2_int(self.depth)
-        lg_slots = log2_int(self.slots)
-        m.d.comb += self.rotation.eq(self.head[:lg_slots] if lg_slots else 0)
+        # Stationary bank file: write every completion, including those
+        # bypassed to the consumer this cycle.  Such writes target freed
+        # banks and are harmless: can_take bounds ucnt + cu <= depth, so
+        # no completion can overwrite an old live unit.  Keeping consume
+        # out of the wide bank enables cuts the emission-decision
+        # feedback path.  Completion k always targets (tail + k) % depth.
+        # Select its data once per bank residue, then use a narrow local
+        # enable; do not build a priority write/hold mux per bank and bit.
+        tail = Signal(lgh)
+        m.d.comb += tail.eq(wrap(self.head + self.ucnt))
+        write_banks = depth if self.non_power_of_two_banks else min(
+            depth, 8 if self.triple else 4)
+        # In the banked production configuration the wide pitches
+        # complete at most one unit.  Broadcast its suffix to every bank.
+        # For a narrow pitch completion zero already zero-extends that
+        # suffix, including when a different completion takes this bank.
+        share_suffix = self.banked_slots and all(p <= WIN_BYTES or p >= bb *
+                                                 (1 + self.dual)
+                                                 for p in self.pitches)
+        write_bits = min(ub, WIN_BYTES) * 8 if share_suffix else ub * 8
+        write_data = []
+        for residue in range(write_banks):
+            expr = Const(0, write_bits)
+            for k in range(self.MAX_COMP):
+                if self.non_power_of_two_banks:
+                    hit = tail == (residue - k) % depth
+                else:
+                    hit = (tail + k)[:log2_int(write_banks)] == residue
+                if depth < self.MAX_COMP:
+                    hit = hit & (k < cu)
+                expr = expr | Mux(hit, comp[k][:write_bits], 0)
+            if share_suffix:
+                expr = Cat(expr, comp[0][write_bits:])
+            selected = Signal(ub * 8, name=f'write_data{residue}')
+            m.d.comb += selected.eq(expr)
+            write_data.append(selected)
+
+        if self.non_power_of_two_banks:
+            head_row = self.head >= self.slots
+            m.d.comb += self.rotation.eq(
+                Mux(head_row, self.head - self.slots, self.head))
+        else:
+            m.d.comb += self.rotation.eq(
+                self.head[:lg_slots] if self.banked_slots and lg_slots else 0)
         for v in range(self.slots):
             # Visible unit v: the bank copy when ucnt > v, else this
             # cycle's completion v - ucnt bypasses to the slot.
@@ -557,24 +737,42 @@ class UnitAssembler(Elaboratable):
                 # This works for arbitrary heads, including every
                 # short-tail superblock; no alignment assumption.
                 offset = Signal(max(lg_slots, 1), name=f'offset{v}')
-                row = Signal(max(lgh - lg_slots, 1), name=f'bank_row{v}')
-                m.d.comb += [
-                    offset.eq((v -
-                               self.rotation)[:lg_slots] if lg_slots else 0),
-                    row.eq((self.head[lg_slots:] + (v < self.rotation)
-                            )[:lgh - lg_slots] if lgh > lg_slots else 0),
-                ]
-                selected = Const(0, ub * 8)
-                for r in range(depth // self.slots):
-                    selected = Mux(row == r, self.uf[r * self.slots + v],
-                                   selected)
-                # Only the narrow flat prefix needs a multi-completion
-                # bypass mux. A >32-B unit completes at most once per
-                # beat, so its valid bypass can only be completion 0.
                 bypass = Const(0, WIN_BYTES * 8)
-                for k in range(self.MAX_COMP):
-                    bypass = Mux(offset == self.ucnt + k,
-                                 comp[k][:WIN_BYTES * 8], bypass)
+                if self.non_power_of_two_banks:
+                    next_row = v < self.rotation
+                    m.d.comb += offset.eq(
+                        Mux(next_row, v + self.slots - self.rotation,
+                            v - self.rotation))
+                    row_sel = head_row ^ next_row
+                    selected = Mux(row_sel, self.uf[v + self.slots],
+                                   self.uf[v])
+                    # The completion that becomes visible unit v is
+                    # written to the bank this column reads (its queue
+                    # index is ucnt + v - offset and its bank is
+                    # (head + ucnt + k) % depth), so the write steering
+                    # already holds it: no second selection per slot.
+                    bypass = Mux(row_sel,
+                                 write_data[v + self.slots][:WIN_BYTES * 8],
+                                 write_data[v][:WIN_BYTES * 8])
+                else:
+                    row = Signal(max(lgh - lg_slots, 1), name=f'bank_row{v}')
+                    m.d.comb += [
+                        offset.eq((
+                            v - self.rotation)[:lg_slots] if lg_slots else 0),
+                        row.eq((self.head[lg_slots:] + (v < self.rotation)
+                                )[:lgh - lg_slots] if lgh > lg_slots else 0),
+                    ]
+                    selected = Const(0, ub * 8)
+                    for r in range(depth // self.slots):
+                        selected = Mux(row == r, self.uf[r * self.slots + v],
+                                       selected)
+                        bypass = Mux(
+                            row == r, write_data[(r * self.slots + v) %
+                                                 write_banks][:WIN_BYTES * 8],
+                            bypass)
+                # Only the narrow flat prefix needs the completion
+                # bypass. A >32-B unit completes at most once per
+                # beat, so its valid bypass can only be completion 0.
                 expr = Mux(self.ucnt > offset, selected,
                            Cat(bypass, comp[0][WIN_BYTES * 8:]))
             else:
@@ -584,65 +782,179 @@ class UnitAssembler(Elaboratable):
                 expr = Mux(self.ucnt > v, bank_at((self.head + v)[:lgh]), expr)
             m.d.comb += self.slot[v].eq(expr)
 
-        # The next partial unit: the view's bytes past the last
-        # completion, a constant slice selected by (pitch, cu) -- a
-        # plain select chain (a Switch over concatenated values does
-        # not const-fold reliably).
-        part_sliced = Const(0, ub * 8)
-        for p in self.pitches:
-            for k in range(self.MAX_COMP + 1):
-                lo = 8 * p * k
-                if lo >= stream_bits:
-                    src = Const(0, ub * 8)
-                elif lo + ub * 8 <= stream_bits:
-                    src = stream[lo:lo + ub * 8]
-                else:
-                    # Only the stream's remaining bytes exist; the
-                    # rest of the register stays zero (the invariant
-                    # that part is clean above ph).
-                    src = Cat(stream[lo:], Const(0,
-                                                 ub * 8 - (stream_bits - lo)))
-                part_sliced = Mux((self.pitch == p) & (cu == k), src,
-                                  part_sliced)
-        part_next = Mux(self.beat_in, part_sliced, self.part)
-
-        # Write every completion, including those bypassed to the
-        # consumer this cycle.  Such writes target freed banks and are
-        # harmless: can_take bounds ucnt + cu <= depth, so no completion
-        # can overwrite an old live unit.  Keeping consume out of the
-        # wide bank enables cuts the emission-decision feedback path.
-        # Completion k always targets (tail + k) % depth.  Select its
-        # data once per bank residue, then use a narrow local enable;
-        # do not build a priority write/hold mux per bank and bit.
-        tail = Signal(lgh)
-        m.d.comb += tail.eq(self.head + self.ucnt)
-        write_data = []
-        for residue in range(min(depth, self.MAX_COMP)):
-            selected = Signal(ub * 8, name=f'write_data{residue}')
-            expr = Const(0, ub * 8)
-            for k in range(self.MAX_COMP):
-                hit = (((tail + k) % min(depth, self.MAX_COMP)) == residue)
-                if depth < self.MAX_COMP:
-                    hit = hit & (k < cu)
-                expr = expr | Mux(hit, comp[k], Const(0, ub * 8))
-            m.d.comb += selected.eq(expr)
-            write_data.append(selected)
-        for b in range(self.depth):
+        for b in range(depth):
             enable = Const(0)
             for k in range(self.MAX_COMP):
-                dst = (tail + k)[:lgh]
-                enable = enable | ((k < cu) & (dst == b))
+                if self.non_power_of_two_banks:
+                    hit = tail == (b - k) % depth
+                else:
+                    hit = (tail + k)[:lgh] == b
+                enable = enable | ((k < cu) & hit)
             with m.If(self.beat_in & enable):
                 m.d.sync += self.uf[b].eq(write_data[b % len(write_data)])
+
+        # Residual: the view past this intake's completions, right
+        # aligned.  Only the offsets some (pitch, completion count) can
+        # select are built; share identical offsets.  Each is read at
+        # the widest pitch that selects it: the view is zero above the
+        # arrived bytes and the residual is shorter than the pitch, so
+        # residual bytes at or above the pitch are already zero.
+        offsets = {}
+        for pitch in self.pitches:
+            lanes_n = 3 if self.triple and pitch == WIN_BYTES else 1 + self.dual
+            max_bytes = bb * lanes_n
+            max_completed = min(self.completion_bound(pitch),
+                                (max_bytes + pitch - 1) // pitch)
+            for completed in range(bb // pitch, max_completed + 1):
+                offset = pitch * completed
+                hit = (self.pitch == pitch) & (cu == completed)
+                if offset not in offsets:
+                    offsets[offset] = [Const(0), 0]
+                offsets[offset][0] = offsets[offset][0] | hit
+                offsets[offset][1] = max(offsets[offset][1], pitch)
+        part_sliced = Const(0, ub * 8)
+        for offset, (hit, widest) in sorted(offsets.items()):
+            lo = offset * 8
+            if lo < stream_bits:
+                keep = min(ub, widest) * 8
+                data = Cat(stream[lo:lo + keep], Const(0, ub * 8 - keep))
+                part_sliced = part_sliced | Mux(hit, data, 0)
+        part_next = Mux(self.beat_in, part_sliced, self.part)
+
         m.d.sync += self.ucnt.eq(
             Mux(self.clr, 0, self.ucnt + cu - self.consume))
         m.d.sync += self.part.eq(Mux(self.clr, 0, part_next))
         m.d.sync += self.ph.eq(
             Mux(self.clr, 0, Mux(self.beat_in, rem, self.ph)))
         m.d.sync += self.head.eq(
-            Mux(self.clr, 0, (self.head + self.consume)[:lgh]))
+            Mux(self.clr, 0, wrap(self.head + self.consume)))
 
         return m
+
+
+@dataclass(frozen=True)
+class ReadPort:
+    name: str
+    issue_queue_depth: int
+    return_buffer_beats: int
+    sync_read_buffer: bool = True
+    axi_data_width: int | None = None
+
+
+@dataclass(frozen=True)
+class ReadRegion:
+    """Half-open logical window with port selection based on absolute addresses."""
+
+    start: int
+    end: int
+    ports: tuple[int, ...]
+    stripe_bytes: int | None = None
+
+    def contains(self, start, end):
+        return (start >= self.start) & (start < self.end) & (end <= self.end)
+
+    def port_for(self, addr):
+        if self.stripe_bytes is None:
+            return Const(self.ports[0])
+        shift = log2_int(self.stripe_bytes)
+        return Array(Const(port)
+                     for port in self.ports)[addr[shift:shift +
+                                                  log2_int(len(self.ports))]]
+
+    def beats_to_boundary(self, addr, lg_beat):
+        shift = log2_int(self.stripe_bytes)
+        return (1 << (shift - lg_beat)) - addr[lg_beat:shift]
+
+
+@dataclass(frozen=True)
+class ReadTopology:
+    """SG1 routing and buffering. Region and port references are tuple indices."""
+
+    ports: tuple[ReadPort, ...]
+    regions: tuple[ReadRegion, ...]
+    primary_region: int
+    scale_region: int
+    shared_port: int
+    secondary_region: int | None = None
+    retirement_lanes: int = 1
+    dual_bank_shared_port: bool = False
+
+    @property
+    def payload_regions(self):
+        primary = self.regions[self.primary_region]
+        if self.secondary_region is None:
+            return (primary, )
+        return (primary, self.regions[self.secondary_region])
+
+    @property
+    def scales(self):
+        return self.regions[self.scale_region]
+
+    @property
+    def striped(self):
+        return self.secondary_region is not None
+
+    def validate(self, addr_width, beat_bytes):
+        region_ids = (self.primary_region, self.scale_region)
+        if self.striped:
+            region_ids += (self.secondary_region, )
+        if any(not 0 <= i < len(self.regions) for i in region_ids):
+            raise ValueError('invalid SG1 region reference')
+        if self.striped and self.primary_region == self.secondary_region:
+            raise ValueError('SG1 striping requires distinct payload regions')
+        if not 0 <= self.shared_port < len(self.ports):
+            raise ValueError('invalid shared SG1 port')
+        if self.retirement_lanes not in (1, 2, 3):
+            raise ValueError('SG1 supports one to three retirement lanes')
+        if (self.striped or self.retirement_lanes > 1) and beat_bytes != 64:
+            raise ValueError(
+                'SG1 striping and dual retirement require 64-byte beats')
+        names = {port.name for port in self.ports}
+        if '' in names or len(names) != len(self.ports):
+            raise ValueError('SG1 port names must be nonempty and unique')
+        for port in self.ports:
+            if port.issue_queue_depth < 0 or port.return_buffer_beats < 2:
+                raise ValueError('invalid SG1 port buffering')
+            if self.retirement_lanes == 3 and port.return_buffer_beats < 4:
+                raise ValueError(
+                    'Three-lane retirement requires at least four beats per port'
+                )
+            if port.return_buffer_beats & (port.return_buffer_beats - 1):
+                raise ValueError(
+                    'SG1 return buffer depth must be a power of two')
+        last_end = 0
+        for region in sorted(self.regions, key=lambda region: region.start):
+            if not (last_end <= region.start < region.end <= 1 << addr_width
+                    and
+                    region.start % beat_bytes == region.end % beat_bytes == 0):
+                raise ValueError(
+                    'SG1 regions must be disjoint, beat-aligned windows')
+            last_end = region.end
+            count = len(region.ports)
+            if (not count or len(set(region.ports)) != count
+                    or any(not 0 <= i < len(self.ports)
+                           for i in region.ports)):
+                raise ValueError('invalid SG1 region ports')
+            stripe = region.stripe_bytes
+            if count == 1:
+                if stripe is not None:
+                    raise ValueError(
+                        'a direct SG1 region cannot specify an interleave')
+            elif (count & (count - 1) or stripe is None or stripe < beat_bytes
+                  or stripe & (stripe - 1) or stripe * count > 1 << addr_width
+                  or any(
+                      self.ports[i].return_buffer_beats < stripe // beat_bytes
+                      for i in region.ports)):
+                raise ValueError(
+                    'invalid SG1 interleave geometry or buffering')
+        if self.scales.stripe_bytes is not None:
+            raise ValueError('SG1 scales require a direct region')
+        for i, port in enumerate(self.ports):
+            if port.axi_data_width not in (None, beat_bytes * 8):
+                if (port.axi_data_width != beat_bytes * 4
+                        or i in (self.shared_port, self.scales.ports[0])):
+                    raise ValueError(
+                        'Only dedicated payload ports may use half-width AXI')
 
 
 class StreamSupply(HasTRoomParams, Elaboratable):
@@ -653,38 +965,58 @@ class StreamSupply(HasTRoomParams, Elaboratable):
     valid on the ``start`` pulse and stay held for the run.
     """
 
-    def __init__(self, params):
+    def __init__(self, params, *, read_topology=None):
         super().__init__(params)
+        self.read_topology = read_topology
+        self.split_responses = read_topology is not None
+        self.striped = self.split_responses and read_topology.striped
+        self.dual_retirement = (self.split_responses
+                                and read_topology.retirement_lanes >= 2)
+        self.triple_retirement = (self.split_responses
+                                  and read_topology.retirement_lanes == 3)
+        self.secondary_base = Signal(self.addr_width)
+        self.primary_beats = Signal(5)
 
         if self.data_width > 512:
             raise ValueError(
                 f'stream prototype supports up to 512-bit beats, not '
                 f'{self.data_width}')
-        if self.n_outputs not in (2, 4):
-            raise ValueError(
-                'the SG1 image interleave matches n_outputs: supported '
-                f'widths are 2 and 4, not {self.n_outputs}')
-
         # Emission skid lanes and per-format capacities sized by the
         # group width: the decoder emits up to n_outputs units per
         # cycle, and the K-quant bonded group needs its n_outputs
         # chunks resident plus the streaming margin (b3's one-chunk
         # starvation), so the unit file holds the group plus margin
-        # (the circular bank file wraps by truncation: powers of two
-        # only). The meta buffer must serve the bonded group's entries
+        # (two rows of banks for non-power-of-two lane counts). The meta buffer
+        # must serve the bonded group's entries
         # (n * 18 B worst case) while still admitting a full beat.
-        self.lg_lane = max(log2_int(self.n_outputs), 1)
-        self.asm_depth = 4 if self.n_outputs <= 2 else 8
+        self.lg_lane = max((self.n_outputs - 1).bit_length(), 1)
+        min_depth = 8 if self.n_outputs > 2 or self.triple_retirement else 4
+        if self.n_outputs & (self.n_outputs - 1):
+            self.asm_depth = 2 * self.n_outputs
+        else:
+            self.asm_depth = max(min_depth, 2 * self.n_outputs)
         self.meta_buf_bytes = max(
             SG_META_BUF_BYTES,
             self.n_outputs * Q6_META_BYTES + self.beat_bytes)
+        self.circular_meta = self.split_responses and self.beat_bytes == 64
 
         self.mem_rreq = Decoupled(StreamReadReq, self.params)
-        self.mem_rresp = Decoupled(StreamReadResp, self.params)
+        if self.split_responses:
+            # Payload beats arrive in order with up to two per response
+            # on their own port, scales on a second port that bypasses
+            # the payload ordering entirely.
+            self.mem_rresp = Decoupled(StreamPayPair,
+                                       self.params,
+                                       triple=self.triple_retirement)
+            self.mem_sresp = Decoupled(StreamScaleBeat, self.params)
+        else:
+            self.mem_rresp = Decoupled(StreamReadResp, self.params)
 
         self.seg_q = [
-            Queue(self.mm_seg_fifo, WSegWord, self.params, flow=False)
-            for _ in range(self.n_outputs)
+            Queue(self.mm_seg_fifo,
+                  WSegWord,
+                  self.params,
+                  flow=self.sg_lane_bypass) for _ in range(self.n_outputs)
         ]
         self.segs = [q.deq for q in self.seg_q]
 
@@ -692,11 +1024,27 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         # when this queue accepts, including requests not yet on the bus.
         self.req_q = Queue(2, StreamReadReq, self.params, flow=False)
 
-        self.pay_q = Queue(self.sg_pay_fifo,
-                           Record,
-                           [('data', self.data_width, Direction.FANOUT)],
-                           flow=False,
-                           has_flush=True)
+        if self.split_responses:
+            self.pay_q = Queue(self.sg_pay_fifo,
+                               StreamPayPair,
+                               self.params,
+                               flow=False,
+                               has_flush=True,
+                               use_sync_read_mem=True,
+                               triple=self.triple_retirement)
+            # Pair formation gate: formats whose pitch completes at
+            # most MAX_COMP units across two beats (everything but
+            # Q5_0's 20-byte pitch) may retire two beats per cycle.
+            # The gate lives here so the merger never forms a pair the
+            # assembler would have to halve.
+            self.pair_ok = Signal()
+            self.triple_ok = Signal()
+        else:
+            self.pay_q = Queue(self.sg_pay_fifo,
+                               Record,
+                               [('data', self.data_width, Direction.FANOUT)],
+                               flow=False,
+                               has_flush=True)
         self.meta_q = Queue(self.sg_meta_fifo,
                             Record,
                             [('data', self.data_width, Direction.FANOUT)],
@@ -749,17 +1097,25 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         # Saturation is safe only inside the bounded successor chain,
         # never in the persistent counter (large tiles would reach
         # their short tail prematurely).
-        self.tail_lanes = Signal(max(log2_int(self.n_outputs), 1) + 1)
+        self.tail_lanes = Signal(self.lg_lane + 1)
         self.grp_rem = Signal(self.rows_bits)
-        self.mdata = Signal(self.meta_buf_bytes * 8)
+        if not self.circular_meta:
+            self.mdata = Signal(self.meta_buf_bytes * 8)
         self.mhave = Signal(8)
+        if self.mm_starvation_counters:
+            self.payload_short = Signal()
+            self.scale_short = Signal()
+            self.payload_eligible = Signal()
+            self.scale_eligible = Signal()
         self.pay_asm = UnitAssembler(beat_bytes=self.beat_bytes,
                                      unit_bytes=Q6_CHUNK_BYTES,
                                      depth=self.asm_depth,
                                      pitches=(Q5_WIN_BYTES, WIN_BYTES,
                                               Q4_CHUNK_BYTES, Q6_CHUNK_BYTES),
                                      slots=self.n_outputs,
-                                     banked_slots=True)
+                                     banked_slots=True,
+                                     dual=self.dual_retirement,
+                                     triple=self.triple_retirement)
 
         # Emission skid: the registered boundary between assembly and
         # decoding. The emission decision (the fire vector, unit
@@ -790,7 +1146,7 @@ class StreamSupply(HasTRoomParams, Elaboratable):
             Signal(Q6_CHUNK_BYTES * 8, name=f's_slot{i}')
             for i in range(self.n_outputs)
         ]
-        self.s_rotation = Signal(max(log2_int(self.n_outputs), 1))
+        self.s_rotation = Signal(self.lg_lane)
         self.s_jn = [Signal(3, name=f's_jn{i}') for i in range(self.n_outputs)]
         self.s_f = [{
             n: Signal(w, name=f's_f{i}_{n}')
@@ -810,7 +1166,6 @@ class StreamSupply(HasTRoomParams, Elaboratable):
 
         bb = self.beat_bytes
         n = self.n_outputs
-        lgn = log2_int(n)
         lg_lane = self.lg_lane
 
         # Group walk: ``pair`` names an n_outputs-wide output-row group
@@ -826,8 +1181,8 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         # to the tail instead of per-successor group-index compares.
         tail_lanes = self.tail_lanes
         grp_rem = self.grp_rem
-        groups_n = ((self.rows + (n - 1)) >> lgn)[:self.rows_bits]
-        tail_n = (self.rows - ((groups_n - 1) << lgn))[:lg_lane + 1]
+        groups_n = rtl_stream_groups(self.rows, n)
+        tail_n = (self.rows - (groups_n - 1) * n)[:lg_lane + 1]
 
         #
         # Reader: two linear region walkers sharing the tagged port.
@@ -860,6 +1215,21 @@ class StreamSupply(HasTRoomParams, Elaboratable):
             ]
             return burst
 
+        payload_addr = p_addr
+        if self.striped:
+            secondary_addr = Signal(self.addr_width)
+            phase = Signal(5)
+            primary_beats = self.primary_beats
+            striped = self.secondary_base != 0
+            use_secondary = striped & (phase >= primary_beats)
+            payload_addr = Mux(use_secondary, secondary_addr, p_addr)
+            phase_left = Mux(use_secondary, SG1_STRIPE_BEATS - phase,
+                             primary_beats - phase)
+            with m.If(self.start):
+                m.d.sync += [
+                    secondary_addr.eq(self.secondary_base),
+                    phase.eq(0)
+                ]
         p_burst = burst_size(p_rem, self.p_used, p_out, self.sg_pay_fifo)
         m_burst = burst_size(m_rem, self.m_used, m_out, self.sg_meta_fifo)
         # Accumulate freed payload reservations before another request.
@@ -868,8 +1238,23 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         # and outstanding limit, and admit the final short region tail,
         # so batching cannot strand a small FIFO or terminal remainder.
         p_min = min(self.sg_min_burst_beats, self.sg_pay_fifo, self.sg_credits)
+        stripe_tail = Const(0)
+        if self.read_topology is not None:
+            for region in self.read_topology.payload_regions:
+                if region.stripe_bytes is not None:
+                    stripe_left = region.beats_to_boundary(
+                        payload_addr, self.lg_beat)
+                    at_boundary = (region.contains(payload_addr, payload_addr)
+                                   & (p_burst >= stripe_left))
+                    p_burst = Mux(at_boundary, stripe_left, p_burst)
+                    stripe_tail |= at_boundary
+        if self.striped:
+            phase_limit = striped & (p_burst >= phase_left)
+            p_burst = Mux(phase_limit, phase_left, p_burst)
+            stripe_tail |= phase_limit
         p_want = self.run & (p_burst != 0) & ((p_burst >= p_min)
-                                              | (p_burst == p_rem))
+                                              | (p_burst == p_rem)
+                                              | stripe_tail)
         # Metadata defaults to eager refills: batching it requires more
         # lead time/storage ahead of the much larger payload stream.
         m_min = min(self.sg_meta_min_burst_beats, self.sg_meta_fifo,
@@ -879,20 +1264,35 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         request = self.req_q.enq
         m.d.comb += [
             request.valid.eq(p_want | m_want),
-            request.bits.addr.eq(Mux(m_want, m_addr, p_addr)),
+            request.bits.addr.eq(Mux(m_want, m_addr, payload_addr)),
             request.bits.beats.eq(Mux(m_want, m_burst, p_burst)),
             request.bits.meta.eq(m_want),
         ]
 
-        rresp = self.mem_rresp
-        m.d.comb += rresp.ready.eq(
-            Mux(rresp.bits.meta, self.meta_q.enq.ready, self.pay_q.enq.ready))
-        m.d.comb += [
-            self.pay_q.enq.valid.eq(rresp.fire & ~rresp.bits.meta),
-            self.pay_q.enq.bits.data.eq(rresp.bits.data),
-            self.meta_q.enq.valid.eq(rresp.fire & rresp.bits.meta),
-            self.meta_q.enq.bits.data.eq(rresp.bits.data),
-        ]
+        if self.split_responses:
+            # Payload pairs land whole; each fire retires one or two
+            # beats. Scales arrive independently on mem_sresp.
+            rpair = self.mem_rresp
+            mbeat = self.mem_sresp
+            m.d.comb += [
+                rpair.ready.eq(self.pay_q.enq.ready),
+                self.pay_q.enq.valid.eq(rpair.valid),
+                self.pay_q.enq.bits.eq(rpair.bits),
+                mbeat.ready.eq(self.meta_q.enq.ready),
+                self.meta_q.enq.valid.eq(mbeat.valid),
+                self.meta_q.enq.bits.data.eq(mbeat.bits.data),
+            ]
+        else:
+            rresp = self.mem_rresp
+            m.d.comb += rresp.ready.eq(
+                Mux(rresp.bits.meta, self.meta_q.enq.ready,
+                    self.pay_q.enq.ready))
+            m.d.comb += [
+                self.pay_q.enq.valid.eq(rresp.fire & ~rresp.bits.meta),
+                self.pay_q.enq.bits.data.eq(rresp.bits.data),
+                self.meta_q.enq.valid.eq(rresp.fire & rresp.bits.meta),
+                self.meta_q.enq.bits.data.eq(rresp.bits.data),
+            ]
 
         # Bookings and landings can fire in the same cycle; the
         # outstanding counters must fold both into one assignment or
@@ -900,20 +1300,27 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         rreq_fire = request.fire
         p_book = rreq_fire & ~m_want
         m_book = rreq_fire & m_want
-        p_land = rresp.fire & ~rresp.bits.meta
-        m_land = rresp.fire & rresp.bits.meta
+        if self.split_responses:
+            p_land = Mux(self.mem_rresp.fire, self.mem_rresp.bits.beat_count,
+                         0)
+            m_land = Mux(self.mem_sresp.fire, 1, 0)
+            p_deq = Mux(self.pay_q.deq.fire, self.pay_q.deq.bits.beat_count, 0)
+        else:
+            rresp = self.mem_rresp
+            p_land = Mux(rresp.fire & ~rresp.bits.meta, 1, 0)
+            m_land = Mux(rresp.fire & rresp.bits.meta, 1, 0)
+            p_deq = Mux(self.pay_q.deq.fire, 1, 0)
         m.d.sync += [
-            p_out.eq(p_out + Mux(p_book, p_burst, 0) - Mux(p_land, 1, 0)),
-            m_out.eq(m_out + Mux(m_book, m_burst, 0) - Mux(m_land, 1, 0)),
-            self.p_used.eq(self.p_used + Mux(p_book, p_burst, 0) -
-                           self.pay_q.deq.fire),
+            p_out.eq(p_out + Mux(p_book, p_burst, 0) - p_land),
+            m_out.eq(m_out + Mux(m_book, m_burst, 0) - m_land),
+            self.p_used.eq(self.p_used + Mux(p_book, p_burst, 0) - p_deq),
             self.m_used.eq(self.m_used + Mux(m_book, m_burst, 0) -
                            self.meta_q.deq.fire),
         ]
-        with m.If(p_land):
-            m.d.sync += self.pay_beats.eq(self.pay_beats + 1)
+        with m.If(p_land != 0):
+            m.d.sync += self.pay_beats.eq(self.pay_beats + p_land)
         with m.If(m_land):
-            m.d.sync += self.meta_beats.eq(self.meta_beats + 1)
+            m.d.sync += self.meta_beats.eq(self.meta_beats + m_land)
 
         with m.If(self.mem_rreq.fire):
             m.d.sync += self.bursts.eq(self.bursts + 1)
@@ -924,10 +1331,18 @@ class StreamSupply(HasTRoomParams, Elaboratable):
                     m_rem.eq(m_rem - m_burst),
                 ]
             with m.Else():
-                m.d.sync += [
-                    p_addr.eq(p_addr + (p_burst << self.lg_beat)),
-                    p_rem.eq(p_rem - p_burst),
-                ]
+                m.d.sync += p_rem.eq(p_rem - p_burst)
+                if self.striped:
+                    with m.If(striped):
+                        m.d.sync += phase.eq(phase + p_burst)
+                    with m.If(use_secondary):
+                        m.d.sync += secondary_addr.eq(
+                            secondary_addr + (p_burst << self.lg_beat))
+                    with m.Else():
+                        m.d.sync += p_addr.eq(p_addr +
+                                              (p_burst << self.lg_beat))
+                else:
+                    m.d.sync += p_addr.eq(p_addr + (p_burst << self.lg_beat))
 
         with m.If(self.run & ((p_rem | m_rem) != 0) & ~self.mem_rreq.fire):
             m.d.sync += self.port_idle.eq(self.port_idle + 1)
@@ -949,7 +1364,7 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         # ``advance`` yields the following window's state.
         #
         pair, j, lane = self.pair, self.j, self.lane
-        mdata, mhave = self.mdata, self.mhave
+        mhave = self.mhave
 
         def advance(pl, jj, ln, dist):
             """Expressions for the window following (pl, jj, ln).
@@ -1019,8 +1434,8 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         states = list(zip(st_pair, st_j, st_lane, st_dist))
 
         pay = self.pay_q.deq
-        data = pay.bits.data
-
+        if not self.split_responses:
+            data = pay.bits.data
         # Format selects: payload pitch (bytes per window for the
         # flat formats, per 8-window chunk for the K-quants), meta
         # entry pitch, and the chunked flag.
@@ -1028,6 +1443,15 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         is_q6 = self.fmt == Format.Q6_K
         is_q4 = self.fmt == Format.Q4_K
         is_kq = is_q6 | is_q4
+        if self.split_responses:
+            # The merger consumes this to decide whether pairs may
+            # form at all; keep the assembler-side gate as defense in
+            # depth for directly wired testbenches.
+            m.d.comb += [
+                self.pair_ok.eq(self.dual_retirement & ~is_q5),
+                self.triple_ok.eq(self.triple_retirement
+                                  & (self.fmt == Format.Q8_0)),
+            ]
         pitch = Mux(
             is_q5, Q5_WIN_BYTES,
             Mux(is_q6, Q6_CHUNK_BYTES, Mux(is_q4, Q4_CHUNK_BYTES, WIN_BYTES)))
@@ -1058,29 +1482,90 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         # emission; the file's ``can_take`` bound plus the reader's
         # issue credits mean an accepted beat never drops bytes.
         pay_asm = self.pay_asm
-        m.d.comb += [
-            pay_asm.beat.eq(data),
-            pay_asm.pitch.eq(pitch),
-            pay_asm.clr.eq(self.start),
-        ]
-        beat_in = pay.valid & pay_asm.can_take
-        m.d.comb += [
-            pay.ready.eq(beat_in),
-            pay_asm.beat_in.eq(beat_in),
-        ]
+        if self.split_responses:
+            # Q5_0's 20-byte pitch can complete more than MAX_COMP
+            # units across two 64-byte beats, so its delivery stays at
+            # one beat per cycle; every other format's pitch (32 and
+            # above) accepts the pair.
+            m.d.comb += [
+                pay_asm.beat.eq(pay.bits.data0),
+                pay_asm.pitch.eq(pitch),
+                pay_asm.clr.eq(self.start),
+            ]
+            if self.dual_retirement:
+                m.d.comb += [
+                    pay_asm.beat1.eq(pay.bits.data1),
+                    pay_asm.beat1_in.eq(pay.valid & pay.bits.dual & ~is_q5),
+                ]
+            if self.triple_retirement:
+                m.d.comb += [
+                    pay_asm.beat2.eq(pay.bits.data2),
+                    pay_asm.beat2_in.eq(pay.valid & pay.bits.triple
+                                        & self.triple_ok),
+                ]
+            beat_in = pay.valid & pay_asm.can_take
+            m.d.comb += [
+                pay.ready.eq(beat_in),
+                pay_asm.beat_in.eq(beat_in),
+            ]
+        else:
+            m.d.comb += [
+                pay_asm.beat.eq(data),
+                pay_asm.pitch.eq(pitch),
+                pay_asm.clr.eq(self.start),
+            ]
+            beat_in = pay.valid & pay_asm.can_take
+            m.d.comb += [
+                pay.ready.eq(beat_in),
+                pay_asm.beat_in.eq(beat_in),
+            ]
 
-        # Meta assembly: the same byte-granular discipline for scale
-        # entries. Entries live at ``epitch`` pitch; extraction reads
-        # this cycle's view, consumption shifts with the emissions.
+        # Scale entries are spaced by epitch bytes. Extraction uses the
+        # resident count and consumption advances with the emissions.
         mq = self.meta_q.deq
         meta_in = mq.valid & self.run & (mhave <= self.meta_buf_bytes - bb)
         m.d.comb += mq.ready.eq(meta_in)
-        mzext = Cat(mq.bits.data,
-                    Const(0, self.meta_buf_bytes * 8 - self.data_width))
-        mmrg = Signal(self.meta_buf_bytes * 8)
-        m.d.comb += mmrg.eq(mdata | (
-            Mux(meta_in, mzext, Const(0, self.meta_buf_bytes * 8)) <<
-            (mhave * 8)))
+        if self.circular_meta:
+            # Keep full beats in place and advance the read position in
+            # halfwords. A beat-aligned write pointer follows the resident
+            # data. Four words cover the buffer plus its initial phase.
+            scale_words = [
+                Signal(self.data_width, reset_less=True, name=f'scale_word{i}')
+                for i in range(4)
+            ]
+            phase_bits = log2_int(bb // 2)
+            scale_rd = Signal(phase_bits + 2)
+            scale_wr = Signal(2)
+            scale_bank = scale_rd[phase_bits:]
+            scale_phase = scale_rd[:phase_bits]
+            for i, word in enumerate(scale_words):
+                with m.If(meta_in & (scale_wr == i)):
+                    m.d.sync += word.eq(mq.bits.data)
+            with m.If(meta_in):
+                m.d.sync += scale_wr.eq(scale_wr + 1)
+
+            # Eligibility uses the resident count, so a beat accepted this
+            # cycle is first visible to scale extraction on the next edge.
+            view_bytes = self.n_outputs * Q6_META_BYTES
+            span_bytes = view_bytes + bb - 2
+            scale_span = []
+            for offset in range((span_bytes + bb - 1) // bb):
+                width = min(bb, span_bytes - offset * bb) * 8
+                word = Const(0, width)
+                for i, data in enumerate(scale_words):
+                    word = word | Mux(scale_bank == (i - offset) % 4,
+                                      data[:width], 0)
+                scale_span.append(word)
+            mmrg = Signal(view_bytes * 8)
+            m.d.comb += mmrg.eq(Cat(*scale_span) >> (scale_phase * 16))
+        else:
+            mdata = self.mdata
+            mzext = Cat(mq.bits.data,
+                        Const(0, self.meta_buf_bytes * 8 - self.data_width))
+            mmrg = Signal(self.meta_buf_bytes * 8)
+            m.d.comb += mmrg.eq(mdata | (
+                Mux(meta_in, mzext, Const(0, self.meta_buf_bytes * 8)) <<
+                (mhave * 8)))
 
         # Chunk-relative window index for the K-quants (j mod 8).
         jn = j[:3]
@@ -1232,7 +1717,7 @@ class StreamSupply(HasTRoomParams, Elaboratable):
             return dict(out)
 
         flds = [fields(e) for e in range(n)]
-        rows_e = [((states[e][0] << lgn) + states[e][2])[:self.rows_bits]
+        rows_e = [(states[e][0] * n + states[e][2])[:self.rows_bits]
                   for e in range(n)]
 
         # Emission decision: a prefix of the window chain fires when
@@ -1255,6 +1740,13 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         t0 = Mux(grp_rem == 1, tail_lanes, n)
         kq_mneed = Mux(is_q6, (t0 << 4) + (t0 << 1), t0 << 4)
         kq_grp_ok = (avail >= t0) & (mhave >= kq_mneed)
+        if self.mm_starvation_counters:
+            m.d.comb += [
+                self.payload_short.eq(avail < Mux(is_kq, t0, 1)),
+                self.scale_short.eq(mhave < Mux(is_kq, kq_mneed, 2)),
+                self.payload_eligible.eq(p_want),
+                self.scale_eligible.eq(m_want),
+            ]
         for k in range(n):
             kq_grp_ok = kq_grp_ok & Mux(t0 > k, lane_ready(k), Const(1))
         fire = []
@@ -1272,7 +1764,7 @@ class StreamSupply(HasTRoomParams, Elaboratable):
                            Const(e) < t0, Const(1)))
             fire.append(f)
 
-        emits_now = Signal(3)
+        emits_now = Signal(range(n + 1))
         m.d.comb += emits_now.eq(sum(fire))
 
         # The decided record is captured into the skid registers --
@@ -1317,20 +1809,15 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         ]
         for e in range(n):
             # Bonded K-quant emissions share jn; flat decodes do not
-            # use it. Rotate only the narrow decoded words, carrying
-            # the assembler's column rotation across the skid.
+            # use it. Carry the assembler bank rotation across the skid.
             m.d.comb += bank_w[e].eq(decode_unit(self.s_slot[e], self.s_jn[0]))
-        w_e = [Signal(self.seg_len * 8, name=f'decoded{e}') for e in range(n)]
-        for e in range(n):
-            m.d.comb += w_e[e].eq(
-                Array(bank_w)[(self.s_rotation +
-                               e)[:lgn]] if lgn else bank_w[0])
 
         # Distinct lanes within a decided emission set mean each queue
         # takes at most one push per cycle. Each push always finds
         # space (the decision reserved it with the pending-push-padded
         # count), so no skid stall path exists.
         for l, q in enumerate(self.seg_q):
+            hits = [self.s_v[e] & (self.s_lane[e] == l) for e in range(n)]
             enq_valid = Const(0)
             wsel = Const(0, self.seg_len * 8)
             rowsel = Const(0, self.rows_bits)
@@ -1338,13 +1825,20 @@ class StreamSupply(HasTRoomParams, Elaboratable):
                 name: Const(0, len(sig))
                 for name, sig in self.s_f[0].items()
             }
-            for e in range(n):
-                hit = self.s_v[e] & (self.s_lane[e] == l)
+            # Distinct destination lanes make these selects one-hot.
+            for e, hit in enumerate(hits):
                 enq_valid = enq_valid | hit
-                wsel = Mux(hit, w_e[e], wsel)
-                rowsel = Mux(hit, self.s_row[e], rowsel)
+                rowsel = rowsel | Mux(hit, self.s_row[e], 0)
                 for name in fsel:
-                    fsel[name] = Mux(hit, self.s_f[e][name], fsel[name])
+                    fsel[name] = fsel[name] | Mux(hit, self.s_f[e][name], 0)
+            # Combine rotation and lane selection in the control path so
+            # each lane selects directly from the decoded bank words.
+            for bank, words in enumerate(bank_w):
+                select = Const(0)
+                for e, hit in enumerate(hits):
+                    select = select | (hit &
+                                       (self.s_rotation == (bank - e) % n))
+                wsel = wsel | Mux(select, words, 0)
             m.d.comb += q.enq.valid.eq(enq_valid)
             m.d.comb += [
                 q.enq.bits.w.eq(wsel),
@@ -1368,36 +1862,29 @@ class StreamSupply(HasTRoomParams, Elaboratable):
         # emit).
         m.d.comb += pay_asm.consume.eq(
             Mux(is_kq, Mux(jn7 & fire[0], emits_now, 0), emits_now))
-        # Meta release: ``meta_shift`` is bounded per format class --
-        # epitch * {0..n} with epitch 2 flat and 16/18 chunked -- so
-        # the consumption is a small constant-shift mux per class
-        # (flat the even bytes to 2*n, K-quant the pitch multiples to
-        # n*pitch) merged by ``is_kq``, not one wide select over the
-        # whole buffer. The zero-above-valid invariant is preserved:
-        # every merged beat is zero-extended and every shift is within
-        # the valid count, so the tail above ``mhave`` stays zero.
-        # Field extraction reads this cycle's view and lands in the
-        # skid registers, keeping the meta side's advancement
-        # synchronized with the payload's (P2-4: registered
-        # extraction).
+        # These byte counts are even for every supported scale entry.
         flat_shift = epitch * emits_now
         kq_shift = epitch * Mux(jn7 & fire[0], emits_now, 0)
-        flat_vals = tuple(2 * e for e in range(n + 1))
-        kq_vals = tuple(
-            sorted({
-                p * e
-                for p in (Q6_META_BYTES, Q4_META_BYTES)
-                for e in range(n + 1)
-            }))
-        flat_next = Const(0, self.meta_buf_bytes * 8)
-        for v in flat_vals:
-            flat_next = Mux(flat_shift == v, mmrg >> (8 * v), flat_next)
-        kq_next = Const(0, self.meta_buf_bytes * 8)
-        for v in kq_vals:
-            kq_next = Mux(kq_shift == v, mmrg >> (8 * v), kq_next)
-        mdata_next = Mux(is_kq, kq_next, flat_next)
         meta_shift = Mux(is_kq, kq_shift, flat_shift)
-        m.d.sync += mdata.eq(mdata_next)
+        if self.circular_meta:
+            m.d.sync += scale_rd.eq(scale_rd + meta_shift[1:])
+        else:
+            # Keep the flat buffer zero above the resident byte count.
+            flat_vals = tuple(2 * e for e in range(n + 1))
+            kq_vals = tuple(
+                sorted({
+                    p * e
+                    for p in (Q6_META_BYTES, Q4_META_BYTES)
+                    for e in range(n + 1)
+                }))
+            flat_next = Const(0, self.meta_buf_bytes * 8)
+            for v in flat_vals:
+                flat_next = Mux(flat_shift == v, mmrg >> (8 * v), flat_next)
+            kq_next = Const(0, self.meta_buf_bytes * 8)
+            for v in kq_vals:
+                kq_next = Mux(kq_shift == v, mmrg >> (8 * v), kq_next)
+            mdata_next = Mux(is_kq, kq_next, flat_next)
+            m.d.sync += mdata.eq(mdata_next)
         m.d.sync += mhave.eq(mhave + Mux(meta_in, bb, 0) - meta_shift)
 
         # Window state advance on emission: resume at the successor of
@@ -1440,9 +1927,12 @@ class StreamSupply(HasTRoomParams, Elaboratable):
                 lane.eq(0),
                 grp_rem.eq(groups_n),
                 tail_lanes.eq(tail_n),
-                mdata.eq(0),
                 mhave.eq(0),
             ]
+            if self.circular_meta:
+                m.d.sync += [scale_rd.eq(0), scale_wr.eq(0)]
+            else:
+                m.d.sync += mdata.eq(0)
             # Redundant with the ~start squelch in fire[0], kept as the
             # original's explicit same-edge reset of the skid.
             for e in range(n):
@@ -1472,7 +1962,12 @@ class StreamGemv(HasTRoomParams, Elaboratable):
     ``BAD_SHAPE``/``BAD_ALIGN``/``BAD_RANGE`` without touching the port.
     """
 
-    def __init__(self, params, *, mem_base=0, mem_size=None):
+    def __init__(self,
+                 params,
+                 *,
+                 mem_base=0,
+                 mem_size=None,
+                 read_topology=None):
         super().__init__(params)
 
         # Device memory window bounding every DRAM byte the reader
@@ -1488,23 +1983,34 @@ class StreamGemv(HasTRoomParams, Elaboratable):
             raise ValueError(
                 f'memory window [{mem_base:#x}, {mem_base + mem_size:#x}) '
                 f'exceeds the {self.addr_width}-bit address space')
+        if read_topology is not None:
+            read_topology.validate(self.addr_width, self.beat_bytes)
         self.mem_base = mem_base
         self.mem_size = mem_size
 
         self.sink = Decoupled(StreamMatmulDesc, self.params)
         self.segs = Decoupled(MmSegment, self.params)
         self.actram = ActRAM(self.params)
-        self.supply = StreamSupply(self.params)
+        self.read_topology = read_topology
+        self.split_responses = read_topology is not None
+        self.striped = self.split_responses and read_topology.striped
+        self.supply = StreamSupply(self.params, read_topology=read_topology)
         self.mac = MacArray(self.params)
 
         self.act_wr = self.actram.wr
         self.mem_rreq = self.supply.mem_rreq
         self.mem_rresp = self.supply.mem_rresp
+        if self.split_responses:
+            self.mem_sresp = self.supply.mem_sresp
+            self.pair_ok = self.supply.pair_ok
+            self.triple_ok = self.supply.triple_ok
 
         self.done = Signal()
         self.status = Signal(Status)
         self.active = Signal()
         self.start_ok = Signal()
+        self.act_fill_busy = Signal()
+        self.act_commit_pending = Signal()
 
         # Launch-side observation.
         self.slots = Signal(48)
@@ -1515,6 +2021,16 @@ class StreamGemv(HasTRoomParams, Elaboratable):
         self.run_cycles = Signal(48)
         self.drain_cycles = Signal(48)
         self.feed_beats = Signal(48)
+        if self.mm_starvation_counters:
+            self.diag = {
+                name: Signal(48, name=f'mm_diag_{name}')
+                for name in MM_STARVATION_COUNTERS
+            }
+            self.dma_beat = Signal()
+            self.payload_request = Signal(
+                range(len(read_topology.ports) +
+                      1) if self.split_responses else 1)
+            self.scale_request = Signal()
 
         # Reader-side observation (phase B accounting).
         self.pay_beats = Signal(48)
@@ -1544,7 +2060,6 @@ class StreamGemv(HasTRoomParams, Elaboratable):
         ]
 
         n = self.n_outputs
-        lgn = log2_int(n)
 
         cur_fmt = Signal(Format)
         cur_k = Signal(self.lg_act_k + 1)
@@ -1553,10 +2068,9 @@ class StreamGemv(HasTRoomParams, Elaboratable):
         cur_m_base = Signal(self.addr_width)
 
         nsegs = cur_k >> 5
-        pair_row = Cat(cur_rows, Const(0, lgn)) if lgn else cur_rows
         # Group count at this unit's width: ceil(rows / n_outputs)
         # (pairs at n=2, quads at n=4).
-        pairs = ((cur_rows + (n - 1)) >> lgn)[:self.rows_bits]
+        pairs = rtl_stream_groups(cur_rows, n)
         # Extent arithmetic duplicated per format: every pitch and unit
         # shift is a Python constant here (shift+add; no runtime-pitch
         # operand feeding a multiplier cascade) and the format only
@@ -1616,6 +2130,11 @@ class StreamGemv(HasTRoomParams, Elaboratable):
         o_rows = Signal(self.rows_bits)
         o_p_base = Signal(self.addr_width)
         o_m_base = Signal(self.addr_width)
+        o_secondary_base = Signal(self.addr_width)
+        o_primary_beats = Signal(5)
+        cur_secondary_base = Signal(self.addr_width)
+        cur_primary_beats = Signal(5)
+        primary_total = Signal(ext_w)
 
         off_p_sel, off_m_sel = _extents(o_rows, o_k, 'off')
         off_p_bytes = _pick(o_fmt, off_p_sel)
@@ -1649,21 +2168,50 @@ class StreamGemv(HasTRoomParams, Elaboratable):
         p_span = Signal(ext_bits)
         m_span = Signal(ext_bits)
         mem_end = Signal(ext_bits)
+        p_end = o_p_base + p_span
+        if self.read_topology is None:
+            p_in_range = (o_p_base >= self.mem_base) & (p_end <= mem_end)
+            m_in_range = (o_m_base >= self.mem_base) & (o_m_base + m_span
+                                                        <= mem_end)
+        else:
+            primary, *secondary = self.read_topology.payload_regions
+            p_in_range = primary.contains(o_p_base, p_end)
+            m_in_range = self.read_topology.scales.contains(
+                o_m_base, o_m_base + m_span)
+            if self.striped:
+                secondary, = secondary
+                p_in_range |= secondary.contains(o_p_base, p_end)
+                secondary_span = (p_total_r - primary_total) << self.lg_beat
+                stripe_range = (
+                    primary.contains(
+                        o_p_base, o_p_base + (primary_total << self.lg_beat))
+                    & secondary.contains(o_secondary_base,
+                                         o_secondary_base + secondary_span))
+                p_in_range = Mux(o_secondary_base != 0, stripe_range,
+                                 p_in_range)
+                align_ok &= ~o_secondary_base[:self.lg_beat].any()
+        if not self.striped:
+            shape_ok &= o_secondary_base == 0
         m.d.comb += [
             p_span.eq(p_total_r << self.lg_beat),
             m_span.eq(m_total_r << self.lg_beat),
             mem_end.eq(self.mem_base + self.mem_size),
         ]
-        range_ok = ((o_p_base >= self.mem_base)
-                    & (o_m_base >= self.mem_base)
-                    & ((o_p_base + p_span) <= mem_end)
-                    & ((o_m_base + m_span) <= mem_end))
+        range_ok = p_in_range & m_in_range
         ok = shape_ok & align_ok & range_ok
 
         pair = self.join_pair
         seg = self.join_seg
         rd_idx = self.join_rd_idx
         rd_issue = Signal()
+        # With more segments than queue slots, the read cursor can only
+        # cross one row group ahead of the consumer. Stop exactly at
+        # the end of the last group and keep short attention unchanged.
+        wrap_act = (Const(self.sg_act_wrap and self.mm_act_fifo > 1) &
+                    (cur_fmt == Format.Q8_0)
+                    & (cur_k >= 1024) & (nsegs > self.mm_act_fifo))
+        wrap_read = wrap_act & (rd_idx == nsegs) & (pair + 1 < pairs)
+
         rd_pending = Signal()
         m.d.sync += rd_pending.eq(rd_issue)
         act_cnt = self.join_act_cnt
@@ -1674,6 +2222,18 @@ class StreamGemv(HasTRoomParams, Elaboratable):
         resv = Signal(range(self.mm_out_depth + 1))
 
         start_r = Signal()
+        # A PV command may start its reader while the preceding ACT
+        # fill is active. Keep both commit and ACT reads behind that
+        # fill, while the usual weight queues absorb early returns.
+        defer_act = Signal()
+        commit_act = Signal()
+        m.d.comb += [
+            commit_act.eq(self.act_commit_pending & ~self.act_fill_busy),
+            self.actram.commit.eq((self.start_ok & ~defer_act) | commit_act),
+        ]
+        with m.If(commit_act):
+            m.d.sync += self.act_commit_pending.eq(0)
+
         rd_word = ActWord(self.params)
         m.d.comb += [
             rd_word.quants.eq(self.actram.rd_quants),
@@ -1681,6 +2241,8 @@ class StreamGemv(HasTRoomParams, Elaboratable):
             rd_word.sum_a.eq(self.actram.rd_sum_a),
         ]
 
+        if self.mm_starvation_counters:
+            seen_issue = Signal()
         with m.FSM() as fsm:
             with m.State('IDLE'):
                 m.d.comb += self.sink.ready.eq(0)
@@ -1694,6 +2256,8 @@ class StreamGemv(HasTRoomParams, Elaboratable):
                         o_rows.eq(offer.rows),
                         o_p_base.eq(offer.p_base),
                         o_m_base.eq(offer.m_base),
+                        o_secondary_base.eq(offer.ps_base),
+                        o_primary_beats.eq(offer.pl_beats),
                     ]
                     m.next = 'EXT'
 
@@ -1705,7 +2269,18 @@ class StreamGemv(HasTRoomParams, Elaboratable):
                     m_total_r.eq((off_m_bytes +
                                   (self.beat_bytes - 1)) >> self.lg_beat),
                 ]
-                m.next = 'CHK'
+                m.next = 'STRIPE_EXT' if self.striped else 'CHK'
+
+            if self.striped:
+                with m.State('STRIPE_EXT'):
+                    tail = p_total_r[:5]
+                    primary_beats = Mux(o_primary_beats == 0,
+                                        SG1_DEFAULT_PRIMARY_BEATS,
+                                        o_primary_beats)
+                    m.d.sync += primary_total.eq(
+                        (p_total_r >> 5) * primary_beats +
+                        Mux(tail < primary_beats, tail, primary_beats))
+                    m.next = 'CHK'
 
             with m.State('CHK'):
                 # Valid may have dropped after IDLE (epi.ready/halt
@@ -1718,13 +2293,21 @@ class StreamGemv(HasTRoomParams, Elaboratable):
                 # combinational here does not reintroduce the
                 # acceptance cone into the datapath.
                 m.d.comb += self.start_ok.eq(self.sink.fire & ok)
+                m.d.comb += defer_act.eq(offer.early_weights
+                                         & self.act_fill_busy)
+
                 with m.If(self.sink.fire & ok):
                     m.d.sync += [
                         cur_fmt.eq(o_fmt),
+                        self.act_commit_pending.eq(defer_act),
                         cur_k.eq(o_k),
                         cur_rows.eq(o_rows),
                         cur_p_base.eq(o_p_base),
                         cur_m_base.eq(o_m_base),
+                        cur_secondary_base.eq(o_secondary_base),
+                        cur_primary_beats.eq(
+                            Mux(o_primary_beats == 0,
+                                SG1_DEFAULT_PRIMARY_BEATS, o_primary_beats)),
                         # The supply's initialization pulse is
                         # *registered*: the entire command-acceptance
                         # cone (epilogue availability, fire, checks)
@@ -1744,6 +2327,8 @@ class StreamGemv(HasTRoomParams, Elaboratable):
                         self.meta_pad_bytes.eq((m_total_r << self.lg_beat) -
                                                m_bytes_r),
                     ]
+                    if self.mm_starvation_counters:
+                        m.d.sync += seen_issue.eq(0)
                     m.next = 'RUN'
                 with m.Elif(self.sink.fire):
                     m.d.comb += [
@@ -1758,7 +2343,7 @@ class StreamGemv(HasTRoomParams, Elaboratable):
 
             with m.State('RUN'):
                 m.d.sync += start_r.eq(0)
-                unmasked = [((pair << lgn) + p) < pair_row for p in range(n)]
+                unmasked = [(pair * n + p) < cur_rows for p in range(n)]
                 ready = [
                     ~unmasked[p] | self.supply.segs[p].valid for p in range(n)
                 ]
@@ -1782,7 +2367,7 @@ class StreamGemv(HasTRoomParams, Elaboratable):
                 for p in range(n):
                     feed_p = seg_fire & unmasked[p]
                     whead = self.supply.segs[p].bits
-                    lane_row = ((pair << lgn) + p)[:self.rows_bits]
+                    lane_row = (pair * n + p)[:self.rows_bits]
                     m.d.comb += [
                         self.mac.w_in[p].eq(Mux(feed_p, whead.w, 0)),
                         getattr(meta, f'row{p}').eq(
@@ -1796,13 +2381,15 @@ class StreamGemv(HasTRoomParams, Elaboratable):
                         self.supply.seg_q[p].deq.ready.eq(feed_p),
                     ]
 
-                m.d.comb += rd_issue.eq((rd_idx != nsegs)
+                m.d.comb += rd_issue.eq(~self.act_commit_pending
+                                        & ((rd_idx != nsegs) | wrap_read)
                                         & (act_cnt +
                                            rd_pending < self.mm_act_fifo))
                 push = rd_pending
-                m.d.comb += self.actram.rd_seg.eq(rd_idx[:self.lg_act_segs])
+                m.d.comb += self.actram.rd_seg.eq(
+                    Mux(wrap_read, 0, rd_idx[:self.lg_act_segs]))
                 with m.If(rd_issue):
-                    m.d.sync += rd_idx.eq(rd_idx + 1)
+                    m.d.sync += rd_idx.eq(Mux(wrap_read, 1, rd_idx + 1))
                 with m.If(seg_fire & ~push):
                     m.d.sync += act_cnt.eq(act_cnt - 1)
                 with m.Elif(push & ~seg_fire):
@@ -1822,6 +2409,77 @@ class StreamGemv(HasTRoomParams, Elaboratable):
                     m.d.sync += resv.eq(resv - 1)
 
                 n_active = sum(unmasked)
+                if self.mm_starvation_counters:
+                    lane_short = ~Cat(ready).all()
+                    supply = self.supply
+                    # These are decoder-head observations, which can refer
+                    # to a later segment than the consumer on an empty lane.
+                    # The supply clears its cursors and assemblers on
+                    # start_r, so observations from that edge are unassigned.
+                    payload_short = lane_short & ~start_r & supply.payload_short
+                    scale_short = lane_short & ~start_r & supply.scale_short
+                    mask = Cat(~act_ok, lane_short, payload_short, scale_short)
+                    if self.split_responses:
+                        presp = self.mem_rresp
+                        payload_beat = Mux(presp.fire, presp.bits.beat_count,
+                                           0)
+                        scale_beat = self.mem_sresp.fire
+                    else:
+                        resp = self.mem_rresp
+                        payload_beat = Mux(resp.fire & ~resp.bits.meta, 1, 0)
+                        scale_beat = resp.fire & resp.bits.meta
+                    events = {
+                        'commands':
+                        start_r,
+                        'run':
+                        Const(1),
+                        'issue':
+                        seg_fire,
+                        'credit':
+                        operands_ok & ~credit_ok,
+                        'first_issue_wait':
+                        ~seen_issue & ~seg_fire,
+                        'payload_beats':
+                        payload_beat,
+                        'scale_beats':
+                        scale_beat,
+                        'payload_requests':
+                        self.payload_request,
+                        'scale_requests':
+                        self.scale_request,
+                        'payload_eligible_short':
+                        payload_short & supply.payload_eligible,
+                        'scale_eligible_short':
+                        scale_short & supply.scale_eligible,
+                        'payload_outstanding_gap':
+                        payload_short & (supply.p_out != 0) & ~payload_beat,
+                        'scale_outstanding_gap':
+                        scale_short & (supply.m_out != 0) & ~scale_beat,
+                        'dma_overlap':
+                        self.dma_beat,
+                    }
+                    events.update({
+                        f'mask_{value:02x}': mask == value
+                        for value in MM_STARVATION_MASKS
+                    })
+                    with m.If(seg_fire):
+                        m.d.sync += seen_issue.eq(1)
+                    # Shape classes for Qwen3's 128-element heads and
+                    # 64-slot PV windows. Unrelated GEMVs may alias them.
+                    qk = (cur_fmt == Format.Q8_0) & (cur_k == 128)
+                    pv = (cur_fmt == Format.Q8_0) & (cur_k == 64) & (cur_rows
+                                                                     == 128)
+                    for kind, selected in zip(MM_STARVATION_CLASSES,
+                                              (~(qk | pv), qk, pv)):
+                        with m.If(selected):
+                            for field, event in events.items():
+                                counter = self.diag[f'{kind}_{field}']
+                                with m.If(event):
+                                    m.d.sync += counter.eq(counter + event)
+                            with m.If(seg_fire):
+                                macs = self.diag[f'{kind}_macs']
+                                m.d.sync += macs.eq(macs +
+                                                    self.seg_len * n_active)
                 m.d.sync += self.run_cycles.eq(self.run_cycles + 1)
                 with m.If(seg_fire):
                     m.d.sync += [
@@ -1844,7 +2502,9 @@ class StreamGemv(HasTRoomParams, Elaboratable):
                         with m.If(pair + 1 == pairs):
                             m.next = 'DRAIN'
                         with m.Else():
-                            m.d.sync += [pair.eq(pair + 1), rd_idx.eq(0)]
+                            m.d.sync += pair.eq(pair + 1)
+                        with m.If(~wrap_act):
+                            m.d.sync += rd_idx.eq(0)
                     with m.Else():
                         m.d.sync += seg.eq(seg + 1)
 
@@ -1872,12 +2532,6 @@ class StreamGemv(HasTRoomParams, Elaboratable):
             # must not enable the walkers, matching the supply's
             # cycle view of the two-state FSM this replaces.
             self.supply.run.eq(fsm.ongoing('RUN')),
-            # P2a banked ACT RAM: the accept pulse commits the loaded
-            # bank for reading and rotates the write bank. The core's
-            # accept discipline (a stream command is offered only
-            # with the loader quiescent) keeps every commit off an
-            # in-flight fill; single-bank builds ignore the pulse.
-            self.actram.commit.eq(self.start_ok),
             # Registered one-cycle init pulse: high during RUN's
             # first cycle only (CHK sets it, RUN clears it). The
             # supply's start-edge samples read the cur_* registers --
@@ -1893,6 +2547,8 @@ class StreamGemv(HasTRoomParams, Elaboratable):
             self.supply.nsegs.eq(nsegs),
             self.supply.p_base.eq(cur_p_base),
             self.supply.m_base.eq(cur_m_base),
+            self.supply.secondary_base.eq(cur_secondary_base),
+            self.supply.primary_beats.eq(cur_primary_beats),
             self.supply.p_total.eq(p_total_r),
             self.supply.m_total.eq(m_total_r),
             self.actram.pin.eq(~fsm.ongoing('IDLE')),
@@ -1928,12 +2584,18 @@ class StreamAxiReader(HasTRoomParams, Elaboratable):
     RRESP; the command layer accumulates it over the current command.
     """
 
-    def __init__(self, params):
+    def __init__(self, params, *, bus_name=None, axi_data_width=None):
         super().__init__(params)
 
-        self.bus = AXIInterface(data_width=self.data_width,
+        axi_data_width = axi_data_width or self.data_width
+        if axi_data_width not in (self.data_width, self.data_width // 2):
+            raise ValueError(
+                'AXI reads must use full or half logical beat width')
+        self.half_width = axi_data_width != self.data_width
+        self.bus = AXIInterface(data_width=axi_data_width,
                                 addr_width=self.addr_width,
-                                id_width=self.id_width)
+                                id_width=self.id_width,
+                                name=bus_name)
         self.rreq = Decoupled(StreamReadReq, self.params)
         self.rresp = Decoupled(StreamReadResp, self.params)
 
@@ -1942,6 +2604,9 @@ class StreamAxiReader(HasTRoomParams, Elaboratable):
         # Tag entries for the worst outstanding set the supply's credit
         # discipline admits: every outstanding beat of both streams in
         # its own 1-beat sub-burst, plus one page split per stream.
+        if self.mm_starvation_counters:
+            self.payload_request = Signal()
+            self.scale_request = Signal()
         self.tag_depth = 2 * self.sg_credits \
             + ((2 * self.sg_credits * self.beat_bytes) >> 12) + 4
 
@@ -1965,7 +2630,9 @@ class StreamAxiReader(HasTRoomParams, Elaboratable):
         # only for a 256-beat request, which a page never holds.
         to_page = (0x1000 - (req.bits.addr & 0xfff)) >> lg
         direct = Signal()
-        m.d.comb += direct.eq(~req.bits.beats[8] & (req.bits.beats <= to_page))
+        max_beats = 128 if self.half_width else 256
+        m.d.comb += direct.eq((req.bits.beats < max_beats)
+                              & (req.bits.beats <= to_page))
 
         # Split holding register: addr/rem advance per issued sub-burst.
         # Kept as attributes for waveform/testbench observation (the
@@ -1975,6 +2642,8 @@ class StreamAxiReader(HasTRoomParams, Elaboratable):
         hold_rem = self.hold_rem = Signal(9)
         hold_meta = Signal()
         hold_page = (0x1000 - (hold_addr & 0xfff)) >> lg
+        if self.half_width and self.beat_bytes < 32:
+            hold_page = Mux(hold_page <= max_beats, hold_page, max_beats)
         hold_burst = Mux(hold_rem <= hold_page, hold_rem, hold_page)
 
         # The request is consumed when its AR is accepted: directly for
@@ -1992,12 +2661,13 @@ class StreamAxiReader(HasTRoomParams, Elaboratable):
         ar_fire = self.bus.ar.valid & self.bus.ar.ready
         last_sub = ar_fire & ~ar_direct & (hold_rem == hold_burst)
         req_ready_direct = ar_direct & self.bus.ar.ready
+        burst_beats = Mux(ar_direct, req.bits.beats, hold_burst)
+        axi_beats = burst_beats << int(self.half_width)
         m.d.comb += [
             self.bus.ar.valid.eq(ar_direct | ar_hold),
             self.bus.ar.bits.addr.eq(Mux(ar_direct, req.bits.addr, hold_addr)),
-            self.bus.ar.bits.len.eq(
-                Mux(ar_direct, req.bits.beats - 1, hold_burst - 1)),
-            self.bus.ar.bits.size.eq(lg),
+            self.bus.ar.bits.len.eq(axi_beats - 1),
+            self.bus.ar.bits.size.eq(lg - int(self.half_width)),
             self.bus.ar.bits.burst.eq(AXIBurst.INCR),
             self.bus.ar.bits.lock.eq(0),
             self.bus.ar.bits.prot.eq(0),
@@ -2013,6 +2683,11 @@ class StreamAxiReader(HasTRoomParams, Elaboratable):
             tag_q.enq.bits.meta.eq(Mux(ar_direct, req.bits.meta, hold_meta)),
         ]
 
+        if self.mm_starvation_counters:
+            m.d.comb += [
+                self.payload_request.eq(ar_fire & ~tag_q.enq.bits.meta),
+                self.scale_request.eq(ar_fire & tag_q.enq.bits.meta),
+            ]
         with m.If(ar_fire):
             m.d.sync += self.bursts.eq(self.bursts + 1)
             with m.If(~ar_direct):
@@ -2036,15 +2711,350 @@ class StreamAxiReader(HasTRoomParams, Elaboratable):
         # response stream.
         r_fire = self.bus.r.valid & self.bus.r.ready
         r_last = r_fire & self.bus.r.bits.last
+        if self.half_width:
+            low = Signal(self.data_width // 2, reset_less=True)
+            have_low = Signal()
+            m.d.comb += [
+                self.rresp.valid.eq(self.bus.r.valid & have_low),
+                self.rresp.bits.data.eq(Cat(low, self.bus.r.bits.data)),
+                self.bus.r.ready.eq(~have_low | self.rresp.ready),
+            ]
+            with m.If(r_fire):
+                m.d.sync += have_low.eq(~have_low)
+                with m.If(~have_low):
+                    m.d.sync += low.eq(self.bus.r.bits.data)
+        else:
+            m.d.comb += [
+                self.rresp.valid.eq(self.bus.r.valid),
+                self.rresp.bits.data.eq(self.bus.r.bits.data),
+                self.bus.r.ready.eq(self.rresp.ready),
+            ]
         m.d.comb += [
-            self.rresp.valid.eq(self.bus.r.valid),
-            self.rresp.bits.data.eq(self.bus.r.bits.data),
             self.rresp.bits.meta.eq(tag_q.deq.bits.meta),
-            self.bus.r.ready.eq(self.rresp.ready),
             tag_q.deq.ready.eq(r_last),
         ]
-        with m.If(r_fire):
+        with m.If(self.rresp.fire):
             m.d.sync += self.beats.eq(self.beats + 1)
         m.d.comb += self.err.eq(r_fire & (self.bus.r.bits.resp != 0))
 
+        return m
+
+
+def pick_one(items, index):
+    """``items[index]`` as a nested Mux: one small mux per bit.
+
+    A dynamic index over a list must not go through ``Array``: its
+    lowering expands to a per-element select that synthesizes to many
+    times the logic.
+    """
+    expr = items[-1]
+    for i in range(len(items) - 2, -1, -1):
+        expr = Mux(index == i, items[i], expr)
+    return expr
+
+
+class BeatStore(Elaboratable):
+    """One write per cycle and independently read consecutive FIFO beats."""
+
+    def __init__(self,
+                 width,
+                 depth,
+                 *,
+                 use_sync_read_mem=False,
+                 banks=2,
+                 name=None,
+                 src_loc_at=0):
+        assert banks in (2, 4) and depth >= banks
+        self.width = width
+        self.depth = depth
+        self.banks = banks
+        self.use_sync_read_mem = use_sync_read_mem
+        self.w_data = Signal(width, name='w_data')
+        self.w_en = Signal(name='w_en')
+        self.count = Signal(range(depth + 1), name='count')
+        self.head_bank = Signal(range(banks))
+        self.forwarded = Signal(width, reset_less=True)
+        self.forward = Signal(banks)
+        self.bank_data = [
+            Signal(width, name=f'bank{bank}_data') for bank in range(banks)
+        ]
+        self.pop = Signal(range(banks + 1), name='pop')
+        self.clr = Signal(name='clr')
+
+    def elaborate(self, platform):
+        m = Module()
+        lg = log2_int(self.depth)
+        rd = Signal(lg)
+        wr = Signal(lg)
+        w_en = self.w_en & (self.count < self.depth)
+        rd_next = Mux(self.clr, 0, rd + self.pop)[:lg]
+        # BRAM reads the post-pop addresses so both heads are ready on
+        # the next edge. A simultaneous write can supply either new head.
+        read_head = rd_next if self.use_sync_read_mem else rd
+        bank_bits = log2_int(self.banks)
+        ram_style = 'block' if self.use_sync_read_mem else 'distributed'
+        if self.use_sync_read_mem:
+            with m.If(w_en):
+                m.d.sync += self.forwarded.eq(self.w_data)
+        for bank in range(self.banks):
+            wraps = read_head[:bank_bits] > bank
+            addr = (read_head[bank_bits:] + wraps)[:lg - bank_bits]
+            mem = Memory(width=self.width,
+                         depth=self.depth // self.banks,
+                         attrs={'ram_style': ram_style})
+            wport = mem.write_port()
+            if self.use_sync_read_mem:
+                rport = mem.read_port(transparent=False)
+            else:
+                rport = mem.read_port(domain='comb')
+            m.submodules[f'bank{bank}_write'] = wport
+            m.submodules[f'bank{bank}_read'] = rport
+            bank_write = w_en & (wr[:bank_bits] == bank)
+            if self.use_sync_read_mem:
+                m.d.sync += self.forward[bank].eq(bank_write
+                                                  & (wr[bank_bits:] == addr))
+            m.d.comb += [
+                wport.addr.eq(wr[bank_bits:]),
+                wport.data.eq(self.w_data),
+                wport.en.eq(bank_write),
+                rport.addr.eq(addr),
+                self.bank_data[bank].eq(rport.data),
+            ]
+        m.d.comb += self.head_bank.eq(rd[:bank_bits])
+        m.d.sync += [
+            rd.eq(rd_next),
+            wr.eq(Mux(self.clr, 0, (wr + w_en)[:lg])),
+            self.count.eq(Mux(self.clr, 0, self.count + w_en - self.pop)),
+        ]
+        return m
+
+
+class StreamMultiPortReader(HasTRoomParams, Elaboratable):
+    """Independent AXI readers with request-ordered payload retirement."""
+
+    def __init__(self, params, read_topology):
+        super().__init__(params)
+        read_topology.validate(self.addr_width, self.beat_bytes)
+        self.read_topology = read_topology
+        self.readers = [
+            StreamAxiReader(params,
+                            bus_name=port.name,
+                            axi_data_width=port.axi_data_width)
+            for port in read_topology.ports
+        ]
+        self.bus = self.readers[read_topology.shared_port].bus
+        self.aux_buses = {
+            port.name: reader.bus
+            for index, (
+                port,
+                reader) in enumerate(zip(read_topology.ports, self.readers))
+            if index != read_topology.shared_port
+        }
+        self.rreq = Decoupled(StreamReadReq, params)
+        self.presp = Decoupled(StreamPayPair,
+                               params,
+                               triple=read_topology.retirement_lanes == 3)
+        self.mresp = Decoupled(StreamScaleBeat, params)
+        self.pair_en = Signal()
+        self.triple_en = Signal()
+        self.err = Signal()
+        self.payload_request = Signal(range(len(self.readers) + 1))
+        self.scale_request = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+        topology = self.read_topology
+        req, presp, mresp = self.rreq, self.presp, self.mresp
+        triple = topology.retirement_lanes == 3
+        pair_gate = self.pair_en & (topology.retirement_lanes >= 2)
+        port_shape = range(len(self.readers))
+        port = Signal(port_shape)
+        mapped = Signal()
+        addr = req.bits.addr
+        with m.If(req.bits.meta):
+            m.d.comb += [
+                mapped.eq(topology.scales.contains(addr, addr)),
+                port.eq(topology.scales.ports[0]),
+            ]
+        with m.Else():
+            for region in topology.payload_regions:
+                with m.If(region.contains(addr, addr)):
+                    m.d.comb += [mapped.eq(1), port.eq(region.port_for(addr))]
+
+        m.submodules.order = order = Queue(
+            self.sg_credits,
+            Record, [
+                ('port', port_shape, Direction.FANOUT),
+                ('beats', 9, Direction.FANOUT),
+            ],
+            flow=True)
+        stores = []
+        ready = []
+        for index, (config,
+                    reader) in enumerate(zip(topology.ports, self.readers)):
+            # Name the reader after its port (pl, hp0..): a generic
+            # reader{index} collides with other wrapper DMA readers (the
+            # loader's reader1) in the generated Verilog module namespace.
+            setattr(m.submodules, config.name, reader)
+            dual_bank = topology.dual_bank_shared_port and index == topology.shared_port
+            store = BeatStore(self.data_width,
+                              config.return_buffer_beats,
+                              use_sync_read_mem=config.sync_read_buffer,
+                              banks=4 if triple and not dual_bank else 2)
+            setattr(m.submodules, f'store{index}', store)
+            stores.append(store)
+
+            sink = reader.rreq
+            if config.issue_queue_depth:
+                issue = Queue(config.issue_queue_depth,
+                              StreamReadReq,
+                              self.params,
+                              flow=False)
+                setattr(m.submodules, f'issue{index}', issue)
+                m.d.comb += issue.deq.connect(reader.rreq)
+                sink = issue.enq
+            ready.append(sink.ready)
+            m.d.comb += [
+                sink.valid.eq(req.valid & mapped & (port == index)
+                              & (req.bits.meta | order.enq.ready)),
+                sink.bits.eq(req.bits),
+                reader.rresp.ready.eq(
+                    Mux(reader.rresp.bits.meta, mresp.ready, store.count
+                        < config.return_buffer_beats)),
+                store.w_en.eq(reader.rresp.fire & ~reader.rresp.bits.meta),
+                store.w_data.eq(reader.rresp.bits.data),
+            ]
+
+        self.stores = stores
+        self.order_q = order
+        scale_reader = self.readers[topology.scales.ports[0]]
+        selected_ready = Array(ready)[port]
+        m.d.comb += [
+            req.ready.eq(mapped & selected_ready
+                         & (req.bits.meta | order.enq.ready)),
+            order.enq.valid.eq(req.valid & mapped & ~req.bits.meta
+                               & selected_ready),
+            order.enq.bits.port.eq(port),
+            order.enq.bits.beats.eq(req.bits.beats),
+            mresp.valid.eq(scale_reader.rresp.valid
+                           & scale_reader.rresp.bits.meta),
+            mresp.bits.data.eq(scale_reader.rresp.bits.data),
+        ]
+
+        # Ordered dual-beat retirement. ``cur`` names the stripe whose
+        # beats retire next and ``nxt`` the following request, so a
+        # retire can take the head stripe's final beat and the next
+        # stripe's first beat in one cycle instead of bubbling at
+        # every stripe boundary. Kept as attributes for waveform and
+        # testbench observation.
+        self.cur_v = cur_v = Signal(name='cur_v')
+        self.cur_port = cur_port = Signal(port_shape, name='cur_port')
+        self.cur_left = cur_left = Signal(9, name='cur_left')
+        self.nxt_v = nxt_v = Signal(name='nxt_v')
+        self.nxt_port = nxt_port = Signal(port_shape, name='nxt_port')
+        self.nxt_left = nxt_left = Signal(9, name='nxt_left')
+        counts = Array(s.count for s in stores)
+
+        cur_count = counts[cur_port]
+        nxt_count = counts[nxt_port]
+        same_port = nxt_port == cur_port
+        s0_ok = cur_v & (cur_count != 0)
+
+        # Cross at most one request boundary. Leave one beat in the
+        # next request so a retirement only consumes one order entry.
+        def can_retire(lanes):
+            in_current = (cur_left >= lanes) & (cur_count >= lanes)
+            next_needed = (lanes - cur_left)[:2]
+            across = ((cur_left < lanes) & nxt_v & (cur_count >= cur_left) &
+                      (nxt_left > next_needed) &
+                      (nxt_count >= Mux(same_port, lanes, next_needed)))
+            return cur_v & (in_current | across)
+
+        dual_sel = pair_gate & can_retire(2)
+        triple_sel = dual_sel & self.triple_en & can_retire(
+            3) if triple else Const(0)
+        if triple and topology.dual_bank_shared_port:
+            # The shared PL store can supply at most two beats. A triple
+            # can still span PL and HP if the third beat completes the batch.
+            triple_sel = triple_sel & ((cur_port != topology.shared_port) |
+                                       ((cur_left < 3) & ~same_port))
+        retire_count = Signal(range(4))
+        m.d.comb += retire_count.eq(1 + dual_sel + triple_sel)
+
+        for lane in range(topology.retirement_lanes if triple else 2):
+            # If both requests select the same store, its head-relative
+            # index already spans the boundary.
+            from_next = (cur_left <= lane) & ~same_port
+            lane_port = Mux(from_next, nxt_port, cur_port)
+            lane_offset = Mux(from_next, lane - cur_left, lane)
+            lane_data = Const(0, self.data_width)
+            for i, store in enumerate(stores):
+                bank_bits = log2_int(store.banks)
+                selected_bank = (store.head_bank + lane_offset)[:bank_bits]
+                port_hit = lane_port == i
+                if lane == 2 and store.banks == 2:
+                    port_hit = port_hit & from_next
+                # A hit store has exactly one selected bank, so pick it,
+                # then apply the store's forwarding, then the port: three
+                # small muxes per bit (a 4:1, a 2:1 and one port term)
+                # instead of one AND-OR term per (port, bank).
+                picked = pick_one(store.bank_data, selected_bank)
+                if store.use_sync_read_mem:
+                    forwarded = pick_one(
+                        [store.forward[bank] for bank in range(store.banks)],
+                        selected_bank)
+                    picked = Mux(forwarded, store.forwarded, picked)
+                lane_data = lane_data | Mux(port_hit, picked, 0)
+            m.d.comb += presp.bits[f'data{lane}'].eq(lane_data)
+        m.d.comb += [
+            presp.valid.eq(s0_ok),
+            presp.bits.dual.eq(dual_sel),
+        ]
+        if triple:
+            m.d.comb += presp.bits.triple.eq(triple_sel)
+
+        fired = presp.fire
+        cons_cross = fired & (cur_left < retire_count)
+        cons_exhaust = fired & (cur_left == retire_count)
+        next_pop = Signal(range(3))
+        m.d.comb += next_pop.eq(Mux(cons_cross, retire_count - cur_left, 0))
+        for i, store in enumerate(stores):
+            cur_pop = Mux(fired & (cur_port == i),
+                          Mux(cons_cross, cur_left, retire_count), 0)
+            m.d.comb += store.pop.eq(cur_pop + Mux(nxt_port == i, next_pop, 0))
+
+        cl1 = Mux(cons_cross, nxt_left - next_pop,
+                  Mux(fired, cur_left - retire_count, cur_left))
+        cp1 = Mux(cons_cross, nxt_port, cur_port)
+        cv1 = Mux(cons_cross, 1, Mux(cons_exhaust, 0, cur_v))
+        rotate = ~cv1 & nxt_v
+        m.d.sync += [
+            cur_v.eq(Mux(rotate, 1, cv1)),
+            cur_port.eq(Mux(rotate, nxt_port, cp1)),
+            cur_left.eq(Mux(rotate, nxt_left, cl1)),
+        ]
+        # ``nxt`` is consumed both by a full rotation and by a cross
+        # retire that spends one of its beats; either way it must be
+        # refilled from the order queue the same edge, or a later
+        # rotation would replay the whole stripe.
+        nxt_used = rotate | cons_cross
+        m.d.comb += order.deq.ready.eq(nxt_used | ~nxt_v)
+        nxt_load = (nxt_used | ~nxt_v) & order.deq.valid
+        with m.If(nxt_load):
+            m.d.sync += [
+                nxt_v.eq(1),
+                nxt_port.eq(order.deq.bits.port),
+                nxt_left.eq(order.deq.bits.beats),
+            ]
+        with m.Elif(nxt_used):
+            m.d.sync += nxt_v.eq(0)
+
+        m.d.comb += self.err.eq(
+            Cat(*(reader.err for reader in self.readers)).any())
+        if self.mm_starvation_counters:
+            m.d.comb += [
+                self.payload_request.eq(
+                    sum(reader.payload_request for reader in self.readers)),
+                self.scale_request.eq(scale_reader.scale_request),
+            ]
         return m

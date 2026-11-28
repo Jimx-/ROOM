@@ -269,7 +269,7 @@ def test_epilogue_write_backpressure():
 
 
 @pytest.mark.parametrize('fmt,k', [(Format.Q8_0, 32), (Format.Q4_K, 256)])
-@pytest.mark.parametrize('n_outputs', [1, 2, 4])
+@pytest.mark.parametrize('n_outputs', [1, 2, 4, 5])
 def test_epilogue_long_write_stall(fmt, k, n_outputs):
     """Results and fold contexts survive a stall beyond all queue capacity.
 
