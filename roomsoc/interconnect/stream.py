@@ -209,6 +209,9 @@ class Queue(Elaboratable):
     an enqueue in the same cycle. If ``has_flush=True``, the ``flush`` input
     synchronously discards all stored entries.
 
+    With ``use_sync_read_mem=True``, the queue prefetches its head with a
+    synchronous read port and forwards a simultaneous write to that head.
+
     As with any ready/valid channel, a producer must keep ``valid`` and
     ``bits`` stable until the enqueue transfer completes.
     """
@@ -220,11 +223,13 @@ class Queue(Elaboratable):
                  flow=True,
                  pipe=False,
                  has_flush=False,
+                 use_sync_read_mem=False,
                  **kwargs):
         self.depth = depth
         self.flow = flow
         self.pipe = pipe
         self.has_flush = has_flush
+        self.use_sync_read_mem = use_sync_read_mem
 
         self.enq, self.deq = _buffer_interfaces(cls, *args, **kwargs)
 
@@ -236,8 +241,13 @@ class Queue(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        mem = Memory(width=len(self.enq.bits), depth=self.depth)
-        rport = m.submodules.rport = mem.read_port(domain='comb')
+        mem = Memory(
+            width=len(self.enq.bits),
+            depth=self.depth,
+            attrs={'ram_style': 'block'} if self.use_sync_read_mem else None)
+        rport = m.submodules.rport = mem.read_port(
+            domain='sync' if self.use_sync_read_mem else 'comb',
+            transparent=not self.use_sync_read_mem)
         wport = m.submodules.wport = mem.write_port()
 
         enq_ptr = Signal(range(self.depth))
@@ -262,8 +272,8 @@ class Queue(Elaboratable):
             ]
             m.d.sync += enq_ptr.eq(_wrap_incr(enq_ptr, self.depth))
 
-        with m.If(do_deq):
-            m.d.sync += deq_ptr.eq(_wrap_incr(deq_ptr, self.depth))
+        deq_next = Mux(do_deq, _wrap_incr(deq_ptr, self.depth), deq_ptr)
+        m.d.sync += deq_ptr.eq(deq_next)
 
         with m.If(do_enq ^ do_deq):
             m.d.sync += maybe_full.eq(do_enq)
@@ -281,9 +291,19 @@ class Queue(Elaboratable):
             self.deq.valid.eq(~empty),
         ]
 
+        head = rport.data
+        if self.use_sync_read_mem:
+            # Forward same-edge writes explicitly. FPGA BRAM mixed-port
+            # read/write collisions cannot provide the new head reliably.
+            forward = Signal()
+            forwarded = Signal(len(self.enq.bits), reset_less=True)
+            m.d.sync += forward.eq(do_enq & (enq_ptr == deq_next))
+            with m.If(do_enq):
+                m.d.sync += forwarded.eq(self.enq.bits)
+            head = Mux(forward, forwarded, head)
         m.d.comb += [
-            rport.addr.eq(deq_ptr),
-            self.deq.bits.eq(rport.data),
+            rport.addr.eq(deq_next if self.use_sync_read_mem else deq_ptr),
+            self.deq.bits.eq(head),
         ]
 
         if self.flow:

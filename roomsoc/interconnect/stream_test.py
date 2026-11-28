@@ -1,5 +1,5 @@
 from amaranth import Record, Signal
-from amaranth.sim import Simulator
+from amaranth.sim import Settle, Simulator
 
 from roomsoc.interconnect.axi.axi_stream import AXIStreamInterface
 from roomsoc.interconnect.stream import Decoupled, Queue, SkidBuffer
@@ -93,3 +93,48 @@ def test_payload_constructor_remains_supported():
 
     Simulator(queue)
     Simulator(skid)
+
+
+def test_sync_read_queue_forwards_new_head():
+    queue = Queue(4,
+                  Signal,
+                  8,
+                  flow=False,
+                  has_flush=True,
+                  use_sync_read_mem=True)
+    sim = Simulator(queue)
+    sim.add_clock(1e-6)
+
+    def drive():
+        yield queue.enq.valid.eq(1)
+        yield queue.enq.bits.eq(0x35)
+        yield Settle()
+        yield
+        yield Settle()
+        assert (yield queue.deq.valid)
+        assert (yield queue.deq.bits) == 0x35
+
+        # The only resident item retires as the next one is written.
+        yield queue.deq.ready.eq(1)
+        yield queue.enq.bits.eq(0xC7)
+        yield Settle()
+        yield
+        yield Settle()
+        assert (yield queue.deq.valid)
+        assert (yield queue.deq.bits) == 0xC7
+
+        yield queue.enq.valid.eq(0)
+        yield queue.deq.ready.eq(0)
+        yield Settle()
+        yield
+        yield Settle()
+        assert (yield queue.deq.valid)
+        assert (yield queue.deq.bits) == 0xC7
+        yield queue.flush.eq(1)
+        yield Settle()
+        yield
+        yield Settle()
+        assert not (yield queue.deq.valid)
+
+    sim.add_sync_process(drive)
+    sim.run()
