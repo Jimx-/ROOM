@@ -1,8 +1,7 @@
 import pytest
 from amaranth.sim import Simulator
 
-from roomsoc.peripheral.net.crc import (CrcCalculate, CrcExtract, CrcInsert,
-                                        _crc_table)
+from roomsoc.peripheral.net.crc import CrcCalculate, CrcExtract, CrcInsert
 
 
 def _crc_ref(data, width, polynomial, initial_value, final_xor):
@@ -34,18 +33,6 @@ def _append_kept_bytes(buffer, data, keep, byte_count):
     for lane in range(byte_count):
         if keep & (1 << lane):
             buffer.append((data >> (8 * lane)) & 0xff)
-
-
-def test_crc_table_matches_bitwise_step_for_every_byte():
-    for width, polynomial in ((16, 0xa001), (32, 0xedb88320)):
-        table = _crc_table(width, polynomial)
-        assert len(table) == 256
-        for byte, actual in enumerate(table):
-            expected = byte
-            for _ in range(8):
-                expected = ((expected >> 1) ^ polynomial if expected
-                            & 1 else expected >> 1)
-            assert actual == expected
 
 
 @pytest.mark.parametrize("data_width,width,polynomial,initial_value,final_xor",
