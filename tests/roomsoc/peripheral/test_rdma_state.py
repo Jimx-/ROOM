@@ -62,11 +62,12 @@ def _init(dut, qpn, resp_epsn):
     yield
 
 
-def _commit(dut, qpn, valid, resp_epsn):
+def _commit(dut, qpn, valid, resp_epsn, msn=0):
     """Issue an RX commit (write-back) and wait for it to fire."""
     yield dut.commit.bits.qpn.eq(qpn)
     yield dut.commit.bits.valid.eq(valid)
     yield dut.commit.bits.resp_epsn.eq(resp_epsn)
+    yield dut.commit.bits.msn.eq(msn)
     yield dut.commit.valid.eq(1)
     for _ in range(16):
         yield
@@ -112,8 +113,9 @@ def _connection_read(dut, qpn):
     for _ in range(8):
         if (yield dut.resp.valid):
             result = ((yield dut.resp.bits.remote_qpn),
-                      (yield dut.resp.bits.remote_ip),
-                      (yield dut.resp.bits.remote_port))
+                      (yield
+                       dut.resp.bits.remote_ip), (yield
+                                                  dut.resp.bits.remote_port))
             yield
             assert (yield dut.resp.valid) == 0
             return result
@@ -347,8 +349,9 @@ def test_lookup_lock_rejects_other_lookups_and_mismatched_commits():
             yield
         else:
             assert False, "held lookup produced no response"
-        assert ((yield dut.resp.bits.valid),
-                (yield dut.resp.bits.resp_epsn)) == (1, 0x55)
+        assert ((yield
+                 dut.resp.bits.valid), (yield
+                                        dut.resp.bits.resp_epsn)) == (1, 0x55)
         yield
         yield from _commit(dut, 5, 1, 0x55)
 

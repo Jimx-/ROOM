@@ -386,6 +386,10 @@ class DMAHandler(Elaboratable):
         self.write_cmd = Decoupled(Rocev2Stack.MemoryCommand)
         self.write_data = AXIStreamInterface(data_width=data_width)
         self.write_done = Signal()
+        # Models the board adapter's AXI decode-error indication: a
+        # write the memory system refused completes with error instead
+        # of done, which the RC stack turns into QP poison.
+        self.write_error = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -472,10 +476,12 @@ class DMAHandler(Elaboratable):
         # A rejected descriptor is not consumed on the writer's data
         # path: drain its payload here so later traffic cannot wedge
         # behind it, and hold write_done (the RC acknowledgement) so
-        # the failure surfaces as a missing response instead of a
-        # success.
-        m.d.comb += self.write_done.eq(write_active & writer.done
-                                       & ~writer.error)
+        # the failure surfaces to the RC stack as an error completion
+        # instead of a success.
+        m.d.comb += [
+            self.write_done.eq(write_active & writer.done & ~writer.error),
+            self.write_error.eq(write_active & writer.done & writer.error),
+        ]
 
         with m.If(write_active & writer.done):
             with m.If(writer.error & (write_beats != 0)):
@@ -495,7 +501,8 @@ class DMAHandler(Elaboratable):
 class Top(Elaboratable):
     SRAM_DEPTH = 256
 
-    def __init__(self):
+    def __init__(self, *, write_error_delay=0):
+        self.write_error_delay = write_error_delay
         self.rx_data_in = AXIStreamInterface(data_width=64)
         self.tx_data_out = AXIStreamInterface(data_width=64)
         self.sram_inspect_bus = wb.Interface(addr_width=29,
@@ -560,12 +567,18 @@ class Top(Elaboratable):
 
         dma_handler = m.submodules.dma_handler = DMAHandler(addr_width=32,
                                                             data_width=64)
+        write_error = dma_handler.write_error
+        if self.write_error_delay:
+            delayed_error = Signal(self.write_error_delay)
+            m.d.sync += delayed_error.eq(Cat(write_error, delayed_error[:-1]))
+            write_error = delayed_error[-1]
         m.d.comb += [
             roce_stack.mem_read_cmd.connect(dma_handler.read_cmd),
             roce_stack.mem_write_cmd.connect(dma_handler.write_cmd),
             roce_stack.mem_write_data.connect(dma_handler.write_data),
             dma_handler.read_data.connect(roce_stack.mem_read_data),
             roce_stack.mem_write_done.eq(dma_handler.write_done),
+            roce_stack.mem_write_error.eq(write_error),
         ]
 
         dma_sram_bus = wb.Interface(addr_width=29,
@@ -874,10 +887,10 @@ def test_rdma_write_then_read_roundtrip(vaddr, payload):
 
 def test_rdma_rejected_unaligned_write_is_never_acked():
     # A WRITE whose address is off the 8-byte grid is rejected by the
-    # DMA writer with done+error and an unconsumed payload. With no
-    # later write, the observable contract is the acknowledgement: the
-    # rejected request must not be ACKed, while the writes before it
-    # and the read after it complete normally.
+    # DMA writer with done+error and an unconsumed payload. The failure
+    # poisons the QP: the rejected request itself is never ACKed, and
+    # the read after it fails fast with the local-error syndrome
+    # instead of executing.
     requests = _link_established(
         _roce_write(0x1230, bytes(range(8)), psn=1),
         _roce_write(0x1260, b"GOODDATA", psn=2),
@@ -886,23 +899,40 @@ def test_rdma_rejected_unaligned_write_is_never_acked():
     )
     responses, _ = run_rdma(requests)
 
-    assert len(responses) == 5  # arp, conn ack, two write acks, read resp
+    assert len(responses) == 5  # arp, conn ack, two write acks, poison NAK
     roce = [Ether(frame) for frame in responses[2:]]
     assert [packet[BTH].opcode for packet in roce] == [
         BthOpcode.RC_ACKNOWLEDGE,
         BthOpcode.RC_ACKNOWLEDGE,
-        BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
+        BthOpcode.RC_ACKNOWLEDGE,
     ]
+    assert [packet[BTH].psn for packet in roce] == [1, 2, 4]
+    assert roce[2][AETH].syndrome == 0xC0
     assert all(packet[BTH].psn != 3 for packet in roce)
-    assert _roce_payload(roce[2]) == b"GOODDATA"
 
 
-def test_rdma_rejected_write_payload_is_drained_and_next_write_lands():
-    # The writer never consumes the payload of a rejected descriptor.
-    # The handler must drain it: the next write's own bytes reach its
-    # address (before the fix the survivor consumed the rejected
-    # write's stranded beat) and the transport keeps completing
-    # transfers.
+@pytest.mark.parametrize("retry_psn", [1, 3], ids=["duplicate", "gap"])
+def test_rdma_retry_waits_for_pending_write_failure(retry_psn):
+    address = 0x1244
+    requests = _link_established(
+        _roce_write(address, b"REJECTED", psn=1),
+        _roce_write(0x1260, b"RETRYING", psn=retry_psn),
+    )
+    responses, _ = run_rdma(requests, dut=Top(write_error_delay=128), rx_gap=0)
+
+    assert len(responses) == 3
+    response = Ether(responses[2])
+    assert response[BTH].opcode == BthOpcode.RC_ACKNOWLEDGE
+    assert response[BTH].psn == 2
+    assert response[AETH].syndrome == 0xC0
+
+
+def test_rdma_rejected_write_poisons_qp_and_drains_payload():
+    # The writer never consumes the payload of a rejected descriptor;
+    # the handler drains it so traffic keeps flowing. Under the
+    # retransmission contract the failed write also poisons the QP:
+    # every later packet is answered with the local-error syndrome and
+    # never executes, so no survivor bytes land and no read runs.
     requests = _link_established(
         _roce_write(0x1244, b"MUST-BE-DROPPED!!", psn=1),  # 4 mod 8
         _roce_write(0x1260, b"SURVIVOR", psn=2),
@@ -911,19 +941,18 @@ def test_rdma_rejected_write_payload_is_drained_and_next_write_lands():
     word = 0x1260 // 8 % Top.SRAM_DEPTH
     responses, sram = run_rdma(requests, sram_addresses=(word, ))
 
-    assert len(responses) == 4  # arp, conn ack, one write ack, read resp
+    assert len(responses) == 4  # arp, conn ack, two poison NAKs
     roce = [Ether(frame) for frame in responses[2:]]
     assert [packet[BTH].opcode for packet in roce] == [
         BthOpcode.RC_ACKNOWLEDGE,
-        BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
+        BthOpcode.RC_ACKNOWLEDGE,
     ]
-    # The survivor's completion is the only one, but the responder
-    # pops pending writes in order, so the ack still names the rejected
-    # request's psn. Popping the failed entry itself belongs to the IB
-    # stack; a PSN-checking host treats this ack as stale and fails.
-    assert roce[0][BTH].psn == 1
-    assert _roce_payload(roce[1]) == b"SURVIVOR"
-    assert sram == {word: int.from_bytes(b"SURVIVOR", "little")}
+    assert [packet[BTH].psn for packet in roce] == [2, 2]
+    assert [packet[AETH].syndrome for packet in roce] == [0xC0, 0xC0]
+    # The rejected write's own PSN is never acknowledged, and the SRAM
+    # keeps its reset image: neither the survivor nor the read ran.
+    assert all(packet[BTH].psn != 1 for packet in roce)
+    assert sram == {word: word}
 
 
 @pytest.mark.parametrize("qpn", [0, 2, 63])
@@ -961,12 +990,18 @@ def test_connection_setup_programs_nonzero_responder_psn():
     responses, sram = run_rdma(requests,
                                sram_addresses=(accepted_word, rejected_word))
 
-    # ARP + setup ACK + ACK for the matching request. The PSN-0 request is
-    # rejected, proving the programmed value did not come from reset state.
-    assert len(responses) == 3
-    ack = Ether(responses[2])
-    assert ack[BTH].opcode == BthOpcode.RC_ACKNOWLEDGE
-    assert ack[BTH].psn == initial_psn
+    # ARP + setup ACK + ACK for the matching request + a stale-duplicate
+    # re-acknowledgement for PSN 0. The PSN-0 request never executes --
+    # proving the programmed value did not come from reset state -- but
+    # it is now answered so a host retrying it cannot stall.
+    assert len(responses) == 4
+    acks = [Ether(frame) for frame in responses[2:]]
+    assert [ack[BTH].opcode for ack in acks] == [
+        BthOpcode.RC_ACKNOWLEDGE,
+        BthOpcode.RC_ACKNOWLEDGE,
+    ]
+    assert [ack[BTH].psn for ack in acks] == [initial_psn, 0]
+    assert [ack[AETH].syndrome for ack in acks] == [0x00, 0x00]
     assert sram == {
         accepted_word: int.from_bytes(payload, "little"),
         rejected_word: rejected_word,
@@ -1259,9 +1294,11 @@ def test_rdma_randomized_trace_roundtrips_and_survives_backpressure(seed):
     assert stressed == reference
 
 
-def test_replay_of_old_psn_is_rejected():
-    # Two in-order writes are accepted; replaying the first PSN is rejected
-    # without a second DMA side effect or ACK.
+def test_replay_of_old_psn_is_re_acked_without_side_effect():
+    # Two in-order writes are accepted; replaying the first PSN is a
+    # stale duplicate under 24-bit serial-number arithmetic. It must
+    # not write memory again, but it is re-acknowledged at its original
+    # PSN so a requester whose first ACK was lost can retire the retry.
     word_a = (0x1230 // 8) % Top.SRAM_DEPTH
     word_b = (0x1260 // 8) % Top.SRAM_DEPTH
     payload_a = bytes(range(8))
@@ -1275,18 +1312,24 @@ def test_replay_of_old_psn_is_rejected():
     responses, sram = run_rdma(requests, sram_addresses=(word_a, word_b))
 
     assert len(
-        responses) == 4  # ARP + conn ack + 2 write ACKs (replay dropped)
+        responses) == 5  # ARP + conn ack + 2 write ACKs + duplicate re-ACK
     acks = [Ether(f) for f in responses[2:]]
-    assert [a[BTH].psn for a in acks] == [1, 2]
+    assert [a[BTH].psn for a in acks] == [1, 2, 1]
+    assert [a[AETH].syndrome for a in acks] == [0x00, 0x00, 0x00]
+    # MSN is the per-QP accepted-message count at event time: the two
+    # accepts carry 0 and 1, and the duplicate names the current count.
+    assert [a[AETH].msn for a in acks] == [0, 1, 2]
     assert sram == {
         word_a: int.from_bytes(payload_a, "little"),
         word_b: int.from_bytes(payload_b, "little"),
     }
 
 
-def test_future_psn_does_not_advance_state():
-    # A future PSN is rejected without advancing resp_epsn; the expected PSN
-    # that follows is still accepted.
+def test_future_psn_returns_sequence_error_nak():
+    # A future PSN leaves resp_epsn unchanged and is answered with a
+    # sequence-error NAK carrying the expected PSN, so a requester with
+    # a gap can rewind immediately instead of waiting out its timer.
+    # The expected PSN that follows is still accepted.
     future_addr = 0x1230
     expected_addr = 0x1240
     future_word = (future_addr // 8) % Top.SRAM_DEPTH
@@ -1300,13 +1343,50 @@ def test_future_psn_does_not_advance_state():
     responses, sram = run_rdma(requests,
                                sram_addresses=(future_word, expected_word))
 
-    assert len(responses) == 3  # ARP + conn ack + 1 ACK (future dropped)
-    ack = Ether(responses[2])
+    assert len(responses) == 4  # ARP + conn ack + NAK (future dropped) + ACK
+    nak, ack = [Ether(f) for f in responses[2:]]
+    assert nak[BTH].opcode == BthOpcode.RC_ACKNOWLEDGE
+    assert nak[BTH].psn == 1  # carries resp_epsn, not the future PSN
+    assert nak[AETH].syndrome == 0x60
     assert ack[BTH].psn == 1
+    assert ack[AETH].syndrome == 0x00
     assert sram == {
         future_word: future_word,
         expected_word: int.from_bytes(expected_payload, "little"),
     }
+
+
+def test_stale_read_request_regenerates_response():
+    # A replayed read is a stale duplicate whose original response may
+    # have been lost. It must not advance responder state, and it is
+    # re-executed as an idempotent fetch: the regenerated response is
+    # bit-identical and carries the original PSN.
+    word = (0x1230 // 8) % Top.SRAM_DEPTH
+    payload = bytes(range(8))
+    requests = _link_established(
+        _roce_write(0x1230, payload, psn=1),
+        _roce_read_request(0x1230, 8, psn=2),
+        _roce_read_request(0x1230, 8, psn=2),
+        _roce_read_request(0x1230, 8, psn=3),
+    )
+    responses, sram = run_rdma(requests, sram_addresses=(word, ))
+
+    # ARP + conn ack + write ACK + 3 read responses (original psn 2,
+    # regenerated psn 2, and psn 3 -- proving state advanced normally
+    # past the regenerated duplicate).
+    assert len(responses) == 6
+    roce = [Ether(f) for f in responses[2:]]
+    assert [packet[BTH].opcode for packet in roce] == [
+        BthOpcode.RC_ACKNOWLEDGE,
+        BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
+        BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
+        BthOpcode.RC_RDMA_READ_RESPONSE_ONLY,
+    ]
+    assert [packet[BTH].psn for packet in roce] == [1, 2, 2, 3]
+    assert _roce_payload(roce[1]) == payload
+    assert _roce_payload(roce[2]) == payload
+    assert _roce_payload(roce[3]) == payload
+    assert sram == {word: int.from_bytes(payload, "little")}
 
 
 def test_psn_wrap_across_boundary():
@@ -1342,21 +1422,27 @@ def test_two_qps_with_different_starting_psns_are_isolated():
         _connection_setup(local_qpn=5, remote_qpn=5, initial_rx_psn=0x200),
         _roce_write(addrs[0], bytes(range(8)), dest_qp=2, psn=0x100),
         _roce_write(addrs[1], bytes(range(8, 16)), dest_qp=5, psn=0x200),
-        # A future QP-2 PSN must not affect QP 5 or advance QP 2.
+        # A future QP-2 PSN must not affect QP 5 or advance QP 2; it is
+        # answered with a QP-2 NAK carrying QP 2's expected PSN.
         _roce_write(addrs[2], bytes(range(16, 24)), dest_qp=2, psn=0x102),
         _roce_write(addrs[3], bytes(range(24, 32)), dest_qp=5, psn=0x201),
         _roce_write(addrs[4], bytes(range(32, 40)), dest_qp=2, psn=0x101),
     ]
     responses, sram = run_rdma(requests, sram_addresses=words)
 
-    assert len(responses) == 7  # ARP + 2 setup ACKs + 4 accepted writes
+    # ARP + 2 setup ACKs + 4 accepted writes + 1 NAK
+    assert len(responses) == 8
     acks = [Ether(f) for f in responses[3:]]
     assert [(ack[BTH].dest_qp, ack[BTH].psn) for ack in acks] == [
         (2, 0x100),
         (5, 0x200),
+        (2, 0x101),  # NAK: QP 2's expected PSN after the future packet
         (5, 0x201),
         (2, 0x101),
     ]
+    assert acks[2][AETH].syndrome == 0x60
+    assert all(ack[AETH].syndrome == 0x00 for i, ack in enumerate(acks)
+               if i != 2)
     assert sram == {
         words[0]: int.from_bytes(bytes(range(8)), "little"),
         words[1]: int.from_bytes(bytes(range(8, 16)), "little"),

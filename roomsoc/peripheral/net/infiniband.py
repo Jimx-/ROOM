@@ -111,6 +111,15 @@ _bth_opcodes = dict([
 
 BthOpcode = IntEnum("BthOpcode", _bth_opcodes)
 
+# Ack Extended Header syndromes. 0x00 is the wire-format normal
+# acknowledgement; 0x60 is the IB sequence-error NAK (resend from the
+# carried PSN); 0xC0 is this stack's private local-error poison: the
+# write DMA failed, the QP refuses every later packet and the
+# requester must fail closed.
+AETH_ACK = 0x00
+AETH_NAK = 0x60
+AETH_LOCAL_ERROR = 0xC0
+
 
 def _opcode_is_reth(opcode):
     return (opcode == BthOpcode.RC_RDMA_READ_REQUEST) | (
@@ -183,6 +192,8 @@ class _EventMetadata(Record):
             ('addr', 64, Direction.FANOUT),
             ('len', 32, Direction.FANOUT),
             ('psn', 24, Direction.FANOUT),
+            ('syndrome', 8, Direction.FANOUT),
+            ('msn', 24, Direction.FANOUT),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -194,6 +205,7 @@ class _PendingWrite(Record):
         super().__init__([
             ('qpn', 24, Direction.FANOUT),
             ('psn', 24, Direction.FANOUT),
+            ('msn', 24, Direction.FANOUT),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -207,6 +219,7 @@ class InfiniBandMetadata(Record):
             ('partition', 16, Direction.FANOUT),
             ('dest_qp', 24, Direction.FANOUT),
             ('psn', 24, Direction.FANOUT),
+            ('msn', 24, Direction.FANOUT),
         ],
                          name=name,
                          src_loc_at=1 + src_loc_at)
@@ -261,8 +274,9 @@ class InfiniBandDepacketizer(Elaboratable):
         with m.FSM():
             with m.State('IDLE'):
                 with m.If(bth_depacketizer.source.valid):
-                    with m.If(_opcode_is_supported_responder_request(
-                            bth_header.opcode)):
+                    with m.If(
+                            _opcode_is_supported_responder_request(
+                                bth_header.opcode)):
                         m.d.comb += meta_q.enq.valid.eq(1)
                         with m.If(meta_q.enq.fire):
                             m.next = 'RETH_HEADER'
@@ -364,6 +378,7 @@ class StateTable(Elaboratable):
             super().__init__([
                 ('valid', 1, Direction.FANOUT),
                 ('resp_epsn', 24, Direction.FANOUT),
+                ('msn', 24, Direction.FANOUT),
             ],
                              name=name,
                              src_loc_at=1 + src_loc_at)
@@ -384,6 +399,7 @@ class StateTable(Elaboratable):
                 ('qpn', 24, Direction.FANOUT),
                 ('valid', 1, Direction.FANOUT),
                 ('resp_epsn', 24, Direction.FANOUT),
+                ('msn', 24, Direction.FANOUT),
             ],
                              name=name,
                              src_loc_at=1 + src_loc_at)
@@ -440,6 +456,7 @@ class StateTable(Elaboratable):
             self.read.ready.eq(~busy),
             self.resp.bits.valid.eq(read_entry.valid & in_range_r),
             self.resp.bits.resp_epsn.eq(read_entry.resp_epsn),
+            self.resp.bits.msn.eq(read_entry.msn),
         ]
 
         m.d.sync += self.resp.valid.eq(0)
@@ -464,8 +481,9 @@ class StateTable(Elaboratable):
         with m.If(self.commit.valid & commit_matches):
             m.d.comb += [
                 mem_wport.addr.eq(self.commit.bits.qpn[:iw]),
-                mem_wport.data.eq(Cat(self.commit.bits.valid,
-                                      self.commit.bits.resp_epsn)),
+                mem_wport.data.eq(
+                    Cat(self.commit.bits.valid, self.commit.bits.resp_epsn,
+                        self.commit.bits.msn)),
                 mem_wport.en.eq(self.commit.fire & commit_in_range),
                 self.commit.ready.eq(1),
             ]
@@ -474,7 +492,8 @@ class StateTable(Elaboratable):
         with m.Elif(self.init.valid & ~busy & ~self.read.valid):
             m.d.comb += [
                 mem_wport.addr.eq(self.init.bits.qpn[:iw]),
-                mem_wport.data.eq(Cat(Const(1, 1), self.init.bits.resp_epsn)),
+                mem_wport.data.eq(
+                    Cat(Const(1, 1), self.init.bits.resp_epsn, Const(0, 24))),
                 mem_wport.en.eq(self.init.fire & init_in_range),
                 self.init.ready.eq(1),
             ]
@@ -579,20 +598,16 @@ class _ConnectionInitializer(Elaboratable):
         in_range = Signal()
         m.d.comb += [
             in_range.eq(self.req.bits.local_qpn < self.max_qps),
-
             self.conn_write.bits.eq(self.req.bits),
-            self.conn_write.valid.eq(
-                self.req.valid & in_range & self.state_init.ready),
-
+            self.conn_write.valid.eq(self.req.valid & in_range
+                                     & self.state_init.ready),
             self.state_init.bits.qpn.eq(self.req.bits.local_qpn),
-            self.state_init.bits.resp_epsn.eq(
-                self.req.bits.initial_rx_psn),
-            self.state_init.valid.eq(
-                self.req.valid & in_range & self.conn_write.ready),
-
-            self.req.ready.eq(
-                ~in_range
-                | (self.conn_write.ready & self.state_init.ready)),
+            self.state_init.bits.resp_epsn.eq(self.req.bits.initial_rx_psn),
+            self.state_init.valid.eq(self.req.valid & in_range
+                                     & self.conn_write.ready),
+            self.req.ready.eq(~in_range
+                              | (self.conn_write.ready
+                                 & self.state_init.ready)),
         ]
 
         return m
@@ -600,8 +615,9 @@ class _ConnectionInitializer(Elaboratable):
 
 class InfiniBandDropper(Elaboratable):
 
-    def __init__(self, data_width):
+    def __init__(self, data_width, max_qps=64):
         self.data_width = data_width
+        self.max_qps = max_qps
 
         self.meta_in = Decoupled(InfiniBandMetadata)
         self.meta_out = Decoupled(InfiniBandMetadata)
@@ -615,8 +631,20 @@ class InfiniBandDropper(Elaboratable):
         self.state_resp = Valid(StateTable.Entry)
         self.state_commit = Decoupled(StateTable.CommitReq)
 
+        # Responder-generated acknowledgements that bypass the memory
+        # path: re-acknowledgement of stale duplicate writes, NAK for
+        # gap/future packets and the local-error poison response. The
+        # parent drives *qp_poison* from the shared per-QP mask.
+        self.resp_event = Decoupled(_EventMetadata)
+        self.qp_poison = Signal(max_qps)
+        self.qp_write_pending = Signal(max_qps)
+        self.write_started = Signal()
+
         self.data_in = AXIStreamInterface(data_width=data_width)
         self.data_out = AXIStreamInterface(data_width=data_width)
+
+    def _index_width(self):
+        return max(1, (self.max_qps - 1).bit_length())
 
     def elaborate(self, platform):
         m = Module()
@@ -624,6 +652,14 @@ class InfiniBandDropper(Elaboratable):
         meta = InfiniBandMetadata()
         state_entry = StateTable.Entry()
         state_match = Signal()
+        state_stale = Signal()
+        resp_syndrome = Signal(8)
+        resp_psn = Signal(24)
+        qp_index = meta.dest_qp[:self._index_width()]
+        state_poisoned = state_entry.valid & self.qp_poison.bit_select(
+            qp_index, 1)
+        write_pending = state_entry.valid & self.qp_write_pending.bit_select(
+            qp_index, 1)
 
         meta_q = m.submodules.meta_q = Queue(4, InfiniBandMetadata)
         m.d.comb += [
@@ -647,8 +683,9 @@ class InfiniBandDropper(Elaboratable):
                                & self.aeth_in.valid)
                               | (_opcode_is_reth(self.meta_in.bits.opcode)
                                  & self.reth_in.valid)):
-                        with m.If(_opcode_is_supported_responder_request(
-                                self.meta_in.bits.opcode)):
+                        with m.If(
+                                _opcode_is_supported_responder_request(
+                                    self.meta_in.bits.opcode)):
                             m.d.comb += [
                                 self.state_read.bits.qpn.eq(
                                     self.meta_in.bits.dest_qp),
@@ -687,33 +724,100 @@ class InfiniBandDropper(Elaboratable):
 
             with m.State('CHECK'):
                 with m.If(self.state_resp.valid):
+                    # Wrap-aware 24-bit serial-number classification.
+                    # Everything at distance >= 2^23 is unreachable in
+                    # practice; it falls to the future/NAK class.
+                    psn_behind = (self.state_resp.bits.resp_epsn -
+                                  meta.psn)[:24]
                     m.d.sync += [
                         state_entry.eq(self.state_resp.bits),
                         state_match.eq(
                             self.state_resp.bits.valid
-                            & (self.state_resp.bits.resp_epsn
-                               == meta.psn)),
+                            & (self.state_resp.bits.resp_epsn == meta.psn)),
+                        state_stale.eq(self.state_resp.bits.valid
+                                       & (psn_behind != 0)
+                                       & (psn_behind < (1 << 23))),
                     ]
                     m.next = 'COMMIT'
 
             # Close the StateTable transaction: on accept advance
-            # resp_epsn by one (24-bit wrap); on reject write the entry
-            # back unchanged.
+            # resp_epsn and msn by one (24-bit wrap); on every other
+            # class write the entry back unchanged.
             with m.State('COMMIT'):
+                accepted = state_match & ~state_poisoned
                 m.d.comb += [
                     self.state_commit.bits.qpn.eq(meta.dest_qp),
                     self.state_commit.bits.valid.eq(state_entry.valid),
                     self.state_commit.bits.resp_epsn.eq(
-                        Mux(state_match,
-                            (state_entry.resp_epsn + 1)[:24],
+                        Mux(accepted, (state_entry.resp_epsn + 1)[:24],
                             state_entry.resp_epsn)),
-                    self.state_commit.valid.eq(1),
+                    self.state_commit.bits.msn.eq(
+                        Mux(accepted, (state_entry.msn + 1)[:24],
+                            state_entry.msn)),
+                    # A sequence NAK can implicitly ACK earlier PSNs too.
+                    # Classify replies only after this QP's write retires.
+                    self.state_commit.valid.eq(~write_pending),
+                    self.write_started.eq(
+                        self.state_commit.fire & accepted
+                        & (meta.opcode == BthOpcode.RC_RDMA_WRITE_ONLY)),
                 ]
                 with m.If(self.state_commit.fire):
-                    with m.If(state_match):
+                    with m.If(state_poisoned):
+                        # A poisoned QP refuses every packet with the
+                        # local-error syndrome; the entry stays frozen.
+                        m.d.sync += [
+                            resp_syndrome.eq(AETH_LOCAL_ERROR),
+                            resp_psn.eq(state_entry.resp_epsn),
+                        ]
+                        m.next = 'RESPOND'
+                    with m.Elif(state_match):
+                        m.d.sync += meta.msn.eq(state_entry.msn)
                         m.next = 'FORWARD_META'
+                    with m.Elif(state_stale):
+                        with m.If(
+                                meta.opcode == BthOpcode.RC_RDMA_READ_REQUEST):
+                            # Stale reads regenerate their response (an
+                            # idempotent DDR fetch) through the normal
+                            # read path without advancing the entry.
+                            m.d.sync += meta.msn.eq(state_entry.msn)
+                            m.next = 'FORWARD_META'
+                        with m.Else():
+                            # Stale duplicate writes are re-acknowledged
+                            # at their original PSN so a lost ACK cannot
+                            # stall the requester.
+                            m.d.sync += [
+                                resp_syndrome.eq(AETH_ACK),
+                                resp_psn.eq(meta.psn),
+                            ]
+                            m.next = 'RESPOND'
                     with m.Else():
-                        m.next = 'DROP_META'
+                        # Gap/future: NAK carries resp_epsn so the
+                        # requester rewinds and resends from there.
+                        m.d.sync += [
+                            resp_syndrome.eq(AETH_NAK),
+                            resp_psn.eq(state_entry.resp_epsn),
+                        ]
+                        m.next = 'RESPOND'
+
+            with m.State('RESPOND'):
+                m.d.comb += [
+                    self.resp_event.bits.opcode.eq(BthOpcode.RC_ACKNOWLEDGE),
+                    self.resp_event.bits.qpn.eq(meta.dest_qp),
+                    self.resp_event.bits.psn.eq(resp_psn),
+                    self.resp_event.bits.syndrome.eq(resp_syndrome),
+                    self.resp_event.bits.msn.eq(state_entry.msn),
+                    self.resp_event.valid.eq(1),
+                ]
+                with m.If(is_aeth):
+                    m.d.comb += self.aeth_in.ready.eq(1)
+                with m.Else():
+                    m.d.comb += self.reth_in.ready.eq(1)
+
+                with m.If(self.resp_event.fire):
+                    with m.If(_opcode_no_data(meta.opcode)):
+                        m.next = 'IDLE'
+                    with m.Else():
+                        m.next = 'DROP_DATA'
 
             with m.State('FORWARD_META'):
                 m.d.comb += [
@@ -776,6 +880,7 @@ class RxHandler(Elaboratable):
                 ('vaddr', 64, Direction.FANOUT),
                 ('dmalen', 32, Direction.FANOUT),
                 ('psn', 24, Direction.FANOUT),
+                ('msn', 24, Direction.FANOUT),
             ],
                              name=name,
                              src_loc_at=1 + src_loc_at)
@@ -796,6 +901,12 @@ class RxHandler(Elaboratable):
         self.write_cmd = Decoupled(InfiniBandTransportProtocol.MemoryCommand)
         self.ack_event = Decoupled(_EventMetadata)
         self.mem_write_done = Signal()
+        self.mem_write_error = Signal()
+        # Fired when a posted write's DMA failed: the parent latches
+        # the QP into its poison mask so no later packet on that QP is
+        # accepted or re-acknowledged.
+        self.poison_set = Decoupled(Signal, 24)
+        self.write_retired = Valid(Signal, 24)
 
     def elaborate(self, platform):
         m = Module()
@@ -809,21 +920,34 @@ class RxHandler(Elaboratable):
 
         pending_q = m.submodules.pending_q = Queue(16, _PendingWrite)
 
-        completions = Signal(range(17))
-        ack_ready = (completions != 0) & pending_q.deq.valid
-        ack_fire = ack_ready & ack_q.enq.ready
+        # Each pending write must retire, even if the DMA failed. Leaving
+        # a failed entry queued would acknowledge its PSN on a later success.
+        # A failed write instead poisons its QP: the parent's mask makes
+        # the dropper answer every later packet on that QP with the
+        # local-error syndrome, so the requester fails fast and can never
+        # mistake a re-acknowledgement for a completed write.
+        completions = m.submodules.completions = Queue(16, Signal, 1)
+        completion_ready = completions.deq.valid & pending_q.deq.valid
+        write_failed = completions.deq.bits
+        retire = completion_ready & ((write_failed & self.poison_set.ready)
+                                     | (~write_failed & ack_q.enq.ready))
         m.d.comb += [
+            completions.enq.valid.eq(self.mem_write_done
+                                     | self.mem_write_error),
+            completions.enq.bits.eq(self.mem_write_error),
+            completions.deq.ready.eq(retire),
+            self.poison_set.bits.eq(pending_q.deq.bits.qpn),
+            self.poison_set.valid.eq(completion_ready & write_failed),
             ack_q.enq.bits.opcode.eq(BthOpcode.RC_ACKNOWLEDGE),
             ack_q.enq.bits.qpn.eq(pending_q.deq.bits.qpn),
             ack_q.enq.bits.psn.eq(pending_q.deq.bits.psn),
-            ack_q.enq.valid.eq(ack_ready),
-            pending_q.deq.ready.eq(ack_fire),
+            ack_q.enq.bits.syndrome.eq(AETH_ACK),
+            ack_q.enq.bits.msn.eq(pending_q.deq.bits.msn),
+            ack_q.enq.valid.eq(completion_ready & ~write_failed),
+            pending_q.deq.ready.eq(retire),
+            self.write_retired.valid.eq(retire),
+            self.write_retired.bits.eq(pending_q.deq.bits.qpn),
         ]
-
-        with m.If(self.mem_write_done & ~ack_fire):
-            m.d.sync += completions.eq(completions + 1)
-        with m.Elif(~self.mem_write_done & ack_fire):
-            m.d.sync += completions.eq(completions - 1)
 
         meta = InfiniBandMetadata()
         aeth = Record(IB_AETH_LAYOUT)
@@ -857,6 +981,7 @@ class RxHandler(Elaboratable):
                             self.read_req.bits.vaddr.eq(reth.vaddr),
                             self.read_req.bits.dmalen.eq(reth.dmalen),
                             self.read_req.bits.psn.eq(meta.psn),
+                            self.read_req.bits.msn.eq(meta.msn),
                             self.read_req.valid.eq(1),
                         ]
 
@@ -870,6 +995,7 @@ class RxHandler(Elaboratable):
                             write_cmd_q.enq.valid.eq(pending_q.enq.ready),
                             pending_q.enq.bits.qpn.eq(meta.dest_qp),
                             pending_q.enq.bits.psn.eq(meta.psn),
+                            pending_q.enq.bits.msn.eq(meta.msn),
                             pending_q.enq.valid.eq(write_cmd_q.enq.ready),
                         ]
 
@@ -917,6 +1043,8 @@ class ReadFragmenter(Elaboratable):
             event_q.enq.bits.addr.eq(self.req.bits.vaddr),
             event_q.enq.bits.len.eq(self.req.bits.dmalen),
             event_q.enq.bits.psn.eq(self.req.bits.psn),
+            event_q.enq.bits.syndrome.eq(AETH_ACK),
+            event_q.enq.bits.msn.eq(self.req.bits.msn),
             event_q.enq.valid.eq(self.req.valid & cmd_q.enq.ready),
             self.req.ready.eq(cmd_q.enq.ready & event_q.enq.ready),
         ]
@@ -965,6 +1093,11 @@ class MetadataMerger(Elaboratable):
     def __init__(self):
         self.ack_event = Decoupled(_EventMetadata)
         self.read_event = Decoupled(_EventMetadata)
+        # Responder-generated responses (re-acknowledgement, NAK,
+        # local-error poison) outrank queued data acknowledgements so
+        # recovery signals reach the requester without waiting behind
+        # in-flight completions.
+        self.resp_event = Decoupled(_EventMetadata)
 
         self.bth_out = Decoupled(Record, IB_BTH_LAYOUT)
         self.exh_out = Decoupled(_EventMetadata)
@@ -978,7 +1111,18 @@ class MetadataMerger(Elaboratable):
         exh_q = m.submodules.exh_q = Queue(4, _EventMetadata)
         m.d.comb += exh_q.deq.connect(self.exh_out)
 
-        with m.If(self.ack_event.valid):
+        with m.If(self.resp_event.valid):
+            m.d.comb += [
+                bth_q.enq.bits.opcode.eq(BthOpcode.RC_ACKNOWLEDGE),
+                bth_q.enq.bits.dest_qp.eq(self.resp_event.bits.qpn),
+                bth_q.enq.bits.psn.eq(self.resp_event.bits.psn),
+                bth_q.enq.bits.partition.eq(0xffff),
+                exh_q.enq.bits.eq(self.resp_event.bits),
+                bth_q.enq.valid.eq(exh_q.enq.ready),
+                exh_q.enq.valid.eq(bth_q.enq.ready),
+                self.resp_event.ready.eq(exh_q.enq.ready & bth_q.enq.ready),
+            ]
+        with m.Elif(self.ack_event.valid):
             m.d.comb += [
                 bth_q.enq.bits.opcode.eq(BthOpcode.RC_ACKNOWLEDGE),
                 bth_q.enq.bits.dest_qp.eq(self.ack_event.bits.qpn),
@@ -1024,7 +1168,16 @@ class ExtendedPacketizer(Elaboratable):
         aeth = Record(IB_AETH_LAYOUT)
         aeth_packetizer = m.submodules.aeth_packetizer = AXIStreamPacketizer(
             Record, IB_AETH_LAYOUT, data_width=self.data_width)
-        m.d.comb += aeth_packetizer.header.eq(aeth)
+        m.d.comb += [
+            aeth_packetizer.header.eq(aeth),
+            # The acknowledgement header follows the event's syndrome
+            # and message sequence number; byte order mirrors the BTH
+            # field packing in BasePacketizer.
+            aeth.syndrome.eq(meta.syndrome),
+            aeth.msn.eq(
+                Cat(meta.msn[i * 8:(i + 1) * 8]
+                    for i in range(len(meta.msn) // 8, -1, -1))),
+        ]
 
         empty_payload_q = m.submodules.empty_payload_q = Queue(
             4, aeth_packetizer.sink)
@@ -1243,6 +1396,7 @@ class InfiniBandTransportProtocol(Elaboratable):
             InfiniBandTransportProtocol.MemoryCommand)
         self.mem_write_data = AXIStreamInterface(data_width=data_width)
         self.mem_write_done = Signal()
+        self.mem_write_error = Signal()
 
         self.rx_data_in = AXIStreamInterface(data_width=data_width)
 
@@ -1255,22 +1409,39 @@ class InfiniBandTransportProtocol(Elaboratable):
         state_table = m.submodules.state_table = StateTable(
             max_qps=self.max_qps)
 
+        # Per-QP poison mask: set when a posted write's DMA fails,
+        # cleared when a connection is (re)initialized. A plain Signal
+        # register avoids touching the StateTable's single-owner
+        # lookup/commit transaction.
+        poison_mask = Signal(self.max_qps)
+        pending_writes = Signal(self.max_qps)
+        iw = max(1, (self.max_qps - 1).bit_length())
+
         conn_table = m.submodules.conn_table = ConnectionTable(
             max_qps=self.max_qps)
         conn_initializer = m.submodules.conn_initializer = (
             _ConnectionInitializer(max_qps=self.max_qps))
+        init_qpn = self.conn_req.bits.local_qpn
+        init_pending = (init_qpn < self.max_qps) & pending_writes.bit_select(
+            init_qpn[:iw], 1)
         m.d.comb += [
-            self.conn_req.connect(conn_initializer.req),
+            conn_initializer.req.bits.eq(self.conn_req.bits),
+            conn_initializer.req.valid.eq(self.conn_req.valid & ~init_pending),
+            self.conn_req.ready.eq(conn_initializer.req.ready & ~init_pending),
             conn_initializer.conn_write.connect(conn_table.write),
             conn_initializer.state_init.connect(state_table.init),
         ]
+        with m.If(conn_initializer.state_init.fire
+                  & (conn_initializer.state_init.bits.qpn < self.max_qps)):
+            m.d.sync += poison_mask.bit_select(
+                conn_initializer.state_init.bits.qpn[:iw], 1).eq(0)
 
         depacketizer = m.submodules.depacketizer = InfiniBandDepacketizer(
             data_width=self.data_width)
         m.d.comb += self.rx_data_in.connect(depacketizer.data_in)
 
         dropper = m.submodules.dropper = InfiniBandDropper(
-            data_width=self.data_width)
+            data_width=self.data_width, max_qps=self.max_qps)
         m.d.comb += [
             depacketizer.meta.connect(dropper.meta_in),
             depacketizer.reth.connect(dropper.reth_in),
@@ -1279,6 +1450,8 @@ class InfiniBandTransportProtocol(Elaboratable):
             dropper.state_read.connect(state_table.read),
             dropper.state_resp.eq(state_table.resp),
             dropper.state_commit.connect(state_table.commit),
+            dropper.qp_poison.eq(poison_mask),
+            dropper.qp_write_pending.eq(pending_writes),
         ]
 
         rx_handler = m.submodules.rx_handler = RxHandler(
@@ -1291,7 +1464,19 @@ class InfiniBandTransportProtocol(Elaboratable):
             rx_handler.write_cmd.connect(self.mem_write_cmd),
             rx_handler.data_out.connect(self.mem_write_data),
             rx_handler.mem_write_done.eq(self.mem_write_done),
+            rx_handler.mem_write_error.eq(self.mem_write_error),
+            rx_handler.poison_set.ready.eq(1),
         ]
+        with m.If(dropper.write_started):
+            m.d.sync += pending_writes.bit_select(
+                dropper.state_commit.bits.qpn[:iw], 1).eq(1)
+        with m.If(rx_handler.write_retired.valid):
+            m.d.sync += pending_writes.bit_select(
+                rx_handler.write_retired.bits[:iw], 1).eq(0)
+        with m.If(rx_handler.poison_set.fire
+                  & (rx_handler.poison_set.bits < self.max_qps)):
+            m.d.sync += poison_mask.bit_select(rx_handler.poison_set.bits[:iw],
+                                               1).eq(1)
 
         read_fragmenter = m.submodules.read_fragmenter = ReadFragmenter(
             data_width=self.data_width)
@@ -1305,6 +1490,7 @@ class InfiniBandTransportProtocol(Elaboratable):
 
         meta_merger = m.submodules.meta_merger = MetadataMerger()
         m.d.comb += [
+            dropper.resp_event.connect(meta_merger.resp_event),
             rx_handler.ack_event.connect(meta_merger.ack_event),
             read_fragmenter.event.connect(meta_merger.read_event),
         ]
