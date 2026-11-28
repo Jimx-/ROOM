@@ -346,6 +346,7 @@ class Ipv4Dispatcher(Elaboratable):
 
         self.tcp_data_out = AXIStreamInterface(data_width=data_width)
         self.udp_data_out = AXIStreamInterface(data_width=data_width)
+        self.icmp_data_out = AXIStreamInterface(data_width=data_width)
 
         self._protocol = SkidBuffer(Signal, 16)
 
@@ -388,6 +389,8 @@ class Ipv4Dispatcher(Elaboratable):
                         m.d.comb += q_in.deq.connect(self.tcp_data_out)
                     with m.Case(IpProtocol.UDP):
                         m.d.comb += q_in.deq.connect(self.udp_data_out)
+                    with m.Case(IpProtocol.ICMP):
+                        m.d.comb += q_in.deq.connect(self.icmp_data_out)
                     with m.Default():
                         m.d.comb += q_in.deq.ready.eq(1)
 
@@ -399,8 +402,15 @@ class Ipv4Dispatcher(Elaboratable):
 
 class Ipv4Handler(Elaboratable):
 
-    def __init__(self, data_width):
+    def __init__(self, data_width, udp_icmp_tap=False, *, enable_icmp=False):
         self.data_width = data_width
+        # Enable when a consumer is connected to icmp_data_out.
+        self.enable_icmp = enable_icmp
+        # When set, every protocol-UDP packet is additionally mirrored on
+        # udp_icmp_data_out (full IP packet) for an ICMP server's
+        # port-unreachable tap. The mirror must be drained by the consumer;
+        # an undrained tap would back-pressure the real UDP path.
+        self.udp_icmp_tap = udp_icmp_tap
 
         self.my_ip_addr = Signal(32)
 
@@ -409,6 +419,10 @@ class Ipv4Handler(Elaboratable):
         self.tcp_data_out = AXIStreamInterface(data_width=data_width)
         self.udp_data_out = AXIStreamInterface(data_width=data_width)
         self.roce_data_out = AXIStreamInterface(data_width=data_width)
+        self.icmp_data_out = AXIStreamInterface(data_width=data_width)
+
+        if self.udp_icmp_tap:
+            self.udp_icmp_data_out = AXIStreamInterface(data_width=data_width)
 
     def elaborate(self, platform):
         m = Module()
@@ -440,6 +454,39 @@ class Ipv4Handler(Elaboratable):
                                                      self.roce_data_out,
                                                      flow=False)
         m.d.comb += roce_queue.deq.connect(self.roce_data_out)
+        if self.enable_icmp:
+            icmp_queue = m.submodules.icmp_queue = Queue(2,
+                                                         self.icmp_data_out,
+                                                         flow=False)
+            m.d.comb += [
+                dispatcher.icmp_data_out.connect(icmp_queue.enq),
+                icmp_queue.deq.connect(self.icmp_data_out),
+            ]
+        else:
+            m.d.comb += dispatcher.icmp_data_out.ready.eq(1)
+
+        udp_fan = [udp_queue, roce_queue]
+        if self.udp_icmp_tap:
+            udp_icmp_queue = m.submodules.udp_icmp_queue = Queue(
+                2, self.udp_icmp_data_out, flow=False)
+            m.d.comb += udp_icmp_queue.deq.connect(self.udp_icmp_data_out)
+            udp_fan.append(udp_icmp_queue)
+
+        for fan_queue in udp_fan:
+            m.d.comb += dispatcher.udp_data_out.connect(fan_queue.enq)
+
+        fan_ready = Const(1)
+        for fan_queue in udp_fan:
+            fan_ready = fan_ready & fan_queue.enq.ready
+        m.d.comb += dispatcher.udp_data_out.ready.eq(fan_ready)
+
+        for fan_queue in udp_fan:
+            others_ready = Const(1)
+            for other in udp_fan:
+                if other is not fan_queue:
+                    others_ready = others_ready & other.enq.ready
+            m.d.comb += fan_queue.enq.valid.eq(dispatcher.udp_data_out.valid
+                                               & others_ready)
 
         m.d.comb += [
             addr_check.my_ip_addr.eq(self.my_ip_addr),
@@ -448,14 +495,6 @@ class Ipv4Handler(Elaboratable):
             checksum.data_out.connect(dropper.data_in),
             dropper.data_out.connect(dispatcher.data_in),
             dispatcher.tcp_data_out.connect(self.tcp_data_out),
-            dispatcher.udp_data_out.connect(udp_queue.enq),
-            dispatcher.udp_data_out.connect(roce_queue.enq),
-            dispatcher.udp_data_out.ready.eq(udp_queue.enq.ready
-                                             & roce_queue.enq.ready),
-            udp_queue.enq.valid.eq(dispatcher.udp_data_out.valid
-                                   & roce_queue.enq.ready),
-            roce_queue.enq.valid.eq(dispatcher.udp_data_out.valid
-                                    & udp_queue.enq.ready),
         ]
 
         return m

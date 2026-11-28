@@ -8,7 +8,7 @@ frames that fill the internal checksum queue.
 
 import pytest
 from amaranth.sim import Settle, Simulator
-from scapy.layers.inet import IP, IPOption, UDP
+from scapy.layers.inet import ICMP, IP, IPOption, UDP
 from scapy.packet import Raw
 
 from roomsoc.peripheral.net import Ipv4Handler
@@ -44,8 +44,12 @@ def _drive_packets(dut, packets, gap=20):
             yield dut.data_in.valid.eq(1)
 
             yield
-            while not (yield dut.data_in.ready):
+            for _ in range(100):
+                if (yield dut.data_in.ready):
+                    break
                 yield
+            else:
+                pytest.fail("IPv4 input did not accept the beat")
 
         yield dut.data_in.valid.eq(0)
 
@@ -102,6 +106,12 @@ def run_ipv4_handler(packets, *, gap=20, timeout=1000):
     simulator.run()
 
     return forwarded
+
+
+def test_disabled_icmp_does_not_block_udp():
+    echo = bytes(IP(src=PEER_IP, dst=MY_IP) / ICMP() / Raw(b"ping payload"))
+    udp = _ip_packet()
+    assert run_ipv4_handler([echo, udp], gap=0) == [udp]
 
 
 def test_valid_packet_is_forwarded():
